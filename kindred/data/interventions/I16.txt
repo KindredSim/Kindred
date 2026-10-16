@@ -1,0 +1,16 @@
+# Run from 0 to 600 s.
+
+2*A <-> A2 ; kf=0.02 ; kr=0.004
+
+param dilution_factor = 0.5; unit = 1
+
+# scale multiplies every concentration not maintained by a hold.
+# It can be used without tracking volume, as shown here.
+# When volume is tracked, it is divided by the same factor.
+# A factor of 0.5 then halves concentrations and doubles volume.
+intervention: op=scale; time=240.0; factor_param=dilution_factor
+
+intervention_set1 = {
+  [A] = 1.0
+  [A2] = 0.0
+}

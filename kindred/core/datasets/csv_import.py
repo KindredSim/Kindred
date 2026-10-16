@@ -1,180 +1,349 @@
+"""Physical-column-safe parsing for CSV and worksheet rows."""
+
 from __future__ import annotations
 
-import csv
+from dataclasses import dataclass
+import datetime as dt
 import itertools
-import logging
-import os
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+import io
+import csv
+from typing import Callable, Iterable, Mapping, Sequence
 
-import numpy as np
+from kindred.core.datasets.foundation import ObservationSeries, freeze_json_value
+from kindred.core.datasets.observation_payload import (
+    DatasetObservationPayload,
+    new_raw_observation_id,
+)
+from kindred.core.datasets.source_rules import (
+    PhysicalColumn,
+    identify_physical_columns,
+)
+from kindred.core.species import validate_imported_time_seconds, validate_observation
+from kindred.core.quantity_units import Unit, SECOND, conversion_scale, scientific_unit
 
-logger = logging.getLogger(__name__)
-
-__all__ = ["CsvImportInterrupted", "load_csv_dataset", "parse_csv_rows"]
-
+__all__ = [
+    "CsvImportInterrupted",
+    "PhysicalRow",
+    "TemporalCell",
+    "UncachedFormulaCell",
+    "read_csv_rows_from_bytes",
+    "parse_physical_rows",
+]
 
 class CsvImportInterrupted(Exception):
     """Raised internally to unwind when an import is interrupted."""
 
 
-def load_csv_dataset(
-    filepath: str,
-    time_column: Optional[str] = None,
-    species_columns: Optional[Sequence[str]] = None,
+@dataclass(frozen=True, slots=True)
+class UncachedFormulaCell:
+    """Selected XLSX formula text for which no cached value exists."""
+
+    formula: str
+
+    def __str__(self) -> str:
+        return self.formula
+
+
+@dataclass(frozen=True, slots=True)
+class TemporalCell:
+    """XLSX date, time or duration cell retained with its typed meaning."""
+
+    value: dt.datetime | dt.date | dt.time | dt.timedelta
+
+    @property
+    def elapsed_seconds(self) -> float | None:
+        """Durations and clock times are elapsed seconds; calendar cells are not."""
+        value = self.value
+        if isinstance(value, dt.timedelta):
+            return value.total_seconds()
+        if isinstance(value, dt.time):
+            return (value.hour * 3600 + value.minute * 60 + value.second
+                    + value.microsecond / 1_000_000)
+        return None
+
+    def __str__(self) -> str:
+        value = self.value
+        if isinstance(value, dt.timedelta):
+            sign, seconds = ("-", -value) if value < dt.timedelta(0) else ("", value)
+            hours, rest = divmod(seconds, dt.timedelta(hours=1))
+            return f"{sign}{hours}:{str(rest)[2:]}"
+        if isinstance(value, dt.datetime):
+            return value.isoformat(sep=" ")
+        return value.isoformat()
+
+
+@dataclass(frozen=True, slots=True)
+class PhysicalRow:
+    """One parsed logical row with its exact physical source-row start."""
+
+    source_row: int
+    values: Mapping[PhysicalColumn, object]
+
+
+def read_csv_rows_from_bytes(
+    source_bytes: bytes,
     *,
-    interruption_checker: Optional[Callable[[], bool]] = None,
-) -> Tuple[str, Dict[str, object]]:
+    source_label: str,
+) -> tuple[tuple[PhysicalColumn, ...], Iterable[PhysicalRow]]:
+    """Read one immutable CSV snapshot into canonical physical rows.
+
+    The returned iterator owns its UTF-8 reader and closes it when exhausted
+    or explicitly closed.  Header positions remain physical, including blank
+    and sparse positions, for the shared ``parse_physical_rows`` boundary.
     """
-    Load a CSV dataset using explicit or automatic column mapping.
+    owned_bytes = bytes(source_bytes)
+    label = str(source_label).strip() or "<csv>"
+    handle = io.TextIOWrapper(
+        io.BytesIO(owned_bytes),
+        encoding="utf-8-sig",
+        newline="",
+    )
+    reader = csv.reader(handle)
+    # The source bytes were admitted as UTF-8 text at capture or on Open.
+    try:
+        header = next(reader, None)
+    except csv.Error as exc:
+        handle.close()
+        raise ValueError(f"CSV file {label!r}: {exc}") from exc
+    except BaseException:
+        handle.close()
+        raise
+    if header is None:
+        handle.close()
+        raise ValueError(f"CSV file {label!r} is empty.")
+    columns = tuple(identify_physical_columns(header))
+    if not columns:
+        handle.close()
+        raise ValueError(f"CSV file {label!r} has no named columns.")
 
-    Returns (dataset_name, {'t': array, 'species': dict, 'metadata': dict}).
-    """
-    with open(filepath, "r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        _time_source, data = parse_csv_rows(
-            reader,
-            time_column=time_column,
-            species_columns=species_columns,
-            interruption_checker=interruption_checker,
-        )
-    dataset_name = os.path.basename(filepath)
-    return dataset_name, data
+    def _iter_rows() -> Iterable[PhysicalRow]:
+        try:
+            previous_end_row = reader.line_num
+            for row in reader:
+                row_end_row = reader.line_num
+                yield PhysicalRow(
+                    source_row=previous_end_row + 1,
+                    values={
+                        column: (
+                            row[column.source_index]
+                            if column.source_index < len(row)
+                            else ""
+                        )
+                        for column in columns
+                    },
+                )
+                previous_end_row = row_end_row
+        except csv.Error as exc:
+            raise ValueError(f"CSV file {label!r}: {exc}") from exc
+        finally:
+            handle.close()
+
+    return columns, _iter_rows()
 
 
-def parse_csv_rows(
-    rows: Iterable[Mapping[str, str]],
-    time_column: Optional[str] = None,
-    species_columns: Optional[Sequence[str]] = None,
-    interruption_checker: Optional[Callable[[], bool]] = None,
-) -> Tuple[str, Dict[str, object]]:
-    """Convert CSV rows to a dataset payload."""
+def parse_physical_rows(
+    rows: Iterable[Mapping[PhysicalColumn, object] | PhysicalRow],
+    *,
+    columns: Sequence[PhysicalColumn],
+    time_column: PhysicalColumn | None,
+    species_columns: Sequence[PhysicalColumn],
+    time_unit: Unit,
+    observation_units: Mapping[str, Unit],
+    interruption_checker: Callable[[], bool] | None = None,
+    source_label: str | None = None,
+    sheet_name: str | None = None,
+    source_row_start: int = 2,
+    metadata_extras: Mapping[str, object] | None = None,
+) -> DatasetObservationPayload:
+    """Convert physical source rows without ever keying by authored headers."""
+    # The sheet plan comes from resolve_sheet_plan or admitted replay metadata.
+    physical_columns = tuple(columns)
 
     def _raise_if_interrupted() -> None:
         if interruption_checker and interruption_checker():
             raise CsvImportInterrupted()
 
+    def _source_prefix() -> str:
+        parts: list[str] = []
+        if str(source_label or "").strip():
+            parts.append(f"File {str(source_label).strip()!r}")
+        if sheet_name is not None:
+            parts.append(f"sheet {sheet_name!r}")
+        return "" if not parts else ", ".join(parts) + ", "
+
     row_iter = iter(rows)
-    first = next(row_iter, None)
-    if first is None:
-        raise ValueError("CSV file is empty")
+    first_item = next(row_iter, None)
+    if first_item is None:
+        raise ValueError(f"{_source_prefix()}the source contains no data rows.")
+    first_source_row = source_row_start
 
-    columns = list(first.keys())
-    explicit_mapping = bool(time_column or species_columns)
+    def _row_values_and_source_row(
+        item: Mapping[PhysicalColumn, object] | PhysicalRow,
+        logical_index: int,
+    ) -> tuple[Mapping[PhysicalColumn, object], int]:
+        if isinstance(item, PhysicalRow):
+            return item.values, item.source_row
+        return item, first_source_row + logical_index
 
-    # Resolve time column
-    if time_column:
-        if time_column not in columns:
-            raise ValueError(
-                f"Time column '{time_column}' not found. Available columns: {', '.join(columns)}"
-            )
-        time_col = time_column
-    else:
-        time_col = None
-        time_candidates = ["time", "time_s", "t", "Time", "T", "x"]
-        for candidate in time_candidates:
-            if candidate in columns:
-                time_col = candidate
-                break
-        if time_col is None:
-            raise ValueError(
-                "Time column not found. Provide a column name or ensure one of "
-                f"{', '.join(repr(c) for c in time_candidates)} exists."
-            )
+    first, first_row_source = _row_values_and_source_row(first_item, 0)
 
-    _raise_if_interrupted()
+    resolved_time = time_column
+    resolved_species = tuple(species_columns)
 
-    def _normalize_cell(value: object) -> str:
-        if value is None:
-            return ""
-        return str(value).strip()
-
-    def _row_snippet(row: Dict[str, str], max_len: int = 120) -> str:
-        parts = [f"{col}={row.get(col, '')!r}" for col in columns]
-        snippet = ", ".join(parts)
-        if len(snippet) > max_len:
-            return snippet[: max_len - 3] + "..."
-        return snippet
-
-    # Resolve species columns
-    if species_columns:
-        requested = [name.strip() for name in species_columns if name and name.strip()]
-        if not requested:
-            raise ValueError("Provide at least one species column name.")
-        species_candidates: List[str] = []
-        for name in requested:
-            if name == time_col:
-                raise ValueError(f"Species column '{name}' cannot be the same as the time column.")
-            if name not in columns:
-                raise ValueError(
-                    f"Species column '{name}' not found. Available columns: {', '.join(columns)}"
-                )
-            species_candidates.append(name)
-    else:
-        species_candidates = [col for col in columns if col != time_col]
-
-    t_values_list: List[float] = []
-    active_species_columns = list(species_candidates)
-    species_value_lists: Dict[str, List[float]] = {col: [] for col in active_species_columns}
-    saw_nonempty_row = False
-
-    for row_index, row in enumerate(itertools.chain((first,), row_iter), start=1):
-        _raise_if_interrupted()
-        normalized_row = {col: _normalize_cell(row.get(col, "")) for col in columns}
-
-        if not any(value for value in normalized_row.values()):
-            continue
-        saw_nonempty_row = True
-
-        time_value = normalized_row.get(time_col, "")
-        if not time_value:
-            raise ValueError(
-                f"Row {row_index}: missing value in time column '{time_col}' "
-                f"for non-empty row ({_row_snippet(normalized_row)})."
-            )
-
-        try:
-            parsed_time = float(time_value)
-        except Exception as exc:
-            raise ValueError(
-                f"Row {row_index}: invalid numeric value {time_value!r} in time column "
-                f"'{time_col}' ({_row_snippet(normalized_row)})."
-            ) from exc
-
-        t_values_list.append(parsed_time)
-
-        for col in list(active_species_columns):
-            _raise_if_interrupted()
-            try:
-                species_value_lists[col].append(float(normalized_row[col]))
-            except Exception as exc:
-                if species_columns:
-                    raise ValueError(f"Species column '{col}' contains non-numeric values: {exc}") from exc
-                logger.debug("Skipping non-numeric column '%s': %s", col, exc)
-                active_species_columns.remove(col)
-                species_value_lists.pop(col, None)
-
-    if not saw_nonempty_row:
-        raise ValueError("CSV file contains only blank lines in the data section.")
-
-    t_values = np.array(t_values_list, dtype=float)
-
-    species: Dict[str, np.ndarray] = {}
-    for col in species_candidates:
-        _raise_if_interrupted()
-        values = species_value_lists.get(col)
-        if values is None:
-            continue
-        species[col] = np.array(values, dtype=float)
-
-    if not species:
-        raise ValueError("No numeric species columns found. Provide explicit column names.")
-
-    mapping_source = "explicit" if explicit_mapping else "auto"
-    metadata = {
-        "time_column": time_col,
-        "species_columns": list(species.keys()),
-        "mapping_source": mapping_source,
+    time_scale = conversion_scale(time_unit, SECOND)
+    scientific_units = {
+        name: scientific_unit(unit.dimensions) for name, unit in observation_units.items()
+    }
+    observation_scales = {
+        name: conversion_scale(unit, scientific_units[name])
+        for name, unit in observation_units.items()
     }
 
-    data = {"t": t_values, "species": species, "metadata": metadata}
-    return str(time_col), data
+    observations_by_column = {
+        column: {"t": [], "y": [], "source_rows": []}
+        for column in resolved_species
+    }
+    selected_columns = tuple(
+        column for column in physical_columns
+        if column == resolved_time or column in resolved_species
+    )
+    saw_nonempty_row = False
+    def _cell(row: Mapping[PhysicalColumn, object], column: PhysicalColumn) -> str:
+        value = row.get(column, "")
+        if isinstance(value, UncachedFormulaCell):
+            raise ValueError(
+                f"{_source_prefix()}row {row_index}, column {column.assigned_name!r}: selected "
+                f"XLSX formula {value.formula!r} has no cached value."
+            )
+        if isinstance(value, TemporalCell):
+            raise ValueError(
+                f"{_source_prefix()}row {row_index}, column "
+                f"{column.assigned_name!r}: date or time cell {str(value)!r} "
+                "is not a numeric observation. Format measurements as plain numbers."
+            )
+        return "" if value is None else str(value).strip()
+
+    row_items = itertools.chain((first,), row_iter)
+    for logical_index, row_item in enumerate(row_items):
+        if logical_index == 0:
+            row, row_index = first, first_row_source
+        else:
+            row, row_index = _row_values_and_source_row(row_item, logical_index)
+        _raise_if_interrupted()
+        if not any(
+            value is not None and str(value).strip()
+            for value in (row.get(column, "") for column in selected_columns)
+        ):
+            continue
+        saw_nonempty_row = True
+        if resolved_time is not None:
+            temporal = row.get(resolved_time)
+            if isinstance(temporal, TemporalCell):
+                parsed_time = temporal.elapsed_seconds
+                if parsed_time is None:
+                    raise ValueError(
+                        f"{_source_prefix()}row {row_index}, time column "
+                        f"{resolved_time.assigned_name!r}: calendar date cell "
+                        f"{str(temporal)!r} is not an elapsed time. Format "
+                        "times as [h]:mm:ss durations or plain numbers."
+                    )
+            else:
+                raw_time = _cell(row, resolved_time)
+                if not raw_time:
+                    raise ValueError(
+                        f"{_source_prefix()}row {row_index}, time column "
+                        f"{resolved_time.assigned_name!r}: missing value."
+                    )
+                try:
+                    parsed_time = time_scale.apply(float(raw_time))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"{_source_prefix()}row {row_index}, time column "
+                        f"{resolved_time.assigned_name!r}: invalid numeric value "
+                        f"{raw_time!r}."
+                    ) from exc
+            parsed_time = validate_imported_time_seconds(
+                parsed_time,
+                field=(
+                    f"{_source_prefix()}row {row_index}, time column "
+                    f"{resolved_time.assigned_name!r}"
+                ),
+            )
+
+        for column in resolved_species:
+            _raise_if_interrupted()
+            raw_value = _cell(row, column)
+            if not raw_value:
+                continue
+            try:
+                parsed_value = observation_scales[column.assigned_name].apply(float(raw_value))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{_source_prefix()}row {row_index}, column "
+                    f"{column.assigned_name!r}: invalid numeric observation "
+                    f"{raw_value!r}."
+                ) from exc
+            parsed_value = validate_observation(
+                parsed_value,
+                field=(
+                    f"{_source_prefix()}row {row_index}, column "
+                    f"{column.assigned_name!r} observation"
+                ),
+            )
+            spec = observations_by_column[column]
+            if resolved_time is not None:
+                spec["t"].append(parsed_time)
+            spec["y"].append(parsed_value)
+            spec["source_rows"].append(row_index)
+
+    if not saw_nonempty_row:
+        raise ValueError(
+            f"{_source_prefix()}the selected columns contain only blank data rows."
+        )
+
+    observations: list[ObservationSeries] = []
+    retained_columns: list[PhysicalColumn] = []
+    for column in resolved_species:
+        _raise_if_interrupted()
+        spec = observations_by_column[column]
+        if not spec["y"]:
+            continue
+        retained_columns.append(column)
+        observations.append(ObservationSeries(
+            raw_observation_id=new_raw_observation_id(),
+            column_name=column.assigned_name,
+            unit=scientific_units[column.assigned_name],
+            t=tuple(spec["t"]),
+            y=tuple(spec["y"]),
+            source_rows=tuple(spec["source_rows"]),
+        ))
+    if not observations:
+        raise ValueError(f"{_source_prefix()}no numeric observation columns were found.")
+
+    metadata: dict[str, object] = {
+        "original_time_unit": time_unit.symbol,
+        "original_concentration_units": {
+            name: unit.symbol
+            for name, unit in observation_units.items()
+        },
+        "time_column": resolved_time.assigned_name if resolved_time is not None else None,
+        "observation_columns": [
+            column.assigned_name for column in retained_columns
+        ],
+        "physical_columns": [
+            {
+                "source_index": column.source_index,
+                "authored_name": column.authored_name,
+                "assigned_name": column.assigned_name,
+            }
+            for column in physical_columns
+        ],
+        "mapping_source": "explicit",
+    }
+    if sheet_name is not None:
+        metadata["sheet_name"] = str(sheet_name)
+    metadata.update(metadata_extras or {})
+    return DatasetObservationPayload(
+        observations=tuple(observations),
+        source_metadata=freeze_json_value(metadata),
+    )

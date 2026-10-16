@@ -1,1 +1,1 @@
-"""Configuration and profile management."""
+"""Configuration helpers."""

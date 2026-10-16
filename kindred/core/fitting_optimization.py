@@ -7,92 +7,65 @@ operates on an objective callable that returns residual vectors.
 
 from __future__ import annotations
 
-import logging
+import math
+import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Literal, Mapping, Optional, Tuple
 
 import numpy as np
 
-from kindred.core.exceptions import FittingCancelled, FitSimulationError, OptimizationError, SimulationCancelled
-from kindred.core.optimization_de import compute_de_popsize_maxiter
+from kindred.core.exceptions import FittingCancelled
 from kindred.core.optimization_least_squares import build_least_squares_kwargs
 from kindred.core.scipy_optimize import load_scipy_optimize
 
-logger = logging.getLogger(__name__)
-
 __all__ = [
-    "FitProgress",
     "FitResult",
+    "fit_bound_position",
     "fit_parameters",
+    "fit_parameters_with_fixed",
 ]
 
+FitBoundPosition = Literal["lower", "upper", "interior"]
 
-def _is_cancelled_error(exc: BaseException) -> bool:
-    if isinstance(exc, (KeyboardInterrupt, FittingCancelled, SimulationCancelled)):
-        return True
-    message = str(exc).lower()
-    return "cancelled" in message or "canceled" in message or "cancel" in message
-
-
-def _extract_failure_time(exc: BaseException) -> Optional[float]:
-    """Best-effort extraction of a solver failure time from exception causes."""
-    seen: set[int] = set()
-    cur: Optional[BaseException] = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        details = getattr(cur, "details", None)
-        if isinstance(details, dict):
-            for key in ("time", "t_fail"):
-                raw = details.get(key)
-                if isinstance(raw, (int, float, np.integer, np.floating)):
-                    return float(raw)
-        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
-    return None
+# Finite-difference Jacobians resolve exactly dependent fitted values only to
+# singular-value ratios of roughly 1e-8 to 1e-5, far above numpy's default
+# rank tolerance, so the rank uses a tolerance above that level.
+_JACOBIAN_RANK_RTOL = 1e-4
 
 
-def _objective_time_span(objective: object) -> Optional[Tuple[float, float]]:
-    span = getattr(objective, "_kindred_t_span", None) or getattr(objective, "t_span", None)
-    if span is None:
-        return None
-    try:
-        t0 = float(span[0])
-        t1 = float(span[1])
-    except Exception:
-        return None
-    return (t0, t1)
+def fit_bound_position(
+    value: float,
+    minimum: float,
+    maximum: float,
+    *,
+    log10: bool = False,
+) -> FitBoundPosition:
+    """Classify a fitted value as at its lower or upper bound, or interior.
 
+    A value is at a bound when its distance from it, in the coordinate the
+    optimizer moved (log10 under Log Scale), is at most one billionth of that
+    bound's own scale (its magnitude, at least 1, and at most the bounds'
+    width), and it is nearer that bound than the other.  A distant opposite
+    bound therefore never widens the tolerance.  The result is an
+    informational label; values are always published as fitted.
+    """
 
-def _scaled_de_penalty(*, base_penalty: float, exc: BaseException, objective: object) -> float:
-    t_fail = _extract_failure_time(exc)
-    if t_fail is None:
-        return float(base_penalty)
-    span = _objective_time_span(objective)
-    if span is None:
-        return float(base_penalty)
-    t0, t1 = span
-    denom = float(t1 - t0)
-    if not np.isfinite(denom) or denom <= 0.0:
-        return float(base_penalty)
-    frac = (float(t_fail) - float(t0)) / denom
-    if frac < 0.0:
-        frac = 0.0
-    elif frac > 1.0:
-        frac = 1.0
-    scaled = float(base_penalty) * (2.0 - frac)
-    if not np.isfinite(scaled):
-        return float(base_penalty)
-    return float(scaled)
+    def encode(raw: float) -> float:
+        return math.log10(raw) if log10 else float(raw)
 
+    encoded, low, high = encode(value), encode(minimum), encode(maximum)
+    lower_distance = encoded - low
+    upper_distance = high - encoded
 
-@dataclass
-class FitProgress:
-    """Progress information during fitting."""
+    def tolerance(bound: float) -> float:
+        return 1e-9 * min(high - low, max(1.0, abs(bound)))
 
-    iteration: int
-    nfev: int
-    cost: float
-    parameters: Dict[str, float]
-    message: str = ""
+    position: FitBoundPosition = "interior"
+    if lower_distance <= min(upper_distance, tolerance(low)):
+        position = "lower"
+    if upper_distance <= min(lower_distance, tolerance(high)):
+        position = "upper"
+    return position
 
 
 @dataclass
@@ -100,305 +73,215 @@ class FitResult:
     """Results from parameter fitting."""
 
     success: bool
-    parameters: Dict[str, float]
-    uncertainties: Optional[Dict[str, float]]
-    chi_squared: float
-    r_squared: float
-    residuals: np.ndarray
-    nfev: int
+    parameters: Dict[object, float]
     message: str
-    covariance: Optional[np.ndarray] = None
+    identifiability_warning: Optional[str] = None
+
+
+def fit_parameters_with_fixed(
+    objective_func: Callable[[np.ndarray], np.ndarray],
+    initial_params: Dict[object, float],
+    *,
+    fixed_parameters: Dict[object, float],
+    bounds: Dict[object, Tuple[float, float]],
+    method: str,
+    max_nfev: int = 1000,
+    ftol: float,
+    xtol: float,
+    cancellation_check: Callable[[], bool] | None = None,
+) -> FitResult:
+    """Optimize one canonical objective while holding named coordinates fixed.
+
+    The reduced-coordinate wrapper delegates to :func:`fit_parameters`; it is
+    intentionally not a second optimizer implementation.  Returned parameters
+    retain the original full coordinate order and include the fixed values.
+    """
+
+    # Profile fixes one layout coordinate at a point between its fitted value
+    # and one of its admitted bounds.
+    initial = {name: float(value) for name, value in initial_params.items()}
+    fixed = {name: float(value) for name, value in fixed_parameters.items()}
+    names = tuple(initial)
+    free = {name: value for name, value in initial.items() if name not in fixed}
+    free_bounds = {name: bounds[name] for name in free}
+
+    def full_vector(values: Mapping[str, float]) -> np.ndarray:
+        return np.asarray(
+            [fixed[name] if name in fixed else values[name] for name in names],
+            dtype=float,
+        )
+
+    if not free:
+        if cancellation_check is not None and cancellation_check():
+            raise FittingCancelled()
+        return FitResult(
+            success=True,
+            parameters={name: fixed[name] for name in names},
+            message="All optimizer coordinates were fixed.",
+        )
+
+    def reduced_objective(vector: np.ndarray) -> np.ndarray:
+        values = {
+            name: float(vector[index])
+            for index, name in enumerate(free)
+        }
+        return objective_func(full_vector(values))
+
+    reduced = fit_parameters(
+        reduced_objective,
+        free,
+        bounds=free_bounds,
+        method=method,
+        max_nfev=max_nfev,
+        ftol=ftol,
+        xtol=xtol,
+        cancellation_check=cancellation_check,
+    )
+    return FitResult(
+        success=reduced.success,
+        parameters={
+            name: fixed[name] if name in fixed else reduced.parameters[name]
+            for name in names
+        },
+        message=reduced.message,
+        identifiability_warning=reduced.identifiability_warning,
+    )
 
 
 def fit_parameters(
     objective_func: Callable[[np.ndarray], np.ndarray],
-    initial_params: Dict[str, float],
-    bounds: Optional[Dict[str, Tuple[float, float]]] = None,
-    method: str = "lm",
-    progress_callback: Optional[Callable[[FitProgress], None]] = None,
+    initial_params: Dict[object, float],
+    bounds: Dict[object, Tuple[float, float]],
     max_nfev: int = 1000,
     seed: Optional[int] = None,
-    ftol: float = 1e-10,
-    xtol: float = 1e-10,
     *,
+    ftol: float,
+    xtol: float,
+    method: str,
     cancellation_check: Callable[[], bool] | None = None,
-    de_penalty: float | None = None,
-    scipy_loader: Callable[[], tuple[Callable[..., Any], Callable[..., Any]]] | None = None,
 ) -> FitResult:
-    scipy_loader = load_scipy_optimize if scipy_loader is None else scipy_loader
+    """Fit parameters by least squares, or by Differential Evolution polished
+    with Trust Region Reflective at the same tolerances."""
+
+    # The method, evaluation budget, coordinates and their bounds arrive
+    # admitted by the Fit setup or its Profile likelihood configuration.
     param_names = list(initial_params.keys())
-    x0 = np.array([initial_params[name] for name in param_names])
+    # Starts are admitted values or optimizer results inside their admitted
+    # finite ordered bounds.
+    x0 = np.asarray([initial_params[name] for name in param_names], dtype=float)
+    lower = np.asarray([bounds[name][0] for name in param_names], dtype=float)
+    upper = np.asarray([bounds[name][1] for name in param_names], dtype=float)
+    scipy_bounds = (lower, upper)
 
-    if bounds is not None:
-        lower = np.array([bounds.get(name, (-np.inf, np.inf))[0] for name in param_names])
-        upper = np.array([bounds.get(name, (-np.inf, np.inf))[1] for name in param_names])
-        scipy_bounds = (lower, upper)
-    else:
-        scipy_bounds = (-np.inf, np.inf)
-
-    iteration_counter = [0]
-
-    def _vector_to_param_dict(vector: np.ndarray) -> Dict[str, float]:
-        return {name: float(vector[i]) for i, name in enumerate(param_names)}
-
-    def _build_failed_result(message: str, *, failed_params: Optional[Dict[str, float]] = None) -> FitResult:
-        params = failed_params or _vector_to_param_dict(x0)
-        return FitResult(
-            success=False,
-            parameters=params,
-            uncertainties=None,
-            chi_squared=np.inf,
-            r_squared=float("nan"),
-            residuals=np.array([]),
-            nfev=iteration_counter[0],
-            message=message,
-            covariance=None,
-        )
+    identifiability_warning: Optional[str] = None
 
     def wrapped_objective(params):
         if cancellation_check is not None and cancellation_check():
             raise FittingCancelled()
-        residuals = objective_func(params)
-        iteration_counter[0] += 1
-        if progress_callback is not None and iteration_counter[0] % 10 == 0:
-            param_dict = {name: val for name, val in zip(param_names, params)}
-            cost = np.sum(residuals**2)
-            progress_callback(
-                FitProgress(
-                    iteration=iteration_counter[0],
-                    nfev=iteration_counter[0],
-                    cost=cost,
-                    parameters=param_dict,
-                    message=f"Iteration {iteration_counter[0]}",
-                )
+        return objective_func(params)
+
+    def run_least_squares(start: np.ndarray, least_squares_method: str):
+        least_squares, _de = load_scipy_optimize()
+        # SciPy's default finite-difference step keeps an absolute floor, so
+        # coordinates near zero still get usable Jacobian columns.
+        lsq_kwargs = build_least_squares_kwargs(
+            ftol=ftol,
+            xtol=xtol,
+            max_nfev=max_nfev,
+            method=least_squares_method,
+            bounds=scipy_bounds,
+            verbose=0,
+        )
+        with warnings.catch_warnings():
+            # The zero-only gradient stop deliberately sits below epsilon.
+            warnings.filterwarnings(
+                "ignore",
+                message=(
+                    r"^Setting `gtol` below the machine epsilon .* effectively "
+                    r"disables the corresponding termination condition\.$"
+                ),
+                category=UserWarning,
+                module=r"^scipy\.optimize\._lsq\.least_squares$",
             )
-        return residuals
+            return least_squares(wrapped_objective, start, **lsq_kwargs)
 
-    try:
-        if method.lower() == "de":
-            _least_squares, differential_evolution = scipy_loader()
-            if bounds is None:
-                raise ValueError("Differential Evolution requires bounds")
+    if method == "differential_evolution":
+        _least_squares, differential_evolution = load_scipy_optimize()
 
-            invalid_params: list[str] = []
-            for idx, name in enumerate(param_names):
-                low = float(scipy_bounds[0][idx])
-                high = float(scipy_bounds[1][idx])
-                if not (np.isfinite(low) and np.isfinite(high)):
-                    invalid_params.append(name)
-                elif low >= high:
-                    invalid_params.append(name)
-            if invalid_params:
-                raise ValueError(
-                    "Differential Evolution requires finite bounds with min < max. "
-                    f"Parameters with invalid bounds: {', '.join(sorted(set(invalid_params)))}"
-                )
+        def de_objective(params):
+            # The Fit objective returns finite residuals with a finite
+            # sum of squares.
+            residuals = np.asarray(wrapped_objective(params), dtype=float).reshape(-1)
+            return float(np.dot(residuals, residuals))
 
-            effective_penalty = float(de_penalty) if de_penalty is not None else 1e12
-            if de_penalty is None and getattr(objective_func, "_kindred_vector_objective", False):
-                try:
-                    penalty_len = int(np.asarray(getattr(objective_func, "y_exp")).size)
-                    effective_penalty = float((1e6**2) * max(1, penalty_len))
-                except Exception:
-                    effective_penalty = 1e12
+        def polish(_scalar_objective, start, **_scipy_arguments):
+            # SciPy keeps the polish only when it succeeds, scores lower and
+            # stays inside the bounds. Its score is the sum of squares, twice
+            # the least-squares cost.
+            polished = run_least_squares(np.asarray(start, dtype=float), "trf")
+            polished.fun = 2.0 * polished.cost
+            return polished
 
-            def de_objective(params):
-                if cancellation_check is not None and cancellation_check():
-                    raise FittingCancelled()
-                try:
-                    residuals = np.asarray(wrapped_objective(params), dtype=float).reshape(-1)
-                except FittingCancelled:
-                    raise
-                except FitSimulationError as exc:
-                    de_objective.last_error = exc  # type: ignore[attr-defined]
-                    t_fail = _extract_failure_time(exc)
-                    de_objective.last_error_provenance = (  # type: ignore[attr-defined]
-                        {"time": t_fail} if t_fail is not None else None
-                    )
-                    return _scaled_de_penalty(
-                        base_penalty=effective_penalty, exc=exc, objective=objective_func
-                    )
-                except RuntimeError as exc:
-                    if _is_cancelled_error(exc):
-                        raise FittingCancelled() from exc
-                    de_objective.last_error = FitSimulationError(str(exc))  # type: ignore[attr-defined]
-                    t_fail = _extract_failure_time(exc)
-                    de_objective.last_error_provenance = (  # type: ignore[attr-defined]
-                        {"time": t_fail} if t_fail is not None else None
-                    )
-                    return _scaled_de_penalty(
-                        base_penalty=effective_penalty, exc=exc, objective=objective_func
-                    )
-                except Exception as exc:
-                    if _is_cancelled_error(exc):
-                        raise FittingCancelled() from exc
-                    de_objective.last_error = FitSimulationError(str(exc))  # type: ignore[attr-defined]
-                    t_fail = _extract_failure_time(exc)
-                    de_objective.last_error_provenance = (  # type: ignore[attr-defined]
-                        {"time": t_fail} if t_fail is not None else None
-                    )
-                    return _scaled_de_penalty(
-                        base_penalty=effective_penalty, exc=exc, objective=objective_func
-                    )
-
-                if residuals.size == 0 or not np.all(np.isfinite(residuals)):
-                    err = FitSimulationError("Non-finite residuals encountered in DE objective.")
-                    de_objective.last_error = err  # type: ignore[attr-defined]
-                    de_objective.last_error_provenance = None  # type: ignore[attr-defined]
-                    return float(effective_penalty)
-                return float(np.sum(residuals**2))
-
-            de_objective.last_error = None  # type: ignore[attr-defined]
-            de_objective.last_error_provenance = None  # type: ignore[attr-defined]
-
-            dim = max(1, len(x0))
-            budget = max(1, int(max_nfev))
-            popsize, maxiter = compute_de_popsize_maxiter(budget=budget, dim=dim)
-
+        # SciPy's default population size. Its first population is always
+        # scored in full; the generations after it fit in Maximum
+        # evaluations, (maxiter + 1) * popsize * len(x0) at most.
+        popsize = 15
+        maxiter = max(0, max_nfev // (popsize * len(x0)) - 1)
+        # SciPy rescales x0 to [0, 1] and refuses a start that rounds
+        # just outside, as a start on its bound can; such a start moves
+        # inside by a negligible fraction of the range.
+        margin = (upper - lower) * 1e-12
+        error: Exception | None = None
+        try:
             result = differential_evolution(
                 de_objective,
                 bounds=list(zip(scipy_bounds[0], scipy_bounds[1])),
+                x0=np.clip(x0, lower + margin, upper - margin),
                 maxiter=maxiter,
                 popsize=popsize,
                 seed=seed,
                 disp=False,
-                polish=False,
+                polish=polish,
                 workers=1,
             )
-
-            x_opt = result.x
-            success = bool(result.success)
-            message = str(result.message)
-            if not success and "maximum number of iterations has been exceeded" in message.lower():
-                success = True
-            nfev = result.nfev
-
-            try:
-                residuals = objective_func(x_opt)
-            except FittingCancelled:
+        except RuntimeError as exc:
+            # SciPy reports a TypeError or ValueError raised while it scores
+            # its first population as a RuntimeError caused by it.
+            if not isinstance(exc.__cause__, (TypeError, ValueError)):
                 raise
-            except FitSimulationError as exc:
-                logger.error("Simulation failed when evaluating DE optimum: %s", exc)
-                return _build_failed_result(str(exc), failed_params=exc.failed_params or _vector_to_param_dict(x_opt))
-            covariance = None
-        else:
-            least_squares, _de = scipy_loader()
-            if method.lower() == "lm":
-                scipy_method = "lm"
-                scipy_bounds = (-np.inf, np.inf)
-            elif method.lower() == "trf":
-                scipy_method = "trf"
-            elif method.lower() == "dogbox":
-                scipy_method = "dogbox"
-            else:
-                raise ValueError(f"Unknown method: {method}")
+            error = exc.__cause__
+        if error is not None:
+            raise error
+        x_opt = np.asarray(result.x, dtype=float)
+        success = bool(result.success)
+        message = result.message
 
-            if scipy_method in ("trf", "dogbox") and bounds is not None:
-                _lb = np.array(scipy_bounds[0])
-                _ub = np.array(scipy_bounds[1])
-                _eps = np.minimum(1e-12, (_ub - _lb) / 3.0)
-                x0 = np.clip(x0, _lb + _eps, _ub - _eps)
-
-            if scipy_method == "lm":
-                diff_step = float(np.nanmedian(np.maximum(np.abs(x0) * 1e-4, 1e-6)))
-                if not np.isfinite(diff_step) or diff_step <= 0.0:
-                    diff_step = 1e-6
-            else:
-                diff_step = np.maximum(np.abs(x0) * 1e-4, 1e-6)
-            lsq_kwargs = build_least_squares_kwargs(
-                ftol=ftol,
-                xtol=xtol,
-                max_nfev=max_nfev,
-                method=scipy_method,
-                bounds=scipy_bounds,
-                diff_step=diff_step,
-                verbose=0,
-            )
-            result = least_squares(wrapped_objective, x0, **lsq_kwargs)
-
-            x_opt = result.x
-            success = result.success
-            message = result.message
-            nfev = result.nfev
-            try:
-                residuals = objective_func(x_opt)
-            except FittingCancelled:
-                raise
-            except FitSimulationError as exc:
-                logger.error("Simulation failed when evaluating optimal parameters: %s", exc)
-                return _build_failed_result(str(exc), failed_params=exc.failed_params or _vector_to_param_dict(x_opt))
-            except Exception:
-                residuals = result.fun
-
-            try:
-                J = result.jac
-                JtJ = J.T @ J
-                residual_sum = np.sum(residuals**2)
-                dof = len(residuals) - len(x_opt)
-                if dof <= 0:
-                    dof = max(1, len(residuals))
-                residual_var = residual_sum / dof
-                covariance = np.linalg.pinv(JtJ) * residual_var
-            except Exception as exc:
-                logger.debug("Failed to calculate covariance: %s", exc)
-                covariance = None
-    except FittingCancelled:
-        raise
-    except FitSimulationError as exc:
-        logger.error("Simulation failed during fitting: %s", exc)
-        return _build_failed_result(str(exc), failed_params=exc.failed_params)
-    except RuntimeError as exc:
-        if _is_cancelled_error(exc):
-            raise FittingCancelled() from exc
-        logger.error("Fitting failed: %s", exc, exc_info=True)
-        raise OptimizationError(f"Fitting failed: {exc}") from exc
-    except Exception as exc:
-        if _is_cancelled_error(exc):
-            raise FittingCancelled() from exc
-        logger.error("Fitting failed: %s", exc, exc_info=True)
-        raise OptimizationError(f"Fitting failed: {exc}") from exc
-
-    fitted_params = {name: val for name, val in zip(param_names, x_opt)}
-
-    y_model_opt = None
-    y_exp_data = getattr(objective_func, "y_exp", None)
-    y_exp_arr = None
-    if y_exp_data is not None:
-        try:
-            y_exp_arr = np.asarray(y_exp_data, dtype=float).reshape(-1)
-        except Exception:
-            y_exp_arr = None
-    try:
-        residuals_arr = np.asarray(residuals, dtype=float).reshape(-1)
-    except Exception:
-        residuals_arr = None
-    if y_exp_arr is not None and residuals_arr is not None and y_exp_arr.shape == residuals_arr.shape:
-        y_model_opt = y_exp_arr + residuals_arr
-
-    uncertainties = None
-    if covariance is not None:
-        try:
-            std_devs = np.sqrt(np.diag(covariance))
-            uncertainties = {name: std for name, std in zip(param_names, std_devs)}
-        except Exception as exc:
-            logger.debug("Failed to calculate uncertainties: %s", exc)
-
-    chi_squared = np.sum(residuals**2) / len(residuals) if len(residuals) > 0 else np.inf
-    if y_model_opt is not None and y_exp_arr is not None and y_exp_arr.size > 0:
-        ss_res = np.sum((y_exp_arr - y_model_opt) ** 2)
-        ss_tot = np.sum((y_exp_arr - np.mean(y_exp_arr)) ** 2)
-        r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
     else:
-        r_squared = float("nan")
+        result = run_least_squares(x0, method)
+        x_opt = result.x
+        success = bool(result.success)
+        message = result.message
+        if result.status == 1:
+            message = "Fit stopped at zero computed first-order optimality."
+        J = np.asarray(result.jac, dtype=float)
+        param_count = len(x_opt)
+        # Rank of the column-scaled Jacobian, so parameters on very
+        # different scales are not mistaken for dependent ones.
+        # All-zero columns stay zero and count as deficient.
+        norms = np.linalg.norm(J, axis=0)
+        scaled = np.divide(J, norms, out=np.zeros_like(J), where=norms > 0.0)
+        rank = int(np.linalg.matrix_rank(scaled, rtol=_JACOBIAN_RANK_RTOL))
+        if rank < param_count:
+            identifiability_warning = (
+                "These data cannot determine every fitted value independently. "
+                f"The fit Jacobian has rank {rank} for {param_count} fitted value{'' if param_count == 1 else 's'}."
+            )
+
+    fitted_params = {name: float(val) for name, val in zip(param_names, x_opt)}
 
     return FitResult(
         success=success,
         parameters=fitted_params,
-        uncertainties=uncertainties,
-        chi_squared=chi_squared,
-        r_squared=r_squared,
-        residuals=residuals,
-        nfev=nfev,
         message=message,
-        covariance=covariance,
+        identifiability_warning=identifiability_warning,
     )

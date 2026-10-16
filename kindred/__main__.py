@@ -8,78 +8,48 @@ This module launches the Kindred desktop GUI:
 
 from __future__ import annotations
 
-import logging
 import sys
+from multiprocessing import freeze_support
 
-from kindred.gui import startup as gui_startup
 from kindred.io.logging import setup_logging
-
-logger = logging.getLogger(__name__)
-
 
 def main() -> int:
     """Launch the Kindred GUI and return the Qt event-loop exit code."""
+    freeze_support()
+
+    from kindred.gui import startup as gui_startup
+
     if len(sys.argv) > 1:
         print("Kindred launches the desktop GUI and does not accept command-line arguments.", file=sys.stderr)
         return 64
 
-    setup_logging(level=None)
-    startup_debug = gui_startup.startup_debug_enabled()
-    cleanup_startup_diag = gui_startup.enable_startup_diagnostics(enabled=startup_debug)
+    setup_logging()
+    from PySide6 import QtCore, QtGui, QtWidgets
 
-    try:
-        gui_startup.apply_pre_qapplication_startup(startup_debug=startup_debug)
-        qt_core, qt_widgets, q_icon = gui_startup.ensure_qt_modules()
+    gui_startup.apply_qt_startup_workarounds(qt_core=QtCore)
 
-        if startup_debug:
-            logger.warning("Startup phase: begin")
+    from kindred.gui.main_window import MainWindow
 
-        gui_startup.log_plot_backend_startup(startup_debug=startup_debug)
+    QtWidgets.QApplication.setHighDpiScaleFactorRoundingPolicy(
+        QtCore.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
 
-        from kindred.gui.main_window import MainWindow
+    # Fusion is the application's style override, so the theme's proxy style
+    # wraps Fusion rather than the platform default.
+    app = QtWidgets.QApplication([*sys.argv, "-style", "Fusion"])
+    # One numeric-text convention: Python/repr decimal point, never the OS locale.
+    QtCore.QLocale.setDefault(QtCore.QLocale.c())
+    QtCore.QCoreApplication.setOrganizationName("Kindred")
+    QtCore.QCoreApplication.setApplicationName("Kindred")
 
-        qt_widgets.QApplication.setHighDpiScaleFactorRoundingPolicy(
-            qt_core.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-        )
-        if startup_debug:
-            logger.warning("Startup phase: high-DPI policy set")
+    icon = gui_startup.load_app_icon(QtGui.QIcon)
+    if not icon.isNull():
+        app.setWindowIcon(icon)
 
-        app = qt_widgets.QApplication(sys.argv)
-        qt_core.QCoreApplication.setOrganizationName("Kindred")
-        qt_core.QCoreApplication.setApplicationName("Kindred")
-        if startup_debug:
-            logger.warning("Startup phase: QApplication created")
-
-        gui_startup.apply_post_qapplication_startup(startup_debug=startup_debug)
-
-        app.setStyle("Fusion")
-        if startup_debug:
-            logger.warning("Startup phase: app style set")
-
-        icon = gui_startup.load_app_icon(q_icon)
-        if icon is not None and not icon.isNull():
-            app.setWindowIcon(icon)
-        if startup_debug:
-            logger.warning("Startup phase: icon loaded")
-
-        win = gui_startup.construct_main_window(
-            window_factory=MainWindow,
-            startup_debug=startup_debug,
-        )
-        if startup_debug:
-            logger.warning("Startup phase: MainWindow constructed")
-
-        win.show()
-        if startup_debug:
-            logger.warning("Startup phase: MainWindow shown; entering event loop")
-
-        return app.exec()
-    finally:
-        cleanup_startup_diag()
+    win = MainWindow()
+    win.show()
+    return app.exec()
 
 
 if __name__ == "__main__":
-    from multiprocessing import freeze_support
-
-    freeze_support()
     raise SystemExit(main())

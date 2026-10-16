@@ -1,11 +1,6 @@
-# Backups & audit artifacts
-_audit_reports/
-
 # Virtual environments
-.venv/
+.venv*/
 venv/
-.claude/
-.venv-win312/
 kindred.egg-info/
 
 # Python caches / test caches
@@ -17,6 +12,8 @@ __pycache__/
 build/
 dist/
 dist*/
+tests/private/
+tests/private/*
 
 # Type checker / linter caches
 .mypy_cache/
@@ -37,9 +34,12 @@ Thumbs.db
 
 # Logs and Dev Documentation
 *.log
+docs/
 knownbugs.md
 TODO.md
-AGENTS.md
-ARCH_RULES.md
 AUDIT.md
 DSL_REFERENCE.md
+tools/diagnostics/
+
+# Local/private tests - never commit
+/tests/private/

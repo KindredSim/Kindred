@@ -1,0 +1,16 @@
+# Run from 0 to 600 s.
+
+# Light represents illumination using a species variable.
+A + Light -> B ; k=0.01
+B -> A ; k=0.003
+
+# after contains operations performed at the end of each repetition.
+# Ending a hold does not reset its value.
+# Set Light to zero afterward to switch off the light-dependent step.
+intervention: op=protocol; kind=repeat; start_time=0.0; every=180.0; count=3; duration=120.0; during={op=hold,species=Light,value=1.0}; after={op=set,species=Light,value=0.0}
+
+intervention_set1 = {
+  [A] = 1.0
+  [Light] = 0.0
+  [B] = 0.0
+}

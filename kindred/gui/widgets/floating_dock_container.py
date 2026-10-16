@@ -16,13 +16,13 @@ class FloatingDockContainer(QtWidgets.QWidget):
         content: QtWidgets.QWidget,
         dock: QtWidgets.QDockWidget,
         on_dock_back: Callable[[], None],
-        on_reset_layout: Callable[[], None],
+        on_restore_default_layout: Callable[[], None],
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._dock = dock
         self._on_dock_back = on_dock_back
-        self._on_reset_layout = on_reset_layout
+        self._on_restore_default_layout = on_restore_default_layout
         self._content = content
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -47,11 +47,16 @@ class FloatingDockContainer(QtWidgets.QWidget):
         self._dock_back_button.clicked.connect(self._dock_back)
         banner_layout.addWidget(self._dock_back_button)
 
-        self._reset_layout_button = QtWidgets.QPushButton("Restore Default Layout", self._floating_banner)
-        self._reset_layout_button.setObjectName("resetLayoutButton")
-        self._reset_layout_button.setToolTip("Restore all panels to the default workspace layout.")
-        self._reset_layout_button.clicked.connect(self._on_reset_layout)
-        banner_layout.addWidget(self._reset_layout_button)
+        self._restore_default_layout_button = QtWidgets.QPushButton(
+            "Restore Default Panel Layout",
+            self._floating_banner,
+        )
+        self._restore_default_layout_button.setObjectName("restoreDefaultLayoutButton")
+        self._restore_default_layout_button.setToolTip(
+            "Restore the factory panel arrangement and default panel visibility."
+        )
+        self._restore_default_layout_button.clicked.connect(self._on_restore_default_layout)
+        banner_layout.addWidget(self._restore_default_layout_button)
 
         layout.addWidget(self._floating_banner)
         layout.addWidget(self._content, stretch=1)
@@ -71,5 +76,5 @@ class FloatingDockContainer(QtWidgets.QWidget):
         panel_title = str(title).strip() or "This panel"
         self._message_label.setText(
             f"{panel_title} is floating. Drag the title bar to snap it back to a side, or use Dock Back. "
-            "Restore Default Layout returns all panels to the default workspace layout."
+            "Restore Default Panel Layout returns all panels to the factory arrangement."
         )

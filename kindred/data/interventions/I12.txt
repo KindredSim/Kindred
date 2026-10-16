@@ -1,0 +1,20 @@
+# Run from 0 to 600 s.
+
+A + B -> C ; k=0.02
+B + D -> E ; k=0.2
+
+param start_time = 60.0; unit = s
+param reagent_dose = 0.5; unit = M
+
+# Semicolons inside braces separate operations in the same phase.
+# before adds A and then B. after adds D.
+# count=1 applies the sequence once.
+intervention: op=protocol; kind=repeat; start_time_param=start_time; every=180.0; count=1; duration=120.0; before={op=jump,species=A,delta=1.0; op=jump,species=B,delta_param=reagent_dose}; after={op=jump,species=D,delta=1.0}
+
+intervention_set1 = {
+  [A] = 0.0
+  [B] = 0.0
+  [C] = 0.0
+  [D] = 0.0
+  [E] = 0.0
+}

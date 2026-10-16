@@ -16,7 +16,7 @@ For each binary release, the corresponding source materials for the conveyed
 Qt, PySide6, and shiboken6 components are to be provided in the assets
 attached to that same release.
 
-This distribution may also include NumPy, SciPy, Bottleneck, pyqtgraph,
+This distribution may also include NumPy, SciPy, SymPy, pyqtgraph,
 PyQtDarkTheme-fork, and openpyxl. The applicable third-party license texts
 and notices for those components are provided in THIRD_PARTY_LICENSES.txt.
 

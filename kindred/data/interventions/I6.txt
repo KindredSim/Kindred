@@ -1,0 +1,24 @@
+# Run from 0 to 600 s.
+
+A + B -> C ; k=0.02
+A + C -> D ; k=0.01
+
+# param defines a named parameter.
+# unit is optional and specifies the input unit.
+# Fields ending in _param use a named parameter.
+# Use either the number field or its _param counterpart, not both.
+param feed_threshold = 0.2; unit = M
+param target_concentration = 0.5; unit = M
+
+# max_count limits the number of firings.
+# min_interval sets the minimum time between firings, in seconds.
+# Each firing still requires a new threshold crossing.
+# set restores the target concentration rather than adding a fixed dose.
+intervention: op=trigger; watch_species=A; threshold_param=feed_threshold; direction=falling; max_count=3; min_interval=30.0; then={op=set,species=A,value_param=target_concentration}
+
+intervention_set1 = {
+  [A] = 0.5
+  [B] = 1.0
+  [C] = 0.0
+  [D] = 0.0
+}

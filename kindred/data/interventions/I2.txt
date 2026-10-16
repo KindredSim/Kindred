@@ -1,0 +1,17 @@
+# Run from 0 to 600 s.
+
+A <-> B ; kf=0.02 ; kr=0.004
+B + C -> D ; k=0.02
+
+# jump adds delta to the current concentration.
+intervention: op=jump; species=C; time=60.0; delta=1.0
+
+# A negative delta removes material without going below zero.
+intervention: op=jump; species=C; time=120.0; delta=-0.25
+
+intervention_set1 = {
+  [A] = 1.0
+  [B] = 0.0
+  [C] = 0.0
+  [D] = 0.0
+}

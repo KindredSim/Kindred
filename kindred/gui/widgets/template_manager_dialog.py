@@ -1,17 +1,28 @@
 """
 Template Manager Dialog for Kindred.
 
-Provides a GUI for browsing, creating, editing, and loading mechanism templates.
+Provides a GUI for browsing, creating, updating, replacing, and applying
+mechanism templates.
 """
 
 from __future__ import annotations
 
+from kindred.gui.display_name_policy import literal_tooltip
+
 import logging
-from typing import Optional, Dict, Any
+from dataclasses import replace
+from datetime import datetime
+from typing import Any, Callable, Dict, Optional, cast
 
 from PySide6 import QtCore, QtGui, QtWidgets
+from kindred.gui.ui_helpers import clamp_initial_size, set_bounded_label_text
 
 from kindred.config.templates import Template, TemplateManager
+from kindred.io.paths import file_error_text
+from kindred.core.mechanism_source import (
+    MechanismAuthoringSource,
+    restore_initial_condition_declarations,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +34,14 @@ class TemplateEditorDialog(QtWidgets.QDialog):
     Dialog for creating or editing a template.
     """
 
+    saveRequested = QtCore.Signal()
+
     def __init__(
         self,
         parent: Optional[QtWidgets.QWidget] = None,
         template: Optional[Template] = None,
-        mechanism_text: str = "",
+        mechanism_source: Optional[MechanismAuthoringSource] = None,
+        operation: str = "create",
     ):
         """
         Initialize template editor dialog.
@@ -38,15 +52,18 @@ class TemplateEditorDialog(QtWidgets.QDialog):
             Parent widget
         template : Template, optional
             Existing template to edit (None for new template)
-        mechanism_text : str, optional
-            Mechanism text (for new templates)
+        mechanism_source : MechanismAuthoringSource, optional
+            Complete mechanism source; required when ``template`` is None.
         """
         super().__init__(parent)
-        self._template = template
         self._is_edit_mode = template is not None
+        self._operation = operation
+        self._template_id = template.id if template is not None else None
 
-        self.setWindowTitle("Edit Template" if self._is_edit_mode else "New Template")
-        self.resize(700, 600)
+        self.setWindowTitle(
+            "Update Template" if self._is_edit_mode else "Create Template"
+        )
+        clamp_initial_size(self, 700, 600)
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -55,13 +72,16 @@ class TemplateEditorDialog(QtWidgets.QDialog):
 
         # Name
         self._name_edit = QtWidgets.QLineEdit()
-        self._name_edit.setPlaceholderText("e.g., Enzyme Kinetics")
+        self._name_edit.setPlaceholderText("For example: Enzyme Kinetics")
         if template:
             self._name_edit.setText(template.name)
         form_layout.addRow("Name*:", self._name_edit)
 
         # Category
         self._category_combo = QtWidgets.QComboBox()
+        self._category_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self._category_combo.setMinimumContentsLength(12)
+        self._category_combo.setMaximumWidth(240)
         self._category_combo.setEditable(True)
         self._category_combo.addItems([
             "General",
@@ -81,7 +101,7 @@ class TemplateEditorDialog(QtWidgets.QDialog):
 
         # Tags
         self._tags_edit = QtWidgets.QLineEdit()
-        self._tags_edit.setPlaceholderText("e.g., enzyme, michaelis-menten, steady-state")
+        self._tags_edit.setPlaceholderText("For example: enzyme, michaelis-menten, steady-state")
         if template:
             self._tags_edit.setText(", ".join(template.tags))
         form_layout.addRow("Tags:", self._tags_edit)
@@ -96,35 +116,48 @@ class TemplateEditorDialog(QtWidgets.QDialog):
         # Description
         self._description_edit = QtWidgets.QTextEdit()
         self._description_edit.setPlaceholderText(
-            "Describe the template, its purpose, and any key features..."
+            "Describe the template, its purpose, and any key features."
         )
         self._description_edit.setMaximumHeight(100)
         if template:
             self._description_edit.setPlainText(template.description)
-        form_layout.addRow("Description*:", self._description_edit)
+        form_layout.addRow("Description:", self._description_edit)
 
         layout.addLayout(form_layout)
 
         # Mechanism text editor
         layout.addWidget(QtWidgets.QLabel("Mechanism DSL*:"))
+        if not self._is_edit_mode:
+            review_note = QtWidgets.QLabel(
+                "Review the initial-condition declarations before saving. "
+                "Earlier declarations may need editing or removal."
+            )
+            review_note.setWordWrap(True)
+            layout.addWidget(review_note)
         self._mechanism_edit = QtWidgets.QPlainTextEdit()
         self._mechanism_edit.setFont(QtGui.QFont("Courier New", 10))
         if template:
-            self._mechanism_edit.setPlainText(template.mechanism_text)
+            self._mechanism_edit.setPlainText(template.source.reactions_text)
         else:
-            self._mechanism_edit.setPlainText(mechanism_text)
+            self._mechanism_edit.setPlainText(mechanism_source.reactions_text)
         layout.addWidget(self._mechanism_edit, stretch=1)
 
         # Button box
         button_box = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel
         )
-        button_box.accepted.connect(self._validate_and_accept)
+        save_button = button_box.button(QtWidgets.QDialogButtonBox.Save)
+        self._save_button = save_button
+        if save_button is not None:
+            save_button.setText(
+                "Update" if self._operation == "update" else "Create"
+            )
+        button_box.accepted.connect(self._validate_and_request_save)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
 
-    def _validate_and_accept(self):
-        """Validate inputs and accept dialog."""
+    def _validate_and_request_save(self):
+        """Request a synchronous save while preserving the editable draft."""
         # Check required fields
         if not self._name_edit.text().strip():
             QtWidgets.QMessageBox.warning(
@@ -144,7 +177,13 @@ class TemplateEditorDialog(QtWidgets.QDialog):
             self._mechanism_edit.setFocus()
             return
 
-        self.accept()
+        if self._save_button is not None:
+            self._save_button.setEnabled(False)
+        try:
+            self.saveRequested.emit()
+        finally:
+            if self._save_button is not None:
+                self._save_button.setEnabled(True)
 
     def get_template_data(self) -> Dict[str, Any]:
         """
@@ -158,13 +197,16 @@ class TemplateEditorDialog(QtWidgets.QDialog):
         tags_text = self._tags_edit.text().strip()
         tags = [t.strip() for t in tags_text.split(',') if t.strip()]
 
+        source = MechanismAuthoringSource.from_parts(
+            reactions_text=self._mechanism_edit.toPlainText()
+        )
         return {
             'name': self._name_edit.text().strip(),
             'category': self._category_combo.currentText().strip(),
             'tags': tags,
             'author': self._author_edit.text().strip() or None,
             'description': self._description_edit.toPlainText().strip(),
-            'mechanism_text': self._mechanism_edit.toPlainText().strip(),
+            'source': source,
         }
 
 
@@ -172,40 +214,55 @@ class TemplateManagerDialog(QtWidgets.QDialog):
     """
     Template Manager Dialog.
 
-    Provides interface for browsing, creating, editing, and loading templates.
+    Provides explicit Create, Update, Replace, and Apply operations.
     """
-
-    # Signal emitted when user wants to load a template
-    templateLoadRequested = QtCore.Signal(str)  # mechanism_text
 
     def __init__(
         self,
-        parent: Optional[QtWidgets.QWidget] = None,
-        template_manager: Optional[TemplateManager] = None,
-        current_mechanism_text: str = "",
+        parent: QtWidgets.QWidget,
+        *,
+        template_manager: TemplateManager,
+        current_mechanism_source: MechanismAuthoringSource,
+        source_preflight: Callable[
+            [MechanismAuthoringSource], MechanismAuthoringSource | None
+        ],
+        destination_apply: Callable[[MechanismAuthoringSource], bool],
     ):
         """
         Initialize template manager dialog.
 
         Parameters
         ----------
-        parent : QWidget, optional
+        parent : QWidget
             Parent widget
-        template_manager : TemplateManager, optional
-            Template manager instance (creates new if None)
-        current_mechanism_text : str, optional
-            Current mechanism text (for creating templates)
+        template_manager : TemplateManager
+            Template manager instance
+        current_mechanism_source : MechanismAuthoringSource
+            Current complete mechanism source for creating templates.
+        source_preflight : callable
+            Source-tab structural/scientific admission for persistence edits;
+            ``None`` when the user cancels its correction review.
+        destination_apply : callable
+            Destination-tab owner returning whether Apply was accepted.
         """
         super().__init__(parent)
-        self._template_manager = template_manager or TemplateManager()
-        self._current_mechanism_text = current_mechanism_text
+        self._template_manager = template_manager
+        # Create and Replace both store the current mechanism with its
+        # recorded initial-condition declarations restored.
+        self._current_mechanism_source = MechanismAuthoringSource.from_parts(
+            reactions_text=restore_initial_condition_declarations(
+                current_mechanism_source.reactions_text
+            )
+        )
+        self._source_preflight = source_preflight
+        self._destination_apply = destination_apply
         self._current_template: Optional[Template] = None
 
         self.setWindowTitle("Template Manager")
-        self.resize(1000, 700)
+        clamp_initial_size(self, 1000, 700)
 
         self._setup_ui()
-        self._load_templates()
+        self._render_collection_state()
 
     def _setup_ui(self):
         """Setup UI components."""
@@ -216,19 +273,28 @@ class TemplateManagerDialog(QtWidgets.QDialog):
 
         # Search bar
         self._search_edit = QtWidgets.QLineEdit()
-        self._search_edit.setPlaceholderText("Search templates...")
+        self._search_edit.setPlaceholderText("Search templates…")
         self._search_edit.textChanged.connect(self._on_search_changed)
         toolbar_layout.addWidget(QtWidgets.QLabel("Search:"))
         toolbar_layout.addWidget(self._search_edit, stretch=1)
 
         # Category filter
         self._category_combo = QtWidgets.QComboBox()
+        self._category_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self._category_combo.setMinimumContentsLength(12)
+        self._category_combo.setMaximumWidth(240)
         self._category_combo.addItem("All Categories", None)
         self._category_combo.currentIndexChanged.connect(self._on_category_changed)
         toolbar_layout.addWidget(QtWidgets.QLabel("Category:"))
         toolbar_layout.addWidget(self._category_combo)
 
         layout.addLayout(toolbar_layout)
+
+        self._storage_state_label = QtWidgets.QLabel()
+        self._storage_state_label.setObjectName("templateStorageStateLabel")
+        self._storage_state_label.setWordWrap(True)
+        self._storage_state_label.setVisible(False)
+        layout.addWidget(self._storage_state_label)
 
         # Splitter for list and preview
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
@@ -241,7 +307,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         list_layout.addWidget(QtWidgets.QLabel("Templates:"))
         self._template_list = QtWidgets.QListWidget()
         self._template_list.currentItemChanged.connect(self._on_template_selected)
-        self._template_list.itemDoubleClicked.connect(self._on_load_clicked)
+        self._template_list.itemDoubleClicked.connect(self._on_apply_clicked)
         list_layout.addWidget(self._template_list)
 
         splitter.addWidget(list_widget)
@@ -256,17 +322,21 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         details_layout = QtWidgets.QFormLayout(details_group)
 
         self._name_label = QtWidgets.QLabel()
-        self._name_label.setWordWrap(True)
+        set_bounded_label_text(self._name_label, "", max_width=520)
+
         details_layout.addRow("Name:", self._name_label)
 
         self._category_label = QtWidgets.QLabel()
+        set_bounded_label_text(self._category_label, "", max_width=520)
         details_layout.addRow("Category:", self._category_label)
 
         self._tags_label = QtWidgets.QLabel()
-        self._tags_label.setWordWrap(True)
+        set_bounded_label_text(self._tags_label, "", max_width=520)
+
         details_layout.addRow("Tags:", self._tags_label)
 
         self._author_label = QtWidgets.QLabel()
+        set_bounded_label_text(self._author_label, "", max_width=520)
         details_layout.addRow("Author:", self._author_label)
 
         self._modified_label = QtWidgets.QLabel()
@@ -274,7 +344,9 @@ class TemplateManagerDialog(QtWidgets.QDialog):
 
         self._description_text = QtWidgets.QTextEdit()
         self._description_text.setReadOnly(True)
+        self._description_text.setMinimumHeight(60)
         self._description_text.setMaximumHeight(80)
+        self._description_text.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Ignored)
         details_layout.addRow("Description:", self._description_text)
 
         preview_layout.addWidget(details_group)
@@ -293,42 +365,108 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         layout.addWidget(splitter, stretch=1)
 
         # Bottom button bar
-        button_layout = QtWidgets.QHBoxLayout()
+        button_layout = QtWidgets.QGridLayout()
 
-        self._new_btn = QtWidgets.QPushButton("New from Current")
-        self._new_btn.setToolTip("Create a new template from the current mechanism")
-        self._new_btn.clicked.connect(self._on_new_clicked)
-        button_layout.addWidget(self._new_btn)
+        self._create_btn = QtWidgets.QPushButton("Create from Current")
+        self._create_btn.setToolTip(
+            "Create a new template from the current mechanism"
+        )
+        self._create_btn.clicked.connect(self._on_create_clicked)
+        button_layout.addWidget(self._create_btn, 0, 0)
 
-        self._edit_btn = QtWidgets.QPushButton("Edit")
-        self._edit_btn.setEnabled(False)
-        self._edit_btn.clicked.connect(self._on_edit_clicked)
-        button_layout.addWidget(self._edit_btn)
+        self._update_btn = QtWidgets.QPushButton("Update")
+        self._update_btn.clicked.connect(self._on_update_clicked)
+        button_layout.addWidget(self._update_btn, 0, 1)
+
+        self._replace_btn = QtWidgets.QPushButton("Replace from Current")
+        self._replace_btn.setToolTip(
+            "Replace the mechanism of the selected template with the current mechanism"
+        )
+        self._replace_btn.clicked.connect(self._on_replace_clicked)
+        button_layout.addWidget(self._replace_btn, 0, 2)
 
         self._delete_btn = QtWidgets.QPushButton("Delete")
-        self._delete_btn.setEnabled(False)
         self._delete_btn.clicked.connect(self._on_delete_clicked)
-        button_layout.addWidget(self._delete_btn)
+        button_layout.addWidget(self._delete_btn, 1, 0)
 
-        button_layout.addStretch()
 
-        self._load_btn = QtWidgets.QPushButton("Load")
-        self._load_btn.setEnabled(False)
-        self._load_btn.setDefault(True)
-        self._load_btn.clicked.connect(self._on_load_clicked)
-        button_layout.addWidget(self._load_btn)
+        self._apply_btn = QtWidgets.QPushButton("Apply")
+        self._apply_btn.setDefault(True)
+        self._apply_btn.clicked.connect(self._on_apply_clicked)
+        button_layout.addWidget(self._apply_btn, 1, 1)
 
         close_btn = QtWidgets.QPushButton("Close")
         close_btn.clicked.connect(self.close)
-        button_layout.addWidget(close_btn)
+        button_layout.addWidget(close_btn, 1, 2)
 
         layout.addLayout(button_layout)
 
-    def _load_templates(self):
-        """Load templates from template manager."""
-        self._template_manager.load_templates()
-        self._refresh_template_list()
+    def _render_collection_state(
+        self,
+        *,
+        selected_template_id: str | None = None,
+    ) -> None:
+        """Render only the collection state admitted before dialog creation."""
+
         self._update_category_filter()
+        self._refresh_template_list()
+        if selected_template_id is not None:
+            self._select_template(selected_template_id)
+        self._render_storage_state()
+
+    def _render_storage_state(self) -> None:
+        reason = self._template_manager.write_disabled_reason
+        if reason is None:
+            self._storage_state_label.clear()
+            self._storage_state_label.setVisible(False)
+        else:
+            self._storage_state_label.setText(reason)
+            self._storage_state_label.setVisible(True)
+        self._update_action_availability()
+
+    def _update_action_availability(self) -> None:
+        selected = self._current_template is not None
+        write_disabled_reason = self._template_manager.write_disabled_reason
+
+        write_actions = (
+            (
+                self._create_btn,
+                "Create a new template from the current mechanism.",
+                False,
+            ),
+            (
+                self._update_btn,
+                "Update the selected template.",
+                True,
+            ),
+            (
+                self._replace_btn,
+                "Replace the mechanism of the selected template with the current mechanism.",
+                True,
+            ),
+            (
+                self._delete_btn,
+                "Delete the selected template.",
+                True,
+            ),
+        )
+        for button, normal_tooltip, requires_selection in write_actions:
+            if write_disabled_reason is not None:
+                button.setEnabled(False)
+                button.setToolTip(write_disabled_reason)
+            elif requires_selection and not selected:
+                button.setEnabled(False)
+                button.setToolTip("Select a template first.")
+            else:
+                button.setEnabled(True)
+                button.setToolTip(normal_tooltip)
+
+        self._apply_btn.setEnabled(selected)
+        self._apply_btn.setToolTip(
+            "Load the selected template into the mechanism tab this manager was opened for."
+            if selected
+            else "Select a template first."
+        )
 
     def _refresh_template_list(self):
         """Refresh template list widget."""
@@ -338,12 +476,16 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         search_query = self._search_edit.text().strip()
         category_filter = self._category_combo.currentData()
 
-        if search_query:
-            templates = self._template_manager.search_templates(search_query)
-        elif category_filter:
-            templates = self._template_manager.get_templates_by_category(category_filter)
-        else:
-            templates = self._template_manager.get_all_templates()
+        templates = (
+            self._template_manager.search_templates(search_query)
+            if search_query
+            else self._template_manager.get_all_templates()
+        )
+        if category_filter:
+            templates = [
+                template for template in templates
+                if template.category == category_filter
+            ]
 
         # Sort by name
         templates.sort(key=lambda t: t.name.lower())
@@ -357,6 +499,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         # Update status
         count = self._template_list.count()
         self.setWindowTitle(f"Template Manager ({count} template{'s' if count != 1 else ''})")
+        self._update_action_availability()
 
     def _update_category_filter(self):
         """Update category filter combo box."""
@@ -369,6 +512,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         categories = self._template_manager.get_categories()
         for category in categories:
             self._category_combo.addItem(category, category)
+            self._category_combo.setItemData(self._category_combo.count() - 1, literal_tooltip(category), QtCore.Qt.ToolTipRole)
 
         # Restore selection
         if current_category:
@@ -386,14 +530,16 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         """Handle category filter changed."""
         self._refresh_template_list()
 
-    def _on_template_selected(self, current: QtWidgets.QListWidgetItem, previous: QtWidgets.QListWidgetItem):
+    def _on_template_selected(
+        self,
+        current: QtWidgets.QListWidgetItem | None,
+        _previous: QtWidgets.QListWidgetItem | None,
+    ) -> None:
         """Handle template selection."""
         if current is None:
             self._current_template = None
             self._clear_preview()
-            self._edit_btn.setEnabled(False)
-            self._delete_btn.setEnabled(False)
-            self._load_btn.setEnabled(False)
+            self._update_action_availability()
             return
 
         template_id = current.data(QtCore.Qt.UserRole)
@@ -401,9 +547,9 @@ class TemplateManagerDialog(QtWidgets.QDialog):
 
         if self._current_template:
             self._show_preview(self._current_template)
-            self._edit_btn.setEnabled(True)
-            self._delete_btn.setEnabled(True)
-            self._load_btn.setEnabled(True)
+        else:
+            self._clear_preview()
+        self._update_action_availability()
 
     def _show_preview(self, template: Template):
         """Show template preview."""
@@ -413,16 +559,15 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         self._author_label.setText(template.author or "(anonymous)")
 
         # Format modified date
-        from datetime import datetime
         try:
             modified_dt = datetime.fromisoformat(template.modified_at)
             modified_str = modified_dt.strftime("%Y-%m-%d %H:%M")
-        except (ValueError, TypeError, AttributeError):
+        except ValueError:
             modified_str = template.modified_at
 
         self._modified_label.setText(modified_str)
         self._description_text.setPlainText(template.description)
-        self._preview_text.setPlainText(template.mechanism_text)
+        self._preview_text.setPlainText(template.source.reactions_text)
 
     def _clear_preview(self):
         """Clear template preview."""
@@ -434,74 +579,108 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         self._description_text.clear()
         self._preview_text.clear()
 
-    def _on_new_clicked(self):
-        """Handle New button clicked."""
+    def _on_create_clicked(self):
+        """Create one new template from an admitted source candidate."""
         dialog = TemplateEditorDialog(
             parent=self,
-            mechanism_text=self._current_mechanism_text
+            mechanism_source=self._current_mechanism_source,
+            operation="create",
         )
 
-        if dialog.exec() == QtWidgets.QDialog.Accepted:
-            data = dialog.get_template_data()
+        dialog.saveRequested.connect(self._save_template_editor)
+        dialog.exec()
 
-            try:
-                template = self._template_manager.create_template(**data)
-                self._load_templates()
-
-                # Select newly created template
-                for i in range(self._template_list.count()):
-                    item = self._template_list.item(i)
-                    if item.data(QtCore.Qt.UserRole) == template.id:
-                        self._template_list.setCurrentItem(item)
-                        break
-
-                QtWidgets.QMessageBox.information(
-                    self,
-                    "Template Created",
-                    f"Template '{template.name}' created successfully."
-                )
-
-            except Exception as e:
-                logger.error(f"Failed to create template: {e}", exc_info=True)
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "Error",
-                    f"Failed to create template:\n\n{e}"
-                )
-
-    def _on_edit_clicked(self):
-        """Handle Edit button clicked."""
+    def _on_update_clicked(self):
+        """Update one selected template from an admitted source candidate."""
         if not self._current_template:
             return
 
         dialog = TemplateEditorDialog(
             parent=self,
-            template=self._current_template
+            template=self._current_template,
+            operation="update",
         )
 
-        if dialog.exec() == QtWidgets.QDialog.Accepted:
+        dialog.saveRequested.connect(self._save_template_editor)
+        dialog.exec()
+
+    @QtCore.Slot()
+    def _save_template_editor(self):
+        """Finish an editor only after its admitted draft has been persisted."""
+        dialog = cast(TemplateEditorDialog, self.sender())
+        operation = dialog._operation
+        try:
             data = dialog.get_template_data()
+            source = self._source_preflight(data["source"])
+            if source is None:
+                return
+            data["source"] = source
+            if operation == "create":
+                template = self._template_manager.create_template(**data)
+            else:
+                template = self._template_manager.update_template(dialog._template_id, **data)
+        except (OSError, ValueError) as exc:
+            logger.error("Failed to %s template: %s", operation, exc, exc_info=True)
+            QtWidgets.QMessageBox.critical(
+                dialog, "Error", f"Failed to {operation} template:\n\n{file_error_text(exc, self._template_manager.templates_directory)}"
+            )
+            self._render_storage_state()
+            return
 
-            try:
-                self._template_manager.update_template(
-                    self._current_template.id,
-                    **data
-                )
-                self._load_templates()
+        dialog.accept()
+        self._render_collection_state(selected_template_id=template.id)
+        past_operation = "Created" if operation == "create" else "Updated"
+        QtWidgets.QMessageBox.information(
+            self, f"Template {past_operation}",
+            f"Template '{template.name}' {past_operation.lower()} successfully."
+        )
 
-                QtWidgets.QMessageBox.information(
-                    self,
-                    "Template Updated",
-                    f"Template '{data['name']}' updated successfully."
-                )
-
-            except Exception as e:
-                logger.error(f"Failed to update template: {e}", exc_info=True)
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "Error",
-                    f"Failed to update template:\n\n{e}"
-                )
+    def _on_replace_clicked(self):
+        """Explicitly replace one selected template from the source tab."""
+        current = self._current_template
+        if current is None:
+            return
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Replace Template",
+            f"Replace template '{current.name}' with the current mechanism?\n\n"
+            "Its stable identity and metadata will be preserved.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Cancel,
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            admitted_source = self._source_preflight(
+                self._current_mechanism_source
+            )
+            if admitted_source is None:
+                return
+            candidate = replace(
+                current,
+                reactions_text=admitted_source.reactions_text,
+                modified_at=datetime.now().isoformat(),
+            )
+            template = self._template_manager.replace_template(
+                current.id,
+                candidate,
+            )
+            self._render_collection_state(
+                selected_template_id=template.id
+            )
+            QtWidgets.QMessageBox.information(
+                self,
+                "Template Replaced",
+                f"Template '{template.name}' replaced successfully.",
+            )
+        except (OSError, ValueError) as exc:
+            logger.error("Failed to replace template: %s", exc, exc_info=True)
+            self._render_storage_state()
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to replace template:\n\n{file_error_text(exc, self._template_manager.templates_directory)}",
+            )
 
     def _on_delete_clicked(self):
         """Handle Delete button clicked."""
@@ -522,7 +701,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
                 template_name = self._current_template.name
                 self._template_manager.delete_template(self._current_template.id)
                 self._current_template = None
-                self._load_templates()
+                self._render_collection_state()
 
                 QtWidgets.QMessageBox.information(
                     self,
@@ -530,19 +709,25 @@ class TemplateManagerDialog(QtWidgets.QDialog):
                     f"Template '{template_name}' deleted successfully."
                 )
 
-            except Exception as e:
+            except OSError as e:
                 logger.error(f"Failed to delete template: {e}", exc_info=True)
+                self._render_storage_state()
                 QtWidgets.QMessageBox.critical(
                     self,
                     "Error",
-                    f"Failed to delete template:\n\n{e}"
+                    f"Failed to delete template:\n\n{file_error_text(e, self._template_manager.templates_directory)}"
                 )
 
-    def _on_load_clicked(self):
-        """Handle Load button clicked."""
+    def _on_apply_clicked(self, *_args: object) -> None:
+        """Apply the selected source through the destination-tab owner."""
         if not self._current_template:
             return
+        if self._destination_apply(self._current_template.source):
+            self.accept()
 
-        # Emit signal with mechanism text
-        self.templateLoadRequested.emit(self._current_template.mechanism_text)
-        self.accept()
+    def _select_template(self, template_id: str) -> None:
+        for index in range(self._template_list.count()):
+            item = self._template_list.item(index)
+            if item.data(QtCore.Qt.UserRole) == template_id:
+                self._template_list.setCurrentItem(item)
+                return

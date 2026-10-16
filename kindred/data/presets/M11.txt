@@ -1,0 +1,20 @@
+# Run from 0 to 150 s.
+
+A + B <-> Int + Water ; kf=1.0 ; kr=0.01
+Int + C -> PB ; kf=0.01
+PB + Water -> PH + BOH ; kf=100.0
+
+preset_set1 = {
+  [A] = 0.2
+  [B] = 0.2
+  [C] = 0.2
+  [Int] = 0.0
+  [Water] = 0.05
+  [PB] = 0.0
+  [PH] = 0.0
+  [BOH] = 0.0
+}
+
+param concentration_floor = 1e-18; unit = M
+let total_PB = [PB] + [PH]
+let selectivity = [PH] / max([PH] + [BOH], concentration_floor)

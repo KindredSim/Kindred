@@ -1,0 +1,16 @@
+# Run from 0 to 600 s.
+
+A + B <-> C ; kf=0.02 ; kr=0.004
+C <-> D ; kf=0.01 ; kr=0.002
+
+# withdraw removes a well-mixed aliquot.
+# It reduces volume without changing concentrations.
+# The remaining vessel volume must be positive.
+intervention: op=withdraw; time=240.0; initial_volume=10 mL; volume=2 mL
+
+intervention_set1 = {
+  [A] = 1.0
+  [B] = 1.0
+  [C] = 0.0
+  [D] = 0.0
+}

@@ -1,0 +1,21 @@
+# Run from 0 to 600 s.
+
+A + B -> C ; k=0.02
+A + D -> E ; k=0.006
+
+param feed_start = 60.0; unit = s
+param feed_end = 360.0; unit = s
+param flow_rate = 1.0; unit = mL/min
+
+# solution with flux specifies liquid inflow.
+# volume_rate_param supplies the volume added per unit time.
+# Inflow increases vessel volume and mixes the incoming stock.
+intervention: op=flux; start_time_param=feed_start; end_time_param=feed_end; initial_volume=5 mL; solution={volume_rate_param=flow_rate,stock={species=B,value=2 M}}
+
+intervention_set1 = {
+  [A] = 1.0
+  [B] = 0.0
+  [C] = 0.0
+  [D] = 0.5
+  [E] = 0.0
+}

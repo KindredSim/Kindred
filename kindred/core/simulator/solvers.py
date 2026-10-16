@@ -4,44 +4,60 @@ ODE solver wrappers for Kindred.
 
 SciPy is a hard dependency; all integration routes through `scipy.integrate.solve_ivp` with:
 - Deterministic `t_eval` output grid
-- Optional TemperatureSchedule wrapper that injects T into RHS(T=...) calls
-- Optional progress callback wrapper
-- Optional positivity clamp (post-processing)
+- Schedule execution supplies the selected temperature to RHS and Jacobian calls
+- Non-negative concentration invariant enforcement at output boundaries
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, fields
 from typing import (
     Any,
     Callable,
     Dict,
-    Iterable,
-    List,
-    Mapping,
-    Optional,
-    Protocol,
+    Sequence,
     Tuple,
-    cast,
 )
 
 import numpy as np
 from kindred.core.scipy_integrate import load_scipy_integrate
-
-from kindred.core.temperature import TemperatureScheduleDictProtocol, TemperatureScheduleProtocol
 from kindred.core.exceptions import (
-    InitialConditionError,
     SimulationCancelled,
-    TimeGridError,
+    SolverError,
     create_solver_error,
 )
-from kindred.core.time_grid import build_time_grid
-from .jacobian import JacobianConfig, compute_jacobian
+from kindred.core.time_grid import build_time_grid as _build_time_grid
+from .nonnegative_invariant import (
+    NonnegativeProjection,
+    project_nonnegative_trajectory,
+)
+from .intervention_schedule_execution import (
+    InterventionScheduleExecutionOwner,
+    ScheduleExecutionRequest,
+    SegmentExecutionRequest,
+    SegmentIdentity,
+    SegmentRunResult,
+)
+from .solver_types import (
+    SIMULATION_NONFINITE_MESSAGE,
+    Rhs2 as _Rhs2,
+    SimulationCancellationControl as _SimulationCancellationControl,
+    FinalSimulationOutput as _FinalSimulationOutput,
+    SimulationScientificUnavailability as _SimulationScientificUnavailability,
+    _SimulationScientificUnavailabilitySignal,
+    SimulationRequest as _SimulationRequest,
+)
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SOLVER_NAME = "Radau"
+
+class _SymbolicJacobianEvaluationError(RuntimeError):
+    """Internal signal for one failed admitted analytic evaluation."""
+
+    def __init__(self, *, time: float, reason: str) -> None:
+        self.time = float(time)
+        self.reason = str(reason)
+        super().__init__(self.reason)
 
 
 def _solve_ivp(*, fun: Callable[[float, np.ndarray], np.ndarray], t_span: Tuple[float, float], y0: np.ndarray, **kwargs: Any):
@@ -49,403 +65,487 @@ def _solve_ivp(*, fun: Callable[[float, np.ndarray], np.ndarray], t_span: Tuple[
     return solve_ivp(fun=fun, t_span=t_span, y0=y0, **kwargs)
 
 
-class ODERhsNoTemp(Protocol):
-    def __call__(self, t: float, y: np.ndarray) -> np.ndarray: ...
-
-
-class ODERhsWithTemp(Protocol):
-    def __call__(self, t: float, y: np.ndarray, *, T: float) -> np.ndarray: ...
-
-
-ODERhs = ODERhsNoTemp | ODERhsWithTemp
-
-Rhs2 = Callable[[float, np.ndarray], np.ndarray]
-
-
 __all__ = [
-    "SimulationRequest",
-    "SimulationOutput",
-    "DEFAULT_SOLVER_NAME",
-    "build_time_grid",
     "normalize_solver_name",
     "solve_ode",
 ]
 
 
-@dataclass(frozen=True)
-class SimulationRequest:
-    rhs: ODERhs
-    t_span: Tuple[float, float]
-    y0: np.ndarray
-    solver: str = DEFAULT_SOLVER_NAME
-    rtol: float = 1e-6
-    atol: float = 1e-12
-    max_step: Optional[float] = None
-    first_step: Optional[float] = None
-    t_eval: Optional[np.ndarray] = None
-    grid: Optional[Mapping[str, float | int]] = None
-    rosenbrock_jacobian: JacobianConfig = JacobianConfig()
-    jacobian_func: Optional[Callable[[float, np.ndarray], np.ndarray]] = None
-    events: Optional[Iterable[Callable[[float, np.ndarray], float]]] = None
-    event_terminal: Optional[Iterable[bool]] = None
-    positivity: Optional[str] = None
-    pos_indices: Optional[Iterable[int]] = None
-
-    progress_callback: Optional[Callable[[float, float, float], None]] = None
-    temperature_schedule: TemperatureScheduleProtocol | None = None
+def _normal_event_states_with_projection(
+    raw_states: object,
+    *,
+    count: int,
+) -> tuple[
+    tuple[tuple[np.ndarray, ...], ...],
+    NonnegativeProjection,
+]:
+    raw_output = _normal_event_states(raw_states, count=count)
+    projections: list[NonnegativeProjection] = []
+    for exact_rows in raw_output:
+        for exact in exact_rows:
+            _projected, projection = project_nonnegative_trajectory(
+                np.asarray(exact, dtype=float).reshape(-1, 1),
+                context="Simulation event state",
+            )
+            projections.append(projection)
+    return raw_output, NonnegativeProjection.aggregate(projections)
 
 
-@dataclass(frozen=True)
-class SimulationOutput:
-    t: np.ndarray
-    Y: np.ndarray
-    provenance: Dict[str, object]
-    fallback_occurred: bool = False
-    fallback_message: Optional[str] = None
+def _normal_event_states(
+    raw_states: object,
+    *,
+    count: int,
+) -> tuple[tuple[np.ndarray, ...], ...]:
+    # SciPy gives None without events, else one (hits, states) array per event,
+    # shaped (0,) when the event never fired; the first ``count`` events are
+    # the boundary events.
+    output: list[list[np.ndarray]] = [[] for _ in range(count)]
+    for idx, raw in enumerate(tuple(raw_states or ())[:count]):
+        arr = np.asarray(raw, dtype=float)
+        if arr.size == 0:
+            continue
+        for row in arr:
+            state = np.asarray(row, dtype=float).reshape(-1).copy()
+            state.setflags(write=False)
+            output[idx].append(state)
+    return tuple(tuple(rows) for rows in output)
 
 
-def _scipy_method_for(name: str) -> Tuple[str, Optional[str]]:
-    """Map solver name to SciPy method name with correct capitalization."""
-    n = name.upper()
-    scipy_methods = {
-        "LSODA": "LSODA",
-        "RADAU": "Radau",
-        "BDF": "BDF",
-    }
-    if n in scipy_methods:
-        return scipy_methods[n], None
-    if n in ("ROS3", "ROS4"):
-        return DEFAULT_SOLVER_NAME, f"{n} deprecated; using {DEFAULT_SOLVER_NAME}"
-    return DEFAULT_SOLVER_NAME, f"Unknown solver name; using {DEFAULT_SOLVER_NAME}"
-
-
-def normalize_solver_name(name: str) -> Tuple[str, Optional[str]]:
+def normalize_solver_name(name: object) -> str:
     """
     Normalize a user-specified solver name to a SciPy `solve_ivp` method name.
 
-    Returns (method, warning). The warning is non-empty when a deprecated/unknown
-    name is mapped to a supported solver.
+    Unknown names raise `SolverError`.
     """
-    return _scipy_method_for(name)
+    normalized = str(name or "").strip().upper()
+    scipy_methods = {
+        "RADAU": "Radau",
+        "BDF": "BDF",
+    }
+    if normalized in scipy_methods:
+        return scipy_methods[normalized]
+    allowed = ", ".join(sorted(scipy_methods.values()))
+    raise SolverError(f"Unsupported solver name {name!r}. Expected one of: {allowed}.")
 
 
-def _unpack_banded_jacobian(J: np.ndarray, *, ml: int, mu: int) -> np.ndarray:
-    n = J.shape[1]
-    Jd = np.zeros((n, n), float)
-    for j in range(n):
-        i_min = max(0, j - mu)
-        i_max = min(n - 1, j + ml)
-        band_rows = slice(mu + i_min - j, mu + i_max - j + 1)
-        Jd[i_min : i_max + 1, j] = J[band_rows, j]
-    return Jd
-
-
-def _make_scipy_jac(rhs: Callable[[float, np.ndarray], np.ndarray], cfg: "JacobianConfig"):
-    def jac(t: float, y: np.ndarray) -> np.ndarray:
-        J, kind = compute_jacobian(rhs, t, y, cfg=cfg)
-        J_arr = np.asarray(J, dtype=float)
-        if kind.startswith("banded("):
-            ml, mu = cfg.validate_for(J_arr.shape[1])
-            return _unpack_banded_jacobian(J_arr, ml=ml, mu=mu)
-        return J_arr
-
-    return jac
-
-
-class _TemperatureInjectedRhs:
-    def __init__(self, rhs: ODERhsWithTemp, schedule: TemperatureScheduleProtocol) -> None:
-        self._rhs = rhs
-        self._schedule = schedule
-
-    def __call__(self, t: float, y: np.ndarray) -> np.ndarray:
-        T = float(self._schedule(t))
-        return self._rhs(t, y, T=T)
-
-
-class _ProgressRhs:
-    def __init__(
-        self,
-        rhs: Rhs2,
-        *,
-        callback: Callable[[float, float, float], None],
-        t0: float,
-        t1: float,
-        every: int = 10,
-    ) -> None:
-        self._rhs = rhs
-        self._callback = callback
-        self._t0 = float(t0)
-        self._t1 = float(t1)
-        self._every = int(every)
-        self._span = float(self._t1 - self._t0)
-        self._last_bucket = -1
-
-    def __call__(self, t: float, y: np.ndarray) -> np.ndarray:
-        if self._every > 0 and np.isfinite(self._span):
-            if self._span <= 0.0:
-                bucket = 0
-            else:
-                frac = (float(t) - self._t0) / self._span
-                if frac < 0.0:
-                    frac = 0.0
-                elif frac > 1.0:
-                    frac = 1.0
-                bucket = int(frac * float(self._every))
-            if bucket > self._last_bucket:
-                self._last_bucket = bucket
-                self._callback(float(t), self._t0, self._t1)
-        return self._rhs(t, y)
-
-
-def _prepare_time_grid(req: SimulationRequest, *, t0: float, t1: float) -> np.ndarray:
+def _prepare_time_grid(req: _SimulationRequest, *, t0: float, t1: float) -> np.ndarray:
+    # Run, Preview and Scan requests realized this grid when they were built;
+    # Fit supplies its admitted sample times inside the span.
     if req.t_eval is None:
-        return build_time_grid(t0, t1, req.grid or {"N": 2})
-    t_eval = np.asarray(req.t_eval, dtype=float).reshape(-1)
-    if t_eval.size == 0:
-        raise TimeGridError("t_eval must contain at least one time point")
-    if np.any(~np.isfinite(t_eval)):
-        raise TimeGridError("t_eval must contain only finite values")
-    if np.any(np.diff(t_eval) <= 0):
-        raise TimeGridError("t_eval must be strictly increasing")
-    if t_eval[0] < t0 or t_eval[-1] > t1:
-        raise TimeGridError("t_eval must lie within t_span")
-    return t_eval
+        return _build_time_grid(t0, t1, req.grid)
+    return req.t_eval
 
 
-def _prepare_rhs(req: SimulationRequest, *, t0: float, t1: float) -> tuple[Rhs2, Rhs2]:
-    if req.temperature_schedule is None:
-        rhs_for_jac: Rhs2 = cast(ODERhsNoTemp, req.rhs)
-    else:
-        rhs_for_jac = _TemperatureInjectedRhs(cast(ODERhsWithTemp, req.rhs), req.temperature_schedule)
-
-    rhs: Rhs2 = rhs_for_jac
-    if req.progress_callback is not None:
-        rhs = _ProgressRhs(rhs_for_jac, callback=req.progress_callback, t0=t0, t1=t1)
-    return rhs, rhs_for_jac
-
-
-def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str, object]:
+def _build_provenance(req: _SimulationRequest, *, t_eval: np.ndarray) -> Dict[str, object]:
+    symbolic_jacobian = req.symbolic_jacobian
     prov: Dict[str, object] = {
         "solver_requested": req.solver,
         "rtol": float(req.rtol),
         "atol": float(req.atol),
-        "max_step": (None if req.max_step is None else float(req.max_step)),
-        "first_step": (None if req.first_step is None else float(req.first_step)),
-        "grid_type": ("explicit" if req.t_eval is not None else ("dt" if "dt" in (req.grid or {}) else "N")),
+        "grid_type": ("explicit" if req.t_eval is not None else "N"),
         "grid_params": ({"t_eval": list(t_eval)} if req.t_eval is not None else dict(req.grid or {})),
-        "rosenbrock_jacobian": {
-            "mode": getattr(req.rosenbrock_jacobian, "mode", None),
-            "ml": getattr(req.rosenbrock_jacobian, "ml", None),
-            "mu": getattr(req.rosenbrock_jacobian, "mu", None),
-        },
-        "custom_jacobian": bool(req.jacobian_func),
-        "positivity": (req.positivity or None),
-        "pos_indices": (list(req.pos_indices) if req.pos_indices is not None else None),
         "has_temperature_schedule": req.temperature_schedule is not None,
     }
+    prov.update(symbolic_jacobian.provenance_fields())
+    intervention_execution = req.intervention_execution
+    prov["has_intervention_schedule"] = not intervention_execution.is_empty
+    if not intervention_execution.is_empty:
+        prov["intervention_execution"] = (
+            intervention_execution.provenance_projection()
+        )
 
     if req.temperature_schedule is not None:
-        if isinstance(req.temperature_schedule, TemperatureScheduleDictProtocol):
-            try:
-                prov["temperature_schedule"] = req.temperature_schedule.to_dict()
-            except Exception:
-                prov["temperature_schedule"] = str(req.temperature_schedule)
-        else:
-            prov["temperature_schedule"] = str(req.temperature_schedule)
+        prov["temperature_schedule"] = req.temperature_schedule.to_dict()
 
     return prov
 
 
-def _implicit_scipy_alternatives(primary: str) -> List[str]:
-    order = {
-        "LSODA": ["Radau", "BDF"],
-        "Radau": ["BDF"],
-        "BDF": ["Radau"],
-    }
-    return [m for m in order.get(primary, []) if m != primary]
+def _guard_runtime_symbolic_jacobian(
+    jacobian_func: Callable[[float, np.ndarray], np.ndarray],
+    cancellation_control: _SimulationCancellationControl | None,
+) -> Callable[[float, np.ndarray], np.ndarray]:
+    """Reject a non-finite symbolic Jacobian without reclassifying RHS errors."""
 
+    def guarded(time: float, state: np.ndarray) -> np.ndarray:
+        if (
+            cancellation_control is not None
+            and cancellation_control.cancel_requested()
+        ):
+            raise SimulationCancelled()
+        values = np.asarray(state, dtype=float).reshape(-1)
+        matrix = np.asarray(jacobian_func(float(time), values), dtype=float)
+        expected_shape = (values.size, values.size)
+        if matrix.shape != expected_shape:
+            raise _SymbolicJacobianEvaluationError(
+                time=float(time),
+                reason=f"its analytic Jacobian had shape {matrix.shape} instead of {expected_shape}",
+            )
+        if not np.all(np.isfinite(matrix)):
+            raise _SymbolicJacobianEvaluationError(
+                time=float(time),
+                reason="its analytic Jacobian had nonfinite values",
+            )
+        return matrix
 
-def _apply_positivity_to_trajectory(
-    Y: np.ndarray,
-    *,
-    mode: Optional[str],
-    indices: Optional[Iterable[int]],
-) -> np.ndarray:
-    if not mode:
-        return Y
-    if indices is None:
-        return np.maximum(Y, 0.0)
-    Y2 = np.asarray(Y, float).copy()
-    for j in indices:
-        jj = int(j)
-        if 0 <= jj < Y2.shape[0]:
-            Y2[jj, :] = np.maximum(Y2[jj, :], 0.0)
-    return Y2
+    return guarded
 
 
 def _execute_scipy(
-    req: SimulationRequest,
+    req: _SimulationRequest,
     *,
-    rhs: Rhs2,
-    rhs_for_jac: Rhs2,
+    segment_identity: SegmentIdentity,
+    rhs: _Rhs2,
     t0: float,
     t1: float,
     y0: np.ndarray,
     t_eval: np.ndarray,
-    prov: Dict[str, object],
     method: str,
-    note: Optional[str],
-) -> SimulationOutput:
-    if note:
-        prov["emulation_note"] = note
+    boundary_events: Sequence[Callable[[float, np.ndarray], float]],
+    boundary_terminal_flags: Sequence[bool],
+    volume=None,
+) -> SegmentRunResult:
+    species_count = len(y0)
+    # SciPy integrates on a segment-local clock.  BDF does not rescale its
+    # difference history when ``t + h`` rounds, so an absolute origin makes a
+    # fast transient's error estimate depend on ulp(t0) and collapses the step.
+    # Callbacks, samples, roots and dense output keep the absolute clock, and
+    # both segment ends map exactly.
+    origin = float(t0)
+    local_end = float(t1) - origin
 
-    base_kwargs: Dict[str, Any] = dict(t_eval=t_eval, rtol=float(req.rtol), atol=float(req.atol))
-    if req.max_step is not None:
-        base_kwargs["max_step"] = float(req.max_step)
-    if req.first_step is not None:
-        base_kwargs["first_step"] = float(req.first_step)
-    events_list: Optional[List[Callable[[float, np.ndarray], float]]] = None
-    if req.events is not None:
-        events_list = list(req.events)
-        base_kwargs["events"] = events_list
+    def absolute(tau: float) -> float:
+        return float(t1) if tau >= local_end else min(origin + float(tau), float(t1))
 
-    jac_callable = req.jacobian_func or _make_scipy_jac(rhs_for_jac, req.rosenbrock_jacobian)
-    banded_jacobian_active = (
-        getattr(req.rosenbrock_jacobian, "mode", None) == "banded"
-        and req.rosenbrock_jacobian.ml is not None
-        and req.rosenbrock_jacobian.mu is not None
-    )
+    local_rhs = rhs if origin == 0.0 else (lambda tau, state: rhs(absolute(tau), state))
+    base_kwargs: Dict[str, Any] = dict(t_eval=t_eval - origin, rtol=float(req.rtol), atol=float(req.atol))
+    if volume is not None:
+        y0 = np.append(y0, volume.value)
+        base_kwargs["atol"] = np.append(np.full(species_count, req.atol), req.atol * volume.initial_value)
+    from kindred.core.intervention_schedule import InterventionStopAction
+    retain_dense = volume is not None or any(isinstance(item.then, InterventionStopAction) for item in req.intervention_execution.triggers)
+    dense_output = retain_dense or req.sample_solver_steps
+    if dense_output:
+        base_kwargs["dense_output"] = True
+    boundary_events = tuple(boundary_events)
+    events_list: list[Callable[[float, np.ndarray], float]] = []
+    for index, event in enumerate(boundary_events):
+        terminal = bool(boundary_terminal_flags[index])
 
-    def _kwargs_for_method(method_name: str) -> Dict[str, Any]:
-        kwargs = dict(base_kwargs)
-        kwargs["method"] = method_name
-        if method_name in ("Radau", "BDF"):
-            kwargs["jac"] = jac_callable
-            if banded_jacobian_active:
-                # SciPy implicit solvers expect an n x n Jacobian when a jac
-                # callable is supplied; jac_sparsity is ignored in that case.
-                kwargs.pop("jac_sparsity", None)
-        else:
-            kwargs.pop("jac", None)
-            kwargs.pop("jac_sparsity", None)
-        return kwargs
+        def _wrapped_event(
+            t: float,
+            y: np.ndarray,
+            *,
+            _event=event,
+        ) -> float:
+            # Events see the solver state the RHS sees: species, then vessel volume.
+            return float(_event(absolute(t), y))
 
-    attempted_methods: List[str] = []
-    fallback_occurred = False
-    fallback_message: Optional[str] = None
-    primary_method = method
+        _wrapped_event.terminal = terminal  # type: ignore[attr-defined]
+        if hasattr(event, "direction"):
+            _wrapped_event.direction = getattr(event, "direction")  # type: ignore[attr-defined]
+        events_list.append(_wrapped_event)
+    if req.cancellation_control is not None:
+        events_list.append(_cancellation_event(req.cancellation_control))
+    # SciPy evaluates every event at each accepted step (root searches stay
+    # inside that step), so the largest observed time is the last accepted
+    # solver time; a failed step returns before events are evaluated.
+    last_accepted_time = origin
 
-    def _looks_like_brentq_sign_error(exc: BaseException) -> bool:
-        return "different signs" in str(exc).lower()
+    def _observe_accepted_time(tau: float, _y: np.ndarray) -> float:
+        nonlocal last_accepted_time
+        last_accepted_time = max(last_accepted_time, absolute(tau))
+        return 1.0
 
-    def _cancel_requested_via_event() -> bool:
-        for ev in events_list or []:
-            if not bool(getattr(ev, "_kindred_cancel_event", False)):
-                continue
-            cancelled_cb = getattr(ev, "_kindred_cancelled", None)
-            if callable(cancelled_cb) and bool(cancelled_cb()):
-                return True
-        return False
+    events_list.append(_observe_accepted_time)
+    base_kwargs["events"] = events_list
 
-    def _solve_or_cancelled(method_name: str):
-        try:
-            return _solve_ivp(fun=rhs, t_span=(t0, t1), y0=y0, **_kwargs_for_method(method_name))  # type: ignore[misc]
-        except ValueError as exc:
-            # SciPy event root-finder can raise on cancellation races (brentq sign error).
-            # If we have an explicit cancellation event and it reports cancellation requested,
-            # translate to a typed cancellation signal.
-            if events_list and _looks_like_brentq_sign_error(exc) and _cancel_requested_via_event():
-                raise SimulationCancelled() from exc
-            raise
+    symbolic_jacobian = req.symbolic_jacobian
+    jac_callable = symbolic_jacobian.jacobian_func
 
-    sol = _solve_or_cancelled(method)
-    attempted_methods.append(method)
+    if jac_callable is not None:
+        guarded_jacobian = _guard_runtime_symbolic_jacobian(
+            jac_callable,
+            req.cancellation_control,
+        )
+        jac_callable = (
+            guarded_jacobian if origin == 0.0
+            else (lambda tau, state: guarded_jacobian(absolute(tau), state))
+        )
+    solve_kwargs = dict(base_kwargs)
+    solve_kwargs["method"] = method
+    if jac_callable is not None:
+        solve_kwargs["jac"] = jac_callable
 
-    if events_list and getattr(sol, "status", 0) == 1 and getattr(sol, "t_events", None):
-        for idx, ev in enumerate(events_list):
-            if not bool(getattr(ev, "_kindred_cancel_event", False)):
-                continue
-            t_events = sol.t_events[idx] if idx < len(sol.t_events) else None
-            if t_events is not None and len(t_events) > 0:
-                raise SimulationCancelled()
-
-    if not sol.success:
-        prov["solver_failure"] = str(sol.message)
-        last_message = str(sol.message)
-        for alt_method in _implicit_scipy_alternatives(method):
-            alt_sol = _solve_or_cancelled(alt_method)
-            attempted_methods.append(alt_method)
-            if alt_sol.success:
-                sol = alt_sol
-                prov["solver_alternative_used"] = alt_method
-                fallback_occurred = True
-                fallback_message = f"{primary_method} failed; succeeded with {alt_method}"
-                method = alt_method
-                break
-            last_message = str(alt_sol.message)
-        if not sol.success:
-            t_fail = float(sol.t[-1]) if getattr(sol, "t", None) is not None and len(sol.t) > 0 else float(t0)
-            attempt_list = ", ".join(attempted_methods)
-            raise create_solver_error(
-                req.solver,
-                t_fail,
-                f"{last_message}; attempted methods: {attempt_list}",
+    def _solve():
+        if (
+            req.cancellation_control is not None
+            and req.cancellation_control.cancel_requested()
+        ):
+            raise SimulationCancelled()
+        rhs_values = np.asarray(
+            rhs(float(t0), np.asarray(y0, dtype=float).reshape(-1).copy()),
+            dtype=float,
+        ).reshape(-1)
+        if not np.all(np.isfinite(rhs_values)):
+            raise _SimulationScientificUnavailabilitySignal(
+                _SimulationScientificUnavailability(
+                    producer="scipy",
+                    stage="rhs_preflight",
+                    message=SIMULATION_NONFINITE_MESSAGE,
+                    details={
+                        "solver": req.solver,
+                        "time": float(t0),
+                        "segment": segment_identity.to_payload(),
+                    },
+                )
             )
+        try:
+            solved = _solve_ivp(
+                fun=local_rhs,
+                t_span=(0.0, local_end),
+                y0=y0,
+                **solve_kwargs,
+            )  # type: ignore[misc]
+        except ValueError as exc:
+            # SciPy's event root finder raises when an event's sign change
+            # does not survive re-evaluation on the step interpolant.  Its
+            # dense LU factorization or solve raises when a step's Newton
+            # matrix or residual has overflowed to non-finite values.
+            if "different signs" in str(exc).lower():
+                stage, reason = "event_root_finding", "it could not find the time at which a trigger threshold is crossed"
+            elif str(exc) == "array must not contain infs or NaNs":
+                stage, reason = "nonfinite_step", "a step produced values that are not finite"
+            else:
+                raise
+            if (
+                req.cancellation_control is not None
+                and req.cancellation_control.cancel_requested()
+            ):
+                raise SimulationCancelled() from exc
+            error = create_solver_error(req.solver, last_accepted_time, reason, str(exc))
+            if req.candidate_evaluation:
+                raise _SimulationScientificUnavailabilitySignal(
+                    _SimulationScientificUnavailability(
+                        producer="scipy",
+                        stage=stage,
+                        message=error.message,
+                        details={
+                            "solver": req.solver,
+                            "time": last_accepted_time,
+                            "message": str(exc),
+                        },
+                    )
+                ) from exc
+            raise error from exc
+        if (
+            req.cancellation_control is not None
+            and req.cancellation_control.cancel_requested()
+        ):
+            if dense_output:
+                solved.sol = None
+            raise SimulationCancelled()
+        return solved
 
-    prov["solver_used"] = method
-    t_out = np.asarray(sol.t, float)
-    Y_out = _apply_positivity_to_trajectory(
-        np.asarray(sol.y, float),
-        mode=req.positivity,
-        indices=(list(req.pos_indices) if req.pos_indices is not None else None),
+    try:
+        sol = _solve()
+    except _SymbolicJacobianEvaluationError as exc:
+        if (
+            req.cancellation_control is not None
+            and req.cancellation_control.cancel_requested()
+        ):
+            raise SimulationCancelled() from exc
+        details = {
+            "solver": req.solver,
+            "time": float(exc.time),
+            "segment": segment_identity.to_payload(),
+            "reason": exc.reason,
+        }
+        error = create_solver_error(req.solver, exc.time, exc.reason, "")
+        error.details.update(details)
+        if req.candidate_evaluation:
+            raise _SimulationScientificUnavailabilitySignal(
+                _SimulationScientificUnavailability(
+                    producer="analytic_jacobian",
+                    stage="runtime_evaluation",
+                    message=error.message,
+                    details=details,
+                )
+            ) from exc
+        raise error from exc
+
+    try:
+        if not sol.success:
+            if dense_output:
+                sol.sol = None
+            t_fail = last_accepted_time
+            # BDF and Radau report one failure: the step size fell below
+            # the spacing of floating-point numbers at the current time.
+            error = create_solver_error(
+                req.solver, t_fail, "its step size became too small to continue", str(sol.message),
+            )
+            if req.candidate_evaluation:
+                raise _SimulationScientificUnavailabilitySignal(
+                    _SimulationScientificUnavailability(
+                        producer="scipy",
+                        stage="solve_ivp_unsuccessful",
+                        message=error.message,
+                        details={
+                            "solver": req.solver,
+                            "time": t_fail,
+                            "message": str(sol.message),
+                        },
+                    )
+                )
+            raise error
+
+        # Detach SciPy's time vector at ingress.  The trajectory copy below is
+        # owned exactly once by project_nonnegative_trajectory; retain the exact
+        # pre-projection terminal column separately for continuation semantics.
+        t_out = np.asarray(t_eval, dtype=float)[:len(sol.t)].copy()
+        # SciPy returns a 1-D empty array when no requested time was reached.
+        raw_trajectory = np.asarray(sol.y, dtype=float).reshape(len(y0), -1)
+        local_dense = sol.sol
+        if req.sample_solver_steps:
+            # Every accepted step before the solver stopped (an event can end
+            # the segment early).  Steps the absolute clock cannot tell apart
+            # become one row.
+            local = np.asarray(local_dense.ts, dtype=float)
+            local = local[(local > 0.0) & (local < local_dense.t_max)]
+            step_times, first = np.unique(origin + local, return_index=True)
+            extra = ((step_times > origin) & (step_times < absolute(float(local_dense.t_max)))
+                     & ~np.isin(step_times, t_out))
+            if extra.any():
+                times = np.concatenate((t_out, step_times[extra]))
+                order = np.argsort(times, kind="stable")
+                t_out = times[order]
+                raw_trajectory = np.concatenate(
+                    (raw_trajectory,
+                     np.asarray(local_dense(local[first][extra]), dtype=float).reshape(len(y0), -1)),
+                    axis=1,
+                )[:, order]
+        dense = (None if local_dense is None else local_dense if origin == 0.0
+                 else (lambda times: local_dense(np.asarray(times, dtype=float) - origin)))
+        if volume is not None:
+            volume.record_segment(t0, absolute(float(local_dense.t_max)), dense)
+            raw_trajectory = raw_trajectory[:species_count]
+        raw_terminal_state = None
+        if (
+            t_out.size
+            and float(t_out[-1]) == float(t1)
+            and raw_trajectory.ndim == 2
+            and raw_trajectory.shape[1]
+        ):
+            raw_terminal_state = raw_trajectory[:, -1].copy()
+        Y_out, nonnegative_projection = project_nonnegative_trajectory(
+            raw_trajectory,
+            context="Simulation",
+        )
+        event_count = len(boundary_events)
+        event_times = tuple(
+            tuple(absolute(value) for value in values)
+            for values in _normal_event_provenance(
+                sol.t_events,
+                count=event_count,
+            )
+        )
+        raw_event_states, event_state_projection = (
+            _normal_event_states_with_projection(
+                (tuple(np.asarray(states).reshape(-1, len(y0))[:, :species_count] for states in (sol.y_events or ()))
+                 if volume is not None else sol.y_events),
+                count=event_count,
+            )
+        )
+        if (
+            req.cancellation_control is not None
+            and req.cancellation_control.cancel_requested()
+        ):
+            raise SimulationCancelled()
+        return SegmentRunResult(
+            t=t_out,
+            Y=Y_out,
+            event_times=event_times,
+            raw_event_states=raw_event_states,
+            raw_terminal_state=raw_terminal_state,
+            trajectory_projection=nonnegative_projection,
+            event_state_projection=event_state_projection,
+            dense_output=((lambda times, dense=dense: dense(times)[:species_count]) if volume is not None
+                          else dense if retain_dense else None),
+            symbolic_jacobian_used=jac_callable is not None,
+        )
+    finally:
+        if dense_output:
+            sol.sol = None
+
+
+def _run_scipy_segment(request: SegmentExecutionRequest) -> SegmentRunResult:
+    return _execute_scipy(
+        request.request,
+        segment_identity=request.identity,
+        rhs=request.rhs,
+        t0=request.t0,
+        t1=request.t1,
+        y0=request.y0,
+        t_eval=request.t_eval,
+        method=request.method,
+        boundary_events=request.boundary_events,
+        boundary_terminal_flags=request.boundary_terminal_flags,
+        volume=request.volume,
     )
-    if hasattr(sol, "t_events") and sol.t_events:
-        prov["events"] = [list(te) for te in sol.t_events]
-    return SimulationOutput(
-        t=t_out,
-        Y=Y_out,
-        provenance=prov,
-        fallback_occurred=fallback_occurred,
-        fallback_message=fallback_message,
-    )
-
-def _request_from_mapping(payload: Mapping[str, Any], *, allow_unknown_keys: bool) -> SimulationRequest:
-    field_names = {f.name for f in fields(SimulationRequest)}
-    payload_dict = dict(payload)
-    missing = [name for name in ("rhs", "t_span", "y0") if name not in payload_dict]
-    if missing:
-        raise TypeError(f"Missing required SimulationRequest field(s): {', '.join(missing)}")
-    unknown = sorted(set(payload_dict) - field_names)
-    if unknown and not allow_unknown_keys:
-        raise TypeError(f"Unknown SimulationRequest field(s): {', '.join(unknown)}")
-    filtered = {k: v for k, v in payload_dict.items() if k in field_names}
-    return SimulationRequest(**filtered)  # type: ignore[arg-type]
 
 
-def solve_ode(req: SimulationRequest | Mapping[str, Any], *, allow_unknown_keys: bool = False) -> SimulationOutput:
-    if not isinstance(req, SimulationRequest):
-        if isinstance(req, Mapping):
-            req = _request_from_mapping(req, allow_unknown_keys=bool(allow_unknown_keys))
-        else:
-            raise TypeError(f"solve_ode expects SimulationRequest or Mapping, got {type(req)!r}")
-    y0 = np.asarray(req.y0, float)
-    if y0.ndim != 1 or not np.all(np.isfinite(y0)):
-        raise InitialConditionError("y0 must be a 1D finite array")
+def _cancellation_event(
+    control: _SimulationCancellationControl,
+) -> Callable[[float, np.ndarray], float]:
+    """Create the solver-owned event used only for secondary early stop."""
+
+    def event(_time: float, _state: np.ndarray) -> float:
+        return -1.0 if control.cancel_requested() else 1.0
+
+    event.terminal = True  # type: ignore[attr-defined]
+    event.direction = -1.0  # type: ignore[attr-defined]
+    return event
+
+
+def _normal_event_provenance(
+    events: object,
+    *,
+    count: int,
+) -> tuple[tuple[float, ...], ...]:
+    out = [[] for _ in range(count)]
+    # The first ``count`` SciPy events are the boundary events.
+    for idx, raw in enumerate(tuple(events or ())[:count]):
+        out[idx].extend(float(value) for value in raw)
+    return tuple(tuple(values) for values in out)
+
+def solve_ode(
+    req: _SimulationRequest,
+) -> _FinalSimulationOutput | _SimulationScientificUnavailability:
+    if (
+        req.cancellation_control is not None
+        and req.cancellation_control.cancel_requested()
+    ):
+        raise SimulationCancelled()
     t0, t1 = map(float, req.t_span)
     t_eval = _prepare_time_grid(req, t0=t0, t1=t1)
-    rhs, rhs_for_jac = _prepare_rhs(req, t0=t0, t1=t1)
     prov = _build_provenance(req, t_eval=t_eval)
 
-    method, note = _scipy_method_for(req.solver)
-    return _execute_scipy(
-        req,
-        rhs=rhs,
-        rhs_for_jac=rhs_for_jac,
-        t0=t0,
-        t1=t1,
-        y0=y0,
-        t_eval=t_eval,
-        prov=prov,
-        method=method,
-        note=note,
-    )
+    method = req.solver
+    try:
+        output = InterventionScheduleExecutionOwner(_run_scipy_segment).execute(
+            ScheduleExecutionRequest(
+                request=req,
+                t_eval=t_eval,
+                provenance=prov,
+                method=method,
+            )
+        )
+    except _SimulationScientificUnavailabilitySignal as exc:
+        if (
+            req.cancellation_control is not None
+            and req.cancellation_control.cancel_requested()
+        ):
+            raise SimulationCancelled() from exc
+        if req.candidate_evaluation:
+            return exc.outcome
+        raise SolverError(exc.outcome.message, details={"solver": req.solver}) from exc
+    return output

@@ -1,443 +1,808 @@
+"""Direct project file actions, disposition, and Close sequencing."""
+
 from __future__ import annotations
 
-import csv
-import json
 import logging
 import os
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import Enum
 
-import numpy as np
 from PySide6 import QtCore, QtWidgets
 
-from kindred.gui.project_schema import get_default_project_payload, QSETTINGS_KEY_MAP
-from kindred.gui.utils import BusyCursor
-from kindred.gui.widgets.export_dialog import ExportDialog
-
-if TYPE_CHECKING:
-    from kindred.gui.main_window import MainWindow
+from kindred.core.project_document import ProjectDocument
+from kindred.core.validation import and_join
+from kindred.core.project_presentation_state import (
+    WorkspacePresentationState,
+    default_workspace_presentation_state,
+    validate_workspace_presentation_state,
+)
+from kindred.core.project_session import (
+    ProjectContentToken,
+    ProjectSession,
+)
+from kindred.gui.controllers.config_controller import ConfigController
+from kindred.gui.controllers.simulation_job_owner import SimulationJobOwner
+from kindred.gui.dataset_import_staging import DatasetImportStaging
+from kindred.gui.fit_session_owner import FitSessionOwner
+from kindred.gui.workspace_tab_registry import WorkspaceTabRegistry
+from kindred.io.kin_archive_store import KinArchiveStore
+from kindred.io.paths import file_error_text, same_local_path
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ProjectController"]
+__all__ = [
+    "ProjectController",
+    "ProjectTransientState",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectTransientState:
+    """Exact transient authoring and active-work disposition state."""
+
+    reactions_draft: bool = False
+    notes_draft: bool = False
+    initial_condition_drafts: bool = False
+    run_defaults_drafts: bool = False
+    # Mechanism tab names holding an invalid Initial Conditions cell or an
+    # invalid Run-settings draft; Save discards both with one choice.
+    invalid_authoring_tabs: tuple[str, ...] = ()
+    slider_drafts: bool = False
+    active_run_or_preview: bool = False
+    active_fit: bool = False
+    active_import: bool = False
+    active_xlsx_export: bool = False
+    active_scan: bool = False
+    active_calculator: bool = False
+    active_spreadsheet: bool = False
+
+    @property
+    def has_authoring_edits(self) -> bool:
+        return bool(
+            self.reactions_draft
+            or self.notes_draft
+            or self.initial_condition_drafts
+            or self.run_defaults_drafts
+            or self.has_invalid_authoring
+        )
+
+    @property
+    def has_invalid_authoring(self) -> bool:
+        return bool(self.invalid_authoring_tabs)
+
+    @property
+    def has_active_work(self) -> bool:
+        return bool(
+            self.active_run_or_preview
+            or self.active_fit
+            or self.active_import
+            or self.active_xlsx_export
+            or self.active_scan
+            or self.active_calculator
+            or self.active_spreadsheet
+        )
+
+    @property
+    def has_any(self) -> bool:
+        return bool(
+            self.has_authoring_edits
+            or self.slider_drafts
+            or self.has_active_work
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ProjectDispositionRequest:
+    """One call-local combined disposition input."""
+
+    action: str
+    archive_dirty: bool
+    transient: ProjectTransientState
+    application_close: bool = False
+
+
+class _DispositionChoice(Enum):
+    SAVE = "save"
+    DISCARD = "discard"
+    CANCEL = "cancel"
+
+
+@dataclass(frozen=True, slots=True)
+class _DispositionResult:
+    content_token: ProjectContentToken
+    clean_idle: bool = False
+    discard_all_authoring: bool = False
+    discard_slider_drafts: bool = False
 
 
 class ProjectController(QtCore.QObject):
-    """
-    Project + file I/O controller for MainWindow.
+    """The sole Save/Save As/Close disposition owner."""
 
-    Owns:
-    - Project load/save JSON file dialogs
-    - CSV export dialog + file writing
+    projectStateChanged = QtCore.Signal(bool)
+    closeStarted = QtCore.Signal()
+    nativeCloseAuthorized = QtCore.Signal()
 
-    Uses `mw` as the UI routing surface.
-    """
-
-    def __init__(self, mw: MainWindow):
-        super().__init__(mw)
-        self.mw = mw
-        self._export_dialog = None
-        self._current_project_path: Optional[str] = None
-
-    @property
-    def current_project_path(self) -> Optional[str]:
-        return self._current_project_path
+    def __init__(
+        self,
+        parent_widget: QtWidgets.QWidget,
+        *,
+        session: ProjectSession,
+        tabs: WorkspaceTabRegistry,
+        archive_store: KinArchiveStore,
+        config: ConfigController,
+        simulation_jobs: SimulationJobOwner,
+        dataset_imports: DatasetImportStaging,
+        fit_session: FitSessionOwner,
+        xlsx_exports: object,
+        scan: object,
+        calculator_owners: Callable[[], tuple[object, ...]],
+        spreadsheet_editor: Callable[[], object | None],
+        set_status_text: Callable[[str], None],
+        admit_incoming_document: Callable[
+            [ProjectDocument],
+            ProjectDocument | None,
+        ],
+        capture_visible_tab_inputs: Callable[[], None],
+        prepare_before_save: Callable[
+            [bool],
+            tuple[
+                ProjectDocument,
+                tuple[tuple[str, tuple[str, ...]], ...],
+            ]
+            | None,
+        ],
+        commit_saved_document: Callable[
+            [
+                ProjectDocument,
+                tuple[tuple[str, tuple[str, ...]], ...],
+                ProjectContentToken,
+            ],
+            ProjectContentToken | None,
+        ],
+        inspect_transient_state: Callable[[], ProjectTransientState],
+        discard_authoring: Callable[[], None],
+        discard_slider_drafts: Callable[[], None],
+    ) -> None:
+        super().__init__(parent_widget)
+        self._parent_widget = parent_widget
+        self._session = session
+        self._tabs = tabs
+        self._archive_store = archive_store
+        self._config = config
+        self._simulation_jobs = simulation_jobs
+        self._dataset_imports = dataset_imports
+        self._fit_session = fit_session
+        self._xlsx_exports = xlsx_exports
+        self._scan = scan
+        self._calculator_owners = calculator_owners
+        self._spreadsheet_editor = spreadsheet_editor
+        self._set_status_text = set_status_text
+        self._admit_incoming_document = admit_incoming_document
+        self._capture_visible_tab_inputs = capture_visible_tab_inputs
+        self._prepare_before_save = prepare_before_save
+        self._commit_saved_document = commit_saved_document
+        self._inspect_transient_state = inspect_transient_state
+        self._discard_authoring = discard_authoring
+        self._discard_slider_drafts = discard_slider_drafts
+        self._close_started = False
+        self._close_pending = False
+        self._native_close_authorized = False
+        self._simulation_jobs.application_close_settlement_changed.connect(
+            self.notify_close_progress
+        )
+        self._dataset_imports.application_close_settlement_changed.connect(
+            self.notify_close_progress
+        )
+        self._fit_session.application_close_settlement_changed.connect(
+            self.notify_close_progress
+        )
+        self._xlsx_exports.application_close_settlement_changed.connect(
+            self.notify_close_progress
+        )
+        self._scan.application_close_settlement_changed.connect(self.notify_close_progress)
 
     def _set_status(self, text: str) -> None:
-        self.mw.set_status_text(str(text))
+        self._set_status_text(str(text))
 
-    def _serialize_project_state(self) -> Dict[str, object]:
-        return dict(self.mw.serialize_project_state())
+    @property
+    def mutation_admitted(self) -> bool:
+        """Whether a new user mutation may enter the project lifecycle."""
 
-    def _apply_project_payload(self, data: Dict[str, object], *, record_undo: bool) -> bool:
-        return bool(self.mw.apply_project_payload(data, record_undo=record_undo))
+        # Close is a one-way lifecycle.  Keep the admission latched even
+        # after early native authorization has cleared ``_close_pending`` so
+        # the event loop cannot reopen a writable window before closeEvent.
+        return not (self._close_started or self._close_pending)
 
-    def _add_to_recent_files(self, filepath: str) -> None:
-        self.mw.add_to_recent_files(str(filepath))
+    def _reject_mutation_during_close(self, action: str) -> bool:
+        if self.mutation_admitted:
+            return False
+        self._set_status(f"{action} rejected: application Close is in progress.")
+        return True
 
-    def _clear_app_undo_history(self) -> None:
-        stack = getattr(self.mw, "_undo_stack", None)
-        if stack is not None and hasattr(stack, "clear"):
-            stack.clear()
+    def _show_error(self, title: str, message: str) -> None:
+        logger.error("%s: %s", title, message)
+        QtWidgets.QMessageBox.critical(self._parent_widget, title, message)
 
-    def _update_window_title(self) -> None:
-        if self._current_project_path is not None:
-            self.mw.setWindowTitle(f"Kindred \u2014 {os.path.basename(self._current_project_path)}")
-        else:
-            self.mw.setWindowTitle("Kindred")
-
-    # ------------------------------------------------------------------
-    # Project load/save
-    # ------------------------------------------------------------------
-    def load_project(self) -> None:
-        """Load project from JSON file chosen via QFileDialog."""
-        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self.mw,
-            "Load Project",
-            "",
-            "Kindred Project (*.kin);;JSON Files (*.json);;All Files (*)",
+    def _content_token_is_current(
+        self,
+        token: ProjectContentToken,
+        *,
+        action: str,
+    ) -> bool:
+        if self._session.is_content_token_current(token):
+            return True
+        self._set_status(
+            f"{action} was not completed because the current project changed."
         )
-        if not filename:
-            return
+        return False
 
-        self._load_project_from_path(
-            filename,
-            record_undo=False,
-            add_to_recent=True,
-            status_path=filename,
+    def _resolve_disposition(
+        self,
+        action: str,
+        *,
+        application_close: bool = False,
+    ) -> _DispositionResult | None:
+        self._capture_visible_tab_inputs()
+        expected_token = self._session.capture_content_token()
+        request = _ProjectDispositionRequest(
+            action=str(action),
+            archive_dirty=self._session.is_dirty(
+                self._tabs.workspace_presentation()
+            ),
+            transient=self._inspect_transient_state(),
+            application_close=bool(application_close),
+        )
+        if not request.archive_dirty and not request.transient.has_any:
+            return _DispositionResult(
+                content_token=expected_token,
+                clean_idle=True,
+            )
+        choice = self._prompt_disposition(request)
+        if not self._content_token_is_current(
+            expected_token,
+            action=action,
+        ):
+            return None
+        if choice is _DispositionChoice.CANCEL:
+            return None
+        if choice is _DispositionChoice.SAVE:
+            saved_token = self._save_project_from_token(
+                expected_token,
+                discard_invalid_authoring=request.transient.has_invalid_authoring,
+            )
+            if saved_token is None:
+                return None
+            return _DispositionResult(
+                content_token=saved_token,
+                discard_slider_drafts=request.transient.slider_drafts,
+            )
+        if choice is _DispositionChoice.DISCARD:
+            return _DispositionResult(
+                content_token=expected_token,
+                discard_all_authoring=request.transient.has_authoring_edits,
+                discard_slider_drafts=request.transient.slider_drafts,
+            )
+        return None
+
+    def _prompt_disposition(
+        self,
+        request: _ProjectDispositionRequest,
+    ) -> _DispositionChoice:
+        transient = request.transient
+        details: list[str] = []
+        if request.archive_dirty:
+            details.append(
+                "The project document or saved workspace presentation has "
+                "unsaved changes."
+            )
+        if transient.reactions_draft:
+            details.append("Reactions text has not yet been accepted.")
+        if transient.notes_draft:
+            details.append("Notes text has not yet been saved.")
+        if transient.initial_condition_drafts:
+            details.append("Initial Conditions edits have not yet been saved.")
+        if transient.has_invalid_authoring:
+            tabs = ", ".join(repr(name) for name in transient.invalid_authoring_tabs)
+            details.append(
+                f"Initial Conditions or Run settings on mechanism tab(s) {tabs} are invalid."
+            )
+        if transient.run_defaults_drafts:
+            details.append("Run-default edits have not yet been saved.")
+        if transient.slider_drafts:
+            details.append("Slider Preview drafts are not project content.")
+        if transient.active_run_or_preview:
+            details.append("Run or Preview work is still active.")
+        if transient.active_fit:
+            details.append("Fit work is still active.")
+        if transient.active_import:
+            details.append("A dataset import is still active.")
+        if transient.active_xlsx_export:
+            details.append("An XLSX export is still active.")
+        if transient.active_scan:
+            details.append("A Chemical Space Scan is still active.")
+        if transient.active_calculator:
+            details.append("A Calculator query is still active.")
+        if transient.active_spreadsheet:
+            details.append("The spreadsheet editor has temporary data. Closing discards it, and Save saves only project data already created.")
+        details.append(f"Choose once how to proceed before {request.action}.")
+
+        dialog = QtWidgets.QMessageBox(self._parent_widget)
+        dialog.setWindowTitle("Unsaved Project Work")
+        dialog.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        dialog.setText("\n\n".join(details))
+
+        choices: dict[QtWidgets.QAbstractButton, _DispositionChoice] = {}
+        if (
+            request.archive_dirty
+            or transient.notes_draft
+            or transient.reactions_draft
+            or transient.initial_condition_drafts
+            or transient.run_defaults_drafts
+        ):
+            if request.application_close:
+                if transient.has_active_work:
+                    label = (
+                        "Discard Invalid Edits, Save, Stop Active Work, and Close"
+                        if transient.has_invalid_authoring
+                        else "Save, Stop Active Work, and Close"
+                    )
+                else:
+                    label = (
+                        "Discard Invalid Edits, Save, and Close"
+                        if transient.has_invalid_authoring
+                        else "Save and Close"
+                    )
+            else:
+                label = (
+                    "Discard Invalid Edits, Save, and Continue"
+                    if transient.has_invalid_authoring
+                    else "Save and Continue"
+                )
+            button = dialog.addButton(
+                label,
+                QtWidgets.QMessageBox.ButtonRole.AcceptRole,
+            )
+            choices[button] = _DispositionChoice.SAVE
+
+        discard_parts: list[str] = []
+        if request.archive_dirty:
+            discard_parts.append("Project Changes")
+        if transient.reactions_draft:
+            discard_parts.append("Reactions Edit")
+        if transient.notes_draft:
+            discard_parts.append("Notes Edit")
+        if transient.initial_condition_drafts:
+            discard_parts.append("Initial Conditions Edit")
+        if transient.run_defaults_drafts:
+            discard_parts.append("Run Defaults Edit")
+        if transient.has_invalid_authoring:
+            discard_parts.append("Invalid Edit(s)")
+        if transient.slider_drafts:
+            discard_parts.append("Slider Preview")
+        discard_subject = and_join(discard_parts)
+        if request.application_close:
+            if transient.has_active_work:
+                discard_label = (
+                    f"Discard {discard_subject}, Stop Active Work, and Close"
+                    if discard_subject
+                    else "Stop Active Work and Close"
+                )
+            else:
+                discard_label = f"Discard {discard_subject} and Close"
+        else:
+            discard_label = (
+                f"Discard {discard_subject} and Continue"
+                if discard_subject
+                else "Continue"
+            )
+        discard_button = dialog.addButton(
+            discard_label,
+            QtWidgets.QMessageBox.ButtonRole.DestructiveRole,
+        )
+        choices[discard_button] = _DispositionChoice.DISCARD
+
+        cancel_button = dialog.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        choices[cancel_button] = _DispositionChoice.CANCEL
+        if transient.has_active_work:
+            dialog.setDefaultButton(cancel_button)
+        dialog.exec()
+        return choices.get(dialog.clickedButton(), _DispositionChoice.CANCEL)
+
+    def _apply_discard(self, result: _DispositionResult) -> None:
+        if result.discard_all_authoring:
+            self._discard_authoring()
+        if result.discard_slider_drafts:
+            self._discard_slider_drafts()
+
+    def is_current_project_path(self, path: str | os.PathLike[str]) -> bool:
+        """Return whether ``path`` resolves to the active project archive."""
+
+        return same_local_path(path, self._session.current_path)
+
+    def _replace_project(
+        self,
+        document: ProjectDocument,
+        presentation: WorkspacePresentationState,
+        *,
+        baseline_document: ProjectDocument,
+        path: str | None,
+        expected_token: ProjectContentToken,
+        action: str,
+    ) -> bool:
+        if not self._content_token_is_current(expected_token, action=action):
+            return False
+        self._tabs.replace_project(
+            document,
+            presentation,
+            path=path,
+            baseline_document=baseline_document,
+            expected_token=expected_token,
+        )
+        status = (
+            "Created new project." if path is None else f"Loaded project: {path}"
+        )
+        if path is not None:
+            try:
+                self._config.record_recent_project(path)
+            except OSError as exc:
+                logger.warning("Recent-project update failed", exc_info=True)
+                status += f". Updating the recent projects list failed: {exc}"
+        self._set_status(status)
+        self.projectStateChanged.emit(True)
+        return True
+
+    def new_project(self) -> bool:
+        """Replace the current project after project-action admission."""
+
+        if self._reject_mutation_during_close("New Project"):
+            return False
+        disposition = self._resolve_disposition("New Project")
+        if disposition is None:
+            return False
+        self._apply_discard(disposition)
+        document = self._config.default_project_document()
+        presentation = default_workspace_presentation_state(document)
+        return self._replace_project(
+            document,
+            presentation,
+            baseline_document=document,
+            path=None,
+            expected_token=disposition.content_token,
+            action="New Project",
+        )
+
+    def load_project(self) -> bool:
+        """Choose and directly install one validated project archive."""
+
+        if self._reject_mutation_during_close("Open Project"):
+            return False
+        # Capture the visible editor before opening the native picker.  The
+        # picker may take focus away; canceling it must leave this exact draft
+        # owned by the current project with no publication or disposition.
+        self._capture_visible_tab_inputs()
+        path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+            self._parent_widget,
+            "Open Project",
+            self._session.current_path or "",
+            "Kindred Project (*.kin)",
+        )
+        if not path:
+            return False
+        return self.load_recent_project(path)
+
+    def load_recent_project(
+        self,
+        path: str | os.PathLike[str],
+    ) -> bool:
+        """Admit and directly install one selected project archive."""
+
+        if self._reject_mutation_during_close("Open Project"):
+            return False
+        if not os.path.isfile(path):
+            self._show_error(
+                "Open Project Error",
+                f"Could not open project:\n\nThe file does not exist:\n{os.fspath(path)}",
+            )
+            return False
+        disposition = self._resolve_disposition("Open Project")
+        if disposition is None:
+            return False
+        try:
+            archive = self._archive_store.load(path)
+        except Exception as exc:
+            logger.exception("Project archive load failed")
+            self._show_error(
+                "Open Project Error",
+                f"Could not open project:\n\n{file_error_text(exc, path)}",
+            )
+            return False
+        admitted_document = self._admit_incoming_document(archive.document)
+        if admitted_document is None:
+            return False
+        try:
+            presentation = validate_workspace_presentation_state(
+                admitted_document,
+                archive.presentation,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.exception("Incoming project presentation validation failed")
+            self._show_error(
+                "Open Project Error",
+                f"Could not open project:\n\n{exc}",
+            )
+            return False
+        self._apply_discard(disposition)
+        absolute_path = os.path.abspath(os.fsdecode(os.fspath(path)))
+        return self._replace_project(
+            admitted_document,
+            presentation,
+            baseline_document=archive.document,
+            path=absolute_path,
+            expected_token=disposition.content_token,
+            action="Open Project",
         )
 
     def save_project(self) -> bool:
-        """Overwrite the current file, or prompt if no path is known."""
-        if self._current_project_path is not None:
-            return self._write_project_to_path(self._current_project_path)
-        return self.save_project_as()
+        if self._reject_mutation_during_close("Save Project"):
+            return False
+        self._capture_visible_tab_inputs()
+        expected_token = self._session.capture_content_token()
+        prepared = self._prepare_before_save(False)
+        if prepared is None:
+            return False
+        candidate, materialized_by_tab = prepared
+        return (
+            self._save_prepared_document(
+                candidate,
+                materialized_by_tab,
+                expected_token=expected_token,
+                choose_destination=self._session.current_path is None,
+            )
+            is not None
+        )
 
     def save_project_as(self) -> bool:
-        """Always prompt for a file path and save."""
-        filename, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self.mw,
-            "Save Project As",
-            self._current_project_path or "",
-            "Kindred Project (*.kin);;JSON Files (*.json);;All Files (*)",
-        )
-        if not filename:
+        if self._reject_mutation_during_close("Save Project As"):
             return False
-        return self._write_project_to_path(filename)
-
-    def _write_project_to_path(self, filepath: str) -> bool:
-        """Serialize and write the project to the given file path."""
-        try:
-            with BusyCursor():
-                data = self._serialize_project_state()
-                with open(filepath, "w") as handle:
-                    json.dump(data, handle, indent=2)
-        except Exception as exc:
-            logger.error("Failed to save project: %s", exc, exc_info=True)
-            QtWidgets.QMessageBox.critical(
-                self.mw,
-                "Save Error",
-                f"Failed to save project:\n\n{exc}",
-            )
+        self._capture_visible_tab_inputs()
+        expected_token = self._session.capture_content_token()
+        prepared = self._prepare_before_save(False)
+        if prepared is None:
             return False
-
-        # File write succeeded — title and recent-files are best-effort.
-        self._current_project_path = filepath
-        try:
-            self._update_window_title()
-            self._set_status(f"Saved project: {filepath}")
-            logger.info("Saved project to %s", filepath)
-            self._add_to_recent_files(filepath)
-        except Exception:
-            logger.warning("Post-save bookkeeping failed for %s", filepath, exc_info=True)
-        return True
-
-    def new_project(self) -> None:
-        """Reset the application to an empty project state.
-
-        Prompts the user to save unsaved work before clearing.
-        """
-        # ── Single-document assumption ──────────────────────────────────
-        # Kindred is a single-document application.  This method clears
-        # all project state to start fresh.  If multi-document support is
-        # added, this flow must be scoped per-document instead.
-        # ────────────────────────────────────────────────────────────────
-        reply = QtWidgets.QMessageBox.question(
-            self.mw,
-            "New Project",
-            "Do you want to save the current project before starting a new one?",
-            QtWidgets.QMessageBox.StandardButton.Save
-            | QtWidgets.QMessageBox.StandardButton.Discard
-            | QtWidgets.QMessageBox.StandardButton.Cancel,
-            QtWidgets.QMessageBox.StandardButton.Save,
-        )
-        if reply == QtWidgets.QMessageBox.StandardButton.Cancel:
-            return
-        if reply == QtWidgets.QMessageBox.StandardButton.Save:
-            if not self.save_project():
-                return
-
-        empty_payload = get_default_project_payload()
-        # Strip dual-persisted keys so _apply_project_payload falls through
-        # to user preferences for them instead of using factory defaults.
-        for key in QSETTINGS_KEY_MAP:
-            empty_payload.pop(key, None)
-        applied = self._apply_project_payload(empty_payload, record_undo=False)
-        if not applied:
-            return
-        self._clear_app_undo_history()
-        self._current_project_path = None
-        self._update_window_title()
-        self._set_status("New project")
-
-    def load_recent_project(self, filepath: str) -> None:
-        """Load a project from the Recent Projects menu."""
-        if not os.path.exists(filepath):
-            QtWidgets.QMessageBox.warning(
-                self.mw,
-                "File Not Found",
-                f"File no longer exists:\n{filepath}",
+        candidate, materialized_by_tab = prepared
+        return (
+            self._save_prepared_document(
+                candidate,
+                materialized_by_tab,
+                expected_token=expected_token,
+                choose_destination=True,
             )
-            recent_files = self.mw._settings.value("recent_files", [])
-            if filepath in recent_files:
-                recent_files.remove(filepath)
-                self.mw._settings.setValue("recent_files", recent_files)
-                self.mw.config_controller.update_recent_files_menu()
-            return
-
-        self._load_project_from_path(
-            filepath,
-            record_undo=False,
-            add_to_recent=False,
-            status_path=os.path.basename(filepath),
+            is not None
         )
 
-    def _load_project_from_path(
+    def _save_project_from_token(
         self,
-        filepath: str,
+        expected_token: ProjectContentToken,
         *,
-        record_undo: bool,
-        add_to_recent: bool,
-        status_path: str,
-    ) -> None:
-        try:
-            with BusyCursor():
-                with open(filepath, "r") as handle:
-                    data = json.load(handle)
+        discard_invalid_authoring: bool,
+    ) -> ProjectContentToken | None:
+        """Save during one already-admitted project disposition."""
 
-                applied = self._apply_project_payload(data, record_undo=record_undo)
-                if not bool(applied):
-                    return
-                if not record_undo:
-                    self._clear_app_undo_history()
-                self._current_project_path = filepath
-                self._update_window_title()
-                self._set_status(f"Loaded project: {status_path}")
-            logger.info("Loaded project from %s", filepath)
+        prepared = self._prepare_before_save(discard_invalid_authoring)
+        if prepared is None:
+            return None
+        candidate, materialized_by_tab = prepared
+        return self._save_prepared_document(
+            candidate,
+            materialized_by_tab,
+            expected_token=expected_token,
+            choose_destination=self._session.current_path is None,
+        )
 
-            if add_to_recent:
-                self._add_to_recent_files(filepath)
-
-        except Exception as exc:
-            logger.error("Failed to load project: %s", exc, exc_info=True)
-            QtWidgets.QMessageBox.critical(
-                self.mw,
-                "Load Error",
-                f"Failed to load project:\n\n{exc}",
+    def _save_prepared_document(
+        self,
+        candidate: ProjectDocument,
+        materialized_by_tab: tuple[tuple[str, tuple[str, ...]], ...],
+        *,
+        expected_token: ProjectContentToken,
+        choose_destination: bool,
+    ) -> ProjectContentToken | None:
+        if not self._content_token_is_current(
+            expected_token,
+            action="Save Project",
+        ):
+            return None
+        if not choose_destination:
+            return self._write_project(
+                self._session.current_path,
+                candidate,
+                materialized_by_tab,
+                expected_token=expected_token,
             )
-
-    # ------------------------------------------------------------------
-    # CSV export
-    # ------------------------------------------------------------------
-    def export_data(self) -> None:
-        """Export simulation/dataset data to a CSV file using ExportDialog."""
-        payload = self._validate_export_preconditions("data")
-        if payload is None:
-            return
-
-        if self._export_dialog is None:
-            self._export_dialog = ExportDialog(self.mw)
-            self._export_dialog.exportAccepted.connect(self.handle_export_config)
-
-        current_plot = self.mw._plot_tabs.get_current_plot()
-        try:
-            scope = current_plot.get_export_scope_preference()
-        except Exception as exc:
-            logger.debug("Failed to read export scope preference: %s", exc)
-        else:
-            try:
-                self._export_dialog.set_scope(scope)
-            except Exception as exc:
-                logger.debug("Failed to apply export scope preference: %s", exc)
-
-        self._export_dialog.open()
-
-    def _warn_no_export_target(self, message: str) -> None:
-        QtWidgets.QMessageBox.warning(self.mw, "Export Unavailable", message)
-        self.mw.set_status_text(message)
-
-    def _validate_export_preconditions(self, export_type: str):
-        if export_type != "data":
-            raise ValueError(f"Unknown export type: {export_type}")
-
-        current_plot = self.mw._plot_tabs.get_current_plot()
-        payload = self._resolve_export_payload(current_plot)
-        if payload is None:
-            self._warn_no_export_target(
-                "No simulation or dataset data available to export.\n\n"
-                "Please run a simulation (Simulation → Run) or load a dataset (Data → Load Dataset)."
-            )
+        path, _selected_filter = QtWidgets.QFileDialog.getSaveFileName(
+            self._parent_widget,
+            "Save Project As",
+            self._session.current_path or "",
+            "Kindred Project (*.kin)",
+            options=QtWidgets.QFileDialog.Option.DontConfirmOverwrite,
+        )
+        if not path:
             return None
-        return payload
-
-    def _resolve_export_payload(self, plot_widget) -> Optional[Dict[str, object]]:
-        if plot_widget is None:
+        if not self._content_token_is_current(
+            expected_token,
+            action="Save Project",
+        ):
             return None
-
-        try:
-            payload = plot_widget.export_payload()
-        except Exception:
-            payload = None
-        if isinstance(payload, dict) and payload:
-            normalized = self._normalize_export_payload(payload)
-            if normalized is not None:
-                return normalized
-
-        try:
-            data = plot_widget.get_dataset_data()
-        except Exception:
-            data = None
-        if isinstance(data, dict) and data:
-            t_raw = data.get("t")
-            if t_raw is None:
-                return None
-            t_values = np.asarray(t_raw, dtype=float).reshape(-1)
-            if "species" in data and isinstance(data.get("species"), dict):
-                species_map = dict(data["species"])
-            else:
-                species_map = {k: v for k, v in data.items() if k != "t"}
-            species_map = {str(k): v for k, v in species_map.items() if k and k != "species"}
-            if not species_map:
-                return None
-            return {"t": t_values, "series": species_map}
-
-        return None
-
-    @staticmethod
-    def _normalize_export_payload(payload: Dict[str, object]) -> Optional[Dict[str, object]]:
-        t_raw = payload.get("t")
-        if t_raw is None:
+        destination = self._save_as_path(path)
+        if os.path.lexists(destination) and not self._confirm_overwrite(
+            destination
+        ):
             return None
-        series = payload.get("series")
-        if not isinstance(series, dict) or not series:
-            return None
-        return {"t": np.asarray(t_raw, dtype=float).reshape(-1), "series": dict(series)}
-
-    def handle_export_config(self, config: dict) -> None:
-        try:
-            path = config["path"]
-            mode = config.get("mode", "default")
-            scope = config.get("scope", "axis")
-
-            current_plot = self.mw._plot_tabs.get_current_plot()
-            payload = self._resolve_export_payload(current_plot)
-            if payload is None:
-                self._warn_no_export_target("Simulation data is no longer available for export.")
-                return
-
-            if mode == "legacy":
-                header, rows = self._prepare_legacy_export_rows(current_plot)
-            else:
-                header, rows = self._prepare_default_export_rows(current_plot, scope)
-
-            with BusyCursor():
-                with open(path, "w", newline="") as handle:
-                    writer = csv.writer(handle, delimiter=",")
-                    writer.writerow(header)
-                    for row in rows:
-                        writer.writerow(row)
-
-                scope_desc = f"{mode} mode" if mode == "legacy" else f"{mode} mode, scope={scope}"
-                self.mw.set_status_text(f"Exported CSV ({scope_desc}): {path}")
-            logger.info("Exported CSV to %s (mode=%s, scope=%s)", path, mode, scope)
-
-        except ValueError as exc:
-            logger.warning("CSV export aborted: %s", exc)
-            QtWidgets.QMessageBox.warning(self.mw, "Export Error", str(exc))
-        except Exception as exc:
-            logger.error("Failed to export CSV: %s", exc, exc_info=True)
-            QtWidgets.QMessageBox.critical(self.mw, "Export Error", f"Failed to export CSV:\n\n{exc}")
-
-    def _prepare_legacy_export_rows(self, plot) -> Tuple[List[str], List[List[object]]]:
-        payload = self._resolve_export_payload(plot)
-        if not payload:
-            try:
-                raw = plot.export_payload()
-            except Exception:
-                raw = None
-            if isinstance(raw, dict) and raw.get("t") is not None:
-                series = raw.get("series")
-                if isinstance(series, dict) and not series:
-                    raise ValueError("No series data available to export.")
-            raise ValueError("No data available to export.")
-        time_array = np.asarray(payload.get("t"), dtype=float).reshape(-1)
-        series = payload.get("series") or {}
-
-        if time_array.size == 0:
-            raise ValueError("Time axis has no points to export.")
-
-        series_names = list(series.keys())
-        if not series_names:
-            raise ValueError("No series data available to export.")
-
-        data_arrays = []
-        for name in series_names:
-            arr = np.asarray(series[name], dtype=float).reshape(-1)
-            if arr.shape[0] != time_array.shape[0]:
-                raise ValueError(
-                    f"Series '{name}' length ({arr.shape[0]}) does not match time grid ({time_array.shape[0]})."
-                )
-            data_arrays.append(arr)
-
-        header = ["t"] + [f"[{sp}]" for sp in series_names]
-
-        def row_iter():
-            for idx in range(time_array.shape[0]):
-                yield [f"{time_array[idx]:.6f}"] + [f"{arr[idx]:.6f}" for arr in data_arrays]
-
-        return header, row_iter()
-
-    def _prepare_default_export_rows(self, plot, scope: str) -> Tuple[List[str], List[List[object]]]:
-        try:
-            export = plot.build_visible_export(scope)
-        except AttributeError:
-            pass
-        else:
-            if isinstance(export, tuple) and len(export) == 2:
-                return export
-
-        payload = self._resolve_export_payload(plot)
-        if payload:
-            return self._prepare_payload_export_rows(payload, plot=plot, scope=scope)
-
-        raise ValueError(
-            "Current plot does not implement the export interface (expected build_visible_export() or export_payload())."
+        return self._write_project(
+            destination,
+            candidate,
+            materialized_by_tab,
+            expected_token=expected_token,
         )
 
     @staticmethod
-    def _prepare_payload_export_rows(
-        payload: Dict[str, object],
+    def _save_as_path(path: str | os.PathLike[str]) -> str:
+        absolute_path = os.path.abspath(os.fsdecode(os.fspath(path)))
+        _directory, filename = os.path.split(absolute_path)
+        if not filename:
+            raise ValueError("Project save destination requires a file name.")
+        if filename.casefold().endswith(".kin"):
+            return absolute_path
+        return f"{absolute_path}.kin"
+
+    def _confirm_overwrite(self, path: str) -> bool:
+        choice = QtWidgets.QMessageBox.question(
+            self._parent_widget,
+            "Replace Existing Project",
+            f"A project already exists at:\n{path}\n\nReplace it?",
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        return choice == QtWidgets.QMessageBox.StandardButton.Yes
+
+    def _write_project(
+        self,
+        path: str,
+        candidate: ProjectDocument,
+        materialized_by_tab: tuple[tuple[str, tuple[str, ...]], ...],
         *,
-        plot,
-        scope: str,
-    ) -> Tuple[List[str], List[List[object]]]:
-        # Payload-based export is a legacy fallback for plot widgets that do not
-        # implement the public `build_visible_export(scope)` interface. This code
-        # must not reach into plot-private UI state.
-        _ = plot
-        scope = str(scope or "")
-        t_values = np.asarray(payload.get("t"), dtype=float).reshape(-1)
-        if t_values.size == 0:
-            raise ValueError("Time axis has no points to export.")
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        if not self._content_token_is_current(
+            expected_token,
+            action="Save Project",
+        ):
+            return None
+        if self._scan.owns_destination(path):
+            self._show_error("Save Error", "Cannot overwrite the destination of an active Chemical Space Scan.")
+            return None
+        committed_token = self._commit_saved_document(
+            candidate,
+            materialized_by_tab,
+            expected_token,
+        )
+        if committed_token is None:
+            self._set_status(
+                "The selected save candidate was superseded before publication."
+            )
+            return None
+        try:
+            presentation = self._tabs.workspace_presentation()
+            self._archive_store.save(
+                path,
+                candidate,
+                presentation,
+            )
+        except OSError as exc:
+            self._show_error(
+                "Save Error",
+                f"Failed to save project:\n\n{file_error_text(exc, path)}",
+            )
+            return None
+        self._session.mark_saved(
+            path,
+            presentation,
+            expected_token=committed_token,
+        )
+        status = f"Saved project: {path}"
+        try:
+            self._config.record_recent_project(path)
+        except OSError as exc:
+            logger.warning("Recent-project update failed", exc_info=True)
+            status += f". Updating the recent projects list failed: {exc}"
+        self._set_status(status)
+        self.projectStateChanged.emit(False)
+        return committed_token
 
-        series = payload.get("series") or {}
-        if not isinstance(series, dict) or not series:
-            raise ValueError("No series data available to export.")
+    def request_close(self) -> bool:
+        """Start application Close once; subsequent requests only advance it."""
 
-        species_names = [str(name) for name in series.keys() if str(name)]
+        if self._native_close_authorized:
+            return True
+        if self._close_started:
+            self.notify_close_progress()
+            return self._native_close_authorized
+        disposition = self._resolve_disposition(
+            "closing Kindred",
+            application_close=True,
+        )
+        if disposition is None:
+            return False
+        self._apply_discard(disposition)
+        if disposition.clean_idle and self._async_owners_are_settled():
+            fit_idle_closed = self._fit_session.close_idle_for_application_close()
+            scan_idle_closed = self._scan.close_idle_for_application_close()
+            if fit_idle_closed and scan_idle_closed:
+                self._close_started = True
+                self._native_close_authorized = True
+                self.nativeCloseAuthorized.emit()
+                return True
+            # A failed synchronous idle-window teardown is still an owner
+            # cleanup problem. Continue through the normal owner settlement
+            # path so Close remains pending until every owner is settled.
+            self._set_status(
+                "Idle window cleanup did not finish. Waiting for active work to settle."
+            )
+        self._close_started = True
+        self._close_pending = True
+        self.closeStarted.emit()
+        self._simulation_jobs.cancel_for_application_close()
+        self._dataset_imports.cancel_for_application_close()
+        self._fit_session.cancel_for_application_close()
+        self._xlsx_exports.cancel_for_application_close()
+        self._scan.cancel_for_application_close()
+        for calculator in self._calculator_owners():
+            calculator.cancel_for_application_close()
+        spreadsheet = self._spreadsheet_editor()
+        if spreadsheet is not None:
+            spreadsheet.cancel_for_application_close()
+        self.notify_close_progress()
+        return self._native_close_authorized
 
-        arrays: List[np.ndarray] = []
-        for name in species_names:
-            arr = np.asarray(series[name], dtype=float).reshape(-1)
-            if arr.shape[0] != t_values.shape[0]:
-                raise ValueError(
-                    f"Series '{name}' length ({arr.shape[0]}) does not match time grid ({t_values.shape[0]})."
-                )
-            arrays.append(arr)
+    @QtCore.Slot()
+    def notify_close_progress(self) -> None:
+        if not self._close_pending:
+            return
+        if self._async_owners_are_settled():
+            self._authorize_application_close()
 
-        header = ["Time"] + species_names
+    def _async_owners_are_settled(self) -> bool:
+        """Read each asynchronous owner's explicit Close settlement truth."""
 
-        def row_iter():
-            for idx in range(t_values.shape[0]):
-                yield [t_values[idx]] + [arr[idx] for arr in arrays]
+        settled = True
+        spreadsheet = self._spreadsheet_editor()
+        if spreadsheet is not None and not spreadsheet.application_close_settled:
+            settled = False
+        for owner in (
+            self._simulation_jobs,
+            self._dataset_imports,
+            self._fit_session,
+            self._xlsx_exports,
+            self._scan,
+            *self._calculator_owners(),
+        ):
+            if not owner.application_close_settled:
+                settled = False
+        return settled
 
-        return header, row_iter()
+    def _authorize_application_close(self) -> None:
+        if not self._close_pending or self._native_close_authorized:
+            return
+        self._close_pending = False
+        self._native_close_authorized = True
+        self.nativeCloseAuthorized.emit()
+
+    def consume_native_close_authorization(self) -> bool:
+        """Consume the one native-close authorization at the physical boundary."""
+
+        if not self._native_close_authorized:
+            return False
+        self._native_close_authorized = False
+        return True

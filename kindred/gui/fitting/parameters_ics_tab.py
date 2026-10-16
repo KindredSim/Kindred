@@ -1,2030 +1,1603 @@
-"""Parameters tab for the fitting window."""
+"""Fit parameter presentation with current owner-facing hooks.
+
+The widget construction in this module is intentionally close to the executable
+Fit presentation.  The widget is only a view: accepted setup, request
+construction, Fit results, defaults persistence, and worker ownership remain
+outside it.
+"""
 
 from __future__ import annotations
 
-import logging
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
-
-import numpy as np
-from PySide6 import QtWidgets
-from PySide6.QtCore import Qt, Signal
-
-from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
-from kindred.gui.fitting.constants import DEFAULT_PARALLEL_STARTS, FITTING_DEFAULT_SOLVER, INITIAL_PREFIX
-from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
-
-logger = logging.getLogger(__name__)
+import html
 
 
-class _AddFittableParameterDialog(QtWidgets.QDialog):
-    def __init__(
-        self,
-        *,
-        available_rates: Sequence[str],
-        available_scalars: Sequence[str],
-        available_species: Sequence[str],
-        dataset_ids: Sequence[str],
-        available_observables: Optional[Dict[str, str]] = None,
-        parent: Optional[QtWidgets.QWidget] = None,
-    ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Add Parameter")
-        self.setModal(True)
-        self.resize(520, 340)
+from dataclasses import dataclass, replace
+from collections.abc import Mapping, Sequence
+from PySide6 import QtCore, QtGui, QtWidgets
 
-        self._available_rates = [str(x) for x in (available_rates or []) if str(x)]
-        self._available_scalars = [str(x) for x in (available_scalars or []) if str(x)]
-        self._available_species = [str(x) for x in (available_species or []) if str(x)]
-        self._dataset_ids = [str(x) for x in (dataset_ids or []) if str(x)]
-        self._available_observables = self._normalize_available_observables(available_observables)
-        self._selection: Optional[Dict[str, str]] = None
+from kindred.gui.display_name_policy import compact_text, scientific_symbol_html, scientific_symbol_spoken
+from kindred.gui.ui_helpers import (
+    SCIENTIFIC_NAME_HTML_ROLE,
+    SOLVER_TOOLTIP,
+    ScientificNameDelegate,
+    ChoicesComboBox,
+    ControlRowsLayout,
+    cell_text_as_shown,
+    configure_compact_numeric_edit,
+    ignore_wheel,
+)
+from kindred.core.analysis.fit_uncertainty import ProfileLikelihoodOptions
+from kindred.core.analysis.global_fit_execution import FitCoordinate
+from kindred.core.quantity_units import format_unit_for_display
+from kindred.core.validation import parse_finite_numeric_text, six_digit_text
 
-        layout = QtWidgets.QVBoxLayout(self)
+from kindred.core.fitting_method_policy import SUPPORTED_FIT_METHODS, UNCERTAINTY_FIT_METHODS
+from kindred.gui.fitting.constants import FIT_METHOD_LABELS
+from kindred.core.project_document import (
+    FIT_MAX_NFEV_RANGE,
+    FIT_SEED_RANGE,
+    FitDefaults,
+    SUPPORTED_SOLVERS,
+    default_fit_defaults,
+    validate_fit_defaults,
+)
+from kindred.gui.fitting.launch import (
+    FitOriginSnapshot,
+    FitParameterVariable,
+    FitSetupSnapshot,
+    fit_group_labels,
+    fit_uncertainty_coordinates,
+    skipped_fit_analysis_coordinates,
+    _replace_fit_parameter,
+    convert_fit_parameter_scope,
+)
+from kindred.gui.fitting.constants import (
+    admit_fit_tolerance,
+    DIFFERENTIAL_EVOLUTION_METHOD,
+    FUNCTION_TOLERANCE_LABEL,
+    STEP_TOLERANCE_LABEL,
+)
+from kindred.gui.fitting.reporting import fit_identity_text
 
-        self._tabs = QtWidgets.QTabWidget(self)
-        layout.addWidget(self._tabs, stretch=1)
-
-        self._init_rate_tab()
-        self._init_initial_tab()
-        self._init_scalar_tab()
-        self._init_observable_tab()
-        self._connect_observable_signals()
-
-        self._add_button_box(layout)
-
-    @staticmethod
-    def _normalize_available_observables(available_observables: Optional[Dict[str, str]]) -> dict[str, str]:
-        return {
-            str(k): str(v)
-            for k, v in (available_observables or {}).items()
-            if str(k).strip() and str(v).strip()
-        }
-
-    def _init_rate_tab(self) -> None:
-        self._rate_tab = QtWidgets.QWidget(self._tabs)
-        rate_layout = QtWidgets.QVBoxLayout(self._rate_tab)
-        if self._available_rates:
-            rate_layout.addWidget(QtWidgets.QLabel("Select a rate constant to add:"))
-            self._rate_list = QtWidgets.QListWidget(self._rate_tab)
-            self._rate_list.addItems(self._available_rates)
-            self._rate_list.setCurrentRow(0)
-            rate_layout.addWidget(self._rate_list, stretch=1)
-        else:
-            self._rate_list = None
-            rate_layout.addWidget(QtWidgets.QLabel("No additional rate constants are available to add."))
-            rate_layout.addStretch()
-        self._tabs.addTab(self._rate_tab, "Rate Constants")
-
-    def _init_initial_tab(self) -> None:
-        self._initial_tab = QtWidgets.QWidget(self._tabs)
-        init_layout = QtWidgets.QVBoxLayout(self._initial_tab)
-        init_layout.addWidget(QtWidgets.QLabel("Select a species initial concentration parameter to add:"))
-
-        form = QtWidgets.QFormLayout()
-        self._species_combo = QtWidgets.QComboBox(self._initial_tab)
-        self._species_combo.addItems(self._available_species)
-        form.addRow("Species:", self._species_combo)
-
-        mode_row = QtWidgets.QHBoxLayout()
-        self._global_radio = QtWidgets.QRadioButton("Global")
-        self._local_radio = QtWidgets.QRadioButton("Local")
-        self._global_radio.setChecked(True)
-        mode_row.addWidget(self._global_radio)
-        mode_row.addWidget(self._local_radio)
-        mode_row.addStretch()
-        mode_widget = QtWidgets.QWidget(self._initial_tab)
-        mode_widget.setLayout(mode_row)
-        form.addRow("Mode:", mode_widget)
-
-        ds_count = len(self._dataset_ids)
-        ds_label = f"Applies to {ds_count} selected dataset{'s' if ds_count != 1 else ''}."
-        self._dataset_label = QtWidgets.QLabel(ds_label)
-        form.addRow("", self._dataset_label)
-        init_layout.addLayout(form)
-
-        help_label = QtWidgets.QLabel(
-            "Global: one parameter updates the initial value for all selected datasets.\n"
-            "Local: a separate parameter is created for each selected dataset."
-        )
-        help_label.setWordWrap(True)
-        init_layout.addWidget(help_label)
-        init_layout.addStretch()
-        self._tabs.addTab(self._initial_tab, "Initial Concentrations")
-
-    def _init_scalar_tab(self) -> None:
-        self._scalar_tab = QtWidgets.QWidget(self._tabs)
-        scalar_layout = QtWidgets.QVBoxLayout(self._scalar_tab)
-        if self._available_scalars:
-            scalar_layout.addWidget(QtWidgets.QLabel("Select an algebra scalar parameter to add:"))
-            self._scalar_list = QtWidgets.QListWidget(self._scalar_tab)
-            self._scalar_list.addItems(self._available_scalars)
-            self._scalar_list.setCurrentRow(0)
-            scalar_layout.addWidget(self._scalar_list, stretch=1)
-        else:
-            self._scalar_list = None
-            scalar_layout.addWidget(QtWidgets.QLabel("No algebra scalar parameters are available to add."))
-            scalar_layout.addStretch()
-
-        scalar_form = QtWidgets.QFormLayout()
-        scalar_mode_row = QtWidgets.QHBoxLayout()
-        self._scalar_shared_radio = QtWidgets.QRadioButton("Shared")
-        self._scalar_dataset_radio = QtWidgets.QRadioButton("Per-dataset")
-        self._scalar_shared_radio.setChecked(True)
-        scalar_mode_row.addWidget(self._scalar_shared_radio)
-        scalar_mode_row.addWidget(self._scalar_dataset_radio)
-        scalar_mode_row.addStretch()
-        scalar_mode_widget = QtWidgets.QWidget(self._scalar_tab)
-        scalar_mode_widget.setLayout(scalar_mode_row)
-        scalar_form.addRow("Scope:", scalar_mode_widget)
-
-        ds_count = len(self._dataset_ids)
-        scalar_ds_label = f"Applies to {ds_count} selected dataset{'s' if ds_count != 1 else ''}."
-        self._scalar_dataset_label = QtWidgets.QLabel(scalar_ds_label)
-        scalar_form.addRow("", self._scalar_dataset_label)
-        scalar_layout.addLayout(scalar_form)
-
-        scalar_help = QtWidgets.QLabel(
-            "Shared: one scalar value is used for all included datasets.\n"
-            "Per-dataset: a separate scalar is created for each selected dataset.\n"
-            "A scalar cannot be both shared and per-dataset at the same time."
-        )
-        scalar_help.setWordWrap(True)
-        scalar_layout.addWidget(scalar_help)
-        self._tabs.addTab(self._scalar_tab, "Algebra Scalars")
-
-    def _init_observable_tab(self) -> None:
-        self._observable_tab = QtWidgets.QWidget(self._tabs)
-        observable_layout = QtWidgets.QVBoxLayout(self._observable_tab)
-        header_row = QtWidgets.QHBoxLayout()
-        header_row.addWidget(QtWidgets.QLabel("Select an existing algebraic observable from # Algebra:"))
-        header_row.addStretch(1)
-        self._define_new_button = QtWidgets.QPushButton("Define new…", self._observable_tab)
-        header_row.addWidget(self._define_new_button)
-        header_widget = QtWidgets.QWidget(self._observable_tab)
-        header_widget.setLayout(header_row)
-        observable_layout.addWidget(header_widget)
-
-        self._observable_combo = QtWidgets.QComboBox(self._observable_tab)
-        self._observable_combo.addItems(sorted(self._available_observables.keys()))
-        observable_layout.addWidget(self._observable_combo)
-
-        self._no_observables_label = QtWidgets.QLabel(
-            "No algebraic observables found in # Algebra. Use 'Define new…' to add one.",
-            self._observable_tab,
-        )
-        self._no_observables_label.setWordWrap(True)
-        self._no_observables_label.setEnabled(False)
-        observable_layout.addWidget(self._no_observables_label)
-
-        observable_layout.addWidget(QtWidgets.QLabel("Expression preview (read-only):"))
-        self._observable_expr_preview = QtWidgets.QPlainTextEdit(self._observable_tab)
-        self._observable_expr_preview.setReadOnly(True)
-        self._observable_expr_preview.setMinimumHeight(70)
-        self._observable_expr_preview.setPlainText("")
-        observable_layout.addWidget(self._observable_expr_preview)
-
-        scope_form = QtWidgets.QFormLayout()
-        obs_scope_row = QtWidgets.QHBoxLayout()
-        self._observable_shared_radio = QtWidgets.QRadioButton("Shared")
-        self._observable_dataset_radio = QtWidgets.QRadioButton("Per-dataset")
-        self._observable_shared_radio.setChecked(True)
-        obs_scope_row.addWidget(self._observable_shared_radio)
-        obs_scope_row.addWidget(self._observable_dataset_radio)
-        obs_scope_row.addStretch()
-        obs_scope_widget = QtWidgets.QWidget(self._observable_tab)
-        obs_scope_widget.setLayout(obs_scope_row)
-        scope_form.addRow("Auto-added scalars:", obs_scope_widget)
-        ds_count = len(self._dataset_ids)
-        obs_ds_label = f"Applies to {ds_count} selected dataset{'s' if ds_count != 1 else ''}."
-        self._observable_dataset_label = QtWidgets.QLabel(obs_ds_label)
-        scope_form.addRow("", self._observable_dataset_label)
-        observable_layout.addLayout(scope_form)
-
-        self._new_observable_container = QtWidgets.QGroupBox("Define new observable", self._observable_tab)
-        self._new_observable_container.setVisible(False)
-        self._define_new_mode = False
-        new_layout = QtWidgets.QFormLayout(self._new_observable_container)
-        self._new_observable_name_edit = QtWidgets.QLineEdit(self._new_observable_container)
-        self._new_observable_name_edit.setPlaceholderText("e.g. signal")
-        new_layout.addRow("Observable name:", self._new_observable_name_edit)
-        self._new_observable_expr_edit = QtWidgets.QLineEdit(self._new_observable_container)
-        self._new_observable_expr_edit.setPlaceholderText("e.g. scale * ([A] + [B])")
-        new_layout.addRow("Expression:", self._new_observable_expr_edit)
-        observable_layout.addWidget(self._new_observable_container)
-
-        observable_help = QtWidgets.QLabel(
-            "Species must be referenced using brackets: [A], [A]_0 (bare A is invalid).",
-            self._observable_tab,
-        )
-        observable_help.setWordWrap(True)
-        observable_layout.addWidget(observable_help)
-        observable_layout.addStretch(1)
-        self._tabs.addTab(self._observable_tab, "Algebraic Observables")
-
-    def _connect_observable_signals(self) -> None:
-        self._define_new_button.clicked.connect(self._toggle_define_new_observable)
-        self._observable_combo.currentTextChanged.connect(self._refresh_observable_preview)
-        self._refresh_observable_preview()
-        self._refresh_observable_empty_state()
-
-    def _add_button_box(self, layout: QtWidgets.QVBoxLayout) -> None:
-        button_box = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
-            self,
-        )
-        button_box.accepted.connect(self.accept)
-        button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
-
-    def selection(self) -> Optional[Dict[str, str]]:
-        return dict(self._selection or {}) if self._selection else None
-
-    def _refresh_observable_empty_state(self) -> None:
-        has_obs = bool(self._available_observables)
-        self._observable_combo.setVisible(has_obs)
-        self._observable_expr_preview.setVisible(has_obs)
-        self._no_observables_label.setVisible(not has_obs)
-
-    def _refresh_observable_preview(self) -> None:
-        name = str(self._observable_combo.currentText()).strip() if hasattr(self, "_observable_combo") else ""
-        expr = str(self._available_observables.get(name, "")).strip()
-        try:
-            self._observable_expr_preview.setPlainText(expr)
-        except Exception:
-            return
-
-    def _toggle_define_new_observable(self) -> None:
-        self._define_new_mode = not bool(getattr(self, "_define_new_mode", False))
-        self._new_observable_container.setVisible(bool(self._define_new_mode))
-        self._define_new_button.setText("Hide new…" if self._define_new_mode else "Define new…")
-
-    def accept(self) -> None:  # noqa: D401 - Qt override
-        idx = int(self._tabs.currentIndex())
-        if idx == 0:
-            if self._rate_list is None:
-                return
-            item = self._rate_list.currentItem()
-            if item is None:
-                return
-            self._selection = {"type": "rate", "name": str(item.text())}
-        elif idx == 1:
-            species = str(self._species_combo.currentText()).strip()
-            if not species:
-                return
-            mode = "global" if self._global_radio.isChecked() else "local"
-            self._selection = {"type": "initial", "species": species, "mode": mode}
-        elif idx == 2:
-            if self._scalar_list is None:
-                return
-            item = self._scalar_list.currentItem()
-            if item is None:
-                return
-            name = str(item.text()).strip()
-            if not name:
-                return
-            mode = "shared" if self._scalar_shared_radio.isChecked() else "dataset"
-            self._selection = {"type": "scalar", "name": name, "mode": mode}
-        else:
-            mode = "shared" if self._observable_shared_radio.isChecked() else "dataset"
-            if bool(getattr(self, "_define_new_mode", False)):
-                name = str(self._new_observable_name_edit.text()).strip()
-                expr = str(self._new_observable_expr_edit.text()).strip()
-                if not name or not expr:
-                    return
-                self._selection = {"type": "observable_new", "name": name, "expr": expr, "scalar_scope": mode}
-            else:
-                name = str(self._observable_combo.currentText()).strip()
-                expr = str(self._available_observables.get(name, "")).strip()
-                if not name or not expr:
-                    return
-                self._selection = {"type": "observable_existing", "name": name, "expr": expr, "scalar_scope": mode}
-        super().accept()
+__all__ = ["ParametersIcsTab"]
 
 
-class ParametersIcsTab(QtWidgets.QWidget):
-    addAlgebraicObservableRequested = Signal(dict)
-    statusMessage = Signal(str)
+@dataclass(frozen=True, slots=True)
+class _InvalidRow:
+    raw_fields: tuple[tuple[str, str], ...]
+    messages: tuple[tuple[str, str], ...]
+
+
+def _format_number(value: float) -> str:
+    return repr(float(value))
+
+
+def _format_scientific(value: object) -> str:
+    # Keep the accepted binary64 value intact; this is only a projection.
+    text = repr(float(value))
+    if "e" not in text:
+        return text
+    base, exponent = text.split("e", 1)
+    sign = ""
+    digits = exponent
+    if digits and digits[0] in "+-":
+        sign = digits[0]
+        digits = digits[1:]
+    return f"{base}e{sign}{digits.lstrip('0') or '0'}"
+
+
+class _ProfileLikelihoodDialog(QtWidgets.QDialog):
+    """Transactional Profile likelihood options; the table holds its targets."""
 
     def __init__(
         self,
         *,
-        parameter_state: List[Dict[str, Any]],
-        initial_parameter_snapshot: List[Dict[str, Any]],
-        global_dataset_params: Dict[str, Dict[str, float]],
-        global_dataset_variable_params: Dict[str, Dict[str, Dict]],
-        fixed_shared_params: Dict[str, float],
-        shared_param_definitions: Dict[str, Dict[str, Any]],
-        mechanism_species: List[str],
-        dataset_entries: List[Dict[str, Any]],
-        prepared_param_names: List[str],
-        selected_dataset_ids_getter: Callable[[], List[str]],
-        dataset_entries_getter: Callable[[], List[Dict[str, Any]]],
-        worker_running_getter: Callable[[], bool],
-        dataset_manager_getter: Callable[[], Any],
-        reactions_text_getter: Callable[[], str],
-        integration_defaults: Tuple[str, float, float],
-        config_defaults: Dict[str, Any],
-        ic_panel: Optional[UnifiedSpeciesTable] = None,
+        options: ProfileLikelihoodOptions,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        # transitional — ic_panel is passed for forwarder reach-through
-        # only. FittingWindow owns all IC signal wiring. This parameter
-        # and the associated forwarders are removed in Session 3.
-        self._ic_panel = ic_panel
-        # Deep-copy transferred state
-        self._parameter_state = [dict(row) for row in parameter_state]
-        self._initial_parameter_snapshot = [dict(row) for row in initial_parameter_snapshot]
-        self._global_dataset_params = {k: dict(v) for k, v in global_dataset_params.items()}
-        self._global_dataset_variable_params = {
-            k: {kk: dict(vv) for kk, vv in v.items()} if isinstance(v, dict) else v
-            for k, v in global_dataset_variable_params.items()
-        }
-        self._fixed_shared_params = dict(fixed_shared_params)
-        self._shared_param_definitions = {k: dict(v) for k, v in shared_param_definitions.items()}
-        self._mechanism_species = list(mechanism_species)
-        self._dataset_entries = list(dataset_entries)
-        self._prepared_param_names = list(prepared_param_names)
-        self._last_fit_params: Dict[str, float] = {}
-        self._staged_dataset_params: Dict[str, Dict[str, float]] = {}
-        # Callable getters
-        self._selected_dataset_ids_getter = selected_dataset_ids_getter
-        self._dataset_entries_getter = dataset_entries_getter
-        self._worker_running_getter = worker_running_getter
-        self._dataset_manager_getter = dataset_manager_getter
-        self._reactions_text_getter = reactions_text_getter
-        # Build UI
-        self._build_ui(integration_defaults)
-        self._apply_config_defaults(config_defaults)
-        self._populate_parameter_table()
+        self.setWindowTitle("Profile Likelihood")
+        self.setModal(True)
+        form = QtWidgets.QFormLayout(self)
+        self._confidence = QtWidgets.QLineEdit(_format_scientific(options.confidence_level), self)
+        self._points = QtWidgets.QSpinBox(self)
+        self._points.setRange(2, 10_000)
+        self._points.setValue(options.max_bracketing_steps_per_side)
+        self._budget = QtWidgets.QSpinBox(self)
+        self._budget.setRange(1, 100_000)
+        self._budget.setValue(options.max_nfev_per_point)
+        self._method = QtWidgets.QComboBox(self)
+        ParametersIcsTab._add_method_items(self._method)
+        self._method.setCurrentIndex(max(0, self._method.findData(options.optimizer_method)))
+        configure_compact_numeric_edit(self._confidence, characters=8)
+        form.addRow("Confidence level:", self._confidence)
+        form.addRow("Maximum outward search steps per side:", self._points)
+        form.addRow("Maximum evaluations per refit:", self._budget)
+        form.addRow("Optimization method:", self._method)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
 
-    # ------------------------------------------------------------------
-    # UI construction
-    # ------------------------------------------------------------------
+    def options(self) -> ProfileLikelihoodOptions:
+        return ProfileLikelihoodOptions(
+            confidence_level=parse_finite_numeric_text(
+                self._confidence.text(), field="Confidence level"
+            ),
+            max_bracketing_steps_per_side=self._points.value(),
+            max_nfev_per_point=self._budget.value(),
+            optimizer_method=self._method.currentData(),
+        )
 
-    def _build_ui(self, integration_defaults: Tuple[str, float, float]) -> None:
+    def accept(self) -> None:  # noqa: D401 - Qt override
+        try:
+            self.options()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, self.windowTitle(), str(exc))
+            return
+        super().accept()
+
+
+class _ParameterBoundsDialog(QtWidgets.QDialog):
+    """Collect one Minimum/Maximum/scale choice for several Fit parameters."""
+
+    def __init__(
+        self,
+        parameters: Sequence[FitParameterVariable],
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Set Bounds for Parameters")
+        self.setModal(True)
+        form = QtWidgets.QFormLayout(self)
+        self._minimum = QtWidgets.QLineEdit(self)
+        self._maximum = QtWidgets.QLineEdit(self)
+        for edit in (self._minimum, self._maximum):
+            configure_compact_numeric_edit(edit, characters=20)
+        self._log10 = QtWidgets.QCheckBox("Log Scale", self)
+        self._parameters = QtWidgets.QTableWidget(len(parameters), 2, self)
+        self._parameters.setHorizontalHeaderLabels(("Parameter", "Unit"))
+        self._parameters.verticalHeader().setVisible(False)
+        self._parameters.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
+        self._parameters.setItemDelegateForColumn(1, ScientificNameDelegate(self._parameters))
+        for row, parameter in enumerate(parameters):
+            item = QtWidgets.QTableWidgetItem(parameter.display_name)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, parameter.name)
+            item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            self._parameters.setItem(row, 0, item)
+            unit = QtWidgets.QTableWidgetItem(parameter.unit)
+            unit.setData(SCIENTIFIC_NAME_HTML_ROLE, format_unit_for_display(parameter.unit))
+            unit.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
+            self._parameters.setItem(row, 1, unit)
+        form.addRow("Minimum:", self._minimum)
+        form.addRow("Maximum:", self._maximum)
+        form.addRow("", self._log10)
+        form.addRow("Parameters:", self._parameters)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel, self
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def selection(self) -> tuple[tuple[str, ...], str, str, bool]:
+        names = tuple(
+            item.data(QtCore.Qt.ItemDataRole.UserRole)
+            for row in range(self._parameters.rowCount())
+            if (item := self._parameters.item(row, 0)).checkState() == QtCore.Qt.CheckState.Checked
+        )
+        if not names:
+            raise ValueError("Select at least one parameter.")
+        minimum = parse_finite_numeric_text(self._minimum.text(), field="Minimum")
+        maximum = parse_finite_numeric_text(self._maximum.text(), field="Maximum")
+        if minimum >= maximum:
+            raise ValueError("Minimum must be less than Maximum.")
+        if self._log10.isChecked() and minimum <= 0.0:
+            raise ValueError("Log Scale requires a positive Minimum.")
+        return names, self._minimum.text(), self._maximum.text(), self._log10.isChecked()
+
+    def accept(self) -> None:  # noqa: D401 - Qt override
+        try:
+            self.selection()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, self.windowTitle(), str(exc))
+            return
+        super().accept()
+
+
+class _ParameterRosterTable(QtWidgets.QTableWidget):
+    """Prefer eight visible rows initially; the native splitter owns later sizing."""
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not getattr(self, "_columns_initialized", False):
+            self._columns_initialized = True
+            QtCore.QTimer.singleShot(0, self._initialize_columns)
+
+    def _initialize_columns(self) -> None:
+        metrics = self.fontMetrics()
+        em = metrics.horizontalAdvance("M")
+        self.horizontalHeader().setMinimumSectionSize(3 * em)
+        header = self.horizontalHeader()
+        # Sized once for realistic values; widths the user drags are kept.
+        for column, sample in (
+            (_C.START, "-1.23457e-04"), (_C.MIN, "-1.23457e-04"), (_C.MAX, "-1.23457e-04"),
+            (_C.LAST, "-1.23457e-04"), (_C.MECH, "-1.23457e-04"),
+        ):
+            self.setColumnWidth(column, max(header.sectionSizeHint(column), metrics.horizontalAdvance(sample) + em))
+        self.fit_name_column()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.fit_name_column()
+
+    def fit_name_column(self) -> None:
+        """Stretch Parameter while it stays readable; otherwise keep it and scroll."""
+
+        minimum = 18 * self.fontMetrics().horizontalAdvance("M")
+        others = sum(self.columnWidth(column) for column in range(self.columnCount()) if column != _C.NAME)
+        header = self.horizontalHeader()
+        if self.viewport().width() - others >= minimum:
+            header.setSectionResizeMode(_C.NAME, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        else:
+            header.setSectionResizeMode(_C.NAME, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.setColumnWidth(_C.NAME, minimum)
+
+    def sizeHint(self) -> QtCore.QSize:
+        size = super().sizeHint()
+        height = self.horizontalHeader().sizeHint().height() + 2 * self.frameWidth()
+        height += sum(self.rowHeight(row) for row in range(min(8, self.rowCount())))
+        scrollbar = self.horizontalScrollBar()
+        if self.horizontalHeader().length() > self.viewport().width():
+            height += scrollbar.sizeHint().height()
+        size.setHeight(height)
+        return size
+
+
+class _C:
+    VARY, LOG, PROFILE, NAME, START, MIN, MAX, SCOPE, LAST, MECH, UNIT, COUNT = range(12)
+    HEADERS = ("Vary", "Log Scale", "Profile", "Parameter", "Initial Guess", "Minimum", "Maximum",
+               "Across Datasets", "Last Fit Result", "Mechanism Tab Value", "Unit")
+
+
+_DATASET_ROLE = QtCore.Qt.ItemDataRole.UserRole + 1
+_COMPACT_ROLE = QtCore.Qt.ItemDataRole.UserRole + 2
+_INVALID_BG = QtGui.QColor(255, 200, 200)
+_INVALID_FG = QtGui.QColor(80, 0, 0)
+
+
+class _CompactNumberDelegate(QtWidgets.QStyledItemDelegate):
+    """Paint compact values while native editing retains the complete text."""
+
+    def initStyleOption(self, option, index) -> None:
+        super().initStyleOption(option, index)
+        if not index.data(_COMPACT_ROLE):
+            return
+        # The edited cell can repaint during the edit's own resize, before its
+        # row re-renders, while it still holds the unparsed text.
+        try:
+            option.text = six_digit_text(float(option.text))
+        except ValueError:
+            pass
+
+
+@dataclass(frozen=True, slots=True)
+class _ProfileView:
+    """One render's Profile facts: the setup's choices and the fitted values."""
+
+    enabled: bool
+    unticked: frozenset[FitCoordinate]
+    available: frozenset[FitCoordinate]
+    skipped: frozenset[FitCoordinate]
+
+    def tooltip(self, fitted: bool, *, excluded: bool = False) -> str:
+        if not fitted:
+            return "Only a fitted value can be profiled."
+        if excluded:
+            return "Not in this fit: its datasets are excluded."
+        if not self.enabled:
+            return "Turn on Profile Likelihood in Fit Settings to choose what it profiles."
+        return "Profile this fitted value."
+
+
+# Row fields in table order, with the column that shows each.
+_FIELD_COLUMNS = {"log10": _C.LOG, "starting": _C.START, "minimum": _C.MIN, "maximum": _C.MAX}
+
+
+def _field_label(field: str) -> str:
+    return _C.HEADERS[_FIELD_COLUMNS["starting" if field.startswith("dataset:") else field]]
+
+
+class ParametersIcsTab(QtWidgets.QWidget):
+    """Presentation-only parameter, IC-scope, and optimizer panel."""
+
+    setupSnapshotRequested = QtCore.Signal(object)
+    viewStepsRequested = QtCore.Signal()
+    statusMessage = QtCore.Signal(str)
+    validityChanged = QtCore.Signal()
+
+    def __init__(
+        self,
+        *,
+        origin: FitOriginSnapshot,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._origin = origin
+        self._projected_setup: FitSetupSnapshot | None = None
+        self._last_fit_parameters: dict[str, FitParameterVariable] = {}
+        self._last_fit_included: set[str] = set()
+        self._tolerance_drafts: dict[str, str] = {}
+        self._defaults_error_text = ""
+        self._roster_height_initialized = False
+        self._invalid_rows: dict[str, _InvalidRow] = {}
+        self._projecting = False
+        self._running = False
+        self._row_keys: tuple[tuple[str, str | None], ...] = ()
+        self._build_ui()
+
+
+    def _build_ui(self) -> None:
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        params_widget = self._build_parameters_panel(integration_defaults)
-        outer.addWidget(params_widget, stretch=1)
+        outer.addWidget(self._build_parameters_panel(), stretch=1)
 
-    def _build_parameters_panel(self, integration_defaults: Tuple[str, float, float]) -> QtWidgets.QWidget:
-        widget = QtWidgets.QWidget()
-        outer_layout = QtWidgets.QVBoxLayout(widget)
-        outer_layout.setContentsMargins(0, 0, 0, 0)
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._roster_height_initialized:
+            QtCore.QTimer.singleShot(0, self._initialize_roster_height)
 
+    def _on_roster_splitter_moved(self, _position: int, _index: int) -> None:
+        self._roster_height_initialized = True
+
+    def _initialize_roster_height(self) -> None:
+        if self._roster_height_initialized or not self.isVisible():
+            return
+        self._param_table.resizeRowsToContents()
+        self._param_table.updateGeometry()
+        roster = self._left_splitter.widget(0)
+        roster.layout().invalidate()
+        available = (
+            self._left_splitter.contentsRect().height()
+            - self._left_splitter.handle(1).height()
+        )
+        options = self._left_splitter.widget(1).widget().sizeHint().height()
+        preferred = max(roster.sizeHint().height(), available - options)
+        self._left_splitter.setSizes([preferred, max(0, available - preferred)])
+        self._roster_height_initialized = True
+    # ------------------------------------------------------------------
+    # Parameter presentation and complete snapshot replacements
+    # ------------------------------------------------------------------
+
+
+    _SCOPE_CHOICES = {
+        "shared": ("Shared", "One shared value for all datasets."),
+        "per_dataset": ("Per-dataset", "An independent value for each dataset."),
+    }
+
+    def _build_parameters_panel(self) -> QtWidgets.QWidget:  # noqa: C901
+        widget = QtWidgets.QWidget(self)
+        outer = QtWidgets.QVBoxLayout(widget)
+        outer.setContentsMargins(0, 0, 0, 0)
         scroll = QtWidgets.QScrollArea(widget)
         scroll.setWidgetResizable(True)
-        outer_layout.addWidget(scroll, stretch=1)
-
+        outer.addWidget(scroll, stretch=1)
         container = QtWidgets.QWidget(scroll)
         layout = QtWidgets.QVBoxLayout(container)
         layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
         scroll.setWidget(container)
 
-        params_group = QtWidgets.QGroupBox("Parameters")
-        params_layout = QtWidgets.QVBoxLayout(params_group)
-        self._param_table = QtWidgets.QTableWidget()
-        self._param_table.setColumnCount(7)
-        self._param_table.setHorizontalHeaderLabels(["Fit", "Log10", "Name", "Value", "Min", "Max", "Last Fit"])
-        _ph = self._param_table.horizontalHeader()
-        _ph.setStretchLastSection(False)
-        for col in range(self._param_table.columnCount()):
-            _ph.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
-        _ph.setSectionResizeMode(2, QtWidgets.QHeaderView.Interactive)  # Name
-        self._param_table.setColumnWidth(2, 140)
-        self._param_table.itemChanged.connect(self._on_param_table_item_changed)
-        self._param_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self._param_table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        params_layout.addWidget(self._param_table)
+        left = QtWidgets.QWidget(container)
+        left_layout = QtWidgets.QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        self._left_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical, left)
+        self._left_splitter.setObjectName("fit_parameter_left_split")
+        self._left_splitter.setChildrenCollapsible(False)
+        self._left_splitter.splitterMoved.connect(self._on_roster_splitter_moved)
+        left_layout.addWidget(self._left_splitter)
+        roster_pane = QtWidgets.QWidget(self._left_splitter)
+        roster_layout = QtWidgets.QVBoxLayout(roster_pane)
+        roster_layout.setContentsMargins(0, 0, 0, 6)
+        self._param_table = _ParameterRosterTable(0, _C.COUNT, roster_pane)
+        self._param_table.setObjectName("fit_parameter_roster")
+        self._param_table.setWordWrap(False)
+        self._param_table.setAlternatingRowColors(True)
+        self._param_table.verticalHeader().setVisible(False)
+        self._param_table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Fixed)
+        self._param_table.setHorizontalHeaderLabels(_C.HEADERS)
+        self._param_table.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.ContiguousSelection
+        )
+        header = self._param_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        for column in range(_C.COUNT):
+            header.setSectionResizeMode(
+                column,
+                QtWidgets.QHeaderView.ResizeMode.Fixed
+                if column in self._CONTENT_COLUMNS
+                else QtWidgets.QHeaderView.ResizeMode.Stretch if column == _C.NAME
+                else QtWidgets.QHeaderView.ResizeMode.Interactive,
+            )
+        self._param_table.itemChanged.connect(self._on_roster_item_changed)
+        compact = _CompactNumberDelegate(self)
+        for column in (_C.MECH, _C.START, _C.MIN, _C.MAX):
+            self._param_table.setItemDelegateForColumn(column, compact)
+        self._param_table.setItemDelegateForColumn(_C.NAME, ScientificNameDelegate(self._param_table))
+        self._param_table.setItemDelegateForColumn(_C.UNIT, ScientificNameDelegate(self._param_table))
+        self._param_table.installEventFilter(self)
+        roster_layout.addWidget(self._param_table, 1)
+        self._parameter_error = QtWidgets.QLabel(roster_pane)
+        self._parameter_error.setWordWrap(True)
+        self._parameter_error.setVisible(False)
+        roster_layout.addWidget(self._parameter_error)
+        self._discard_parameter_shortcut = QtGui.QShortcut(
+            QtGui.QKeySequence(QtCore.Qt.Key_Escape), self._param_table
+        )
+        self._discard_parameter_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+        self._discard_parameter_shortcut.setEnabled(False)
+        self._discard_parameter_shortcut.activated.connect(self._revert_selected_parameter_draft)
+        layout.addWidget(left, stretch=1)
 
-        action_row = QtWidgets.QHBoxLayout()
-        self._add_param_button = QtWidgets.QPushButton("Add…")
-        self._add_param_button.clicked.connect(self._add_parameter)
-        self._remove_param_button = QtWidgets.QPushButton("Remove")
-        self._remove_param_button.clicked.connect(self._remove_selected_parameters)
-        self._remove_param_button.setEnabled(False)
-        self._param_table.itemSelectionChanged.connect(self._update_remove_button_state)
-        action_row.addWidget(self._add_param_button)
-        action_row.addWidget(self._remove_param_button)
-        action_row.addStretch()
-        params_layout.addLayout(action_row)
+        self._roster_actions_host = QtWidgets.QWidget(roster_pane)
+        actions = ControlRowsLayout(self._roster_actions_host)
+        self._roster_actions_host.installEventFilter(self)
+        self._view_steps_button = QtWidgets.QPushButton("View Mechanism Steps", left)
+        self._view_steps_button.setObjectName("global_fit_parameters_view_steps")
+        self._view_steps_button.clicked.connect(self.viewStepsRequested)
+        self._bounds_button = QtWidgets.QPushButton("Set Bounds for Parameters…", left)
+        self._bounds_button.clicked.connect(self._open_bounds_dialog)
+        for control in (
+            self._bounds_button,
+            self._view_steps_button,
+        ):
+            actions.addWidget(control)
+        roster_layout.addWidget(self._roster_actions_host)
+        self._left_splitter.addWidget(roster_pane)
+        options_pane = QtWidgets.QWidget(self._left_splitter)
+        options_layout = QtWidgets.QVBoxLayout(options_pane)
+        options_layout.setContentsMargins(0, 6, 0, 0)
+        options_scroll = QtWidgets.QScrollArea(self._left_splitter)
+        options_scroll.setObjectName("fit_parameter_options_scroll")
+        options_scroll.setStyleSheet(
+            "QScrollArea#fit_parameter_options_scroll { border: none; padding: 0; margin: 0; }"
+        )
+        options_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        options_scroll.setWidgetResizable(True)
+        options_scroll.setWidget(options_pane)
+        self._left_splitter.addWidget(options_scroll)
 
-        reset_row = QtWidgets.QHBoxLayout()
-        self._reset_initial_button = QtWidgets.QPushButton("Reset to Initial")
-        self._reset_initial_button.clicked.connect(self._reset_to_initial)
-        self._reset_last_button = QtWidgets.QPushButton("Reset to Last Fit")
-        self._reset_last_button.clicked.connect(self._reset_to_last_fit)
-        reset_row.addWidget(self._reset_initial_button)
-        reset_row.addWidget(self._reset_last_button)
-        reset_row.addStretch()
-        params_layout.addLayout(reset_row)
+        settings_group = QtWidgets.QGroupBox("Fit Settings", options_pane)
+        self._settings_group = settings_group
+        settings_group.installEventFilter(self)
+        settings_group.setObjectName("fit_settings_group")
+        settings_group.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Maximum,
+        )
+        settings_layout = QtWidgets.QVBoxLayout(settings_group)
+        self._solver_combo = ChoicesComboBox(settings_group)
+        self._solver_combo.setObjectName("global_fit_solver")
+        self._solver_combo.setToolTip(SOLVER_TOOLTIP)
+        for solver in SUPPORTED_SOLVERS:
+            self._solver_combo.addItem(str(solver), str(solver))
+        self._method_combo = QtWidgets.QComboBox(settings_group)
+        self._method_combo.setObjectName("global_fit_method")
+        for method in SUPPORTED_FIT_METHODS:
+            self._method_combo.addItem(FIT_METHOD_LABELS.get(method, method), method)
+        for combo in (self._method_combo, self._solver_combo):
+            combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+            combo.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        defaults = default_fit_defaults()
+        self._max_eval_spin = QtWidgets.QSpinBox(settings_group)
+        self._max_eval_spin.setRange(*FIT_MAX_NFEV_RANGE)
+        self._max_eval_spin.setValue(defaults.max_nfev)
+        self._max_eval_spin.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        self._seed_check = QtWidgets.QCheckBox(
+            "Fixed Seed", settings_group
+        )
+        self._seed_spin = QtWidgets.QSpinBox(settings_group)
+        self._seed_spin.setRange(*FIT_SEED_RANGE)
+        self._seed_spin.setValue(defaults.seed)
+        self._seed_spin.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        for control in (self._solver_combo, self._method_combo, self._max_eval_spin, self._seed_spin):
+            ignore_wheel(control)
+        # A typed number applies on Enter or focus loss, as one setup change.
+        for spin in (self._max_eval_spin, self._seed_spin):
+            spin.setKeyboardTracking(False)
+        self._seed_check.setChecked(defaults.use_seed)
+        self._seed_spin.setEnabled(defaults.use_seed)
+        self._ftol_edit = QtWidgets.QLineEdit(settings_group)
+        self._xtol_edit = QtWidgets.QLineEdit(settings_group)
+        self._ftol_edit.setObjectName("fit_objective_tolerance")
+        self._xtol_edit.setObjectName("fit_parameter_tolerance")
+        self._ftol_label = QtWidgets.QLabel(f"{FUNCTION_TOLERANCE_LABEL}:", settings_group)
+        self._xtol_label = QtWidgets.QLabel(f"{STEP_TOLERANCE_LABEL}:", settings_group)
+        for label, edit in ((self._ftol_label, self._ftol_edit), (self._xtol_label, self._xtol_edit)):
+            configure_compact_numeric_edit(edit, characters=8)
+            label.setBuddy(edit)
+        self._profile_check = QtWidgets.QCheckBox("Profile Likelihood", settings_group)
+        self._profile_check.setToolTip("Profile the fitted values ticked in the Profile column.")
+        self._profile_configure = QtWidgets.QPushButton("Configure…", settings_group)
+        # One wrapping line: each native form keeps its label and editor
+        # together, and the forms fill each line before starting the next.
+        flow_host = QtWidgets.QWidget(settings_group)
+        flow = ControlRowsLayout(flow_host)
+        for label, control in (
+            ("Optimization method:", self._method_combo),
+            ("Maximum evaluations:", self._max_eval_spin),
+            ("Simulation solver:", self._solver_combo),
+            (self._seed_check, self._seed_spin),
+            (self._ftol_label, self._ftol_edit),
+            (self._xtol_label, self._xtol_edit),
+            (self._profile_check, self._profile_configure),
+        ):
+            group = QtWidgets.QWidget(flow_host)
+            form = QtWidgets.QFormLayout(group)
+            # The right margin separates neighbouring forms on a line.
+            form.setContentsMargins(0, 0, 12, 0)
+            form.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+            form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
+            form.addRow(label, control)
+            flow.addWidget(group)
+            if control is self._seed_spin:
+                self._seed_group = group
+        settings_layout.addWidget(flow_host)
+        controls = (self._method_combo, self._max_eval_spin, self._solver_combo,
+                    self._seed_check, self._seed_spin, self._ftol_edit, self._xtol_edit,
+                    self._profile_check, self._profile_configure)
+        for first, second in zip(controls, controls[1:]):
+            QtWidgets.QWidget.setTabOrder(first, second)
+        self._defaults_error = QtWidgets.QLabel(settings_group)
+        self._defaults_error.setWordWrap(True)
+        self._defaults_error.hide()
+        settings_layout.addWidget(self._defaults_error)
+        self._discard_tolerances_shortcut = QtGui.QShortcut(
+            QtGui.QKeySequence(QtCore.Qt.Key_Escape), settings_group
+        )
+        self._discard_tolerances_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+        self._discard_tolerances_shortcut.setEnabled(False)
+        self._discard_tolerances_shortcut.activated.connect(self._discard_tolerance_drafts)
 
-        algo_form = QtWidgets.QFormLayout()
-        self._method_combo = QtWidgets.QComboBox()
-        self._method_combo.addItems(["lm", "trf", "dogbox", "differential_evolution"])
-        self._method_combo.setCurrentText("trf")
-        self._max_eval_spin = QtWidgets.QSpinBox()
-        self._max_eval_spin.setRange(10, 10000)
-        self._max_eval_spin.setValue(1000)
-        algo_form.addRow("Method:", self._method_combo)
-        algo_form.addRow("Max evaluations:", self._max_eval_spin)
+        options_layout.addWidget(settings_group)
+        options_layout.addStretch(1)
 
-        self._ftol_edit = QtWidgets.QLineEdit("1e-10")
-        setup_scientific_validator(self._ftol_edit)
-        algo_form.addRow("ftol:", self._ftol_edit)
-
-        self._xtol_edit = QtWidgets.QLineEdit("1e-10")
-        setup_scientific_validator(self._xtol_edit)
-        algo_form.addRow("xtol:", self._xtol_edit)
-
-        self._use_parallel_check = QtWidgets.QCheckBox("Parallel multi-start (DE only)")
-        self._seed_check = QtWidgets.QCheckBox("Use fixed random seed")
-        self._seed_check.setChecked(True)
-        self._seed_spin = QtWidgets.QSpinBox()
-        self._seed_spin.setRange(0, 999_999)
-        self._seed_spin.setValue(42)
-        self._seed_spin.setEnabled(self._seed_check.isChecked())
+        # Signals are attached after construction so projection can use one
+        # coherent blocker set and cannot author a half-formed snapshot.
+        self._solver_combo.currentIndexChanged.connect(self._emit_solver_edit)
+        self._method_combo.currentIndexChanged.connect(
+            self._emit_defaults_edit
+        )
+        self._max_eval_spin.valueChanged.connect(
+            self._emit_defaults_edit
+        )
         self._seed_check.toggled.connect(self._seed_spin.setEnabled)
-        algo_form.addRow(self._use_parallel_check)
-        algo_form.addRow(self._seed_check, self._seed_spin)
-        params_layout.addLayout(algo_form)
-
-        default_solver, default_rtol, default_atol = integration_defaults
-        default_solver = str(default_solver or FITTING_DEFAULT_SOLVER)
-
-        def _fmt(value: float) -> str:
-            text = f"{float(value):g}"
-            if "e" not in text:
-                return text
-            base, exp = text.split("e", 1)
-            sign = ""
-            digits = exp
-            if digits and digits[0] in "+-":
-                sign = digits[0]
-                digits = digits[1:]
-            digits = digits.lstrip("0") or "0"
-            return f"{base}e{sign}{digits}"
-
-        integration_header = QtWidgets.QLabel("Integration Settings", params_group)
-        header_font = integration_header.font()
-        header_font.setBold(True)
-        integration_header.setFont(header_font)
-        params_layout.addWidget(integration_header)
-
-        integration_form = QtWidgets.QFormLayout()
-
-        self._integration_solver_combo = QtWidgets.QComboBox(params_group)
-        self._integration_solver_combo.setObjectName("global_fit_integration_solver")
-        self._integration_solver_combo.addItems(["LSODA", "Radau", "BDF"])
-        self._integration_solver_combo.setCurrentText(default_solver)
-
-        self._integration_rtol_edit = QtWidgets.QLineEdit(_fmt(default_rtol), params_group)
-        self._integration_rtol_edit.setObjectName("global_fit_integration_rtol")
-
-        self._integration_atol_edit = QtWidgets.QLineEdit(_fmt(default_atol), params_group)
-        self._integration_atol_edit.setObjectName("global_fit_integration_atol")
-
-        setup_scientific_validator(self._integration_rtol_edit)
-        setup_scientific_validator(self._integration_atol_edit)
-
-        integration_form.addRow("Solver:", self._integration_solver_combo)
-        integration_form.addRow("rtol:", self._integration_rtol_edit)
-        integration_form.addRow("atol:", self._integration_atol_edit)
-        params_layout.addLayout(integration_form)
-
-        layout.addWidget(params_group, stretch=1)
+        self._seed_check.toggled.connect(
+            self._emit_defaults_edit
+        )
+        self._seed_spin.valueChanged.connect(
+            self._emit_defaults_edit
+        )
+        self._profile_check.toggled.connect(self._on_profile_toggled)
+        self._profile_configure.clicked.connect(self._open_profile_dialog)
+        for edit in (self._ftol_edit, self._xtol_edit):
+            edit.textChanged.connect(self._on_tolerance_text_changed)
+            edit.editingFinished.connect(self._emit_defaults_edit)
+        self._project_defaults(defaults)
         return widget
 
-    # ------------------------------------------------------------------
-    # Transitional forwarders for IC panel widgets
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _add_method_items(combo: QtWidgets.QComboBox) -> None:
+        for method in UNCERTAINTY_FIT_METHODS:
+            combo.addItem(FIT_METHOD_LABELS.get(method, method), method)
 
-    @property
-    def _ic_dataset_combo(self):
-        return None
+    def _dataset_display_name(self, dataset_id: str) -> str:
+        return next(mapped.display_name for mapped in self._origin.mapped_datasets if mapped.dataset_id == dataset_id)
 
-    # ------------------------------------------------------------------
-    # IC applied handler
-    # ------------------------------------------------------------------
+    def _parse_label(self, field: str) -> str:
+        """Name a numeric field in its own parse message; a dataset start names its dataset."""
+        if field.startswith("dataset:"):
+            return f"Initial guess for dataset {self._dataset_display_name(field.removeprefix('dataset:'))}"
+        return "Initial guess" if field == "starting" else _field_label(field)
 
-    def _on_ic_applied(self, dataset_id: str, updates: dict, fit_flags_updates: dict) -> None:
-        self._apply_ic_updates_to_window_state(dataset_id, updates, fit_flags_updates)
-        self._populate_parameter_table()
+    def _parameter_by_name(self, name: str) -> FitParameterVariable | None:
+        if self._projected_setup is None:
+            return None
+        return next((item for item in self._projected_setup.parameters if item.name == name), None)
 
-    # ------------------------------------------------------------------
-    # Config defaults
-    # ------------------------------------------------------------------
-
-    def _apply_config_defaults(self, defaults: Dict[str, Any]) -> None:
-        if not defaults:
-            return
-
-        def _fmt_sci(value: float) -> str:
-            text = str(float(value))
-            if "e" not in text:
-                return text
-            base, exp = text.split("e", 1)
-            sign = ""
-            digits = exp
-            if digits and digits[0] in "+-":
-                sign = digits[0]
-                digits = digits[1:]
-            digits = digits.lstrip("0") or "0"
-            return f"{base}e{sign}{digits}"
-
-        method = str(defaults.get("method", "")).strip().lower()
-        if method in {"lm", "trf", "dogbox", "differential_evolution"}:
-            self._method_combo.setCurrentText(method)
-
-        if "max_nfev" in defaults:
-            try:
-                value = int(defaults.get("max_nfev"))
-            except (TypeError, ValueError):
-                value = None
-            if value is not None:
-                value = max(self._max_eval_spin.minimum(), min(self._max_eval_spin.maximum(), value))
-                self._max_eval_spin.setValue(value)
-
-        for key, widget in (
-            ("ftol", getattr(self, "_ftol_edit", None)),
-            ("xtol", getattr(self, "_xtol_edit", None)),
-        ):
-            if key not in defaults or widget is None:
-                continue
-            try:
-                value = float(defaults.get(key))
-            except (TypeError, ValueError):
-                value = None
-            if value is None:
-                continue
-            if value > 0.0:
-                widget.setText(_fmt_sci(value))
-
-        if "use_parallel" in defaults:
-            self._use_parallel_check.setChecked(bool(defaults.get("use_parallel")))
-
-        if "use_seed" in defaults:
-            self._seed_check.setChecked(bool(defaults.get("use_seed")))
-        if "seed" in defaults:
-            try:
-                seed_val = int(defaults.get("seed"))
-            except (TypeError, ValueError):
-                seed_val = None
-            if seed_val is not None:
-                seed_val = max(self._seed_spin.minimum(), min(self._seed_spin.maximum(), seed_val))
-                self._seed_spin.setValue(seed_val)
-        self._seed_spin.setEnabled(self._seed_check.isChecked())
-
-    def _apply_ic_updates_to_window_state(
-        self,
-        dataset_id: str,
-        updates: Dict[str, Dict[str, object]],
-        fit_flags_updates: Dict[str, bool],
-    ) -> None:
-        ds_id = str(dataset_id or "").strip()
-        if not ds_id:
-            return
-        fixed = self._global_dataset_params.setdefault(ds_id, {})
-        specs = self._global_dataset_variable_params.get(ds_id) if isinstance(self._global_dataset_variable_params, dict) else None
-        if not isinstance(specs, dict):
-            specs = {}
-            self._global_dataset_variable_params[ds_id] = specs
-
-        # Drop existing dataset-local init:* parameter rows.
-        self._parameter_state = [
-            row
-            for row in self._parameter_state
-            if not (
-                str(row.get("scope") or "") == "dataset"
-                and str(row.get("dataset_id") or "") == ds_id
-                and str(row.get("param_name") or "").startswith(INITIAL_PREFIX)
-            )
-        ]
-
-        for species, spec in updates.items():
-            param_name = f"{INITIAL_PREFIX}{species}"
-            init_val = float(spec["initial"])
-            fit_flag = bool(fit_flags_updates.get(str(species), False))
-            log10_flag = bool(spec["log10"])
-            min_val = float(spec["min"])
-            max_val = float(spec["max"])
-
-            if fit_flag:
-                specs[param_name] = {"initial": init_val, "min": min_val, "max": max_val, "log10": bool(log10_flag)}
-                fixed.pop(param_name, None)
-                display = f"{param_name} ({ds_id})"
-                self._parameter_state.append(
-                    {
-                        "scope": "dataset",
-                        "name": display,
-                        "param_name": param_name,
-                        "dataset_id": ds_id,
-                        "value": init_val,
-                        "min": min_val,
-                        "max": max_val,
-                        "fit": True,
-                        "log10": bool(log10_flag),
-                        "last_fit": None,
-                    }
-                )
-            else:
-                fixed[param_name] = init_val
-                specs.pop(param_name, None)
-
-        if not specs:
-            self._global_dataset_variable_params.pop(ds_id, None)
-
-    # ------------------------------------------------------------------
-    # Parameter table
-    # ------------------------------------------------------------------
-
-    def _populate_parameter_table(self) -> None:
-        self._param_table.blockSignals(True)
-        self._param_table.setRowCount(len(self._parameter_state))
-        for row, entry in enumerate(self._parameter_state):
-            check_item = QtWidgets.QTableWidgetItem()
-            check_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            check_item.setCheckState(Qt.Checked if entry.get("fit", True) else Qt.Unchecked)
-            self._param_table.setItem(row, 0, check_item)
-            log_item = QtWidgets.QTableWidgetItem()
-            log_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            log_item.setCheckState(Qt.Checked if entry.get("log10", False) else Qt.Unchecked)
-            self._param_table.setItem(row, 1, log_item)
-            name_item = QtWidgets.QTableWidgetItem(str(entry["name"]))
-            name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            name_item.setTextAlignment(Qt.AlignCenter)
-            self._param_table.setItem(row, 2, name_item)
-            value_item = QtWidgets.QTableWidgetItem(f"{entry['value']:.6g}")
-            value_item.setTextAlignment(Qt.AlignCenter)
-            self._param_table.setItem(row, 3, value_item)
-            min_item = QtWidgets.QTableWidgetItem(f"{entry['min']:.6g}")
-            min_item.setTextAlignment(Qt.AlignCenter)
-            self._param_table.setItem(row, 4, min_item)
-            max_item = QtWidgets.QTableWidgetItem(f"{entry['max']:.6g}")
-            max_item.setTextAlignment(Qt.AlignCenter)
-            self._param_table.setItem(row, 5, max_item)
-            last = entry.get("last_fit")
-            display = "—" if last is None else f"{last:.6g}"
-            last_item = QtWidgets.QTableWidgetItem(display)
-            last_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            last_item.setTextAlignment(Qt.AlignCenter)
-            self._param_table.setItem(row, 6, last_item)
-        self._param_table.blockSignals(False)
-        self._update_remove_button_state()
-
-    def _refresh_live_fit_value_cells(self) -> None:
-        if self._param_table.rowCount() != len(self._parameter_state):
-            self._populate_parameter_table()
-            return
-
-        needs_full_rebuild = False
-        self._param_table.blockSignals(True)
+    def project_setup_snapshot(self, snapshot: FitSetupSnapshot) -> None:
+        previous = self._projected_setup
+        self._origin = snapshot.origin
+        self._projected_setup = snapshot
+        if previous is not None:
+            # A scope or group change discards that parameter's invalid text.
+            structure = {
+                item.name: (item.scope, item.per_dataset_config.groups) for item in previous.parameters
+            }
+            for parameter in snapshot.parameters:
+                if (
+                    structure[parameter.name] != (parameter.scope, parameter.per_dataset_config.groups)
+                    and self._retire_numeric_drafts({parameter.name})
+                ):
+                    self.statusMessage.emit(f"Invalid values for {parameter.display_name} discarded.")
+        self._projecting = True
         try:
-            for row, entry in enumerate(self._parameter_state):
-                value_item = self._param_table.item(row, 3)
-                last_fit_item = self._param_table.item(row, 6)
-                if value_item is None or last_fit_item is None:
-                    needs_full_rebuild = True
-                    break
-
-                value_text = f"{float(entry['value']):.6g}"
-                last_fit = entry.get("last_fit")
-                last_fit_text = "—" if last_fit is None else f"{float(last_fit):.6g}"
-
-                if value_item.text() != value_text:
-                    value_item.setText(value_text)
-                if last_fit_item.text() != last_fit_text:
-                    last_fit_item.setText(last_fit_text)
+            self._render_roster()
+            self._solver_combo.setCurrentText(snapshot.solver)
+            self._project_defaults(snapshot.defaults)
+            self._project_advanced_analysis(snapshot)
         finally:
-            self._param_table.blockSignals(False)
+            self._projecting = False
+        self._refresh_parameter_error()
 
-        if needs_full_rebuild:
-            self._populate_parameter_table()
+    def set_last_fit_result(self, snapshot: FitSetupSnapshot) -> None:
+        """Show the last completed Fit's values in the Last Fit Result column."""
+        self._last_fit_parameters = {item.name: item for item in snapshot.parameters}
+        self._last_fit_included = {item.dataset_id for item in snapshot.datasets if item.included}
+        self._rerender_roster()
+
+    def _rerender_roster(self) -> None:
+        if self._projected_setup is None:
             return
-        self._update_remove_button_state()
-
-    def _on_param_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
-        """
-        Keep `_parameter_state` as the source of truth for per-parameter flags.
-
-        The table is repopulated during best-updates; without syncing, user toggles
-        (Fit/Log10) would be reset on repaint.
-        """
+        self._projecting = True
         try:
-            row = int(item.row())
-            col = int(item.column())
-        except Exception:
-            return
-        if not (0 <= row < len(self._parameter_state)):
-            return
-        entry = self._parameter_state[row]
-        if col == 0:
-            fit_flag = item.checkState() == Qt.Checked
-            entry["fit"] = bool(fit_flag)
-            if entry.get("scope") == "dataset":
-                ds_id = str(entry.get("dataset_id") or "")
-                param_name = str(entry.get("param_name") or "")
-                if ds_id and param_name:
-                    if fit_flag:
-                        self._global_dataset_variable_params.setdefault(ds_id, {})
-                        self._global_dataset_variable_params[ds_id][param_name] = {
-                            "initial": float(entry.get("value", 0.0)),
-                            "min": float(entry.get("min", -np.inf)),
-                            "max": float(entry.get("max", np.inf)),
-                            "log10": bool(entry.get("log10", False)),
-                        }
-                        fixed_map = self._global_dataset_params.get(ds_id)
-                        if isinstance(fixed_map, dict):
-                            fixed_map.pop(param_name, None)
-                    else:
-                        self._global_dataset_params.setdefault(ds_id, {})[param_name] = float(entry.get("value", 0.0))
-                        spec_map = self._global_dataset_variable_params.get(ds_id)
-                        if isinstance(spec_map, dict):
-                            spec_map.pop(param_name, None)
-                            if not spec_map:
-                                self._global_dataset_variable_params.pop(ds_id, None)
-        elif col == 1:
-            entry["log10"] = item.checkState() == Qt.Checked
-            if entry.get("scope") == "dataset":
-                ds_id = str(entry.get("dataset_id") or "")
-                param_name = str(entry.get("param_name") or "")
-                spec_map = self._global_dataset_variable_params.get(ds_id)
-                if isinstance(spec_map, dict) and param_name in spec_map and isinstance(spec_map.get(param_name), dict):
-                    spec_map[param_name]["log10"] = bool(entry["log10"])
-        elif col in {3, 4, 5}:
-            field = {3: "value", 4: "min", 5: "max"}.get(col)
-            if not field:
-                return
-            raw = item.text()
-            try:
-                value = float(raw)
-            except Exception:
-                QtWidgets.QMessageBox.warning(self.window(), "Invalid Parameter", "Parameter values must be numeric.")
-                self._populate_parameter_table()
-                return
-            entry[field] = value
-            if entry.get("scope") == "dataset":
-                ds_id = str(entry.get("dataset_id") or "")
-                param_name = str(entry.get("param_name") or "")
-                if entry.get("fit", True):
-                    spec_map = self._global_dataset_variable_params.setdefault(ds_id, {})
-                    spec = spec_map.setdefault(param_name, {})
-                    if isinstance(spec, dict):
-                        spec["initial"] = float(entry["value"])
-                        spec["min"] = float(entry["min"])
-                        spec["max"] = float(entry["max"])
-                        spec["log10"] = bool(entry.get("log10", False))
-                else:
-                    self._global_dataset_params.setdefault(ds_id, {})[param_name] = float(entry.get("value", 0.0))
+            self._render_roster()
+        finally:
+            self._projecting = False
 
-    def _update_remove_button_state(self) -> None:
-        if not hasattr(self, "_remove_param_button"):
-            return
-        if self._worker_running_getter():
-            self._remove_param_button.setEnabled(False)
-            return
-        rows = {item.row() for item in self._param_table.selectedItems()}
-        self._remove_param_button.setEnabled(bool(rows))
-
-    # ------------------------------------------------------------------
-    # Add / remove parameters
-    # ------------------------------------------------------------------
-
-    def _add_parameter(self) -> None:
-        if self._worker_running_getter():
-            QtWidgets.QMessageBox.information(self.window(), "Fit Running", "Stop the current fit before editing parameters.")
-            return
-        dataset_ids = self._selected_dataset_ids_getter()
-        if not dataset_ids:
-            QtWidgets.QMessageBox.warning(self.window(), "No Datasets", "Select at least one dataset to include before adding parameters.")
-            return
-        available_observables: Dict[str, str] = {}
-        if callable(getattr(self, "_reactions_text_getter", None)):
-            try:
-                from kindred.core.algebra.observable_introspection import extract_observables_from_algebra_text
-                from kindred.core.simulator.algebra_section import extract_algebra_section_text
-
-                reactions_text = str(self._reactions_text_getter() or "")
-                algebra_text = extract_algebra_section_text(reactions_text)
-                available_observables = extract_observables_from_algebra_text(algebra_text)
-            except Exception:
-                available_observables = {}
-        dialog = _AddFittableParameterDialog(
-            available_rates=self._available_rate_param_names(),
-            available_scalars=self._available_scalar_param_names(),
-            available_species=self._available_initial_species(dataset_ids),
-            dataset_ids=dataset_ids,
-            available_observables=available_observables,
-            parent=self,
+    def _render_roster(self) -> None:
+        snapshot = self._projected_setup
+        dataset_ids = tuple(item.dataset_id for item in snapshot.datasets)
+        included = {item.dataset_id for item in snapshot.datasets if item.included}
+        available = fit_uncertainty_coordinates(snapshot.parameters, snapshot.datasets)
+        profile = _ProfileView(
+            enabled=snapshot.profile.enabled,
+            unticked=snapshot.profile.unticked,
+            available=frozenset(available),
+            skipped=skipped_fit_analysis_coordinates(
+                available, excluded_dataset_ids=set(dataset_ids) - included,
+                parameters=snapshot.parameters,
+            ),
         )
-        if dialog.exec() != QtWidgets.QDialog.Accepted:
-            return
-        selection = dialog.selection() or {}
-        if selection.get("type") == "rate":
-            name = str(selection.get("name") or "").strip()
-            if name:
-                self._add_rate_parameter(name)
-        elif selection.get("type") == "initial":
-            species = str(selection.get("species") or "").strip()
-            mode = str(selection.get("mode") or "").strip().lower()
-            if not species:
-                return
-            if mode == "local":
-                self._add_local_initial_parameter(species, dataset_ids)
-            else:
-                self._add_global_initial_parameter(species, dataset_ids)
-        elif selection.get("type") == "scalar":
-            name = str(selection.get("name") or "").strip()
-            mode = str(selection.get("mode") or "shared").strip().lower()
-            if not name:
-                return
-            if mode == "dataset":
-                self._add_local_scalar_parameter(name, dataset_ids)
-            else:
-                self._add_shared_scalar_parameter(name, dataset_ids)
-        elif selection.get("type") in {"observable_existing", "observable_new"}:
-            request = dict(selection)
-            request["dataset_ids"] = list(dataset_ids)
-            request["persist"] = selection.get("type") == "observable_new"
-            self.addAlgebraicObservableRequested.emit(request)
-            return
-        self._populate_parameter_table()
-
-    def _add_rate_parameter(self, name: str) -> None:
-        present = {
-            str(entry.get("param_name") or "")
-            for entry in self._parameter_state
-            if entry.get("scope") == "shared"
-        }
-        if name in present:
-            return
-        if name in (self._fixed_shared_params or {}):
-            value = float(self._fixed_shared_params.pop(name))
-            definition = dict(getattr(self, "_shared_param_definitions", {}).get(name) or {})
-            default_min = value * 0.1 if value else -10.0
-            default_max = value * 10.0 if value else 10.0
-            definition.setdefault("min", default_min)
-            definition.setdefault("max", default_max)
-            try:
-                min_bound = float(definition["min"])
-            except Exception:
-                min_bound = default_min
-                definition["min"] = float(min_bound)
-            try:
-                max_bound = float(definition["max"])
-            except Exception:
-                max_bound = default_max
-                definition["max"] = float(max_bound)
-        else:
-            definition = dict(getattr(self, "_shared_param_definitions", {}).get(name) or {})
-            definition.setdefault("value", 1.0)
-            try:
-                value = float(definition["value"])
-            except Exception:
-                value = 1.0
-            definition["value"] = float(value)
-
-            default_min = value * 0.1 if value else -10.0
-            default_max = value * 10.0 if value else 10.0
-            definition.setdefault("min", default_min)
-            definition.setdefault("max", default_max)
-            try:
-                min_bound = float(definition["min"])
-            except Exception:
-                min_bound = default_min
-                definition["min"] = float(min_bound)
-            try:
-                max_bound = float(definition["max"])
-            except Exception:
-                max_bound = default_max
-                definition["max"] = float(max_bound)
-        self._parameter_state.append(
-            {
-                "scope": "shared",
-                "name": name,
-                "param_name": name,
-                "dataset_id": None,
-                "value": value,
-                "min": min_bound,
-                "max": max_bound,
-                "fit": True,
-                "log10": False,
-                "last_fit": None,
-            }
+        rows: list[tuple[FitParameterVariable, str | None]] = []
+        for parameter in snapshot.parameters:
+            rows.append((parameter, None))
+            if parameter.scope != "shared":
+                rows.extend((parameter, dataset_id) for dataset_id in dataset_ids)
+        keys = tuple((parameter.name, dataset_id) for parameter, dataset_id in rows)
+        current = self._param_table.currentIndex()
+        current_key = (
+            self._row_keys[current.row()]
+            if current.isValid() and current.row() < len(self._row_keys) else None
         )
-
-    def _global_init_param_present(self, param_name: str) -> bool:
-        # Initial-condition parameters are fixed per-dataset (dataset_params), not as shared fixed params.
-        # Treating "init:*" as present in `_fixed_shared_params` blocks re-adding after removal.
-        if (not str(param_name).startswith(INITIAL_PREFIX)) and param_name in (self._fixed_shared_params or {}):
-            return True
-        for entry in self._parameter_state:
-            if entry.get("scope") == "shared" and str(entry.get("param_name") or "") == str(param_name):
-                return True
-        return False
-
-    def _add_global_initial_parameter(self, species: str, dataset_ids: Sequence[str]) -> None:
-        param_name = f"{INITIAL_PREFIX}{species}"
-        if self._global_init_param_present(param_name):
-            QtWidgets.QMessageBox.information(self.window(), "Add Parameter", f"A global parameter for '{species}_0' already exists.")
-            return
-        value = None
-        if param_name in (self._fixed_shared_params or {}):
-            try:
-                value = float(self._fixed_shared_params.pop(param_name))
-            except Exception:
-                value = None
-        if value is None:
-            ds0 = str(list(dataset_ids)[0])
-            try:
-                value = float((self._global_dataset_params.get(ds0) or {}).get(param_name))
-            except Exception:
-                value = 0.0
-        if not np.isfinite(float(value)):
-            value = 0.0
-        min_bound = 0.0
-        max_bound = max(10.0, float(value) * 10.0 if float(value) else 10.0)
-
-        # Remove conflicting local specs for selected datasets to avoid overrides.
-        remove_rows: List[int] = []
-        for idx, entry in enumerate(self._parameter_state):
-            if entry.get("scope") != "dataset":
-                continue
-            if str(entry.get("param_name") or "") != param_name:
-                continue
-            if str(entry.get("dataset_id") or "") not in {str(x) for x in dataset_ids}:
-                continue
-            remove_rows.append(idx)
-        if remove_rows:
-            self._remove_parameter_rows(remove_rows, update_fixed=False)
-
-        for ds_id in dataset_ids:
-            spec_map = self._global_dataset_variable_params.get(str(ds_id))
-            if isinstance(spec_map, dict):
-                spec_map.pop(param_name, None)
-                if not spec_map:
-                    self._global_dataset_variable_params.pop(str(ds_id), None)
-
-        self._parameter_state.append(
-            {
-                "scope": "shared",
-                "name": f"Global {species}_0",
-                "param_name": param_name,
-                "dataset_id": None,
-                "value": float(value),
-                "min": float(min_bound),
-                "max": float(max_bound),
-                "fit": True,
-                "log10": False,
-                "last_fit": None,
-            }
-        )
-
-    def _add_local_initial_parameter(self, species: str, dataset_ids: Sequence[str]) -> None:
-        param_name = f"{INITIAL_PREFIX}{species}"
-        if self._global_init_param_present(param_name):
-            QtWidgets.QMessageBox.warning(
-                self.window(),
-                "Add Parameter",
-                f"Remove the global '{species}_0' parameter before adding local parameters.",
-            )
-            return
-        present = {
-            (str(entry.get("dataset_id") or ""), str(entry.get("param_name") or ""))
-            for entry in self._parameter_state
-            if entry.get("scope") == "dataset"
-        }
-        for ds_id in dataset_ids:
-            ds_id = str(ds_id)
-            if (ds_id, param_name) in present:
-                continue
-            fixed_map = self._global_dataset_params.get(ds_id) if isinstance(self._global_dataset_params, dict) else None
-            try:
-                value = float((fixed_map or {}).get(param_name, 0.0))
-            except Exception:
-                value = 0.0
-            if not np.isfinite(float(value)):
-                value = 0.0
-            min_bound = 0.0
-            max_bound = max(10.0, float(value) * 10.0 if float(value) else 10.0)
-            self._global_dataset_variable_params.setdefault(ds_id, {})
-            self._global_dataset_variable_params[ds_id][param_name] = {
-                "initial": float(value),
-                "min": float(min_bound),
-                "max": float(max_bound),
-                "log10": False,
-            }
-            self._parameter_state.append(
-                {
-                    "scope": "dataset",
-                    "name": f"{species}_0 ({ds_id})",
-                    "param_name": param_name,
-                    "dataset_id": ds_id,
-                    "value": float(value),
-                    "min": float(min_bound),
-                    "max": float(max_bound),
-                    "fit": True,
-                    "log10": False,
-                    "last_fit": None,
-                }
-            )
-
-    def _add_shared_scalar_parameter(self, name: str, dataset_ids: Sequence[str]) -> None:
-        # Remove conflicting per-dataset entries for the selected datasets.
-        remove_rows: List[int] = []
-        for idx, entry in enumerate(self._parameter_state):
-            if entry.get("scope") != "dataset":
-                continue
-            if str(entry.get("param_name") or "") != str(name):
-                continue
-            if str(entry.get("dataset_id") or "") not in {str(x) for x in dataset_ids}:
-                continue
-            remove_rows.append(idx)
-        if remove_rows:
-            self._remove_parameter_rows(remove_rows, update_fixed=False)
-
-        for ds_id in dataset_ids:
-            ds_id = str(ds_id)
-            spec_map = self._global_dataset_variable_params.get(ds_id)
-            if isinstance(spec_map, dict):
-                spec_map.pop(str(name), None)
-                if not spec_map:
-                    self._global_dataset_variable_params.pop(ds_id, None)
-            fixed_map = self._global_dataset_params.get(ds_id)
-            if isinstance(fixed_map, dict):
-                fixed_map.pop(str(name), None)
-                if not fixed_map:
-                    self._global_dataset_params.pop(ds_id, None)
-
-        self._add_rate_parameter(str(name))
-
-    def _add_local_scalar_parameter(self, name: str, dataset_ids: Sequence[str]) -> None:
-        # Enforce exclusivity: do not allow a scalar to be both shared and per-dataset.
-        if any(
-            entry.get("scope") == "shared" and str(entry.get("param_name") or "") == str(name)
-            for entry in self._parameter_state
-        ):
-            QtWidgets.QMessageBox.warning(
-                self.window(),
-                "Add Parameter",
-                f"Remove the shared '{name}' parameter before adding per-dataset scalar parameters.",
-            )
-            return
-
-        definition = dict(getattr(self, "_shared_param_definitions", {}).get(str(name)) or {})
-        definition.setdefault("value", 1.0)
+        blocker = QtCore.QSignalBlocker(self._param_table)
         try:
-            base_value = float(definition["value"])
-        except Exception:
-            base_value = 1.0
-        if str(name) in (self._fixed_shared_params or {}):
-            raw_value = self._fixed_shared_params.pop(str(name))
-            try:
-                base_value = float(raw_value)
-            except (TypeError, ValueError):
-                self._fixed_shared_params[str(name)] = raw_value
-        definition["value"] = float(base_value)
-
-        default_min = base_value * 0.1 if base_value else -10.0
-        default_max = base_value * 10.0 if base_value else 10.0
-        definition.setdefault("min", default_min)
-        definition.setdefault("max", default_max)
-        try:
-            min_bound = float(definition["min"])
-        except Exception:
-            min_bound = default_min
-            definition["min"] = float(min_bound)
-        try:
-            max_bound = float(definition["max"])
-        except Exception:
-            max_bound = default_max
-            definition["max"] = float(max_bound)
-
-        present = {
-            (str(entry.get("dataset_id") or ""), str(entry.get("param_name") or ""))
-            for entry in self._parameter_state
-            if entry.get("scope") == "dataset"
-        }
-        for ds_id in dataset_ids:
-            ds_id = str(ds_id)
-            key = (ds_id, str(name))
-            if key in present:
-                continue
-            self._global_dataset_variable_params.setdefault(ds_id, {})
-            self._global_dataset_variable_params[ds_id][str(name)] = {
-                "initial": float(base_value),
-                "min": float(min_bound),
-                "max": float(max_bound),
-                "log10": False,
-            }
-            fixed_map = self._global_dataset_params.get(ds_id)
-            if isinstance(fixed_map, dict):
-                fixed_map.pop(str(name), None)
-                if not fixed_map:
-                    self._global_dataset_params.pop(ds_id, None)
-            self._parameter_state.append(
-                {
-                    "scope": "dataset",
-                    "name": f"{name} ({ds_id})",
-                    "param_name": str(name),
-                    "dataset_id": ds_id,
-                    "value": float(base_value),
-                    "min": float(min_bound),
-                    "max": float(max_bound),
-                    "fit": True,
-                    "log10": False,
-                    "last_fit": None,
-                }
-            )
-
-    def _remove_selected_parameters(self) -> None:
-        rows = sorted({item.row() for item in self._param_table.selectedItems()})
-        if not rows:
-            return
-        self._remove_parameter_rows(rows)
-        self._populate_parameter_table()
-
-    def _remove_parameter_rows(self, rows: Sequence[int], *, update_fixed: bool = True) -> None:
-        for row in sorted({int(r) for r in (rows or []) if isinstance(r, int)}, reverse=True):
-            if not (0 <= row < len(self._parameter_state)):
-                continue
-            entry = self._parameter_state[row]
-            scope = str(entry.get("scope") or "")
-            if scope == "shared":
-                param_name = str(entry.get("param_name") or "")
-                if update_fixed and param_name:
-                    if param_name.startswith(INITIAL_PREFIX):
-                        # Shared "init:*" is only used when explicitly fittable; when removed, fall back
-                        # to per-dataset fixed initials and allow re-adding.
-                        self._fixed_shared_params.pop(param_name, None)
-                    else:
-                        self._fixed_shared_params[param_name] = float(entry.get("value", 0.0))
-                if update_fixed and param_name.startswith(INITIAL_PREFIX):
-                    for ds_id in self._selected_dataset_ids_getter():
-                        self._global_dataset_params.setdefault(ds_id, {})[param_name] = float(entry.get("value", 0.0))
-            elif scope == "dataset":
-                ds_id = str(entry.get("dataset_id") or "")
-                param_name = str(entry.get("param_name") or "")
-                if update_fixed and ds_id and param_name:
-                    self._global_dataset_params.setdefault(ds_id, {})[param_name] = float(entry.get("value", 0.0))
-                spec_map = self._global_dataset_variable_params.get(ds_id)
-                if isinstance(spec_map, dict):
-                    spec_map.pop(param_name, None)
-                    if not spec_map:
-                        self._global_dataset_variable_params.pop(ds_id, None)
-            self._parameter_state.pop(row)
-
-    def _available_rate_param_names(self) -> List[str]:
-        def _is_scalar(name: str) -> bool:
-            definition = dict(getattr(self, "_shared_param_definitions", {}).get(str(name)) or {})
-            definition.setdefault("source", "")
-            return str(definition["source"] or "").strip().lower() == "scalar parameter"
-
-        present = {
-            str(entry.get("param_name") or "")
-            for entry in self._parameter_state
-            if entry.get("scope") == "shared" and not str(entry.get("param_name") or "").startswith(INITIAL_PREFIX)
-            and not _is_scalar(str(entry.get("param_name") or ""))
-        }
-        candidates = {
-            name
-            for name in (getattr(self, "_shared_param_definitions", {}) or {}).keys()
-            if name and not str(name).startswith(INITIAL_PREFIX) and not _is_scalar(str(name))
-        }
-        candidates |= {
-            str(k)
-            for k in (self._fixed_shared_params or {}).keys()
-            if str(k) and not str(k).startswith(INITIAL_PREFIX) and not _is_scalar(str(k))
-        }
-        remaining = sorted({name for name in candidates if name and name not in present})
-        return remaining
-
-    def _available_scalar_param_names(self) -> List[str]:
-        def _is_scalar(name: str) -> bool:
-            definition = dict(getattr(self, "_shared_param_definitions", {}).get(str(name)) or {})
-            definition.setdefault("source", "")
-            return str(definition["source"] or "").strip().lower() == "scalar parameter"
-
-        present = {
-            str(entry.get("param_name") or "")
-            for entry in self._parameter_state
-            if entry.get("scope") == "shared" and _is_scalar(str(entry.get("param_name") or ""))
-        }
-        candidates = {
-            str(name)
-            for name in (getattr(self, "_shared_param_definitions", {}) or {}).keys()
-            if _is_scalar(str(name))
-        }
-        candidates |= {str(k) for k in (self._fixed_shared_params or {}).keys() if _is_scalar(str(k))}
-        remaining = sorted({name for name in candidates if name and name not in present})
-        return remaining
-
-    def _available_initial_species(self, dataset_ids: Sequence[str]) -> List[str]:
-        species: set[str] = set()
-        allowed = {str(x) for x in (self._mechanism_species or []) if str(x).strip()}
-        for ds_id in dataset_ids or []:
-            fixed_map = self._global_dataset_params.get(str(ds_id), {}) if isinstance(self._global_dataset_params, dict) else {}
-            if isinstance(fixed_map, dict):
-                for key in fixed_map.keys():
-                    k = str(key)
-                    if k.startswith(INITIAL_PREFIX):
-                        candidate = k[len(INITIAL_PREFIX):]
-                        if not allowed or candidate in allowed:
-                            species.add(candidate)
-            var_map = self._global_dataset_variable_params.get(str(ds_id), {}) if isinstance(self._global_dataset_variable_params, dict) else {}
-            if isinstance(var_map, dict):
-                for key in var_map.keys():
-                    k = str(key)
-                    if k.startswith(INITIAL_PREFIX):
-                        candidate = k[len(INITIAL_PREFIX):]
-                        if not allowed or candidate in allowed:
-                            species.add(candidate)
-
-        if not species:
-            if allowed:
-                species |= allowed
-            else:
-                for entry in self._dataset_entries_getter():
-                    for name in (entry.get("selected_species") or []):
-                        if str(name).strip():
-                            species.add(str(name))
-        return sorted(species)
-
-    def _auto_add_missing_scalars_as_parameters(
-        self,
-        *,
-        missing_scalars: Sequence[str],
-        dataset_ids: Sequence[str],
-        scalar_scope: str,
-    ) -> None:
-        fallback_scalars: list[str] = []
-        requested_scope = "dataset" if str(scalar_scope or "").lower().startswith("d") else "shared"
-        selected_dataset_ids = {str(x) for x in dataset_ids}
-        for scalar in missing_scalars:
-            scalar_name = str(scalar)
-            if requested_scope == "dataset":
-                shared_present = any(
-                    entry.get("scope") == "shared" and str(entry.get("param_name") or "") == scalar_name
-                    for entry in (self._parameter_state or [])
-                )
-                if shared_present:
-                    fallback_scalars.append(scalar_name)
-                    self._add_shared_scalar_parameter(scalar_name, dataset_ids)
+            if keys != self._row_keys:
+                # Only a structural change (scope, roster) replaces rows; ordinary
+                # edits update cells in place so an open editor stays valid.
+                self._param_table.setRowCount(0)
+                self._param_table.setRowCount(len(rows))
+                self._row_keys = keys
+            for row, (parameter, dataset_id) in enumerate(rows):
+                if dataset_id is None:
+                    self._render_parameter_row(row, parameter, profile)
                 else:
-                    self._add_local_scalar_parameter(scalar_name, dataset_ids)
-            else:
-                self._add_shared_scalar_parameter(scalar_name, dataset_ids)
+                    self._render_dataset_row(row, parameter, dataset_id, dataset_id in included, profile)
+            self._resize_to_contents()
+            self._param_table.updateGeometry()
+        finally:
+            del blocker
+        if current_key in keys:
+            self._param_table.setCurrentCell(keys.index(current_key), current.column())
+        elif current_key is not None and (current_key[0], None) in keys:
+            self._param_table.setCurrentCell(keys.index((current_key[0], None)), current.column())
 
-            for entry in self._parameter_state:
-                if str(entry.get("param_name") or "") != scalar_name:
-                    continue
-                if entry.get("scope") == "shared":
-                    entry["min"] = -np.inf
-                    entry["max"] = np.inf
-                elif entry.get("scope") == "dataset" and str(entry.get("dataset_id") or "") in selected_dataset_ids:
-                    entry["min"] = -np.inf
-                    entry["max"] = np.inf
+    _CONTENT_COLUMNS = (_C.VARY, _C.LOG, _C.PROFILE, _C.SCOPE, _C.UNIT)
 
-            for ds_id in selected_dataset_ids:
-                spec_map = self._global_dataset_variable_params.get(str(ds_id))
-                if isinstance(spec_map, dict) and scalar_name in spec_map and isinstance(spec_map.get(scalar_name), dict):
-                    spec_map[scalar_name]["min"] = -np.inf
-                    spec_map[scalar_name]["max"] = np.inf
+    def _resize_to_contents(self) -> None:
+        """Measure rows and content-sized columns once per render."""
 
-        if fallback_scalars:
-            QtWidgets.QMessageBox.information(
-                self.window(),
-                "Algebraic Observables",
-                "Some scalars could not be added as per-dataset (existing shared parameter). "
-                f"Added as Shared instead: {', '.join(sorted(set(fallback_scalars)))}",
-            )
-
-    def _seed_dataset_initial_params_from_fit_settings(self, dataset_id: str) -> None:
-        ds_id = str(dataset_id or "").strip()
-        if not ds_id:
-            return
-        dataset_manager = self._dataset_manager_getter()
-        if dataset_manager is None or not hasattr(dataset_manager, "get_fit_settings"):
-            return
-        try:
-            settings = dataset_manager.get_fit_settings(ds_id)
-        except Exception:
-            return
-
-        fixed = self._global_dataset_params.setdefault(ds_id, {})
-        var_specs = self._global_dataset_variable_params.get(ds_id) if isinstance(self._global_dataset_variable_params, dict) else None
-        if not isinstance(var_specs, dict):
-            var_specs = {}
-            self._global_dataset_variable_params[ds_id] = var_specs
-
-        for species in self._mechanism_species:
-            key = f"{INITIAL_PREFIX}{species}"
-            init_val = float((getattr(settings, "initial_conditions", {}) or {}).get(species, 0.0))
-            fit_flag = bool((getattr(settings, "fit_flags", {}) or {}).get(species, False))
-            log10_flag = bool((getattr(settings, "log10_flags", {}) or {}).get(species, False))
-            bounds = (getattr(settings, "bounds", {}) or {}).get(species)
-            if not bounds:
-                bounds = (0.0, max(10.0, init_val * 10 or 10.0))
-            try:
-                min_val = float(bounds[0])
-                max_val = float(bounds[1])
-            except Exception:
-                min_val, max_val = (0.0, max(10.0, init_val * 10 or 10.0))
-
-            if fit_flag:
-                var_specs[key] = {"initial": init_val, "min": min_val, "max": max_val, "log10": bool(log10_flag)}
-                fixed.pop(key, None)
-            else:
-                fixed[key] = init_val
-                var_specs.pop(key, None)
-
-        if not var_specs:
-            self._global_dataset_variable_params.pop(ds_id, None)
-
-    # ------------------------------------------------------------------
-    # Reset / config
-    # ------------------------------------------------------------------
-
-    def _reset_to_initial(self) -> None:
-        self._parameter_state = [dict(row) for row in self._initial_parameter_snapshot]
-        self._fixed_shared_params = {}
-        self._populate_parameter_table()
-
-    def _reset_to_last_fit(self) -> None:
-        if not self._last_fit_params:
-            return
-        for entry in self._parameter_state:
-            if entry.get("scope") == "shared":
-                name = entry["param_name"]
-                if name in self._last_fit_params:
-                    entry["value"] = float(self._last_fit_params[name])
-                    entry["fit"] = True
-                    entry["last_fit"] = self._last_fit_params[name]
-            elif entry.get("scope") == "dataset":
-                ds_id = str(entry.get("dataset_id") or "")
-                param_name = str(entry.get("param_name") or "")
-                ds_map = self._staged_dataset_params.get(ds_id) if ds_id else None
-                if isinstance(ds_map, dict) and param_name in ds_map:
-                    entry["value"] = float(ds_map[param_name])
-                    entry["last_fit"] = float(ds_map[param_name])
-        self._populate_parameter_table()
-
-    def _collect_parameter_config(self) -> Optional[Dict[str, Any]]:
-        parameters: Dict[str, float] = {}
-        bounds: Dict[str, Tuple[float, float]] = {}
-        log10_params: Dict[str, bool] = {}
-        fixed_params: Dict[str, float] = dict(self._fixed_shared_params or {})
-        updated_state: List[Dict[str, Any]] = []
-        for row in range(self._param_table.rowCount()):
-            fit_flag = self._param_table.item(row, 0).checkState() == Qt.Checked
-            entry = self._parameter_state[row]
-            log10_flag = self._param_table.item(row, 1).checkState() == Qt.Checked
-            param_name = str(entry.get("param_name") or "")
-            try:
-                value = float(self._param_table.item(row, 3).text())
-                min_val = float(self._param_table.item(row, 4).text())
-                max_val = float(self._param_table.item(row, 5).text())
-            except (ValueError, AttributeError):
-                QtWidgets.QMessageBox.warning(
-                    self.window(),
-                    "Invalid Parameter",
-                    f"Parameter '{self._param_table.item(row, 2).text()}' contains non-numeric values.",
-                )
-                return None
-            if not (min_val < max_val):
-                QtWidgets.QMessageBox.warning(
-                    self.window(),
-                    "Invalid Bounds",
-                    f"Parameter '{self._param_table.item(row, 2).text()}' bounds must satisfy min < max.",
-                )
-                return None
-            if log10_flag:
-                if not (value > 0.0 and min_val > 0.0 and max_val > 0.0):
-                    QtWidgets.QMessageBox.warning(
-                        self.window(),
-                        "Invalid Log10 Bounds",
-                        f"Parameter '{self._param_table.item(row, 2).text()}' requires value/min/max > 0 when Log10 is enabled.",
-                    )
-                    return None
-            scope = str(entry.get("scope") or "shared")
-            updated = dict(entry)
-            updated["value"] = value
-            updated["min"] = min_val
-            updated["max"] = max_val
-            updated["fit"] = bool(fit_flag)
-            updated["log10"] = bool(log10_flag)
-            updated_state.append(updated)
-            if scope == "shared":
-                if fit_flag:
-                    parameters[param_name] = value
-                    bounds[param_name] = (min_val, max_val)
-                    log10_params[param_name] = bool(log10_flag)
-                else:
-                    fixed_params[param_name] = value
-            elif scope == "dataset":
-                ds_id = str(entry.get("dataset_id") or "")
-                if ds_id and param_name:
-                    if fit_flag:
-                        spec_map = self._global_dataset_variable_params.setdefault(ds_id, {})
-                        spec_map[param_name] = {
-                            "initial": value,
-                            "min": min_val,
-                            "max": max_val,
-                            "log10": bool(log10_flag),
-                        }
-                        fixed_map = self._global_dataset_params.get(ds_id)
-                        if isinstance(fixed_map, dict):
-                            fixed_map.pop(param_name, None)
-                    else:
-                        self._global_dataset_params.setdefault(ds_id, {})[param_name] = float(value)
-                        spec_map = self._global_dataset_variable_params.get(ds_id)
-                        if isinstance(spec_map, dict):
-                            spec_map.pop(param_name, None)
-                            if not spec_map:
-                                self._global_dataset_variable_params.pop(ds_id, None)
-        self._parameter_state = updated_state
-        if not parameters and not any((entry.get("scope") == "dataset" and entry.get("fit", True)) for entry in self._parameter_state):
-            QtWidgets.QMessageBox.warning(self.window(), "No Parameters", "Select at least one parameter to fit.")
-            return None
-
-        method = self._method_combo.currentText().strip().lower()
-        config = {
-            "parameters": parameters,
-            "bounds": bounds,
-            "log10_params": log10_params,
-            "fixed_params": fixed_params,
-            "method": method,
-            "max_nfev": self._max_eval_spin.value(),
-            "ftol": max(safe_float_parse(self._ftol_edit.text(), 1e-10), 1e-15),
-            "xtol": max(safe_float_parse(self._xtol_edit.text(), 1e-10), 1e-15),
-            "seed": self._seed_spin.value() if self._seed_check.isChecked() else None,
-            "use_parallel": self._use_parallel_check.isChecked(),
-            "parallel_starts": DEFAULT_PARALLEL_STARTS,
-        }
-        return config
-
-    def _build_parameter_state(self, definitions: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        state: List[Dict[str, Any]] = []
-        self._shared_param_definitions: Dict[str, Dict[str, Any]] = {}
-        missing_name_count = 0
-        for definition in definitions or []:
-            name_raw = definition.get("name")
-            if name_raw is None:
-                missing_name_count += 1
-                continue
-            name = str(name_raw)
-            if not name.strip():
-                continue
-            value = float(definition.get("value", 1.0))
-            min_bound = float(definition.get("min", value * 0.1 if value else -10.0))
-            max_bound = float(definition.get("max", value * 10.0 if value else 10.0))
-            self._shared_param_definitions[name] = dict(definition)
-            state.append(
-                {
-                    "scope": "shared",
-                    "name": name,
-                    "param_name": name,
-                    "dataset_id": None,
-                    "value": value,
-                    "min": min_bound,
-                    "max": max_bound,
-                    "fit": True,
-                    "log10": False,
-                    "last_fit": None,
-                }
-            )
-
-        for ds_id, specs in (self._global_dataset_variable_params or {}).items():
-            if not isinstance(specs, dict):
-                continue
-            for param_name, spec in specs.items():
-                if not isinstance(spec, dict):
-                    continue
-                param_name = str(param_name)
-                if not param_name.strip():
-                    continue
-                try:
-                    init_val = float(spec.get("initial", 0.0))
-                    min_val = float(spec.get("min", -np.inf))
-                    max_val = float(spec.get("max", np.inf))
-                except (TypeError, ValueError) as exc:
-                    logger.debug(
-                        "Skipping invalid global-fit dataset parameter spec '%s' for dataset '%s': %s",
-                        param_name,
-                        ds_id,
-                        exc,
-                        exc_info=True,
-                    )
-                    continue
-                log10_flag = bool(spec.get("log10", False))
-                if param_name.startswith(INITIAL_PREFIX):
-                    species = param_name[len(INITIAL_PREFIX):]
-                    display = f"{species}_0 ({ds_id})"
-                else:
-                    display = f"{param_name} ({ds_id})"
-                state.append(
-                    {
-                        "scope": "dataset",
-                        "name": display,
-                        "param_name": param_name,
-                        "dataset_id": str(ds_id),
-                        "value": init_val,
-                        "min": min_val,
-                        "max": max_val,
-                        "fit": True,
-                        "log10": log10_flag,
-                        "last_fit": None,
-                    }
-                )
-
-        if not state:
-            logger.warning("Fitting window opened with no parameter definitions.")
-        if missing_name_count:
-            logger.debug("Skipped %d global-fit parameter definitions without a 'name' field.", missing_name_count)
-        return state
-
-    def _collect_integration_settings_for_run(self) -> Optional[Tuple[str, float, float]]:
-        from kindred.core.simulator.solvers import normalize_solver_name
-
-        allowed = ("LSODA", "Radau", "BDF")
-        combo = getattr(self, "_integration_solver_combo", None)
-        solver_label = str(combo.currentText()).strip() if combo is not None else FITTING_DEFAULT_SOLVER
-        if solver_label not in allowed:
-            solver_label = FITTING_DEFAULT_SOLVER
-        solver_method, solver_warning = normalize_solver_name(solver_label)
-        if solver_warning:
-            QtWidgets.QMessageBox.information(
-                self.window(),
-                "Solver Normalization",
-                f"{solver_warning}\n\nRequested: {solver_label}\nUsing: {solver_method}",
-            )
-
-        rtol_edit = getattr(self, "_integration_rtol_edit", None)
-        atol_edit = getattr(self, "_integration_atol_edit", None)
-        rtol_text = str(rtol_edit.text()).strip() if rtol_edit is not None else "1e-6"
-        atol_text = str(atol_edit.text()).strip() if atol_edit is not None else "1e-12"
-        if not rtol_text:
-            rtol_text = "1e-6"
-        if not atol_text:
-            atol_text = "1e-12"
-
-        try:
-            rtol = float(rtol_text)
-            atol = float(atol_text)
-        except Exception:
-            QtWidgets.QMessageBox.warning(
-                self.window(),
-                "Advanced Integration Settings",
-                "rtol and atol must be valid floating-point numbers (scientific notation is allowed).",
-            )
-            return None
-        if not (np.isfinite(rtol) and rtol > 0.0):
-            QtWidgets.QMessageBox.warning(self.window(), "Advanced Integration Settings", "rtol must be a finite value > 0.")
-            return None
-        if not (np.isfinite(atol) and atol > 0.0):
-            QtWidgets.QMessageBox.warning(self.window(), "Advanced Integration Settings", "atol must be a finite value > 0.")
-            return None
-        return str(solver_method), float(rtol), float(atol)
-
-    # ------------------------------------------------------------------
-    # Mechanism rebuild
-    # ------------------------------------------------------------------
-
-    def _scan_parameter_definitions_for_mechanism(self, mechanism_text: str, dataset_manager: Any = None) -> list[dict[str, Any]]:
-        if dataset_manager is None:
-            dataset_manager = self._dataset_manager_getter()
-        scan_params = getattr(dataset_manager, "scan_mechanism_parameters", None)
-        if not callable(scan_params):
-            return [
-                dict(definition)
-                for definition in (getattr(self, "_shared_param_definitions", {}) or {}).values()
-                if isinstance(definition, dict)
-            ]
-        param_defs = scan_params(str(mechanism_text or ""))
-        return [dict(definition) for definition in (param_defs or []) if isinstance(definition, dict)]
-
-    def _mechanism_species_for_text(self, mechanism_text: str) -> list[str]:
-        try:
-            from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-
-            mechanism = parse_dsl_to_mechanism(str(mechanism_text or ""), initials={})
-        except Exception:
-            logger.debug("Failed to parse mechanism species for fitting-window refresh.", exc_info=True)
-            return [str(name) for name in (getattr(self, "_mechanism_species", []) or []) if str(name).strip()]
-        species_map = getattr(mechanism, "species", {}) or {}
-        species_names = [str(name) for name in species_map.keys() if str(name).strip()]
-        return list(dict.fromkeys(species_names))
+        self._param_table.resizeRowsToContents()
+        for column in self._CONTENT_COLUMNS:
+            self._param_table.resizeColumnToContents(column)
+        self._param_table.fit_name_column()
 
     @staticmethod
-    def _coerce_variable_spec(spec: dict[str, Any]) -> Optional[dict[str, float]]:
-        if not isinstance(spec, dict):
-            return None
-        try:
-            initial = float(spec.get("initial", 0.0))
-            min_val = float(spec.get("min", -np.inf))
-            max_val = float(spec.get("max", np.inf))
-        except (TypeError, ValueError):
-            return None
-        return {
-            "initial": float(initial),
-            "min": float(min_val),
-            "max": float(max_val),
-            "log10": bool(spec.get("log10", False)),
-        }
+    def _readonly_item(text: str = "") -> QtWidgets.QTableWidgetItem:
+        item = QtWidgets.QTableWidgetItem(text)
+        item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable)
+        return item
 
-    def rebuild_for_mechanism(self, mechanism_text: str, dataset_entries: List[Dict[str, Any]]) -> list[str]:
-        param_defs = self._scan_parameter_definitions_for_mechanism(mechanism_text)
-        param_names = [str(d.get("name")) for d in (param_defs or []) if d.get("name")]
-        self._shared_param_definitions = {str(d.get("name")): dict(d) for d in (param_defs or []) if d.get("name")}
-        self._prepared_param_names = list(param_names)
+    def _number_item(self, text: str, message: str | None) -> QtWidgets.QTableWidgetItem:
+        item = QtWidgets.QTableWidgetItem(text)
+        item.setTextAlignment(QtCore.Qt.AlignCenter)
+        item.setData(_COMPACT_ROLE, message is None)
+        item.setData(QtCore.Qt.AccessibleTextRole, text)
+        if message is not None:
+            item.setBackground(_INVALID_BG)
+            item.setForeground(_INVALID_FG)
+            item.setToolTip(message)
+        return item
 
-        mechanism_species = self._mechanism_species_for_text(mechanism_text)
-        allowed_species = {str(name) for name in mechanism_species if str(name).strip()}
-        allowed_param_names = {str(name) for name in param_names if str(name).strip()}
+    def _unit_item(self, unit: str) -> QtWidgets.QTableWidgetItem:
+        item = self._readonly_item(unit)
+        item.setData(SCIENTIFIC_NAME_HTML_ROLE, format_unit_for_display(unit))
+        item.setData(QtCore.Qt.AccessibleTextRole, unit)
+        item.setToolTip(unit)
+        return item
 
-        old_state = [dict(row) for row in (getattr(self, "_parameter_state", []) or []) if isinstance(row, dict)]
-        old_shared_rows = {
-            str(row.get("param_name") or ""): dict(row)
-            for row in old_state
-            if str(row.get("scope") or "") == "shared" and str(row.get("param_name") or "").strip()
-        }
-        old_dataset_rows = {
-            (str(row.get("dataset_id") or ""), str(row.get("param_name") or "")): dict(row)
-            for row in old_state
-            if str(row.get("scope") or "") == "dataset"
-            and str(row.get("dataset_id") or "").strip()
-            and str(row.get("param_name") or "").strip()
-        }
+    def _render_parameter_row(self, row: int, parameter: FitParameterVariable, profile: "_ProfileView") -> None:
+        config = parameter.selected_config
+        draft = self._invalid_rows.get(parameter.name)
+        raw = dict(draft.raw_fields) if draft is not None else {}
+        messages = dict(draft.messages) if draft is not None else {}
+        vary = QtWidgets.QTableWidgetItem()
+        vary.setFlags(
+            QtCore.Qt.ItemFlag.ItemIsEnabled
+            | QtCore.Qt.ItemFlag.ItemIsSelectable
+            | QtCore.Qt.ItemFlag.ItemIsUserCheckable
+        )
+        # Partly ticked when some datasets are varied and some fixed.
+        vary.setCheckState(
+            QtCore.Qt.CheckState.Unchecked if not config.fit
+            else QtCore.Qt.CheckState.PartiallyChecked if config.fixed_dataset_ids
+            else QtCore.Qt.CheckState.Checked
+        )
+        vary.setData(QtCore.Qt.ItemDataRole.UserRole, parameter.name)
+        self._param_table.setItem(row, _C.VARY, vary)
+        name_item = self._readonly_item(parameter.display_name)
+        symbol = scientific_symbol_html(parameter.name, family=parameter.family, role=parameter.role)
+        context = parameter.display_name.removeprefix(parameter.name)
+        name_item.setData(SCIENTIFIC_NAME_HTML_ROLE,
+                          symbol + (" " + html.escape(compact_text(context, max_chars=36).display) if context else ""))
+        name_item.setData(QtCore.Qt.ItemDataRole.AccessibleTextRole,
+                          scientific_symbol_spoken(parameter.name, family=parameter.family, role=parameter.role))
+        name_item.setData(QtCore.Qt.ItemDataRole.UserRole, parameter.name)
+        name_item.setToolTip(f"{parameter.display_name}\nParameter ID: {parameter.name}")
+        self._param_table.setItem(row, _C.NAME, name_item)
+        origin_parameter = next(item for item in self._origin.parameter_defaults if item.name == parameter.name)
+        mechanism = self._readonly_item(_format_number(origin_parameter.shared_config.value))
+        mechanism.setTextAlignment(QtCore.Qt.AlignCenter)
+        mechanism.setData(_COMPACT_ROLE, True)
+        mechanism.setToolTip(
+            "The value currently in the mechanism tab: "
+            f"{six_digit_text(origin_parameter.shared_config.value)}"
+        )
+        self._param_table.setItem(row, _C.MECH, mechanism)
+        if parameter.scope == "shared":
+            start = self._number_item(raw.get("starting", _format_number(config.value)), messages.get("starting"))
+        else:
+            start = self._readonly_item("Per-dataset")
+            start.setTextAlignment(QtCore.Qt.AlignCenter)
+            start.setForeground(self.palette().color(QtGui.QPalette.PlaceholderText))
+            start.setToolTip("Edit the initial guess of each dataset in the rows below.")
+        self._param_table.setItem(row, _C.START, start)
+        self._param_table.setItem(row, _C.MIN, self._number_item(raw.get("minimum", _format_number(config.minimum)), messages.get("minimum")))
+        self._param_table.setItem(row, _C.MAX, self._number_item(raw.get("maximum", _format_number(config.maximum)), messages.get("maximum")))
+        log_item = QtWidgets.QTableWidgetItem()
+        log_item.setFlags(
+            QtCore.Qt.ItemFlag.ItemIsEnabled
+            | QtCore.Qt.ItemFlag.ItemIsSelectable
+            | QtCore.Qt.ItemFlag.ItemIsUserCheckable
+        )
+        log10 = raw.get("log10", "1" if config.log10 else "") == "1"
+        log_item.setCheckState(QtCore.Qt.Checked if log10 else QtCore.Qt.Unchecked)
+        log_item.setToolTip("Fit this parameter on a logarithmic scale (requires positive bounds).")
+        if "log10" in messages:
+            log_item.setBackground(_INVALID_BG)
+            log_item.setToolTip(messages["log10"])
+        self._param_table.setItem(row, _C.LOG, log_item)
+        targets = [item for item in profile.available if item.name == parameter.name]
+        ticked = [item for item in targets if item not in profile.unticked]
+        self._param_table.setItem(row, _C.PROFILE, self._profile_item(
+            # Partly ticked when some of a Per-dataset parameter's values are.
+            QtCore.Qt.CheckState.Unchecked if not ticked
+            else QtCore.Qt.CheckState.Checked if len(ticked) == len(targets)
+            else QtCore.Qt.CheckState.PartiallyChecked,
+            # Grayed, like its dataset rows, when every value's datasets are excluded.
+            editable=profile.enabled and any(item not in profile.skipped for item in targets),
+            tooltip=profile.tooltip(bool(targets), excluded=bool(targets) and all(
+                item in profile.skipped for item in targets
+            )),
+        ))
+        self._param_table.setItem(row, _C.SCOPE, self._readonly_item())
+        combo = self._param_table.cellWidget(row, _C.SCOPE)
+        if not isinstance(combo, QtWidgets.QComboBox):
+            combo = ChoicesComboBox(self._param_table)
+            ignore_wheel(combo)
+            combo.setObjectName("fit_parameter_scope")
+            combo.setAccessibleName(f"Across Datasets for {parameter.name}")
+            for scope, (label, tooltip) in self._SCOPE_CHOICES.items():
+                combo.addItem(label, scope)
+                combo.setItemData(combo.count() - 1, tooltip, QtCore.Qt.ToolTipRole)
+            combo.currentIndexChanged.connect(
+                lambda _index, name=parameter.name, box=combo: self._on_scope_changed(name, box)
+            )
+            self._param_table.setCellWidget(row, _C.SCOPE, combo)
+        with QtCore.QSignalBlocker(combo):
+            combo.setCurrentIndex(combo.findData(parameter.scope))
+        combo.setToolTip(self._SCOPE_CHOICES[parameter.scope][1])
+        last = self._readonly_item(self._last_fit_summary(parameter.name))
+        last.setTextAlignment(QtCore.Qt.AlignCenter)
+        self._param_table.setItem(row, _C.LAST, last)
+        self._param_table.setItem(row, _C.UNIT, self._unit_item(parameter.unit))
 
-        filtered_fixed_shared: Dict[str, float] = {}
-        for name, value in (getattr(self, "_fixed_shared_params", {}) or {}).items():
-            key = str(name or "").strip()
-            if not key or key not in allowed_param_names:
+    def _render_dataset_row(
+        self, row: int, parameter: FitParameterVariable, dataset_id: str, included: bool,
+        profile: "_ProfileView",
+    ) -> None:
+        for column in range(_C.COUNT):
+            self._param_table.setItem(row, column, self._readonly_item())
+        name = self._dataset_display_name(dataset_id)
+        name_item = self._readonly_item("    " + name)
+        name_item.setData(QtCore.Qt.ItemDataRole.UserRole, parameter.name)
+        name_item.setData(_DATASET_ROLE, dataset_id)
+        name_item.setToolTip(
+            f"{parameter.display_name} — {name}\nDataset ID: {dataset_id}"
+            + ("" if included else "\nNot included in this fit")
+        )
+        if not included:
+            name_item.setForeground(self.palette().color(QtGui.QPalette.PlaceholderText))
+        self._param_table.setItem(row, _C.NAME, name_item)
+        config = parameter.per_dataset_config
+        group = next((item for item in config.groups if dataset_id in item), None)
+        varied = dataset_id in config.varied_dataset_ids
+        checkable = (
+            QtCore.Qt.ItemFlag.ItemIsSelectable
+            | QtCore.Qt.ItemFlag.ItemIsEnabled
+            | QtCore.Qt.ItemFlag.ItemIsUserCheckable
+        )
+        vary = QtWidgets.QTableWidgetItem()
+        vary.setFlags(checkable)
+        vary.setCheckState(QtCore.Qt.CheckState.Checked if varied else QtCore.Qt.CheckState.Unchecked)
+        vary.setToolTip("Fit the value of this dataset. Uncheck to use it as entered.")
+        self._param_table.setItem(row, _C.VARY, vary)
+        labels = fit_group_labels(parameter, self._projected_setup.datasets, self._origin)
+        group_box = QtWidgets.QTableWidgetItem(
+            f"Group {labels[group[0]][0]}" if group is not None else "Group —"
+        )
+        # Only a varied dataset can share a fitted value.
+        group_box.setFlags(checkable if varied else QtCore.Qt.ItemFlag.ItemIsSelectable)
+        group_box.setCheckState(
+            QtCore.Qt.CheckState.Checked if group is not None else QtCore.Qt.CheckState.Unchecked
+        )
+        group_box.setToolTip(
+            "Share one fitted value with other datasets. Uncheck to leave the group."
+            if varied else "A fixed dataset cannot share a fitted value."
+        )
+        self._param_table.setItem(row, _C.SCOPE, group_box)
+        target = (
+            FitCoordinate("group", parameter.name, group[0]) if group is not None
+            else FitCoordinate("dataset", parameter.name, dataset_id) if varied
+            else None
+        )
+        member = group is not None and dataset_id != group[0]
+        self._param_table.setItem(row, _C.PROFILE, self._profile_item(
+            QtCore.Qt.CheckState.Checked if target is not None and target not in profile.unticked
+            else QtCore.Qt.CheckState.Unchecked,
+            editable=profile.enabled and target is not None and not member and target not in profile.skipped,
+            tooltip=(
+                f"Shared with {self._dataset_display_name(group[0])}. Tick it there."
+                if member else profile.tooltip(target is not None, excluded=target in profile.skipped)
+            ),
+        ))
+        draft = self._invalid_rows.get(parameter.name)
+        raw = dict(draft.raw_fields) if draft is not None else {}
+        values = dict(config.dataset_values)
+        text = raw.get(f"dataset:{dataset_id}", _format_number(values[dataset_id]))
+        if group is not None and dataset_id != group[0]:
+            # A member shows its group's start; only the origin row edits it.
+            start = self._readonly_item(text)
+            start.setTextAlignment(QtCore.Qt.AlignCenter)
+            start.setData(_COMPACT_ROLE, True)
+            start.setToolTip(
+                f"Shared with {self._dataset_display_name(group[0])}. Edit the initial guess there."
+            )
+        else:
+            start = self._number_item(text, dict(draft.messages).get(f"dataset:{dataset_id}") if draft is not None else None)
+            if not varied and draft is None:
+                start.setToolTip("Fixed: used as entered.")
+        start.setData(QtCore.Qt.ItemDataRole.UserRole, parameter.name)
+        start.setData(_DATASET_ROLE, dataset_id)
+        self._param_table.setItem(row, _C.START, start)
+        last = self._last_fit_parameters.get(parameter.name)
+        # A dataset outside the last fit shows no result, even when a group
+        # wrote that fit's value into it.
+        last_values = (
+            dict(last.selected_config.dataset_values)
+            if last is not None and last.scope != "shared" and dataset_id in self._last_fit_included
+            else {}
+        )
+        last_item = self._readonly_item(
+            six_digit_text(last_values[dataset_id]) if dataset_id in last_values else "—"
+        )
+        last_item.setTextAlignment(QtCore.Qt.AlignCenter)
+        self._param_table.setItem(row, _C.LAST, last_item)
+        self._param_table.setItem(row, _C.UNIT, self._unit_item(parameter.unit))
+
+    @staticmethod
+    def _profile_item(
+        state: QtCore.Qt.CheckState, *, editable: bool, tooltip: str,
+    ) -> QtWidgets.QTableWidgetItem:
+        """A Profile box; it is grayed and keeps its tick when it cannot be edited."""
+
+        item = QtWidgets.QTableWidgetItem()
+        item.setFlags(
+            QtCore.Qt.ItemFlag.ItemIsSelectable
+            | QtCore.Qt.ItemFlag.ItemIsEnabled
+            | QtCore.Qt.ItemFlag.ItemIsUserCheckable
+            if editable else QtCore.Qt.ItemFlag.ItemIsSelectable
+        )
+        item.setCheckState(state)
+        item.setToolTip(tooltip)
+        return item
+
+    def _last_fit_summary(self, name: str) -> str:
+        last = self._last_fit_parameters.get(name)
+        if last is None:
+            return "—"
+        if last.scope == "shared":
+            return six_digit_text(last.selected_config.value)
+        return "Per-dataset"
+
+    def _parameter_rows(self, name: str) -> tuple[int, list[tuple[int, str]]]:
+        parent = -1
+        datasets: list[tuple[int, str]] = []
+        for row in range(self._param_table.rowCount()):
+            item = self._param_table.item(row, _C.NAME)
+            if item is None or item.data(QtCore.Qt.ItemDataRole.UserRole) != name:
                 continue
-            try:
-                filtered_fixed_shared[key] = float(value)
-            except (TypeError, ValueError):
-                continue
-
-        current_fixed = getattr(self, "_global_dataset_params", {}) or {}
-        current_variable = getattr(self, "_global_dataset_variable_params", {}) or {}
-        refreshed_fixed: Dict[str, Dict[str, float]] = {}
-        refreshed_variable: Dict[str, Dict[str, Dict[str, float]]] = {}
-        for entry in dataset_entries or []:
-            ds_id = str(entry.get("id") or "").strip()
-            if not ds_id:
-                continue
-            old_fixed = current_fixed.get(ds_id, {}) if isinstance(current_fixed.get(ds_id), dict) else {}
-            old_variable = current_variable.get(ds_id, {}) if isinstance(current_variable.get(ds_id), dict) else {}
-            fixed_map: Dict[str, float] = {}
-            variable_map: Dict[str, Dict[str, float]] = {}
-
-            for key, value in old_fixed.items():
-                param_name = str(key or "").strip()
-                if not param_name:
-                    continue
-                if param_name.startswith(INITIAL_PREFIX):
-                    species = param_name[len(INITIAL_PREFIX):]
-                    if species not in allowed_species:
-                        continue
-                elif param_name not in allowed_param_names:
-                    continue
-                try:
-                    fixed_map[param_name] = float(value)
-                except (TypeError, ValueError):
-                    continue
-
-            for key, spec in old_variable.items():
-                param_name = str(key or "").strip()
-                if not param_name:
-                    continue
-                if param_name.startswith(INITIAL_PREFIX):
-                    species = param_name[len(INITIAL_PREFIX):]
-                    if species not in allowed_species:
-                        continue
-                elif param_name not in allowed_param_names:
-                    continue
-                cleaned = self._coerce_variable_spec(spec)
-                if cleaned is None:
-                    continue
-                variable_map[param_name] = cleaned
-
-            for species in mechanism_species:
-                param_name = f"{INITIAL_PREFIX}{species}"
-                if param_name in fixed_map or param_name in variable_map:
-                    continue
-                if self._ic_panel is not None:
-                    fit_flag, default_spec = self._ic_panel.initial_parameter_defaults_for_species(ds_id, species)
-                else:
-                    fit_flag, default_spec = False, {"initial": 0.0, "min": 0.0, "max": 10.0, "log10": False}
-                if fit_flag:
-                    variable_map[param_name] = dict(default_spec)
-                else:
-                    fixed_map[param_name] = float(default_spec["initial"])
-
-            if fixed_map:
-                refreshed_fixed[ds_id] = fixed_map
-            if variable_map:
-                refreshed_variable[ds_id] = variable_map
-
-        self._global_dataset_params = refreshed_fixed
-        self._global_dataset_variable_params = refreshed_variable
-        self._fixed_shared_params = filtered_fixed_shared
-        self._mechanism_species = list(mechanism_species)
-
-        rebuilt_state = self._build_parameter_state(param_defs)
-        merged_state: List[Dict[str, Any]] = []
-        merged_shared_names: set[str] = set()
-        merged_dataset_keys: set[tuple[str, str]] = set()
-        for row in rebuilt_state:
-            scope = str(row.get("scope") or "")
-            if scope == "shared":
-                param_name = str(row.get("param_name") or "")
-                if param_name in self._fixed_shared_params:
-                    continue
-                previous = old_shared_rows.get(param_name)
-                if previous is not None:
-                    merged = dict(row)
-                    for field in ("value", "min", "max"):
-                        try:
-                            merged[field] = float(previous.get(field, row.get(field)))
-                        except (TypeError, ValueError):
-                            merged[field] = float(row.get(field, 0.0))
-                    merged["fit"] = bool(previous.get("fit", True))
-                    merged["log10"] = bool(previous.get("log10", False))
-                    merged["last_fit"] = previous.get("last_fit")
-                    row = merged
-                merged_shared_names.add(param_name)
-            elif scope == "dataset":
-                ds_key = (str(row.get("dataset_id") or ""), str(row.get("param_name") or ""))
-                previous = old_dataset_rows.get(ds_key)
-                if previous is not None:
-                    row = dict(row)
-                    row["last_fit"] = previous.get("last_fit")
-                merged_dataset_keys.add(ds_key)
-            merged_state.append(row)
-
-        for param_name, previous in old_shared_rows.items():
-            if not param_name.startswith(INITIAL_PREFIX):
-                continue
-            if param_name in merged_shared_names:
-                continue
-            species = param_name[len(INITIAL_PREFIX):]
-            if species not in allowed_species:
-                continue
-            restored = dict(previous)
-            restored["scope"] = "shared"
-            restored["param_name"] = str(param_name)
-            restored["dataset_id"] = None
-            restored["fit"] = bool(previous.get("fit", True))
-            restored["log10"] = bool(previous.get("log10", False))
-            restored["name"] = str(previous.get("name") or f"Global {species}_0")
-            try:
-                shared_value = float(previous.get("value", 0.0))
-            except (TypeError, ValueError):
-                shared_value = 0.0
-            for field, fallback in (
-                ("value", shared_value),
-                ("min", 0.0),
-                ("max", max(10.0, shared_value * 10.0 if shared_value else 10.0)),
-            ):
-                try:
-                    restored[field] = float(previous.get(field, fallback))
-                except (TypeError, ValueError):
-                    restored[field] = float(fallback)
-            merged_state.append(restored)
-            merged_shared_names.add(param_name)
-
-        for (ds_id, param_name), previous in old_dataset_rows.items():
-            if (ds_id, param_name) in merged_dataset_keys:
-                continue
-            fixed_map = refreshed_fixed.get(str(ds_id), {})
-            if not isinstance(fixed_map, dict) or param_name not in fixed_map:
-                continue
-            restored = dict(previous)
-            restored["scope"] = "dataset"
-            restored["dataset_id"] = str(ds_id)
-            restored["param_name"] = str(param_name)
-            restored["fit"] = False
-            restored["value"] = float(fixed_map[param_name])
-            restored["log10"] = bool(previous.get("log10", False))
-            if str(param_name).startswith(INITIAL_PREFIX):
-                species = str(param_name)[len(INITIAL_PREFIX):]
-                restored["name"] = str(previous.get("name") or f"{species}_0 ({ds_id})")
+            dataset_id = item.data(_DATASET_ROLE)
+            if dataset_id is None:
+                parent = row
             else:
-                restored["name"] = str(previous.get("name") or f"{param_name} ({ds_id})")
-            for field, fallback in (("min", restored["value"] * 0.1 if restored["value"] else -10.0), ("max", restored["value"] * 10.0 if restored["value"] else 10.0)):
-                try:
-                    restored[field] = float(previous.get(field, fallback))
-                except (TypeError, ValueError):
-                    restored[field] = float(fallback)
-            merged_state.append(restored)
-            merged_dataset_keys.add((str(ds_id), str(param_name)))
+                datasets.append((row, str(dataset_id)))
+        return parent, datasets
 
-        self._parameter_state = merged_state
-        self._initial_parameter_snapshot = [dict(row) for row in self._parameter_state]
-        self._dataset_entries = list(dataset_entries)
-        self._populate_parameter_table()
-        if self._ic_panel is not None:
-            self._ic_panel.set_mechanism_species(list(self._mechanism_species))
-            self._ic_panel.refresh_dataset_combo(list(self._dataset_entries))
-        return list(self._prepared_param_names)
+    def _on_roster_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._projecting:
+            return
+        name_item = self._param_table.item(item.row(), _C.NAME)
+        name = str(name_item.data(QtCore.Qt.ItemDataRole.UserRole))
+        dataset_id = name_item.data(_DATASET_ROLE)
+        checked = item.checkState() == QtCore.Qt.CheckState.Checked
+        if item.column() == _C.VARY and dataset_id is None:
+            self._emit_vary_edit(name, checked)
+        elif item.column() == _C.VARY:
+            self._on_dataset_vary_changed(name, str(dataset_id), checked)
+        elif item.column() == _C.SCOPE and dataset_id is not None:
+            self._on_group_box_changed(name, str(dataset_id), checked)
+        elif item.column() == _C.PROFILE:
+            self._on_profile_tick(name, None if dataset_id is None else str(dataset_id), checked)
+        elif item.column() in (_C.START, _C.MIN, _C.MAX, _C.LOG):
+            self._emit_parameter_row_edit(name)
 
-    # ------------------------------------------------------------------
-    # Public API — state getters (return copies)
-    # ------------------------------------------------------------------
+    def _selected_parameter(self) -> FitParameterVariable | None:
+        row = self._param_table.currentRow()
+        item = self._param_table.item(row, _C.NAME) if row >= 0 else None
+        name = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if item is not None else ""
+        return self._parameter_by_name(name) if name else None
 
-    def get_parameter_state(self) -> List[Dict[str, Any]]:
-        return [dict(row) for row in self._parameter_state]
-
-    def set_parameter_state(self, value: List[Dict[str, Any]]) -> None:
-        self._parameter_state = [dict(row) for row in value]
-
-    def get_initial_parameter_snapshot(self) -> List[Dict[str, Any]]:
-        return [dict(row) for row in self._initial_parameter_snapshot]
-
-    def get_global_dataset_params(self) -> Dict[str, Dict[str, float]]:
-        return {k: dict(v) for k, v in self._global_dataset_params.items()}
-
-    def set_global_dataset_params(self, value: Dict[str, Dict[str, float]]) -> None:
-        self._global_dataset_params = {k: dict(v) for k, v in value.items()}
-
-    def get_global_dataset_variable_params(self) -> Dict[str, Dict[str, Dict]]:
-        return {
-            k: {kk: dict(vv) for kk, vv in v.items()} if isinstance(v, dict) else v
-            for k, v in self._global_dataset_variable_params.items()
+    def _row_raw_fields(self, parameter: FitParameterVariable) -> dict[str, str]:
+        parent, datasets = self._parameter_rows(parameter.name)
+        table = self._param_table
+        raw = {
+            "minimum": table.item(parent, _C.MIN).text(),
+            "maximum": table.item(parent, _C.MAX).text(),
+            "log10": "1" if table.item(parent, _C.LOG).checkState() == QtCore.Qt.Checked else "",
         }
+        if parameter.scope == "shared":
+            raw["starting"] = table.item(parent, _C.START).text()
+        for row, dataset_id in datasets:
+            raw[f"dataset:{dataset_id}"] = table.item(row, _C.START).text()
+        return raw
 
-    def set_global_dataset_variable_params(self, value: Dict[str, Dict[str, Dict]]) -> None:
-        self._global_dataset_variable_params = {
-            k: {kk: dict(vv) for kk, vv in v.items()} if isinstance(v, dict) else v
-            for k, v in value.items()
+    def _invalid_cells(self) -> list[tuple[str, str, str]]:
+        """Each invalid cell as (parameter name, field, message) in table order."""
+
+        cells = []
+        for parameter in self._projected_setup.parameters if self._projected_setup else ():
+            draft = self._invalid_rows.get(parameter.name)
+            if draft is None:
+                continue
+            messages = dict(draft.messages)
+            fields = [field for field in _FIELD_COLUMNS if field in messages]
+            fields += [field for field, _raw in draft.raw_fields if field.startswith("dataset:") and field in messages]
+            cells += [(parameter.name, field, messages[field]) for field in fields]
+        return cells
+
+    def _refresh_parameter_error(self) -> None:
+        # Every message names its field (and a dataset start its dataset once).
+        messages = tuple(dict.fromkeys(
+            f"{name}: {message}" for name, _field, message in self._invalid_cells()
+        ))
+        self._parameter_error.setText(
+            "\n".join(messages)
+            + "\nSelect a cell of that parameter and press Esc to discard its invalid edits."
+            if messages else ""
+        )
+        self._parameter_error.setVisible(bool(messages))
+        self._discard_parameter_shortcut.setEnabled(bool(messages))
+
+    def _revert_selected_parameter_draft(self) -> None:
+        parameter = self._selected_parameter()
+        if parameter is None:
+            return
+        if not self._retire_numeric_drafts({parameter.name}):
+            return
+        self._rerender_roster()
+        self.statusMessage.emit(
+            f"Invalid values for {parameter.display_name} reverted."
+        )
+
+    def _parameter_projection_for_change(
+        self, parameter: FitParameterVariable, raw: Mapping[str, str],
+    ) -> tuple[FitParameterVariable | None, dict[str, str]]:
+        """Build one complete parameter from the row texts, or mark the changed cells.
+
+        A row that is not admissible marks every cell the user changed with
+        the row's admission message; unchanged cells are never marked.
+        """
+
+        config = parameter.selected_config
+        parsed: dict[str, float] = {}
+        messages: dict[str, str] = {}
+        for field, text in raw.items():
+            if field == "log10":
+                continue
+            try:
+                parsed[field] = self._parse_number(text, self._parse_label(field))
+            except ValueError as exc:
+                messages[field] = str(exc)
+        if messages:
+            return None, messages
+        log10 = raw["log10"] == "1"
+        dataset_values = dict(config.dataset_values)
+        dataset_values.update(
+            (field.removeprefix("dataset:"), value)
+            for field, value in parsed.items() if field.startswith("dataset:")
+        )
+        # Admitting an origin edit copies its value to every group member.
+        for group in config.groups:
+            for member in group[1:]:
+                dataset_values[member] = dataset_values[group[0]]
+        try:
+            active = replace(
+                config,
+                value=parsed.get("starting", config.value),
+                minimum=parsed["minimum"],
+                maximum=parsed["maximum"],
+                log10=log10,
+                dataset_values=config.dataset_values if parameter.scope == "shared" else tuple(dataset_values.items()),
+            )
+            return replace(
+                parameter,
+                **{"shared_config" if parameter.scope == "shared" else "per_dataset_config": active},
+            ), {}
+        except ValueError as exc:
+            text = fit_identity_text(str(exc), self._origin).removeprefix(f"{parameter.name} ")
+            message = text[:1].upper() + text[1:]
+        accepted = {
+            "starting": config.value, "minimum": config.minimum, "maximum": config.maximum,
+            **{f"dataset:{key}": value for key, value in config.dataset_values},
         }
+        changed = [field for field, value in parsed.items() if value != accepted[field]]
+        if log10 != config.log10:
+            changed.append("log10")
+        return None, dict.fromkeys(changed, message)
 
-    def get_fixed_shared_params(self) -> Dict[str, float]:
-        return dict(self._fixed_shared_params)
+    def _emit_parameter_replacement(self, replacement: FitParameterVariable) -> None:
+        """Emit the setup with one parameter replaced.
 
-    def set_fixed_shared_params(self, value: Dict[str, float]) -> None:
-        self._fixed_shared_params = dict(value)
+        Profile keeps the untick of every fitted value that still exists; a
+        group whose origin left keeps it under its new origin.  A value that
+        becomes fitted is ticked.
+        """
 
-    def get_last_fit_params(self) -> Dict[str, float]:
-        return dict(self._last_fit_params)
+        setup = self._projected_setup
+        previous = self._parameter_by_name(replacement.name)
+        parameters = tuple(
+            replacement if item.name == replacement.name else item for item in setup.parameters
+        )
+        available = set(fit_uncertainty_coordinates(parameters, setup.datasets))
+        renamed = {
+            FitCoordinate("group", replacement.name, group[0]):
+                FitCoordinate("group", replacement.name, remaining[0])
+            for group in previous.selected_config.groups
+            for remaining in replacement.selected_config.groups
+            if remaining[0] != group[0] and set(remaining) <= set(group)
+        }
+        unticked = frozenset(renamed.get(item, item) for item in setup.profile.unticked) & available
+        self.setupSnapshotRequested.emit(
+            replace(setup, parameters=parameters, profile=replace(setup.profile, unticked=unticked))
+        )
+        self._rerender_roster()
 
-    def set_last_fit_params(self, value: Dict[str, float]) -> None:
-        self._last_fit_params = dict(value)
+    def _emit_vary_edit(self, name: str, desired_fit: bool) -> None:
+        """Apply the parameter row's Vary: every dataset varied, or every one fixed."""
 
-    def get_staged_dataset_params(self) -> Dict[str, Dict[str, float]]:
-        return {k: dict(v) for k, v in self._staged_dataset_params.items()}
+        if self._running:
+            return
+        parameter = self._parameter_by_name(name)
+        config = parameter.selected_config
+        if desired_fit == config.fit and not config.fixed_dataset_ids:
+            self._rerender_roster()
+            return
+        if desired_fit:
+            replacement = _replace_fit_parameter(parameter, fit=True, fixed_dataset_ids=())
+            self._emit_parameter_replacement(replacement)
+            return
+        # Vary off fixes every dataset and dissolves the parameter's groups.
+        replacement = _replace_fit_parameter(parameter, fit=False, groups=(), fixed_dataset_ids=())
+        self._emit_parameter_replacement(replacement)
 
-    def set_staged_dataset_params(self, value: Dict[str, Dict[str, float]]) -> None:
-        self._staged_dataset_params = {k: dict(v) for k, v in value.items()}
+    def _on_dataset_vary_changed(self, name: str, dataset_id: str, checked: bool) -> None:
+        """Vary or fix one dataset's value; a dataset that is fixed leaves its group."""
 
-    def get_mechanism_species(self) -> List[str]:
-        return list(self._mechanism_species)
+        if self._running:
+            return
+        parameter = self._parameter_by_name(name)
+        config = parameter.per_dataset_config
+        all_ids = {item for item, _value in config.dataset_values}
+        fixed = set(config.fixed_dataset_ids) if config.fit else set(all_ids)
+        if checked == (dataset_id not in fixed):
+            self._rerender_roster()
+            return
+        if checked:
+            replacement = _replace_fit_parameter(
+                parameter, fit=True, fixed_dataset_ids=tuple(fixed - {dataset_id}),
+            )
+            self._emit_parameter_replacement(replacement)
+            return
+        fixed.add(dataset_id)
+        groups = self._groups_without(parameter, dataset_id)
+        replacement = (
+            _replace_fit_parameter(parameter, fit=False, groups=(), fixed_dataset_ids=())
+            if fixed == all_ids
+            else _replace_fit_parameter(parameter, groups=groups, fixed_dataset_ids=tuple(fixed))
+        )
+        self._emit_parameter_replacement(replacement)
 
-    def set_mechanism_species(self, value: List[str]) -> None:
-        self._mechanism_species = list(value)
+    def _emit_parameter_row_edit(self, name: str) -> None:
+        if self._running:
+            return
+        parameter = self._parameter_by_name(name)
+        raw = self._row_raw_fields(parameter)
+        edited, messages = self._parameter_projection_for_change(parameter, raw)
+        if edited is None:
+            self._store_invalid_numeric_draft(parameter.name, raw, messages)
+            self._rerender_roster()
+            return
+        updated = replace(
+            self._projected_setup,
+            parameters=tuple(
+                edited if item.name == edited.name else item
+                for item in self._projected_setup.parameters
+            ),
+        )
+        self._retire_numeric_drafts({parameter.name})
+        if updated == self._projected_setup:
+            self._rerender_roster()
+            return
+        self.setupSnapshotRequested.emit(updated)
 
-    def get_prepared_param_names(self) -> List[str]:
-        return list(self._prepared_param_names)
-
-    def set_prepared_param_names(self, value: List[str]) -> None:
-        self._prepared_param_names = list(value)
-
-    def get_shared_param_definitions(self) -> Dict[str, Dict[str, Any]]:
-        return {k: dict(v) for k, v in self._shared_param_definitions.items()}
-
-    def set_shared_param_definitions(self, value: Dict[str, Dict[str, Any]]) -> None:
-        self._shared_param_definitions = {k: dict(v) for k, v in value.items()}
-
-    # ------------------------------------------------------------------
-    # Public API — state mutation from fit results
-    # ------------------------------------------------------------------
-
-    def push_fit_results(
-        self,
-        shared_params: Dict[str, float],
-        dataset_params: Optional[Dict[str, Dict[str, float]]],
-    ) -> None:
-        self._last_fit_params = dict(shared_params)
-        self._staged_dataset_params = {k: dict(v) for k, v in (dataset_params or {}).items()}
-        for entry in self._parameter_state:
-            if entry.get("scope") == "shared":
-                name = entry["param_name"]
-                if name in shared_params:
-                    entry["value"] = float(shared_params[name])
-                    entry["last_fit"] = float(shared_params[name])
-            elif entry.get("scope") == "dataset":
-                ds_id = str(entry.get("dataset_id") or "")
-                param_name = str(entry.get("param_name") or "")
-                if ds_id and param_name:
-                    ds_map = (dataset_params or {}).get(ds_id) or {}
-                    if isinstance(ds_map, dict) and param_name in ds_map:
-                        entry["value"] = float(ds_map[param_name])
-                        entry["last_fit"] = float(ds_map[param_name])
-        self._populate_parameter_table()
-
-    def push_best_update(
-        self,
-        shared_params: Dict[str, float],
-        dataset_params: Optional[Dict[str, Dict[str, float]]],
-    ) -> None:
-        self._last_fit_params = dict(shared_params)
-        if isinstance(dataset_params, dict):
-            self._staged_dataset_params = {
-                str(ds_id): dict(param_map) for ds_id, param_map in dataset_params.items() if isinstance(param_map, dict)
+    def _open_bounds_dialog(self) -> None:
+        if self._projecting or self._running or self._projected_setup is None:
+            return
+        setup = self._projected_setup
+        dialog = _ParameterBoundsDialog(setup.parameters, parent=self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        names, minimum, maximum, log10 = dialog.selection()
+        edited: dict[str, FitParameterVariable] = {}
+        for parameter in setup.parameters:
+            if parameter.name not in names:
+                continue
+            raw = {
+                **self._row_raw_fields(parameter),
+                "minimum": minimum,
+                "maximum": maximum,
+                "log10": "1" if log10 else "",
             }
-        for entry in self._parameter_state:
-            if entry.get("scope") == "shared":
-                name = str(entry.get("param_name") or "")
-                if name in shared_params:
-                    entry["value"] = float(shared_params[name])
-                    entry["last_fit"] = float(shared_params[name])
-            elif entry.get("scope") == "dataset":
-                ds_id = str(entry.get("dataset_id") or "")
-                param_name = str(entry.get("param_name") or "")
-                if ds_id and param_name and isinstance(dataset_params, dict):
-                    ds_map = dataset_params.get(ds_id) or {}
-                    if isinstance(ds_map, dict) and param_name in ds_map:
-                        entry["value"] = float(ds_map[param_name])
-                        entry["last_fit"] = float(ds_map[param_name])
-        self._refresh_live_fit_value_cells()
+            replacement, messages = self._parameter_projection_for_change(parameter, raw)
+            if replacement is None:
+                self._store_invalid_numeric_draft(parameter.name, raw, messages)
+            else:
+                edited[parameter.name] = replacement
+                self._retire_numeric_drafts({parameter.name})
+        updated = replace(
+            setup,
+            parameters=tuple(edited.get(item.name, item) for item in setup.parameters),
+        )
+        if updated == setup:
+            self._rerender_roster()
+            return
+        self.setupSnapshotRequested.emit(updated)
 
-    # ------------------------------------------------------------------
-    # Public API — running state
-    # ------------------------------------------------------------------
+    def _on_scope_changed(self, name: str, combo: QtWidgets.QComboBox) -> None:
+        if self._projecting or self._running or self._projected_setup is None:
+            return
+        parameter = self._parameter_by_name(name)
+        if parameter is None:
+            return
+        desired = str(combo.currentData() or "")
+        if desired == parameter.scope:
+            return
+        replacement = convert_fit_parameter_scope(
+            parameter, desired, self._projected_setup.datasets, self._origin,
+        )
+        # Restore the projection first; the owner's accepted snapshot reprojects.
+        with QtCore.QSignalBlocker(combo):
+            combo.setCurrentIndex(combo.findData(parameter.scope))
+        self._emit_parameter_replacement(replacement)
+
+    def _groups_without(
+        self, parameter: FitParameterVariable, dataset_id: str,
+    ) -> tuple[tuple[str, ...], ...]:
+        """The parameter's groups after one dataset leaves.
+
+        A group left with one member dissolves; when its origin leaves, the
+        first remaining member in table order becomes the origin.
+        """
+
+        order = tuple(item.dataset_id for item in self._projected_setup.datasets)
+        groups = []
+        for group in parameter.per_dataset_config.groups:
+            remaining = sorted((item for item in group if item != dataset_id), key=order.index)
+            if len(remaining) < 2:
+                continue
+            origin = group[0] if group[0] in remaining else remaining[0]
+            groups.append((origin, *(item for item in remaining if item != origin)))
+        return tuple(groups)
+
+    def _on_group_box_changed(self, name: str, dataset_id: str, checked: bool) -> None:
+        """Unchecking leaves the dataset's group; checking opens the membership dialog."""
+
+        if self._running:
+            return
+        parameter = self._parameter_by_name(name)
+        config = parameter.per_dataset_config
+        if not checked:
+            self._emit_group_change(parameter, self._groups_without(parameter, dataset_id))
+            return
+        choice = self._group_membership_dialog(parameter, dataset_id)
+        if choice is None:
+            self._rerender_roster()
+            return
+        joined, added = choice
+        if joined is None:
+            if not added:
+                self.statusMessage.emit("A group needs at least one other dataset.")
+                self._rerender_roster()
+                return
+            self._emit_group_change(parameter, (*config.groups, (dataset_id, *added)))
+            return
+        self._emit_group_change(parameter, tuple(
+            (*group, dataset_id, *added) if group[0] == joined else group for group in config.groups
+        ))
+
+    def _group_membership_dialog(
+        self, parameter: FitParameterVariable, dataset_id: str,
+    ) -> tuple[str | None, tuple[str, ...]] | None:
+        """Ask which group the dataset joins, or which datasets form a new group with it.
+
+        Returns the joined group's origin (None for a new group) and the other
+        datasets added, or None on Cancel.  The dialog only adds: existing
+        members stay, and datasets in other groups or fixed are greyed.
+        """
+
+        config = parameter.per_dataset_config
+        labels = fit_group_labels(parameter, self._projected_setup.datasets, self._origin)
+        groups = sorted(config.groups, key=lambda group: labels[group[0]][0])
+        included = {item.dataset_id for item in self._projected_setup.datasets if item.included}
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"Datasets Sharing {parameter.display_name}")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.addWidget(QtWidgets.QLabel(f"Datasets sharing {parameter.display_name}:", dialog))
+        target = QtWidgets.QComboBox(dialog)
+        target.addItem("New Group", None)
+        for group in groups:
+            target.addItem(labels[group[0]][1], group[0])
+        layout.addWidget(target)
+        checks: dict[str, QtWidgets.QCheckBox] = {}
+        for dataset in self._projected_setup.datasets:
+            name = self._dataset_display_name(dataset.dataset_id)
+            check = QtWidgets.QCheckBox(
+                name if dataset.dataset_id in included else f"{name} (not in fit)", dialog,
+            )
+            layout.addWidget(check)
+            checks[dataset.dataset_id] = check
+
+        def project() -> None:
+            """Tick and lock the clicked dataset and the chosen group's members."""
+
+            joined = target.currentData()
+            members = next((group for group in groups if group[0] == joined), ())
+            occupied = {member for group in groups for member in group}
+            for item, check in checks.items():
+                locked = item == dataset_id or item in members
+                free = not locked and item not in occupied and item in config.varied_dataset_ids
+                check.setChecked(locked or (free and check.isChecked()))
+                check.setEnabled(free)
+
+        target.currentIndexChanged.connect(project)
+        project()
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return None
+        return target.currentData(), tuple(
+            item for item, check in checks.items() if check.isChecked() and check.isEnabled()
+        )
+
+    def _emit_group_change(
+        self, parameter: FitParameterVariable, groups: tuple[tuple[str, ...], ...],
+    ) -> None:
+        """Emit the setup with new groups; every member stores its origin's value."""
+
+        values = dict(parameter.per_dataset_config.dataset_values)
+        for group in groups:
+            for member in group[1:]:
+                values[member] = values[group[0]]
+        self._emit_parameter_replacement(
+            _replace_fit_parameter(parameter, dataset_values=tuple(values.items()), groups=groups),
+        )
+
+    @property
+    def invalid_edit_locations(self) -> tuple[str, ...]:
+        """Name each invalid cell by parameter, dataset and column, in table order."""
+
+        located = [
+            f"{self._dataset_display_name(field.removeprefix('dataset:'))}: {name} {_field_label(field)}"
+            if field.startswith("dataset:")
+            else f"{name} {_field_label(field)}"
+            for name, field, _message in self._invalid_cells()
+        ]
+        if self._defaults_error_text:
+            # Only the tolerance pair rule fails without one box failing alone.
+            located += [
+                f"Fit Settings: {label}" for label in self._invalid_tolerance_labels()
+            ] or ["Fit Settings: tolerances"]
+        return tuple(located)
+
+    def _store_invalid_numeric_draft(
+        self,
+        name: str,
+        raw_fields: Mapping[str, str],
+        messages: Mapping[str, str],
+    ) -> None:
+        draft = _InvalidRow(tuple(raw_fields.items()), tuple(messages.items()))
+        if self._invalid_rows.get(name) != draft:
+            self._invalid_rows[name] = draft
+            self._refresh_parameter_error()
+            self.validityChanged.emit()
+
+    def _retire_numeric_drafts(
+        self,
+        parameter_names: set[str] | None = None,
+    ) -> bool:
+        keys = tuple(
+            name for name in self._invalid_rows
+            if parameter_names is None or name in parameter_names
+        )
+        for key in keys:
+            self._invalid_rows.pop(key)
+        if keys:
+            self._refresh_parameter_error()
+            self.validityChanged.emit()
+        return bool(keys)
+
+    @staticmethod
+    def _parse_number(raw_text: str, field: str) -> float:
+        return parse_finite_numeric_text(raw_text, field=field)
+
+    def _project_defaults(self, defaults: FitDefaults) -> None:
+        blocker = [
+            QtCore.QSignalBlocker(control)
+            for control in (
+                self._method_combo,
+                self._max_eval_spin,
+                self._seed_check,
+                self._seed_spin,
+                self._ftol_edit,
+                self._xtol_edit,
+            )
+        ]
+        self._method_combo.setCurrentIndex(self._method_combo.findData(defaults.method))
+        self._max_eval_spin.setValue(defaults.max_nfev)
+        self._seed_check.setChecked(defaults.use_seed)
+        self._seed_spin.setValue(defaults.seed)
+        self._seed_spin.setEnabled(defaults.use_seed)
+        self._ftol_edit.setText(self._tolerance_drafts.get("ftol", _format_scientific(defaults.ftol)))
+        self._xtol_edit.setText(self._tolerance_drafts.get("xtol", _format_scientific(defaults.xtol)))
+        # Only Differential Evolution draws random numbers.
+        self._seed_group.setVisible(defaults.method == DIFFERENTIAL_EVOLUTION_METHOD)
+        del blocker
+
+    def _defaults_projection(self) -> FitDefaults:
+        defaults = self._projected_setup.defaults
+        method = self._method_combo.currentData()
+        ftol = self._tolerance_value(self._ftol_edit, self._ftol_label)
+        xtol = self._tolerance_value(self._xtol_edit, self._xtol_label)
+        return validate_fit_defaults(
+            replace(
+                defaults,
+                method=method,
+                max_nfev=self._max_eval_spin.value(),
+                ftol=ftol,
+                xtol=xtol,
+                use_seed=self._seed_check.isChecked(),
+                seed=self._seed_spin.value(),
+            )
+        )
+
+    def _tolerance_value(self, edit: QtWidgets.QLineEdit, label: QtWidgets.QLabel) -> float:
+        """Parse one tolerance box, naming it by its visible label."""
+
+        return admit_fit_tolerance(edit.text(), label.text().removesuffix(":"))
+
+    def _invalid_tolerance_labels(self) -> list[str]:
+        labels = []
+        for edit, label in ((self._ftol_edit, self._ftol_label), (self._xtol_edit, self._xtol_label)):
+            try:
+                self._tolerance_value(edit, label)
+            except ValueError:
+                labels.append(label.text().removesuffix(":"))
+        return labels
+
+    def _emit_defaults_edit(self, *_args: object) -> None:
+        if self._projecting or self._running or self._projected_setup is None:
+            return
+        try:
+            snapshot = replace(
+                self._projected_setup,
+                defaults=self._defaults_projection(),
+            )
+        except ValueError as exc:
+            self._set_defaults_error(str(exc))
+            self._project_defaults(self._projected_setup.defaults)
+            return
+        self._tolerance_drafts.clear()
+        self._set_defaults_error("")
+        self.setupSnapshotRequested.emit(snapshot)
+        self._project_defaults(self._projected_setup.defaults)
+
+    def _on_tolerance_text_changed(self, _text: str) -> None:
+        if self._projecting or self._projected_setup is None:
+            return
+        self._tolerance_drafts = {
+            "ftol": self._ftol_edit.text(), "xtol": self._xtol_edit.text(),
+        }
+        try:
+            self._defaults_projection()
+        except ValueError as exc:
+            self._set_defaults_error(str(exc))
+        else:
+            self._set_defaults_error("")
+
+    def _set_defaults_error(self, message: str) -> None:
+        # Readiness names each failing box, so every tolerance change refreshes it.
+        self._defaults_error_text = message
+        self._defaults_error.setText(
+            message + "\nPress Esc in a tolerance box to restore the accepted tolerances." if message else ""
+        )
+        self._defaults_error.setVisible(bool(message))
+        self._discard_tolerances_shortcut.setEnabled(bool(self._tolerance_drafts))
+        self.validityChanged.emit()
+
+    def _discard_tolerance_drafts(self) -> None:
+        self._tolerance_drafts.clear()
+        self._set_defaults_error("")
+        if self._projected_setup is not None:
+            self._project_defaults(self._projected_setup.defaults)
+
+    def _emit_solver_edit(self, *_args: object) -> None:
+        if self._projecting or self._running or self._projected_setup is None:
+            return
+        self.setupSnapshotRequested.emit(
+            replace(self._projected_setup, solver=self._solver_combo.currentData())
+        )
+
+    def _project_advanced_analysis(self, snapshot: FitSetupSnapshot) -> None:
+        with QtCore.QSignalBlocker(self._profile_check):
+            self._profile_check.setChecked(snapshot.profile.enabled)
+
+    def _emit_profile(self, **changes: object) -> None:
+        setup = self._projected_setup
+        self.setupSnapshotRequested.emit(replace(setup, profile=replace(setup.profile, **changes)))
+
+    def _on_profile_toggled(self, enabled: bool) -> None:
+        if self._projecting or self._running or self._projected_setup is None:
+            return
+        self._emit_profile(enabled=enabled)
+
+    def _open_profile_dialog(self) -> None:
+        if self._projecting or self._running or self._projected_setup is None:
+            return
+        dialog = _ProfileLikelihoodDialog(options=self._projected_setup.profile.options, parent=self)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self._emit_profile(options=dialog.options())
+
+    def _on_profile_tick(self, name: str, dataset_id: str | None, checked: bool) -> None:
+        """Tick or untick a row's fitted values; a parameter row covers all of them."""
+
+        if self._running:
+            return
+        setup = self._projected_setup
+        targets = {
+            item for item in fit_uncertainty_coordinates(setup.parameters, setup.datasets)
+            if item.name == name and (dataset_id is None or item.dataset_id == dataset_id)
+        }
+        unticked = setup.profile.unticked - targets if checked else setup.profile.unticked | targets
+        if unticked == setup.profile.unticked:
+            self._rerender_roster()
+            return
+        self._emit_profile(unticked=unticked)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt override
+        if watched is getattr(self, "_param_table", None) and event.type() == QtCore.QEvent.KeyPress:
+            if event.matches(QtGui.QKeySequence.Copy):
+                # Contiguous selection: one rectangle, disabled cells included.
+                ranges = watched.selectedRanges()
+                if ranges:
+                    area = ranges[0]
+                    payload = "\n".join(
+                        "\t".join(
+                            self._copy_text(row, column)
+                            for column in range(area.leftColumn(), area.rightColumn() + 1)
+                        ) for row in range(area.topRow(), area.bottomRow() + 1)
+                    )
+                    mime = QtCore.QMimeData()
+                    mime.setText(payload)
+                    QtWidgets.QApplication.clipboard().setMimeData(mime)
+                return True
+        if watched in (getattr(self, "_settings_group", None), getattr(self, "_roster_actions_host", None)):
+            if event.type() in {
+                QtCore.QEvent.Resize, QtCore.QEvent.LayoutRequest, QtCore.QEvent.Show,
+                QtCore.QEvent.FontChange, QtCore.QEvent.StyleChange,
+            } and watched.layout() is not None:
+                required = watched.layout().totalHeightForWidth(watched.width())
+                watched.setFixedHeight(max(watched.minimumSizeHint().height(), required))
+        if watched is getattr(self, "_param_table", None) and event.type() in {
+            QtCore.QEvent.Show, QtCore.QEvent.FontChange, QtCore.QEvent.StyleChange,
+        }:
+            self._resize_to_contents()
+        return super().eventFilter(watched, event)
+
+    def _copy_text(self, row: int, column: int) -> str:
+        """Plain copy text: every cell as displayed."""
+
+        combo = self._param_table.cellWidget(row, column)
+        if combo is not None:
+            return combo.currentText()
+        item = self._param_table.item(row, column)
+        if item is None:
+            return ""
+        if column in (_C.VARY, _C.LOG, _C.PROFILE) and item.data(QtCore.Qt.ItemDataRole.CheckStateRole) is not None:
+            return {
+                QtCore.Qt.CheckState.Checked: "Yes",
+                QtCore.Qt.CheckState.PartiallyChecked: "Some datasets",
+            }.get(item.checkState(), "No")
+        # Copy carries the delegate's display text (numbers at six digits).
+        return cell_text_as_shown(self._param_table, self._param_table.indexFromItem(item)).strip()
 
     def set_running_state(self, running: bool) -> None:
-        if hasattr(self, "_add_param_button"):
-            self._add_param_button.setEnabled(not running)
-        if hasattr(self, "_remove_param_button"):
-            self._remove_param_button.setEnabled(
-                (not running) and bool({item.row() for item in self._param_table.selectedItems()})
-            )
-        if self._ic_panel is not None:
-            self._ic_panel.set_running_state(running)
+        self._running = bool(running)
 
-    # ------------------------------------------------------------------
-    # Public API — dataset lifecycle
-    # ------------------------------------------------------------------
-
-    def refresh_ic_dataset_combo(self, dataset_entries: List[Dict[str, Any]]) -> None:
-        self._dataset_entries = list(dataset_entries)
-        if self._ic_panel is not None:
-            self._ic_panel.refresh_dataset_combo(dataset_entries)
-
-    def remove_dataset_parameter_rows(self, dataset_ids: Sequence[str]) -> None:
-        remove_set = {str(x) for x in dataset_ids}
-        for ds_id in remove_set:
-            self._global_dataset_params.pop(ds_id, None)
-            self._global_dataset_variable_params.pop(ds_id, None)
-            self._staged_dataset_params.pop(ds_id, None)
-        kept: List[Dict[str, Any]] = []
-        for row in self._parameter_state:
-            if str(row.get("scope") or "") == "dataset" and str(row.get("dataset_id") or "") in remove_set:
-                continue
-            kept.append(row)
-        self._parameter_state = kept
-        if remove_set:
-            self._populate_parameter_table()
-
-    def seed_dataset_initial_params(self, dataset_id: str) -> None:
-        self._seed_dataset_initial_params_from_fit_settings(dataset_id)
-
-    def repaint_parameter_table(self) -> None:
-        self._populate_parameter_table()
-
-    def add_missing_scalars_as_parameters(
-        self,
-        missing_scalars: Sequence[str],
-        dataset_ids: Sequence[str],
-        scalar_scope: str,
-    ) -> None:
-        self._auto_add_missing_scalars_as_parameters(
-            missing_scalars=missing_scalars,
-            dataset_ids=dataset_ids,
-            scalar_scope=scalar_scope,
-        )
-        self._populate_parameter_table()
-
-    def mirror_staged_ic_values(self) -> int:
-        total_updates = 0
-        for dataset_id, param_map in self._staged_dataset_params.items():
-            if not isinstance(param_map, dict):
-                continue
-            for key, value in param_map.items():
-                key_str = str(key)
-                if not key_str.startswith(INITIAL_PREFIX):
-                    continue
-                self._global_dataset_params.setdefault(dataset_id, {})[key_str] = float(value)
-                if dataset_id in self._global_dataset_variable_params:
-                    spec = self._global_dataset_variable_params[dataset_id].get(key_str)
-                    if isinstance(spec, dict):
-                        spec["initial"] = float(value)
-                total_updates += 1
-        return total_updates
-
-    def collect_integration_settings(self) -> Optional[Tuple[str, float, float]]:
-        return self._collect_integration_settings_for_run()
+    def clear_pending_setup_edits(self) -> None:
+        self._retire_numeric_drafts()
+        self._discard_tolerance_drafts()
+        if self._projected_setup is not None:
+            self.project_setup_snapshot(self._projected_setup)

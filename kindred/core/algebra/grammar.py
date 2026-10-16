@@ -5,7 +5,7 @@ Reference data for the Algebra DSL grammar, helpers, and protected symbols.
 ---------------------------------------------------------------------------
 EBNF (power is right-associative):
 
-    algebra_block  := "# Algebra" newline { let_stmt }
+    algebra_block  := { let_stmt }
     let_stmt       := "let" IDENT "=" expr newline
     expr           := logic_or
     logic_or       := logic_and { "||" logic_and }
@@ -13,13 +13,13 @@ EBNF (power is right-associative):
     equality       := comparison { ("==" | "!=") comparison }
     comparison     := term { ("<"|"<="|">"|">=") term }
     term           := factor { ("+"|"-") factor }
-    factor         := power { ("*"|"/") power }
-    power          := unary { ("**"|"^") unary }      # right associative
-    unary          := ("+"|"-"|"!") unary | primary
+    factor         := unary { ("*"|"/") unary }
+    power          := primary [ ("**"|"^") unary ]    # right associative
+    unary          := ("+"|"-"|"!") unary | power
     primary        := NUMBER | IDENT | func_call | species_ref | "(" expr ")"
     func_call      := IDENT "(" [ arg_list ] ")"
     arg_list       := expr { "," expr }
-    species_ref    := "[" IDENT "]" | "[" IDENT "]_0" | "[" IDENT "]" "(" "T0" ")"
+    species_ref    := "[" IDENT "]" | "[" IDENT "]_0"
 
 Built-in functions:
     sqrt, ln, log10, log1p, exp, expm1, sin, cos, tan, abs, min, max, pow, erf
@@ -27,34 +27,13 @@ Helpers:
     heaviside(x), clip(x, lo, hi), ifelse(cond, a, b)
 
 Protected symbols (read-only; listed here for reference only):
-    k_B, h, ħ, N_A, R, Rkcal, T
+    k_B, h, h_bar, N_A, R, T
 """
 
 from __future__ import annotations
 
 from enum import Enum
 from typing import Dict, List, Tuple
-
-
-# ----------------------------- EBNF (reference) ------------------------------
-
-EBNF: str = (
-    "algebra_block  := \"# Algebra\" newline { let_stmt }\n"
-    "let_stmt       := \"let\" IDENT \"=\" expr newline\n"
-    "expr           := logic_or\n"
-    "logic_or       := logic_and { \"||\" logic_and }\n"
-    "logic_and      := equality { \"&&\" equality }\n"
-    "equality       := comparison { (\"==\" | \"!=\") comparison }\n"
-    "comparison     := term { (\"<\"|\"<=\"|\">\"|\">=\") term }\n"
-    "term           := factor { (\"+\"|\"-\") factor }\n"
-    "factor         := power { (\"*\"|\"/\") power }\n"
-    "power          := unary { (\"**\"|\"^\") unary }  # right associative\n"
-    "unary          := (\"+\"|\"-\"|\"!\") unary | primary\n"
-    "primary        := NUMBER | IDENT | func_call | species_ref | \"(\" expr \")\"\n"
-    "func_call      := IDENT \"(\" [ arg_list ] \")\"\n"
-    "arg_list       := expr { \",\" expr }\n"
-    "species_ref    := \"[\" IDENT \"]\" | \"[\" IDENT \"]_0\" | \"[\" IDENT \"]\" \"(\" \"T0\" \")\"\n"
-)
 
 
 # ----------------------------- token kinds -----------------------------------
@@ -70,7 +49,6 @@ class TokenKind(str, Enum):
 
     # Keywords
     LET = "LET"
-    T0 = "T0"
 
     # Punctuation
     LPAREN = "LPAREN"        # (
@@ -97,12 +75,8 @@ class TokenKind(str, Enum):
     GT = "GT"                # >
     GTE = "GTE"              # >=
 
-    # Header marker
-    HASH = "HASH"            # #   (used to match "# Algebra")
-
-
 # ----------------------------- lexical spec (data only) ----------------------
-# Intended for a future lexer. Order matters for maximal munch on multi-char ops.
+# Used by the parser's lexer. Order matters for maximal munch on multi-char ops.
 
 # Regex fragments are Python-style, but this module performs no lexing itself.
 # Whitespace (spaces/tabs) should be skipped by the lexer; NEWLINEs are tokens.
@@ -118,6 +92,8 @@ TOKEN_SPEC: List[Tuple[TokenKind, str]] = [
     (TokenKind.NEQ, r"!="),
     (TokenKind.LTE, r"<="),
     (TokenKind.GTE, r">="),
+    (TokenKind.LT, r"<"),
+    (TokenKind.GT, r">"),
     # Single-char operators and punctuation
     (TokenKind.PLUS, r"\+"),
     (TokenKind.MINUS, r"-"),
@@ -131,7 +107,6 @@ TOKEN_SPEC: List[Tuple[TokenKind, str]] = [
     (TokenKind.RBRACK, r"\]"),
     (TokenKind.COMMA, r","),
     (TokenKind.EQUALS, r"="),
-    (TokenKind.HASH, r"#"),
     # Literals
     # NUMBER: decimal or integer with optional exponent (e or E), no leading +
     (TokenKind.NUMBER, r"(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][+\-]?\d+)?"),
@@ -142,18 +117,7 @@ TOKEN_SPEC: List[Tuple[TokenKind, str]] = [
 # Keywords that the lexer should fold to specific TokenKind when IDENT matches.
 KEYWORDS: Dict[str, TokenKind] = {
     "let": TokenKind.LET,
-    "T0": TokenKind.T0,
-    # "Algebra" stays IDENT; the header is recognized as "#"+"Algebra" at the parser level.
 }
-
-# Built-in function names (reference for parser validation; not enforced here).
-BUILTIN_FUNCTIONS: List[str] = [
-    "sqrt", "ln", "log10", "log1p", "exp", "expm1",
-    "sin", "cos", "tan", "abs", "min", "max", "pow", "erf",
-]
-
-HELPER_FUNCTIONS: List[str] = ["heaviside", "clip", "ifelse"]
-
 
 # ----------------------------- precedence ------------------------------------
 
@@ -171,9 +135,9 @@ PRECEDENCE: Dict[str, int] = {
     "-": 5,
     "*": 6,
     "/": 6,
-    "**": 7,   # power
-    "^": 7,    # power alias
-    "unary": 8,  # synthetic precedence for unary +, -, !
+    "unary": 7,  # synthetic precedence for unary +, -, !
+    "**": 8,   # power
+    "^": 8,    # power alias
 }
 
 ASSOCIATIVITY: Dict[str, str] = {
@@ -196,12 +160,9 @@ ASSOCIATIVITY: Dict[str, str] = {
 
 
 __all__ = [
-    "EBNF",
     "TokenKind",
     "TOKEN_SPEC",
     "KEYWORDS",
-    "BUILTIN_FUNCTIONS",
-    "HELPER_FUNCTIONS",
     "PRECEDENCE",
     "ASSOCIATIVITY",
 ]

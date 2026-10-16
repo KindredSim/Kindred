@@ -2,106 +2,169 @@
 Temperature schedule DSL parsing for Kindred.
 
 Supports parsing temperature schedule definitions from DSL text:
-- temp_const: T = 298.15 K  (constant temperature)
-- temp_step: t=[0,50,100], T=[298,320,310]  (piecewise steps)
+- temp_step: t=[0,50,100], T=[298,320]  (piecewise steps)
 - temp_response: t=[0,50,100], T=[298,320], tau=10  (first-order response)
 
 Integrates with TemperatureSchedule class from kindred.core.temperature.
 
 Example DSL:
-    # Constant temperature (default)
-    temp_const: T=298.15
-
     # Piecewise temperature schedule
-    temp_step: t=[0,50,100,150], T=[298,320,320,310]
-    # Creates intervals: [0,50)→298K, [50,100)→320K, [100,150]→310K
+    temp_step: t=[0,50,100,150], T=[298,320,310]
+    # Creates intervals: [0,50)→298K, [50,100)→320K, [100,150)→310K;
+    # the final 310K temperature continues after t=150.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from typing import List, Optional
+from typing import List
 
+from .authored_source_errors import AuthoredSourceError
 from .temperature import TemperatureSchedule, TemperatureScheduleError
+from .validation import parse_finite_numeric_text
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["parse_temperature_schedule", "TemperatureDSLError"]
 
 
-class TemperatureDSLError(ValueError):
-    """
-    Enhanced error for temperature schedule DSL parsing.
-
-    Provides helpful context and examples for common mistakes.
-    """
-    def __init__(self, message: str, *, suggestion: str = None, examples: list = None):
-        self.suggestion = suggestion
-        self.examples = examples or []
-
-        # Build comprehensive error message
-        parts = [message]
-        if suggestion:
-            parts.append(f"\nSuggestion: {suggestion}")
-        if examples:
-            parts.append("\nValid examples:")
-            for ex in examples:
-                parts.append(f"  • {ex}")
-
-        super().__init__("\n".join(parts))
+class TemperatureDSLError(AuthoredSourceError):
+    """Temperature schedule DSL parsing error."""
 
 
-def _parse_number_list(text: str) -> List[float]:
-    """
-    Parse comma-separated list of numbers from string like '[1,2,3]' or '1,2,3'.
-
-    Parameters
-    ----------
-    text : str
-        Text containing numbers
-
-    Returns
-    -------
-    list of float
-        Parsed numbers
-
-    Raises
-    ------
-    TemperatureDSLError
-        If parsing fails
-    """
-    # Remove brackets if present
-    text = text.strip()
-    if text.startswith('[') and text.endswith(']'):
-        text = text[1:-1]
-
-    # Split by comma and parse
-    parts = [p.strip() for p in text.split(',')]
+def _parse_finite_number(text: str, *, field: str) -> float:
+    token = text.strip()
+    if not token:
+        raise TemperatureDSLError(f"{field} must not be empty.")
     try:
-        return [float(p) for p in parts if p]
-    except ValueError as e:
-        raise TemperatureDSLError(f"Failed to parse number list '{text}': {e}")
+        return parse_finite_numeric_text(token, field=field)
+    except ValueError as exc:
+        raise TemperatureDSLError(str(exc)) from exc
 
 
-def parse_temperature_schedule(dsl_text: str) -> Optional[TemperatureSchedule]:
+def _parse_number_list(text: str, *, field: str) -> List[float]:
+    """Parse one completely consumed, nonempty bracketed numeric list."""
+
+    token = text.strip()
+    if not (token.startswith("[") and token.endswith("]")):
+        raise TemperatureDSLError(f"{field} must be a bracketed numeric list.")
+    contents = token[1:-1]
+    parts = contents.split(",")
+    if not contents.strip() or any(not part.strip() for part in parts):
+        raise TemperatureDSLError(
+            f"{field} must not contain empty list elements."
+        )
+    return [
+        _parse_finite_number(part, field=f"{field} element")
+        for part in parts
+    ]
+
+
+def _split_directive_fields(payload: str, *, syntax_name: str) -> list[str]:
+    fields: list[str] = []
+    start = 0
+    bracket_depth = 0
+    for index, character in enumerate(payload):
+        if character == "[":
+            if bracket_depth:
+                raise TemperatureDSLError(
+                    f"Invalid {syntax_name} syntax: nested lists are not supported."
+                )
+            bracket_depth = 1
+        elif character == "]":
+            if not bracket_depth:
+                raise TemperatureDSLError(
+                    f"Invalid {syntax_name} syntax: unmatched closing bracket."
+                )
+            bracket_depth = 0
+        elif character == "," and not bracket_depth:
+            fields.append(payload[start:index].strip())
+            start = index + 1
+    if bracket_depth:
+        raise TemperatureDSLError(
+            f"Invalid {syntax_name} syntax: unclosed list."
+        )
+    fields.append(payload[start:].strip())
+    if any(not field for field in fields):
+        raise TemperatureDSLError(
+            f"Invalid {syntax_name} syntax: fields must not be empty."
+        )
+    return fields
+
+
+def _parse_directive_fields(
+    line: str,
+    *,
+    syntax_name: str,
+    expected_fields: frozenset[str],
+) -> dict[str, str]:
+    source, _comment_marker, _comment = line.partition("#")
+    match = re.fullmatch(
+        rf"(?is){re.escape(syntax_name)}:(?P<payload>.*)",
+        source.strip(),
+    )
+    if match is None:
+        raise TemperatureDSLError(f"Invalid {syntax_name} syntax.")
+    payload = match.group("payload").strip()
+    if not payload:
+        raise TemperatureDSLError(
+            f"Invalid {syntax_name} syntax: directive fields are required."
+        )
+
+    parsed: dict[str, str] = {}
+    for field in _split_directive_fields(payload, syntax_name=syntax_name):
+        if field.count("=") != 1:
+            raise TemperatureDSLError(
+                f"Invalid {syntax_name} field {field!r}. Expected name=value."
+            )
+        name, value = (part.strip() for part in field.split("=", 1))
+        if not name or not value:
+            raise TemperatureDSLError(
+                f"Invalid {syntax_name} field {field!r}. Name and value are required."
+            )
+        if name in parsed:
+            raise TemperatureDSLError(
+                f"Duplicate {syntax_name} field {name!r}."
+            )
+        parsed[name] = value
+
+    missing = sorted(expected_fields - set(parsed))
+    unknown = sorted(set(parsed) - expected_fields)
+    if missing or unknown:
+        details: list[str] = []
+        if missing:
+            details.append("Missing: " + ", ".join(missing) + ".")
+        if unknown:
+            details.append("Unknown: " + ", ".join(unknown) + ".")
+        raise TemperatureDSLError(
+            f"Invalid {syntax_name} fields. " + " ".join(details)
+        )
+    return parsed
+
+
+def parse_temperature_schedule(
+    directive_line: str,
+    *,
+    nominal_temperature: float = 298.15,
+) -> TemperatureSchedule:
     """
-    Parse temperature schedule from DSL text.
+    Parse one admitted temperature schedule directive.
 
     Recognizes:
-    - temp_const: T=298.15  (constant temperature)
-    - temp_step: t=[0,50,100], T=[298,320,310]  (piecewise)
+    - temp_step: t=[0,50,100], T=[298,320]  (piecewise)
     - temp_response: t=[0,50,100], T=[298,320], tau=10
 
     Parameters
     ----------
-    dsl_text : str
-        DSL text containing temperature schedule definition
+    directive_line : str
+        One top-level temperature schedule directive already admitted by the
+        simulator DSL owner.
 
     Returns
     -------
-    TemperatureSchedule or None
-        Parsed schedule, or None if no temperature schedule found
+    TemperatureSchedule
+        Parsed schedule
 
     Raises
     ------
@@ -110,101 +173,48 @@ def parse_temperature_schedule(dsl_text: str) -> Optional[TemperatureSchedule]:
 
     Examples
     --------
-    >>> dsl = "temp_const: T=310.15"
-    >>> schedule = parse_temperature_schedule(dsl)
-    >>> schedule(0.0)
-    310.15
-
-    >>> dsl = "temp_step: t=[0,50,100], T=[298,320,310]"
+    >>> dsl = "temp_step: t=[0,50,100], T=[298,320]"
     >>> schedule = parse_temperature_schedule(dsl)
     >>> schedule(25.0)
     298.0
     >>> schedule(75.0)
     320.0
     """
-    lines = [line.strip() for line in dsl_text.splitlines()]
-
-    for line in lines:
-        if not line or line.startswith('#'):
-            continue
-
-        # Constant temperature: temp_const: T=298.15
-        if line.lower().startswith('temp_const:'):
-            return _parse_const_temperature(line)
-
-        # Piecewise temperature: temp_step: t=[...], T=[...]
-        if line.lower().startswith('temp_step:'):
-            return _parse_piecewise_temperature(line)
-
-        if line.lower().startswith('temp_response:'):
-            return _parse_response_temperature(line)
-
-    # No temperature schedule found
-    return None
-
-
-def _parse_const_temperature(line: str) -> TemperatureSchedule:
-    """
-    Parse constant temperature line.
-
-    Format: temp_const: T=298.15
-
-    Parameters
-    ----------
-    line : str
-        DSL line
-
-    Returns
-    -------
-    TemperatureSchedule
-        Constant temperature schedule
-    """
-    # Extract T=<value>
-    match = re.search(r'T\s*=\s*([0-9.eE+-]+)', line, re.IGNORECASE)
-    if not match:
+    lines = directive_line.splitlines()
+    if len(lines) != 1:
         raise TemperatureDSLError(
-            "Invalid temp_const syntax",
-            suggestion="Use format: temp_const: T=<value>",
-            examples=[
-                "temp_const: T=298.15",
-                "temp_const: T=310.0"
-            ]
+            "Temperature schedule parsing requires exactly one admitted directive."
         )
-
-    try:
-        temperature = float(match.group(1))
-    except ValueError:
-        raise TemperatureDSLError(
-            f"Invalid temperature value: {match.group(1)}",
-            suggestion="Temperature must be a valid number",
-            examples=["T=298.15", "T=3.1015e+02"]
+    line = lines[0].strip()
+    lower = line.lower()
+    if lower.startswith('temp_step:'):
+        return _parse_piecewise_temperature(
+            line,
+            nominal_temperature=nominal_temperature,
         )
-
-    if temperature <= 0:
-        raise TemperatureDSLError(
-            f"Temperature must be positive, got {temperature} K",
-            suggestion="Temperature must be in Kelvin (absolute temperature)",
-            examples=[
-                "T=298.15  (room temperature)",
-                "T=273.15  (ice point)",
-                "T=373.15  (boiling point of water)"
-            ]
+    if lower.startswith('temp_response:'):
+        return _parse_response_temperature(
+            line,
+            nominal_temperature=nominal_temperature,
         )
+    raise TemperatureDSLError(
+        "Expected one admitted temp_step: or temp_response: directive."
+    )
 
-    logger.info(f"Parsed constant temperature: T = {temperature} K")
-    return TemperatureSchedule.constant(temperature)
-
-
-def _parse_piecewise_temperature(line: str) -> TemperatureSchedule:
+def _parse_piecewise_temperature(
+    line: str,
+    *,
+    nominal_temperature: float,
+) -> TemperatureSchedule:
     """
     Parse piecewise temperature line.
 
-    Format: temp_step: t=[0,50,100], T=[298,320,310]
+    Format: temp_step: t=[0,50,100], T=[298,320]
 
     Creates intervals:
     - [0, 50) → 298 K
     - [50, 100) → 320 K
-    - [100, inf) → 310 K (last interval extends to infinity)
+    - [100, inf) → 320 K (the final temperature continues)
 
     Parameters
     ----------
@@ -216,35 +226,20 @@ def _parse_piecewise_temperature(line: str) -> TemperatureSchedule:
     TemperatureSchedule
         Piecewise temperature schedule
     """
-    times, temperatures = _parse_time_temperature_lists(
+    fields = _parse_directive_fields(
         line,
         syntax_name="temp_step",
-        examples=[
-            "temp_step: t=[0,50,100], T=[298,350]",
-            "temp_step: t=[0,25,50,75], T=[298,310,320]",
-        ],
+        expected_fields=frozenset({"t", "T"}),
     )
+    times = _parse_number_list(fields["t"], field="temp_step t")
+    temperatures = _parse_number_list(fields["T"], field="temp_step T")
 
     # Validate
     if len(times) < 2:
-        raise TemperatureDSLError(
-            f"At least 2 time points required, got {len(times)}",
-            suggestion="Provide at least 2 time points to define an interval",
-            examples=[
-                "t=[0,100], T=[298]  (one interval)",
-                "t=[0,50,100], T=[298,350]  (two intervals)"
-            ]
-        )
+        raise TemperatureDSLError("t needs at least two time points.")
 
     if len(temperatures) != len(times) - 1:
-        raise TemperatureDSLError(
-            f"Temperature count mismatch: {len(temperatures)} temperatures for {len(times)} time points",
-            suggestion=f"Need exactly {len(times)-1} temperature(s) for {len(times)} time points",
-            examples=[
-                "t=[0,50,100], T=[298,350]  (2 intervals: [0,50)→298K, [50,100)→350K)",
-                "t=[0,25,50,75], T=[298,310,320]  (3 intervals)"
-            ]
-        )
+        raise TemperatureDSLError("T must have one temperature fewer than t has time points.")
 
     # Build intervals: [(t_start, t_end, T), ...]
     intervals = []
@@ -259,81 +254,45 @@ def _parse_piecewise_temperature(line: str) -> TemperatureSchedule:
         logger.debug(f"  t ∈ [{t_start}, {t_end}): T = {temp} K")
 
     try:
-        return TemperatureSchedule.piecewise(intervals)
+        return TemperatureSchedule.piecewise(
+            intervals,
+            baseline_temperature=nominal_temperature,
+        )
     except TemperatureScheduleError as e:
-        raise TemperatureDSLError(f"Invalid piecewise schedule: {e}")
+        raise TemperatureDSLError(str(e)) from e
 
 
-def _parse_time_temperature_lists(
+def _parse_response_temperature(
     line: str,
     *,
-    syntax_name: str,
-    examples: list[str],
-) -> tuple[List[float], List[float]]:
-    t_match = re.search(r'\bt\s*=\s*\[([^\]]+)\]', line)
-    T_match = re.search(r'\bT\s*=\s*\[([^\]]+)\]', line)
-
-    if not t_match or not T_match:
-        raise TemperatureDSLError(
-            f"Invalid {syntax_name} syntax",
-            suggestion=f"Format: {syntax_name}: t=[time_points], T=[temperatures]",
-            examples=examples,
-        )
-
-    times = _parse_number_list(t_match.group(1))
-    temperatures = _parse_number_list(T_match.group(1))
-    return times, temperatures
-
-
-def _parse_response_temperature(line: str) -> TemperatureSchedule:
+    nominal_temperature: float,
+) -> TemperatureSchedule:
     """
     Parse first-order response temperature line.
 
     Format: temp_response: t=[0,50,100], T=[298,320], tau=10
     """
-    times, temperatures = _parse_time_temperature_lists(
+    fields = _parse_directive_fields(
         line,
         syntax_name="temp_response",
-        examples=[
-            "temp_response: t=[0,50,100], T=[298,350], tau=10",
-            "temp_response: t=[0,25,50,75], T=[298,310,320], tau=5",
-        ],
+        expected_fields=frozenset({"t", "T", "tau"}),
     )
-    tau_match = re.search(r'\btau\s*=\s*([0-9.eE+-]+)', line, re.IGNORECASE)
-    if not tau_match:
-        raise TemperatureDSLError(
-            "Invalid temp_response syntax",
-            suggestion="Format: temp_response: t=[time_points], T=[temperatures], tau=<value>",
-            examples=[
-                "temp_response: t=[0,50,100], T=[298,350], tau=10",
-                "temp_response: t=[0,25,50,75], T=[298,310,320], tau=5",
-            ],
-        )
-
-    try:
-        tau = float(tau_match.group(1))
-    except ValueError:
-        raise TemperatureDSLError(
-            f"Invalid tau value: {tau_match.group(1)}",
-            suggestion="tau must be a valid positive number",
-        )
-    if tau <= 0:
-        raise TemperatureDSLError(
-            f"tau must be positive, got {tau}",
-            suggestion="Use a strictly positive time constant",
-        )
+    times = _parse_number_list(fields["t"], field="temp_response t")
+    temperatures = _parse_number_list(
+        fields["T"], field="temp_response T"
+    )
+    tau = _parse_finite_number(fields["tau"], field="temp_response tau")
     if len(times) < 2:
-        raise TemperatureDSLError(
-            f"At least 2 time points required, got {len(times)}",
-            suggestion="Provide at least 2 time points to define an interval",
-        )
+        raise TemperatureDSLError("t needs at least two time points.")
     if len(temperatures) != len(times) - 1:
-        raise TemperatureDSLError(
-            f"Temperature count mismatch: {len(temperatures)} temperatures for {len(times)} time points",
-            suggestion=f"Need exactly {len(times)-1} temperature(s) for {len(times)} time points",
-        )
+        raise TemperatureDSLError("T must have one temperature fewer than t has time points.")
 
     try:
-        return TemperatureSchedule.response(times, temperatures, tau=tau)
+        return TemperatureSchedule.response(
+            times,
+            temperatures,
+            tau=tau,
+            baseline_temperature=nominal_temperature,
+        )
     except TemperatureScheduleError as e:
-        raise TemperatureDSLError(f"Invalid response schedule: {e}")
+        raise TemperatureDSLError(str(e)) from e

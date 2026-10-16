@@ -1,0 +1,18 @@
+# Run from 0 to 600 s.
+
+A <-> B ; kf=0.02 ; kr=0.004
+B -> C ; k=0.006
+B -> D ; k=0.002
+
+# [A]_0 refers to the initial concentration of A.
+let conversion = 1 - [A] / [A]_0
+
+# watch_observable references a let definition by name.
+intervention: op=trigger; watch_observable=conversion; threshold=0.8; direction=rising; then={op=stop}
+
+intervention_set1 = {
+  [A] = 1.0
+  [B] = 0.0
+  [C] = 0.0
+  [D] = 0.0
+}

@@ -1,10 +1,18 @@
-# Preset M7 — Dimerization 2A ⇌ A2
-# Mechanism
-equilibrium: 2*A <-> A2 ; kf = 0.05 ; kr = 0.02
+# Run from 0 to 10 s.
 
-# Initials
-[A]  = 1.0
-[A2] = 0.0
+E + S <-> ES ; kf=10.0 ; kr=2.0
+ES -> E + P ; kf=1.0
 
-# Algebra
-let total = [A] + 2*[A2]
+preset_set1 = {
+  [E] = 1.0
+  [S] = 10.0
+  [ES] = 0.0
+  [P] = 0.0
+}
+
+param concentration_floor = 1e-30; unit = M
+let product_rate = k2 * [ES]
+let total_enzyme = [E] + [ES]
+
+# An observable can reference another observable by name.
+let bound_fraction = [ES] / max(total_enzyme, concentration_floor)

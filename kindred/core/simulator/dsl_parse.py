@@ -3,176 +3,373 @@ Computational Simulator DSL tools.
 
 Current contract
 ----------------
-- Entries: `reaction:`, `equilibrium:` and a `States/TS` block.
+- Steps use unprefixed reaction lines.
+- Irreversible arrows: `->` and `=>`; reversible arrows: `<->` and `<=>`.
 - Accepted keys with normalization:
-  T, degeneracy, κ, C°|C0, dG_act|ΔG‡, Ea, dG_eq|ΔG°, k|kf|kr, A, k_fast,
-  energy=kcal/mol|kJ/mol|J/mol, state, edge
-- If dG_eq/ΔG° is provided and Keq is omitted, compute Keq = exp(-ΔG°/(R*T)).
+  degeneracy, kappa, C0, dG_act, Ea, dG_eq, k|kf|kr, A,
+  energy=kcal/mol|kJ/mol|J/mol
+- Packaged preset sources use this same public syntax and remain admitted by
+  the same parser.
+- Source-level `T=`, `C0=`, and `energy=` override supplied mechanism defaults.
+- If dG_eq is provided and Keq is omitted, compute concentration-form
+  Keq = exp(-dG_eq/(R*T)) * C0**delta_n with reaction-dependent units.
 - Default per step is Eyring; Arrhenius override via A/Ea.
-- Units inferred from molecularity (1/(M^(n−1)*s)); bimolecular Eyring divides by C°.
-- TS degree fixed to 2 and enforced; attempts to violate raise a structured error.
-- Preview output uses scientific notation, 3 significant figures, and ROUND_HALF_UP:
-  "A <-> B ; kf=1.23e+05 ; kr=4.56e+03  # model=Eyring; unit=1/s; κ=1.0; T=298.15 K; source=explicit"
+- Units inferred from molecularity (1/(M^(n−1)*s)); bimolecular Eyring divides by C0.
 
 Scope
 -----
 - Parse a simple line-oriented DSL (no nested syntax).
-- Provide structured results and preview strings for the GUI Simulator.
+- Provide immutable analysis and retained prepared execution structures.
 - No file access; caller passes text.
 
 Non-goals
 ---------
-- Persisting anything, touching mechanisms directly, or solver integration.
+- Persisting anything or solver integration.
 
 """
 
 from __future__ import annotations
 
-import logging
 import math
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, cast, TYPE_CHECKING
+from dataclasses import dataclass, replace
+from fractions import Fraction
+from threading import Lock
+from typing import Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING
 
 import re
 
+from ..equilibrium_rate_authority import (
+    validate_equilibrium_rate_authority_flags,
+)
+from ..mechanism_source import (
+    INITIAL_PROVENANCE_PREFIX,
+)
+from ..kinetics import ArrheniusRateModel, ConstantRateModel, EyringRateModel
 from ..units import UnitsModel
-from .dsl_types import StepPreview
+from ..units import (
+    admit_arrhenius_prefactor,
+    admit_energy_j_per_mol,
+    admit_keq,
+    admit_rate,
+    admit_role_value,
+    energy_to_j_per_mol,
+    normalize_energy_unit,
+)
+from ..species import validate_c0, validate_concentration, validate_temperature
+from ..validation import six_digit_source_text
+from ..stoichiometry import directional_order_fraction
 from .errors import (
-    DSLError,
+    DSLError as _DSLError,
     invalid_number_error,
     missing_arrow_error,
     invalid_species_term_error,
-    empty_stoichiometry_error,
-    invalid_keyvalue_pair_error,
-    invalid_boolean_error,
+)
+from .parameter_algebra_spec import classify_parameter_algebra_declaration
+from .parameter_namespace import (
+    build_namespace_from_mechanism,
+)
+from .dsl_build_input import (
+    DslBuildStep,
+    DslSourceCoordinate,
+    canonical_source_coordinate_name,
 )
 
 if TYPE_CHECKING:
-    from ..mechanism import Mechanism
-    from ..temperature import TemperatureScheduleProtocol
-    from .dsl_parameter_scan import ParameterDefinition
-    from .state_model import StateNetwork
-
-logger = logging.getLogger(__name__)
+    from ..intervention_schedule import InterventionSchedule
+    from ..intervention_schedule_compiler import InterventionExecutionContract
+    from ..temperature import TemperatureSchedule
 
 
 __all__ = [
-    "DSLError",
-    "StepPreview",
-    "DSLResult",
-    "ParameterDefinition",
-    "parse_and_preview",
-    "parse_dsl",
-    "parse_dsl_to_mechanism",
-    "extract_parameters_from_dsl",
-    "extract_parameter_names_from_dsl",
+    "DslAnalysis",
+    "DslInitialConditionAdmission",
+    "DslInitialConditionAssignment",
+    "DslInitialConditionDeclaration",
+    "DslParameterCoordinateUpdate",
+    "DslSourceOrigin",
+    "PreparedDslRequestSet",
+    "derive_source_with_parameter_updates",
+    "prepare_dsl_request_set",
 ]
 
 
 # ------------------------------ normalized keys ------------------------------
 
 _KEY_ALIASES: Dict[str, str] = {
-    # temperature / states
+    # temperature / states (keys are casefold-normalized)
     "t": "T",
     "degeneracy": "degeneracy",
-    "kappa": "κ",
-    "κ": "κ",
-    "c°": "C0",
+    "kappa": "kappa",
     "c0": "C0",
     # energies / model params
     "dg_act": "dG_act",
-    "Δg‡": "dG_act",
-    "Δg^‡": "dG_act",
-    "dG_act": "dG_act",
-    "ΔG‡": "dG_act",
     "ea": "Ea",
-    "Ea": "Ea",
     "dg_eq": "dG_eq",
-    "Δg°": "dG_eq",
-    "dG_eq": "dG_eq",
-    "ΔG°": "dG_eq",
     "a": "A",
-    "A": "A",
     "k": "k",
-    "K": "Keq",  # Equilibrium constant (surface alias; distinct from lowercase k)
     "keq": "Keq",
-    "k_eq": "Keq",
     "kf": "kf",
     "kr": "kr",
-    "k_fast": "k_fast",
     # units selector
     "energy": "energy",
-    # state graph
-    "state": "state",
-    "edge": "edge",
 }
 
 _ARROW_RE = re.compile(r"<->|<=>|->|=>")
-_SPECIES_TERM_RE = re.compile(r"^\s*(?:(\d+(?:\.\d+)?)\s*\*?\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*$")
+_TEMPERATURE_DIRECTIVE_PREFIXES = ("temp_step:", "temp_response:")
+_SPECIES_TERM_RE = re.compile(
+    r"^\s*(?:(-?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?)\s*\*?\s*)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*$"
+)
+_SCIENTIFIC_COEFFICIENT_MANTISSA_RE = re.compile(
+    r"^\s*-?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))[eE]$"
+)
 _COMMA_SEMI_SPLIT_RE = re.compile(r"[,;]")
-_STATE_REST_SPLIT_RE = re.compile(r"[;,]")
 _SEMI_SPLIT_RE = re.compile(r"[;]")
 
-_REACTION_KNOWN_KEYS = frozenset({"κ", "kf", "k", "kr", "A", "Ea", "Keq", "dG_eq", "dG_act"})
-_EQUILIBRIUM_KNOWN_KEYS = frozenset({"Keq", "kf", "kr", "dG_eq", "dg_eq", "cm_id"})
-
-
+_REACTION_KNOWN_KEYS = frozenset(
+    {"kappa", "degeneracy", "kf", "k", "kr", "A", "Ea", "Keq", "dG_eq", "dG_act"}
+)
 # ------------------------------ data models ----------------------------------
-
-@dataclass
-class DSLResult:
-    """
-    Container for parsed simulator content.
-
-    Fields
-    ------
-    previews : list[StepPreview]
-        Human-readable preview lines.
-    notes : list[str]
-        Non-fatal normalization notes for UI display.
-    temperature_schedule : TemperatureScheduleProtocol | None
-        Temperature schedule for time-dependent temperature.
-        None if no temperature schedule specified.
-    ir : DSLIR | None
-        Structured intermediate representation (single source of truth for parsing).
-    """
-    previews: List[StepPreview] = field(default_factory=list)
-    notes: List[str] = field(default_factory=list)
-    temperature_schedule: Optional["TemperatureScheduleProtocol"] = None
-    ir: Optional["DSLIR"] = None
-
 
 @dataclass
 class DSLIR:
     """
     Structured intermediate representation (IR) for the simulator DSL.
 
-    Preview generation and Mechanism construction are derived from this IR to
+    Immutable analysis and Mechanism construction are derived from this IR to
     prevent semantic drift across entry points.
     """
 
-    version: int
     energy_unit: str
     temperature_K: float
     standard_conc_M: float
-    kappa_global: float
-    temperature_schedule: Optional["TemperatureScheduleProtocol"]
-    state_network: "StateNetwork"
-    steps: List["ParsedStep"]
-    algebra_lines: List[str]
-    initials_from_dsl: Dict[str, float]
-    notes: List[str] = field(default_factory=list)
+    temperature_schedule: Optional["TemperatureSchedule"]
+    intervention_schedule: Optional["InterventionSchedule"]
+    steps: List[DslBuildStep]
+    inline_initial_conditions: "DslInitialConditionAdmission"
+    # (line number, authored text) of each intervention declaration, by ordinal.
+    intervention_lines: tuple[tuple[int, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DslSourceOrigin:
+    authored_ordinal: int
+    source_text: str
+    physical_line_index: int = 0
+    step_index: int | None = None
+    # The parser assigns each line's own unique coordinates.
+    coordinates: tuple[DslSourceCoordinate, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DslParameterCoordinateUpdate:
+    """One exact writable coordinate value for typed DSL derivation."""
+
+    name: str
+    value: float
+
+
+_DSL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+@dataclass(frozen=True, slots=True)
+class DslInitialConditionAssignment:
+    """One validated inline concentration assignment."""
+
+    species: str
+    value: float
+
+
+@dataclass(frozen=True, slots=True)
+class DslInitialConditionDeclaration:
+    """One named block or one anonymous source-ordered declaration."""
+
+    source_kind: str
+    source_name: str | None
+    assignments: tuple[DslInitialConditionAssignment, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DslInitialConditionAdmission:
+    """The sole typed inline-IC parser result for one exact source."""
+
+    declarations: tuple[DslInitialConditionDeclaration, ...] = ()
+    materialized_source: str = ""
+
+    @property
+    def has_declarations(self) -> bool:
+        return bool(self.declarations)
+
+    @property
+    def named_declarations(
+        self,
+    ) -> tuple[DslInitialConditionDeclaration, ...]:
+        return tuple(
+            item for item in self.declarations if item.source_kind == "named"
+        )
+
+@dataclass(frozen=True, slots=True)
+class DslAnalysis:
+    """Deeply immutable, source-backed public DSL admission evidence."""
+
+    origins: tuple[DslSourceOrigin, ...]
+    species_names: tuple[str, ...]
+    observable_names: tuple[str, ...]
+    inline_initial_conditions: DslInitialConditionAdmission
+    temperature_K: float
+    standard_conc_M: float
+    energy_unit: str
+    # (line number, authored text) of each intervention declaration, by ordinal.
+    intervention_lines: tuple[tuple[int, str], ...]
+
+
+class PreparedDslRequestSet:
+    """Single-parse owner of one immutable analysis and execution structure."""
+
+    __slots__ = (
+        "analysis",
+        "__mechanism",
+        "__intervention_schedule",
+        "__intervention_execution",
+        "__parameter_algebra_spec",
+        "__compiled_ode_topology",
+        "__symbolic_jacobian_structure",
+        "__symbolic_structure_initialized",
+        "__structure_lock",
+    )
+
+    def __init__(
+        self,
+        *,
+        analysis: DslAnalysis,
+        mechanism: object,
+        intervention_schedule: InterventionSchedule | None,
+        intervention_execution: InterventionExecutionContract | None,
+        parameter_algebra_spec: object,
+    ) -> None:
+        # Its sole producer retains a parameterized schedule declaratively
+        # and compiles every other schedule, including none.
+        self.analysis = analysis
+        self.__mechanism = mechanism
+        self.__intervention_schedule = intervention_schedule
+        self.__intervention_execution = intervention_execution
+        self.__parameter_algebra_spec = parameter_algebra_spec
+        self.__compiled_ode_topology = None
+        self.__symbolic_jacobian_structure = None
+        self.__symbolic_structure_initialized = False
+        self.__structure_lock = Lock()
+
+    def mutable_mechanism_shell(self) -> object:
+        from collections.abc import Mapping
+
+        from kindred.core.mechanism import Mechanism
+
+        def clone_metadata(value: object) -> object:
+            if isinstance(value, Mapping):
+                return {key: clone_metadata(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [clone_metadata(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(clone_metadata(item) for item in value)
+            if isinstance(value, (set, frozenset)):
+                return type(value)(clone_metadata(item) for item in value)
+            return value
+
+        shell = Mechanism()
+        shell.species = self.__mechanism.species
+        shell.metadata = clone_metadata(self.__mechanism.metadata)
+        shell.reactions = list(self.__mechanism.reactions)
+        shell.equilibria = [
+            replace(equilibrium, metadata=clone_metadata(equilibrium.metadata))
+            for equilibrium in self.__mechanism.equilibria
+        ]
+        return shell
+
+    def accepted_mechanism_for_structure(self) -> object:
+        """Return the privately retained accepted mechanism for read-only use."""
+
+        return self.__mechanism
+
+    def compiled_ode_topology(self) -> object:
+        """Lazily retain one immutable ODE topology for this accepted owner."""
+
+        topology = self.__compiled_ode_topology
+        if topology is None:
+            with self.__structure_lock:
+                topology = self.__compiled_ode_topology
+                if topology is None:
+                    from kindred.core.ode_builder import CompiledOdeTopology
+
+                    topology = CompiledOdeTopology.from_mechanism(
+                        self.__mechanism
+                    )
+                    self.__compiled_ode_topology = topology
+        return topology
+
+    def symbolic_jacobian_structure(self) -> object:
+        """Lazily retain one symbolic structure for this accepted mechanism."""
+
+        structure = self.__symbolic_jacobian_structure
+        if not self.__symbolic_structure_initialized:
+            with self.__structure_lock:
+                if not self.__symbolic_structure_initialized:
+                    from kindred.core.symbolic.errors import (
+                        UnsupportedSymbolicExpressionError,
+                    )
+                    from kindred.core.symbolic.jacobian import (
+                        build_symbolic_jacobian_structure,
+                    )
+
+                    try:
+                        structure = build_symbolic_jacobian_structure(
+                            self.__mechanism
+                        )
+                    except UnsupportedSymbolicExpressionError:
+                        structure = None
+                    self.__symbolic_jacobian_structure = structure
+                    self.__symbolic_structure_initialized = True
+                structure = self.__symbolic_jacobian_structure
+        return structure
+
+    def temperature_schedule_for_execution(self) -> Optional["TemperatureSchedule"]:
+        """Return the accepted mechanism's retained typed schedule directly."""
+
+        from kindred.core.mechanism_metadata import MechanismMetadataKeys
+
+        return self.__mechanism.metadata.get(MechanismMetadataKeys.TEMPERATURE_SCHEDULE)
+
+    def parameterized_intervention_schedule_for_binding(self) -> InterventionSchedule | None:
+        return self.__intervention_schedule
+
+    def authored_stop_declarations(self) -> tuple[str, ...]:
+        from kindred.core.intervention_schedule import InterventionStopAction
+        triggers = (
+            self.__intervention_schedule.triggers
+            if self.__intervention_schedule is not None
+            else self.__intervention_execution.triggers
+        )
+        return tuple(item.source_text for item in triggers
+                     if isinstance(item.then, InterventionStopAction) and item.source_text is not None)
+
+    def intervention_execution_contract(self) -> InterventionExecutionContract | None:
+        return self.__intervention_execution
+
+    def parameter_algebra_spec_for_execution(self) -> object:
+        return self.__parameter_algebra_spec
 
 
 # ------------------------------ helpers --------------------------------------
 
 def _norm_key(k: str) -> str:
     key = k.strip()
-    # Preserve uppercase K as the equilibrium alias distinct from lowercase k.
-    if key == "K":
+    normalized = key.casefold()
+    if normalized == "keq":
         return "Keq"
-    # Otherwise normalize to lowercase and look up
-    return _KEY_ALIASES.get(key.lower(), key)
+    # Bare uppercase K is not lowercase k and is not accepted as a Keq alias.
+    if key == "K":
+        return "K"
+    # Match the ASCII key table without changing existing key-case handling.
+    return _KEY_ALIASES.get(normalized, key)
 
 
 def _parse_keyvals(
@@ -181,6 +378,8 @@ def _parse_keyvals(
     reject_duplicate_canonical_keys: bool = False,
     line_number: int | None = None,
     line_content: str | None = None,
+    coordinate_spans: list[tuple[str, int, int]] | None = None,
+    source_offset: int = 0,
 ) -> Dict[str, str]:
     """
     Parse comma or semicolon-separated key=value pairs with lenient spacing.
@@ -190,116 +389,64 @@ def _parse_keyvals(
     """
     out: Dict[str, str] = {}
     original_spellings: Dict[str, str] = {}
-    if not rest.strip():
+    # Inline comments are source bytes, not part of the admitted key/value
+    # grammar.  Keep offsets relative to the original line so exact Apply
+    # can retain the comment and everything after it byte-for-byte.
+    comment_index = rest.find("#")
+    code = rest if comment_index < 0 else rest[:comment_index]
+    if not code.strip():
         return out
     # Split on both commas and semicolons to support both formats
-    for chunk in _COMMA_SEMI_SPLIT_RE.split(rest):
+    cursor = 0
+    for chunk in _COMMA_SEMI_SPLIT_RE.split(code):
+        chunk_offset = cursor
+        cursor += len(chunk)
+        if cursor < len(code):
+            cursor += 1
         if not chunk.strip():
             continue
         if "=" not in chunk:
-            # tolerate stray tokens like "state=..." lines; raise for truly malformed
-            raise invalid_keyvalue_pair_error(chunk)
+            # every chunk must be a key=value pair
+            raise _DSLError(
+                f"Expected key=value, got '{chunk.strip()}'.",
+                line_number=line_number,
+                line_content=line_content,
+            )
         k, v = chunk.split("=", 1)
         raw_key = k.strip()
         canonical_key = _norm_key(raw_key)
         previous_spelling = original_spellings.get(canonical_key)
         if reject_duplicate_canonical_keys and previous_spelling is not None:
-            raise DSLError(
-                f"Duplicate parameter: '{previous_spelling}' and '{raw_key}' both resolve to {canonical_key}",
+            raise _DSLError(
+                f"{raw_key} appears twice."
+                if previous_spelling == raw_key
+                else f"'{previous_spelling}' and '{raw_key}' both set {canonical_key}.",
                 line_number=line_number,
                 line_content=line_content,
             )
         original_spellings[canonical_key] = raw_key
         out[canonical_key] = v.strip()
+        if coordinate_spans is not None and out[canonical_key]:
+            value_start = (
+                source_offset
+                + chunk_offset
+                + chunk.find("=")
+                + 1
+                + (len(v) - len(v.lstrip()))
+            )
+            value_end = value_start + len(out[canonical_key])
+            coordinate_spans.append(
+                (canonical_key, value_start, value_end)
+            )
     return out
 
 
-_MEMBERS_TERM_RE = re.compile(r"^(\d+)?([A-Za-z_][A-Za-z0-9_]*)$")
-
-
-def _parse_members_expr(expr: str) -> Tuple[str, ...]:
-    """
-    Parse a state `members=` expression like "A+B" or "2A+B" into a tuple with duplicates.
-
-    This is used to recover stoichiometry for state-network conversion.
-    """
-    s = str(expr or "").strip()
-    if not s:
-        raise ValueError("members cannot be empty")
-    parts = [p.strip() for p in s.split("+") if p.strip()]
-    if not parts:
-        raise ValueError("members cannot be empty")
-    out: List[str] = []
-    for raw in parts:
-        term = raw.replace(" ", "")
-        m = _MEMBERS_TERM_RE.match(term)
-        if not m:
-            raise ValueError(f"invalid members term {raw!r}")
-        coeff = int(m.group(1) or "1")
-        if coeff <= 0:
-            raise ValueError("members coefficients must be positive integers")
-        name = m.group(2)
-        out.extend([name] * coeff)
-    return tuple(out)
-
-
-def _parse_state_rest(rest: str) -> Tuple[Optional[str], Dict[str, str]]:
-    """
-    Parse the `state:` line body and return (name, kv).
-
-    Supports both:
-      - "name=A; kind=GS; energy=0.0"
-      - "A, kind=GS, energy=0.0"
-    """
-    parts = [p.strip() for p in _STATE_REST_SPLIT_RE.split(str(rest or "")) if p.strip()]
-    name: Optional[str] = None
-    kv_parts: List[str] = []
-    for part in parts:
-        if "=" in part:
-            kv_parts.append(part)
-        elif name is None:
-            name = part
-    kv = _parse_keyvals(",".join(kv_parts)) if kv_parts else {}
-    if not name:
-        name = kv.get("state") or kv.get("name")
-    return name, kv
-
-
-def _extract_numeric_value(expr: str) -> Optional[float]:
-    """
-    Best-effort extraction of a numeric literal from a DSL value string.
-
-    Accepts values like "1.0", "1e-3", or "12.5 kJ/mol" (unit is ignored).
-    Returns None if the value is not purely numeric.
-    """
-    if expr is None:
-        return None
-    value = expr.strip()
-    if not value:
-        return None
-    parts = value.split()
-    candidate = parts[0]
-    return _float_or_none(candidate)
-
-
-def extract_parameters_from_dsl(text: str) -> List["ParameterDefinition"]:
-    from .dsl_parameter_scan import extract_parameters_from_dsl as _impl
-
-    return _impl(text)
-
-
-def extract_parameter_names_from_dsl(text: str) -> set[str]:
-    from .dsl_parameter_scan import extract_parameter_names_from_dsl as _impl
-
-    return _impl(text)
-
-
-def __getattr__(name: str):
-    if name == "ParameterDefinition":
-        from .dsl_parameter_scan import ParameterDefinition
-
-        return ParameterDefinition
-    raise AttributeError(name)
+def _ambiguous_stoichiometry_error(text: str) -> _DSLError:
+    return _DSLError(
+        f"Ambiguous stoichiometry {text.strip()!r}: separate coefficients from "
+        "species with spaces, as in '2E + 2S' or '2 E2S', or write a "
+        "scientific-notation coefficient with '*', as in '2e2*S'."
+    )
 
 
 def _parse_species_side(text: str) -> Dict[str, float]:
@@ -309,11 +456,26 @@ def _parse_species_side(text: str) -> Dict[str, float]:
     """
     if not text.strip():
         return {}
-    result: Dict[str, float] = {}
-    for term in text.split("+"):
+    result: Dict[str, Fraction] = {}
+    terms: list[str] = []
+    term_start = 0
+    for index, character in enumerate(text):
+        if character != "+":
+            continue
+        prefix = text[term_start:index]
+        if (
+            _SCIENTIFIC_COEFFICIENT_MANTISSA_RE.fullmatch(prefix)
+            and text[index + 1:index + 2].isdigit()
+        ):
+            raise _ambiguous_stoichiometry_error(text)
+        terms.append(text[term_start:index])
+        term_start = index + 1
+    terms.append(text[term_start:])
+
+    for term in terms:
         term = term.strip()
         if not term:
-            raise DSLError("Malformed stoichiometry: empty term (e.g., consecutive '+' signs)")
+            raise _DSLError("Malformed stoichiometry: empty term, for example consecutive '+' signs.")
         m = _SPECIES_TERM_RE.match(term)
         if not m and "*" in term:
             # Allow patterns like "2 * B" while rejecting "A B"
@@ -321,13 +483,23 @@ def _parse_species_side(text: str) -> Dict[str, float]:
         if not m:
             raise invalid_species_term_error(term)
         coef_s, name = m.groups()
-        coef = _float_or_none(coef_s) if coef_s is not None else 1.0
-        if coef == 0.0:
-            continue
-        result[name] = result.get(name, 0.0) + coef
-    if not result:
-        raise empty_stoichiometry_error()
-    return result
+        if (
+            coef_s is not None
+            and "e" in coef_s.casefold()
+            and m.string is term
+            and m.end(1) == m.start(2)
+        ):
+            raise _ambiguous_stoichiometry_error(text)
+        if name == "t":
+            raise _DSLError(
+                "'t' is reserved for simulation time and cannot be used as a species name."
+            )
+        coef = _float_or_none(coef_s, "coefficient") if coef_s is not None else 1.0
+        if coef <= 0.0:
+            raise _DSLError("Stoichiometric coefficients must be positive.")
+        exact = Fraction(1) if coef_s is None else Fraction(coef_s)
+        result[name] = result.get(name, Fraction(0)) + exact
+    return {name: float(total) for name, total in result.items()}
 
 
 def _parse_stoich(ar: str) -> Tuple[Dict[str, float], Dict[str, float], str]:
@@ -337,7 +509,7 @@ def _parse_stoich(ar: str) -> Tuple[Dict[str, float], Dict[str, float], str]:
     """
     m = _ARROW_RE.search(ar)
     if not m:
-        raise missing_arrow_error(ar)
+        raise missing_arrow_error()
     arrow = m.group(0)
     lhs = ar[: m.start()]
     rhs = ar[m.end() :]
@@ -346,17 +518,37 @@ def _parse_stoich(ar: str) -> Tuple[Dict[str, float], Dict[str, float], str]:
     return react, prod, arrow
 
 
-def _float_or_none(s: Optional[str]) -> Optional[float]:
+def _float_or_none(s: Optional[str], field: str) -> Optional[float]:
     if s is None:
         return None
     try:
         v = float(s)
-    except Exception:
-        logger.debug(f"Failed to convert '{s}' to float", exc_info=True)
-        raise invalid_number_error(str(s), "value")
+    except (TypeError, ValueError, OverflowError):
+        raise invalid_number_error(str(s), field)
     if not math.isfinite(v):
-        raise invalid_number_error(str(s), "value")
+        raise invalid_number_error(str(s), field)
     return v
+
+
+_DEGENERACY_LITERAL_RE = re.compile(r"\+?\d+")
+
+
+def _parse_degeneracy(
+    raw: str,
+    *,
+    line_number: int | None,
+    line_content: str | None,
+) -> int:
+    """Admit only a positive integer literal for an Eyring degeneracy."""
+
+    literal = raw.strip()
+    if not _DEGENERACY_LITERAL_RE.fullmatch(literal) or int(literal) <= 0:
+        raise _DSLError(
+            "degeneracy must be a positive integer.",
+            line_number=line_number,
+            line_content=line_content,
+        )
+    return int(literal)
 
 
 def _validate_rate_or_K(
@@ -368,510 +560,745 @@ def _validate_rate_or_K(
 ) -> None:
     if value is None:
         return
-    if math.isnan(value) or math.isinf(value) or value < 0:
-        raise DSLError(
-            f"'{name}' must be a non-negative finite number, got {value}",
+    try:
+        if str(name) == "Keq":
+            admit_keq(value, field=name)
+        else:
+            admit_rate(value, field=name, allow_zero=str(name) in {"k", "kf"})
+    except ValueError as exc:
+        raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
+
+
+def _validate_equilibrium_rate_authority_for_dsl(
+    *,
+    has_kf: bool,
+    has_kr: bool,
+    has_Keq: bool,
+    has_dG_eq: bool,
+    line_number: Optional[int],
+    line_content: Optional[str],
+) -> None:
+    try:
+        validate_equilibrium_rate_authority_flags(
+            has_kf=has_kf,
+            has_kr=has_kr,
+            has_Keq=has_Keq,
+            has_dG_eq=has_dG_eq,
+        )
+    except ValueError as exc:
+        raise _DSLError(
+            str(exc),
+            line_number=line_number,
+            line_content=line_content,
+        ) from exc
+
+
+def _forward_rate_family_from_params(
+    params: Mapping[str, str],
+    *,
+    reversible: bool,
+    line_number: int | None,
+    line_content: str | None,
+) -> str:
+    """Select exactly one authored Constant/Arrhenius/Eyring family."""
+
+    if "kf" in params and "k" in params:
+        raise _DSLError(
+            "A step cannot have both k and kf.",
             line_number=line_number,
             line_content=line_content,
         )
-
-
-def _bool_from_str(s: str) -> bool:
-    v = s.strip().lower()
-    if v in ("1", "true", "yes", "on"):
-        return True
-    if v in ("0", "false", "no", "off"):
-        return False
-    raise invalid_boolean_error(s, "boolean")
-
-
-def _derive_equilibrium_rates_with_context(
-    *,
-    line_number: Optional[int],
-    line_content: Optional[str],
-    **kwargs,
-):
-    """
-    Call derive_equilibrium_rates while translating ValueError into DSLError with context.
-    """
-    try:
-        from .common import derive_equilibrium_rates
-
-        return derive_equilibrium_rates(**kwargs)
-    except (ValueError, OverflowError, ZeroDivisionError) as exc:
-        raise DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
+    families = {
+        family
+        for family, present in (
+            ("Constant", any(key in params for key in ("kf", "k"))),
+            ("Arrhenius", any(key in params for key in ("A", "Ea"))),
+            ("Eyring", "dG_act" in params),
+        )
+        if present
+    }
+    if len(families) > 1:
+        raise _DSLError(
+            "Forward rate authority must use exactly one of Constant "
+            "(k or kf), Arrhenius (A and Ea), or Eyring (dG_act).",
+            line_number=line_number,
+            line_content=line_content,
+        )
+    if not families:
+        raise _DSLError(
+            "This reversible step has no forward rate. Add kf=, A= with Ea=, or "
+            "dG_act=, plus one of kr=, Keq=, or dG_eq=."
+            if reversible
+            else "This step has no rate. Add k=, A= with Ea=, or dG_act=.",
+            line_number=line_number,
+            line_content=line_content,
+        )
+    family = next(iter(families))
+    if family == "Arrhenius" and not ("A" in params and "Ea" in params):
+        raise _DSLError(
+            "An Arrhenius rate needs both A and Ea.",
+            line_number=line_number,
+            line_content=line_content,
+        )
+    if "kappa" in params and family != "Eyring":
+        raise _DSLError(
+            "Per-step kappa is valid only for an Eyring forward rate.",
+            line_number=line_number,
+            line_content=line_content,
+        )
+    return family
 
 
 # ------------------------------ main parsing ---------------------------------
 
-_DSL_IR_VERSION = 1
+_NAMED_INITIAL_BLOCK_START_RE = re.compile(
+    r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{\s*(?P<body>.*?)\s*$"
+)
+_BRACKET_INITIAL_ASSIGNMENT_RE = re.compile(
+    r"^\[(?P<species>[A-Za-z_][A-Za-z0-9_]*)\]\s*=\s*(?P<value>.+?)\s*$"
+)
+
+
+def _inline_initial_number(
+    token: str,
+    *,
+    set_name: str | None,
+    species: str,
+    line_number: int,
+    line_content: str,
+) -> float:
+    context = (
+        f"set {set_name!r}, species {species!r}"
+        if set_name is not None
+        else f"anonymous set, species {species!r}"
+    )
+    try:
+        value = float(str(token).strip())
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise _DSLError(
+            f"Initial condition value for {context} must be numeric.",
+            line_number=line_number,
+            line_content=line_content,
+        ) from exc
+    try:
+        return validate_concentration(value, field=f"Initial condition value for {context}")
+    except ValueError as exc:
+        raise _DSLError(
+            str(exc),
+            line_number=line_number,
+            line_content=line_content,
+        ) from exc
+
+
+def _inline_initial_assignments(
+    code: str,
+    *,
+    set_name: str | None,
+    line_number: int,
+    line_content: str,
+) -> tuple[DslInitialConditionAssignment, ...]:
+    stripped = str(code).strip()
+    lowered = stripped.lower()
+    if lowered.startswith(("init:", "initial:")):
+        _prefix, body = stripped.split(":", 1)
+        raw_parts = body.split(",")
+        if not body.strip() or any(not part.strip() for part in raw_parts):
+            raise _DSLError(
+                "Initial condition directive requires comma-separated "
+                "species=value assignments.",
+                line_number=line_number,
+                line_content=line_content,
+            )
+        pairs: list[tuple[str, str]] = []
+        for part in raw_parts:
+            if part.count("=") != 1:
+                raise _DSLError(
+                    "Initial condition directive assignments must use exactly "
+                    "one '='.",
+                    line_number=line_number,
+                    line_content=line_content,
+                )
+            species, value_token = part.split("=", 1)
+            species = species.strip()
+            if not _DSL_IDENTIFIER_RE.fullmatch(species):
+                raise _DSLError(
+                    f"Initial condition species {species!r} must be an "
+                    "identifier.",
+                    line_number=line_number,
+                    line_content=line_content,
+                )
+            pairs.append((species, value_token))
+    else:
+        raw_parts = stripped.split(",")
+        if any(not part.strip() for part in raw_parts):
+            raise _DSLError(
+                "Bracket initial conditions must be comma-separated "
+                "assignments.",
+                line_number=line_number,
+                line_content=line_content,
+            )
+        pairs = []
+        for part in raw_parts:
+            match = _BRACKET_INITIAL_ASSIGNMENT_RE.fullmatch(part.strip())
+            if match is None:
+                raise _DSLError(
+                    "Initial conditions must use '[Species] = value' or "
+                    "'init: Species=value' syntax.",
+                    line_number=line_number,
+                    line_content=line_content,
+                )
+            pairs.append(
+                (
+                    str(match.group("species")),
+                    str(match.group("value")),
+                )
+            )
+    return tuple(
+        DslInitialConditionAssignment(
+            species=species,
+            value=_inline_initial_number(
+                value_token,
+                set_name=set_name,
+                species=species,
+                line_number=line_number,
+                line_content=line_content,
+            ),
+        )
+        for species, value_token in pairs
+    )
+
+
+def _commented_initial_source(
+    lines: list[str],
+    claimed_indexes: set[int],
+) -> str:
+    rendered = [
+        (
+            INITIAL_PROVENANCE_PREFIX + line.rstrip()
+            if index in claimed_indexes
+            else line.rstrip()
+        )
+        for index, line in enumerate(lines)
+    ]
+    return "\n".join(rendered).strip()
+
+
+def _admit_unique_initial_assignments(
+    assignments: tuple[DslInitialConditionAssignment, ...],
+    seen: set[str],
+    *,
+    scope: str,
+    line_number: int,
+    line_content: str,
+) -> None:
+    """Reject duplicate species before constructing the typed admission."""
+
+    for assignment in assignments:
+        if assignment.species in seen:
+            raise _DSLError(
+                "Duplicate inline initial-condition assignment for "
+                f"species {assignment.species!r} in {scope}.",
+                line_number=line_number,
+                line_content=line_content,
+            )
+        seen.add(assignment.species)
+
+
+def _admit_inline_initial_conditions(
+    text: str,
+) -> tuple[DslInitialConditionAdmission, frozenset[int]]:
+    """Parse all inline IC syntax once and return claimed zero-based lines."""
+
+    lines = text.splitlines()
+    declarations: list[DslInitialConditionDeclaration] = []
+    claimed_indexes: set[int] = set()
+    named_keys: set[str] = set()
+    anonymous_species: set[str] = set()
+    index = 0
+    while index < len(lines):
+        raw = lines[index]
+        code = raw.split("#", 1)[0].strip()
+        if not code:
+            index += 1
+            continue
+        header = _NAMED_INITIAL_BLOCK_START_RE.fullmatch(code)
+        if header is not None:
+            set_name = str(header.group("name"))
+            body = str(header.group("body"))
+            # Parameter algebra declarations own their own grammar.
+            if set_name.lower() in {"let", "param"}:
+                index += 1
+                continue
+            key = set_name.casefold()
+            if key in named_keys:
+                raise _DSLError(
+                    f"Duplicate inline initial-condition set name: "
+                    f"{set_name!r}.",
+                    line_number=index + 1,
+                    line_content=raw,
+                )
+            named_keys.add(key)
+            start = index
+            assignments: list[DslInitialConditionAssignment] = []
+            named_species: set[str] = set()
+            one_line_closed = False
+            if "}" in body:
+                before_close, close, after_close = body.partition("}")
+                if close and after_close.strip():
+                    raise _DSLError(
+                        "Inline initial-condition block closing '}' must end "
+                        "the declaration.",
+                        line_number=index + 1,
+                        line_content=raw,
+                    )
+                if before_close.strip():
+                    parsed = _inline_initial_assignments(
+                        before_close.strip(),
+                        set_name=set_name,
+                        line_number=index + 1,
+                        line_content=raw,
+                    )
+                    _admit_unique_initial_assignments(
+                        parsed,
+                        named_species,
+                        scope=f"set {set_name!r}",
+                        line_number=index + 1,
+                        line_content=raw,
+                    )
+                    assignments.extend(parsed)
+                one_line_closed = True
+            elif body.strip():
+                parsed = _inline_initial_assignments(
+                    body,
+                    set_name=set_name,
+                    line_number=index + 1,
+                    line_content=raw,
+                )
+                _admit_unique_initial_assignments(
+                    parsed,
+                    named_species,
+                    scope=f"set {set_name!r}",
+                    line_number=index + 1,
+                    line_content=raw,
+                )
+                assignments.extend(parsed)
+            if one_line_closed:
+                end = index
+            else:
+                cursor = index + 1
+                while cursor < len(lines):
+                    block_raw = lines[cursor]
+                    block_code = block_raw.split("#", 1)[0].strip()
+                    if not block_code:
+                        cursor += 1
+                        continue
+                    if block_code == "}":
+                        break
+                    if "}" in block_code:
+                        before_close, close, after_close = block_code.partition(
+                            "}"
+                        )
+                        if not close or after_close.strip():
+                            raise _DSLError(
+                                "Inline initial-condition block closing '}' "
+                                "must end the declaration.",
+                                line_number=cursor + 1,
+                                line_content=block_raw,
+                            )
+                        if before_close.strip():
+                            parsed = _inline_initial_assignments(
+                                before_close,
+                                set_name=set_name,
+                                line_number=cursor + 1,
+                                line_content=block_raw,
+                            )
+                            _admit_unique_initial_assignments(
+                                parsed,
+                                named_species,
+                                scope=f"set {set_name!r}",
+                                line_number=cursor + 1,
+                                line_content=block_raw,
+                            )
+                            assignments.extend(parsed)
+                        break
+                    parsed = _inline_initial_assignments(
+                        block_code,
+                        set_name=set_name,
+                        line_number=cursor + 1,
+                        line_content=block_raw,
+                    )
+                    _admit_unique_initial_assignments(
+                        parsed,
+                        named_species,
+                        scope=f"set {set_name!r}",
+                        line_number=cursor + 1,
+                        line_content=block_raw,
+                    )
+                    assignments.extend(parsed)
+                    cursor += 1
+                if cursor >= len(lines):
+                    raise _DSLError(
+                        f"Inline initial-condition set {set_name!r} is "
+                        "missing a closing '}'.",
+                        line_number=start + 1,
+                        line_content=raw,
+                    )
+                end = cursor
+            claimed_indexes.update(range(start, end + 1))
+            declarations.append(
+                DslInitialConditionDeclaration(
+                    source_kind="named",
+                    source_name=set_name,
+                    assignments=tuple(assignments),
+                )
+            )
+            index = end + 1
+            continue
+        lowered = code.lower()
+        if code.startswith("[") or lowered.startswith(("init:", "initial:")):
+            parsed = _inline_initial_assignments(
+                code,
+                set_name=None,
+                line_number=index + 1,
+                line_content=raw,
+            )
+            _admit_unique_initial_assignments(
+                parsed,
+                anonymous_species,
+                scope="the anonymous initial-condition set",
+                line_number=index + 1,
+                line_content=raw,
+            )
+            claimed_indexes.add(index)
+            declarations.append(
+                DslInitialConditionDeclaration(
+                    source_kind="anonymous",
+                    source_name=None,
+                    assignments=parsed,
+                )
+            )
+        index += 1
+    return (
+        DslInitialConditionAdmission(
+            declarations=tuple(declarations),
+            materialized_source=_commented_initial_source(
+                lines,
+                claimed_indexes,
+            ),
+        ),
+        frozenset(claimed_indexes),
+    )
+
+
+def _admit_temperature_directive(text: str) -> tuple[int, str] | None:
+    """Admit zero or one top-level typed temperature directive and its line."""
+    directives: list[tuple[int, str, str]] = []
+    for line_number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        lower = line.lower()
+        for prefix in _TEMPERATURE_DIRECTIVE_PREFIXES:
+            if lower.startswith(prefix):
+                directives.append((line_number, raw, prefix[:-1]))
+                break
+    if len(directives) > 1:
+        line_number, raw, _kind = directives[1]
+        kinds = ", ".join(kind for _number, _raw, kind in directives)
+        raise _DSLError(
+            "At most one top-level temperature schedule directive is "
+            f"allowed. Found {len(directives)} ({kinds}).",
+            line_number=line_number,
+            line_content=raw,
+        )
+    return directives[0][:2] if directives else None
+
+
+def _line_content(raw_line: str) -> str:
+    """Remove only the physical line ending, retaining authored whitespace."""
+
+    if raw_line.endswith("\r\n"):
+        return raw_line[:-2]
+    if raw_line.endswith(("\r", "\n")):
+        return raw_line[:-1]
+    return raw_line
+
+
+def _source_coordinates_from_key_value_spans(
+    key_value_spans: tuple[tuple[str, int, int], ...],
+    *,
+    physical_line_index: int,
+    step_index: int,
+    step: DslBuildStep,
+    line_content: str,
+) -> tuple[DslSourceCoordinate, ...]:
+    """Project parser-captured value spans into canonical source identities."""
+
+    equilibrium = step.reversible
+    coordinates: list[DslSourceCoordinate] = []
+    seen_names: set[str] = set()
+    for role, value_start, value_end in key_value_spans:
+        if role in {"k", "kf"}:
+            if equilibrium:
+                canonical_role = "kf"
+            else:
+                canonical_role = "k"
+        elif role in {"kr", "Keq"}:
+            if not equilibrium:
+                continue
+            canonical_role = role
+        elif role in {"A", "Ea", "dG_act", "dG_eq"}:
+            if role == "dG_eq" and not equilibrium:
+                continue
+            canonical_role = role
+        elif role == "degeneracy":
+            if not isinstance(step.forward_model, EyringRateModel):
+                continue
+            canonical_role = role
+        elif role == "kappa":
+            # kappa is a physical Eyring coordinate only when explicitly
+            # authored.  Its source span remains tied to the original key
+            # spelling; only the canonical authority name is normalized.
+            if not isinstance(step.forward_model, EyringRateModel):
+                continue
+            canonical_role = "kappa"
+        else:
+            continue
+        canonical_name = canonical_source_coordinate_name(
+            step_index,
+            canonical_role,
+        )
+        if canonical_name in seen_names:
+            raise _DSLError(
+                f"Duplicate source coordinate {canonical_name!r}.",
+                line_number=physical_line_index + 1,
+                line_content=line_content,
+            )
+        seen_names.add(canonical_name)
+        coordinates.append(
+            DslSourceCoordinate(
+                canonical_name=canonical_name,
+                role=canonical_role,
+                physical_line_index=physical_line_index,
+                value_start=value_start,
+                value_end=value_end,
+            )
+        )
+    return tuple(coordinates)
 
 
 def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
     """
     Parse simulator DSL into a structured intermediate representation (IR).
 
-    This is the single source of truth for top-level DSL parsing. Preview generation
-    (`parse_dsl`) and Mechanism construction (`parse_dsl_to_mechanism`) derive their
-    behavior from this IR to prevent semantic drift across entry points.
+    This is the single source of truth for top-level DSL admission. Immutable
+    analysis and Mechanism construction derive from this IR so consumers never
+    parse source independently.
     """
     u = units or UnitsModel()
     energy_unit = u.energy_unit
     temperature_K = float(u.temperature_K)
     standard_conc_M = float(u.standard_conc_M)
-    kappa_global = 1.0
 
-    from .state_model import StateNetwork, TSDegreeError
+    temperature_directive = _admit_temperature_directive(text)
+    steps: List[DslBuildStep] = []
+    inline_initial_conditions, inline_initial_line_indexes = (
+        _admit_inline_initial_conditions(text)
+    )
 
-    state_network = StateNetwork()
-    steps: List[ParsedStep] = []
-    algebra_lines: List[str] = []
-    initials_from_dsl: Dict[str, float] = {}
-    notes: List[str] = []
+    # Build the temperature schedule after resolving the nominal temperature.
+    from ..temperature_dsl import TemperatureDSLError, parse_temperature_schedule
+    from ..intervention_schedule import _admit_intervention_directives
 
-    in_algebra_section = False
+    intervention_schedule, intervention_lines = _admit_intervention_directives(text)
 
-    # Parse temperature schedule if present
-    from ..temperature_dsl import parse_temperature_schedule
+    raw_lines = text.splitlines(keepends=True)
+    line_contents = [_line_content(raw_line) for raw_line in raw_lines]
+    lines = [line.rstrip() for line in line_contents]
 
-    temperature_schedule = parse_temperature_schedule(text)
+    # Resolve source-wide settings before lowering any reaction.  A directive
+    # may appear anywhere in the source, but each global setting has exactly
+    # one source owner and duplicate definitions fail before chemistry is
+    # constructed.
+    global_directive_lines: set[int] = set()
+    global_directives: dict[str, tuple[int, str]] = {}
+    for line_no, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Only capital T sets temperature; lowercase t is simulation time.
+        directive = re.match(r"(?:(?i:energy|c0)|T)\s*=(?!>)", line)
+        if directive is None:
+            continue
+        key = _KEY_ALIASES[directive.group(0).split("=")[0].strip().lower()]
+        assignments = _parse_keyvals(
+            line,
+            reject_duplicate_canonical_keys=True,
+            line_number=line_no,
+            line_content=raw,
+        )
+        if set(assignments) != {key}:
+            raise _DSLError(
+                f"Global {key}= must be the only assignment on its line.",
+                line_number=line_no,
+                line_content=raw,
+            )
+        if key in global_directives:
+            raise _DSLError(
+                f"Duplicate global {key} directive.",
+                line_number=line_no,
+                line_content=raw,
+            )
+        global_directives[key] = (line_no, raw)
+        global_directive_lines.add(line_no)
 
-    raw_lines = text.splitlines()
-    if not any(line.strip() and not line.strip().startswith("#") for line in raw_lines):
-        raise DSLError("DSL text is empty. Provide at least one reaction or directive.")
+    if "energy" in global_directives:
+        line_no, raw = global_directives["energy"]
+        try:
+            energy_unit = _parse_energy_unit_directive(raw.strip())
+        except _DSLError as exc:
+            if exc.line_number is None:
+                raise _DSLError(
+                    str(exc.message),
+                    line_number=line_no,
+                    line_content=raw,
+                ) from exc
+            raise
+    if "C0" in global_directives:
+        line_no, raw = global_directives["C0"]
+        try:
+            standard_conc_M = _parse_standard_conc_directive(raw.strip())
+        except _DSLError as exc:
+            if exc.line_number is None:
+                raise _DSLError(
+                    str(exc.message),
+                    line_number=line_no,
+                    line_content=raw,
+                ) from exc
+            raise
 
-    lines = [ln.rstrip() for ln in raw_lines]
+    if "T" in global_directives:
+        line_no, raw = global_directives["T"]
+        try:
+            values = _parse_keyvals(raw.strip(), reject_duplicate_canonical_keys=True)
+            temperature_K = validate_temperature(_float_or_none(values["T"], "T"), field="T")
+        except (ValueError, _DSLError) as exc:
+            raise _DSLError(
+                str(exc), line_number=line_no, line_content=raw,
+            ) from exc
+
+    temperature_schedule = None
+    if temperature_directive is not None:
+        line_no, raw = temperature_directive
+        try:
+            temperature_schedule = parse_temperature_schedule(
+                raw, nominal_temperature=temperature_K,
+            )
+        except TemperatureDSLError as exc:
+            raise _DSLError(
+                str(exc), line_number=line_no, line_content=raw,
+            ) from exc
+
     for line_no, raw in enumerate(lines, start=1):
         line = raw.strip()
         lower = line.lower()
 
-        # Check for algebra section marker
-        if lower.startswith("# algebra"):
-            in_algebra_section = True
-            continue
-
-        # Check for other section markers (exit algebra section)
-        if lower.startswith("# ") and in_algebra_section and not lower.startswith("# algebra"):
-            in_algebra_section = False
-
-        # Collect algebra lines
-        if in_algebra_section and line and not line.startswith("#"):
-            algebra_lines.append(line)
-            continue
-
         if not line or line.startswith("#"):
             continue
 
-        # Computational Mode source-of-truth lines are embedded in the Reaction DSL
-        # but are not part of the simulation DSL. Simulations consume only the
-        # generated mechanism block, so `comp:` lines must be ignored here.
-        if lower.startswith("comp:"):
-            continue
-
         # Temperature schedule lines: parsed separately above
-        if lower.startswith(("time:", "temp_const:", "temp_step:", "temp_response:")):
+        if lower.startswith(_TEMPERATURE_DIRECTIVE_PREFIXES):
+            continue
+        if lower.startswith("intervention:"):
             continue
 
-        # Header-like switches
-        if lower.startswith("energy="):
-            try:
-                energy_unit = _parse_energy_unit_directive(line)
-            except DSLError as exc:
-                if exc.line_number is None:
-                    raise DSLError(str(exc.message), suggestion=exc.suggestion, examples=exc.examples,
-                                   line_number=line_no, line_content=raw) from exc
-                raise
-            notes.append(f"energy unit set to {energy_unit}")
+        # Source-wide settings were resolved before lowering.
+        if line_no in global_directive_lines:
             continue
 
-        if lower.startswith("t="):
-            try:
-                temperature_K = _parse_temperature_directive(line)
-            except DSLError as exc:
-                if exc.line_number is None:
-                    raise DSLError(str(exc.message), suggestion=exc.suggestion, examples=exc.examples,
-                                   line_number=line_no, line_content=raw) from exc
-                raise
-            notes.append(f"T set to {temperature_K:.2f} K")
+        if line_no - 1 in inline_initial_line_indexes:
             continue
 
-        if lower.startswith("c0=") or lower.startswith("c°="):
-            try:
-                standard_conc_M = _parse_standard_conc_directive(line)
-            except DSLError as exc:
-                if exc.line_number is None:
-                    raise DSLError(str(exc.message), suggestion=exc.suggestion, examples=exc.examples,
-                                   line_number=line_no, line_content=raw) from exc
-                raise
-            notes.append(f"C° set to {standard_conc_M:g} M")
+        classification = classify_parameter_algebra_declaration(raw, line_number=line_no)
+        if classification.kind == "let":
             continue
 
-        if lower.startswith("κ=") or lower.startswith("kappa="):
-            try:
-                kappa_global = _parse_kappa_directive(line)
-            except DSLError as exc:
-                if exc.line_number is None:
-                    raise DSLError(str(exc.message), suggestion=exc.suggestion, examples=exc.examples,
-                                   line_number=line_no, line_content=raw) from exc
-                raise
-            notes.append(f"κ set to {kappa_global:g}")
+        if classification.kind == "param":
             continue
 
-        # Initial conditions: [A]=1.0 or [A] = 1.0 or init: A=1.0
-        if line.startswith("[") and "=" in line:
-            try:
-                initials_from_dsl.update(_parse_bracket_initials(line))
-            except DSLError as exc:
-                if exc.line_number is None:
-                    raise DSLError(str(exc.message), suggestion=exc.suggestion, examples=exc.examples,
-                                   line_number=line_no, line_content=raw) from exc
-                raise
-            continue
-
-        if lower.startswith("init:") or lower.startswith("initial:"):
-            try:
-                initials_from_dsl.update(_parse_init_directive(line))
-            except DSLError as exc:
-                if exc.line_number is None:
-                    raise DSLError(str(exc.message), suggestion=exc.suggestion, examples=exc.examples,
-                                   line_number=line_no, line_content=raw) from exc
-                raise
-            continue
-
-        # State and edge definitions - parse into state network
-        if lower.startswith("state:"):
-            _, rest = line.split(":", 1)
-            name, state_kwargs = _parse_state_step(
-                rest,
-                energy_unit=energy_unit,
+        if classification.kind == "invalid_step_key_identifier":
+            target = classification.raw_name or raw.strip()
+            raise _DSLError(
+                f"{target!r} is a reaction-line field, so it cannot name a param or let line.",
                 line_number=line_no,
                 line_content=raw,
             )
-            try:
-                state_network.add_state(name, **state_kwargs)
-            except ValueError as exc:
-                raise DSLError(str(exc), line_number=line_no, line_content=raw) from exc
-            continue
 
-        if lower.startswith("edge:"):
-            _, rest = line.split(":", 1)
-            a, b = _parse_edge_step(rest, line_number=line_no, line_content=raw)
-            try:
-                state_network.add_edge(a, b)
-            except (KeyError, ValueError) as exc:
-                raise DSLError(str(exc), line_number=line_no, line_content=raw) from exc
-            continue
-
-        # reaction: line
-        if lower.startswith("reaction:"):
-            _, rest = line.split(":", 1)
-            steps.append(
-                _parse_reaction_step(
-                    rest,
-                    energy_unit=energy_unit,
-                    T=temperature_K,
-                    C0=standard_conc_M,
-                    kappa_global=kappa_global,
-                    line_number=line_no,
-                    line_content=raw,
-                )
+        if classification.kind == "unsupported_bare_assignment":
+            target = classification.raw_name or raw.strip()
+            raise _DSLError(
+                f"Assignment {target!r} must start with let or param.",
+                line_number=line_no,
+                line_content=raw,
             )
-            continue
 
-        # equilibrium: line
-        if lower.startswith("equilibrium:"):
-            _, rest = line.split(":", 1)
-            steps.append(
-                _parse_equilibrium_step(
-                    rest,
-                    energy_unit=energy_unit,
-                    T=temperature_K,
-                    C0=standard_conc_M,
-                    kappa_global=kappa_global,
-                    line_number=line_no,
-                    line_content=raw,
-                )
-            )
-            continue
-
-        # Fallback: Try to parse as bare arrow syntax (no "reaction:" or "equilibrium:" prefix)
         if _ARROW_RE.search(line):
-            steps.append(
-                _parse_bare_arrow_step(
-                    line,
-                    energy_unit=energy_unit,
-                    T=temperature_K,
-                    C0=standard_conc_M,
-                    kappa_global=kappa_global,
-                    line_number=line_no,
-                    line_content=raw,
-                )
+            leading_offset = len(line_contents[line_no - 1]) - len(
+                line_contents[line_no - 1].lstrip()
             )
+            parsed_step = _parse_bare_arrow_step(
+                line,
+                energy_unit=energy_unit,
+                C0=standard_conc_M,
+                line_number=line_no,
+                line_content=raw,
+                physical_line_index=line_no - 1,
+                step_index=len(steps) + 1,
+                source_offset=leading_offset,
+            )
+            steps.append(parsed_step)
             continue
 
-        raise DSLError(f"unrecognized line: {line!r}", line_number=line_no, line_content=raw)
+        raise _DSLError(
+            "Unrecognized line."
+            + (" Temperature is set with capital T=." if re.match(r"t\s*=(?!>)", line) else ""),
+            line_number=line_no,
+            line_content=raw,
+        )
 
-    if state_network.states() or state_network.edges():
-        try:
-            state_network.validate()
-        except (TSDegreeError, ValueError) as exc:
-            raise DSLError(str(exc)) from None
-
-    if temperature_schedule is not None:
-        notes.append(f"Temperature schedule detected: {temperature_schedule}")
-
+    if not steps:
+        raise _DSLError("Enter at least one reaction.")
     return DSLIR(
-        version=_DSL_IR_VERSION,
         energy_unit=str(energy_unit),
         temperature_K=float(temperature_K),
         standard_conc_M=float(standard_conc_M),
-        kappa_global=float(kappa_global),
         temperature_schedule=temperature_schedule,
-        state_network=state_network,
+        intervention_schedule=intervention_schedule,
         steps=steps,
-        algebra_lines=algebra_lines,
-        initials_from_dsl=initials_from_dsl,
-        notes=notes,
+        inline_initial_conditions=inline_initial_conditions,
+        intervention_lines=intervention_lines,
     )
-
-
-def parse_dsl(text: str, *, units: UnitsModel | None = None) -> DSLResult:
-    """
-    Parse DSL text and compute preview lines.
-
-    Parameters
-    ----------
-    text : str
-        DSL content.
-    units : UnitsModel | None
-        Units context (energy unit, T, C0/p0). If None, defaults are used.
-
-    Returns
-    -------
-    DSLResult
-    """
-    ir = _parse_dsl_ir(text, units=units)
-    from .dsl_preview import build_step_previews
-
-    previews = build_step_previews(
-        ir.steps,
-        temperature_K=ir.temperature_K,
-        kappa_global=ir.kappa_global,
-    )
-    return DSLResult(
-        previews=previews,
-        notes=list(ir.notes),
-        temperature_schedule=ir.temperature_schedule,
-        ir=ir,
-    )
-
-
-def parse_and_preview(text: str, *, units: UnitsModel | None = None) -> List[str]:
-    """
-    Convenience: return just the preview strings for GUI display.
-    """
-    res = parse_dsl(text, units=units)
-    return [p.text for p in res.previews]
 
 
 # ------------------------------ Mechanism building ---------------------------
 
-@dataclass
-class ParsedStep:
-    """Internal representation of a parsed reaction step."""
-    reactants: Dict[str, float]
-    products: Dict[str, float]
-    reversible: bool
-    kf: float
-    kr: Optional[float]
-    model: str  # "Eyring" or "Arrhenius"
-    is_equilibrium: bool  # True if from "equilibrium:" line
-    arrhenius_A: Optional[float] = None
-    arrhenius_Ea_J_per_mol: Optional[float] = None
-    eyring_dG_act_J_per_mol: Optional[float] = None
-    kappa: Optional[float] = None
-    standard_conc_M: Optional[float] = None
-    dG_eq_J_per_mol: Optional[float] = None
-    Keq_input: Optional[float] = None
-    explicit_rates: List[float] = field(default_factory=list)
-    user_kf_explicit: bool = False
-    user_kr_explicit: bool = False
-
 
 def _parse_energy_unit_directive(line: str) -> str:
-    from .common import normalize_energy_unit
-
-    kv = _parse_keyvals(line)
-    raw = kv.get("energy")
-    if not raw:
-        raise DSLError("energy= directive requires a value (kJ/mol, kcal/mol, or J/mol)")
+    raw = _parse_keyvals(line, reject_duplicate_canonical_keys=True)["energy"]
     try:
         return normalize_energy_unit(raw)
     except ValueError:
-        raise DSLError(
-            f"energy must be 'kJ/mol', 'kcal/mol', or 'J/mol', got {raw!r}",
-            examples=["energy=kJ/mol", "energy=kcal/mol", "energy=J/mol"],
+        raise _DSLError(
+            f"energy must be kJ/mol, kcal/mol, or J/mol, not '{raw}'."
         )
-
-
-def _parse_temperature_directive(line: str) -> float:
-    kv = _parse_keyvals(line)
-    raw = kv.get("T")
-    if not raw:
-        raise DSLError("T= directive requires a numeric value")
-    T = _float_or_none(raw)
-    if T is None or T <= 0:
-        raise DSLError("T must be positive")
-    return float(T)
 
 
 def _parse_standard_conc_directive(line: str) -> float:
-    kv = _parse_keyvals(line)
-    raw = kv.get("C0")
-    if not raw:
-        raise DSLError("C0= directive requires a numeric value")
-    C0 = _float_or_none(raw)
-    if C0 is None or C0 <= 0:
-        raise DSLError("C0 must be positive")
-    return float(C0)
-
-
-def _parse_kappa_directive(line: str) -> float:
-    kv = _parse_keyvals(line)
-    raw = kv.get("κ")
-    if not raw:
-        raise DSLError("κ= directive requires a numeric value")
-    kappa = _float_or_none(raw)
-    if kappa is None or kappa <= 0:
-        raise DSLError("κ must be positive")
-    return float(kappa)
-
-
-def _parse_bracket_initials(line: str) -> Dict[str, float]:
-    initials: Dict[str, float] = {}
-    for item in line.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        if item.startswith("[") and "]" in item and "=" in item:
-            bracket_end = item.index("]")
-            species = item[1:bracket_end].strip()
-            eq_pos = item.index("=", bracket_end)
-            value_str = item[eq_pos + 1 :].strip()
-            value = _float_or_none(value_str)
-            if value is None:
-                raise DSLError(f"Initial condition value must be numeric, got: {value_str}")
-            initials[species] = float(value)
-    return initials
-
-
-def _parse_init_directive(line: str) -> Dict[str, float]:
-    _, rest = line.split(":", 1)
-    kv = _parse_keyvals(rest)
-    initials: Dict[str, float] = {}
-    for species, value_str in kv.items():
-        value = _float_or_none(value_str)
-        if value is None:
-            raise DSLError(f"Initial condition value must be numeric for {species}, got: {value_str}")
-        initials[species] = float(value)
-    return initials
-
-
-def _parse_state_step(
-    rest: str,
-    *,
-    energy_unit: str,
-    line_number: int,
-    line_content: str,
-) -> Tuple[str, Dict[str, object]]:
-    from .kinetics import normalize_energy_to_J_per_mol
-
-    rest = rest.strip()
+    raw = _parse_keyvals(line, reject_duplicate_canonical_keys=True)["C0"]
     try:
-        name, kv = _parse_state_rest(rest)
-    except Exception as exc:
-        raise DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
-
-    if not name:
-        raise DSLError(
-            "state: requires a name",
-            examples=["state: GS1 ; kind=GS ; energy=0.0"],
-            line_number=line_number, line_content=line_content,
-        )
-
-    kind = (kv.get("kind") or "GS").strip().upper()
-    energy_unit_val = kv.get("energy_unit") or energy_unit
-    energy_val_raw = kv.get("energy")
-    ej = 0.0
-    if energy_val_raw is not None and str(energy_val_raw).strip() != "":
-        tok = str(energy_val_raw).strip().split()
-        if len(tok) == 2 and tok[1] in ("kJ/mol", "kcal/mol", "J/mol"):
-            v0 = _float_or_none(tok[0])
-            if v0 is None:
-                raise DSLError(
-                    "state energy must be numeric",
-                    examples=["state: TS1 ; energy=85.5 kJ/mol"],
-                    line_number=line_number, line_content=line_content,
-                )
-            ej = normalize_energy_to_J_per_mol(float(v0), tok[1])
-        else:
-            v0 = _float_or_none(tok[0])
-            if v0 is None:
-                raise DSLError(
-                    "state energy must be numeric",
-                    examples=["state: TS1 ; energy=85.5"],
-                    line_number=line_number, line_content=line_content,
-                )
-            ej = normalize_energy_to_J_per_mol(float(v0), cast(str, energy_unit_val))
-
-    degeneracy_raw = _float_or_none(kv.get("degeneracy"))
-    degeneracy = 1.0 if degeneracy_raw is None else float(degeneracy_raw)
-    standard_state = kv.get("standard_state") or "C0"
-    members = None
-    if kv.get("members") is not None and str(kv.get("members")).strip() != "":
-        try:
-            members = _parse_members_expr(str(kv.get("members")))
-        except Exception as exc:
-            raise DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
-    std_prod = None
-    if kv.get("std") is not None and str(kv.get("std")).strip() != "":
-        std_val = _extract_numeric_value(str(kv.get("std")))
-        if std_val is None:
-            raise DSLError("std must be numeric", line_number=line_number, line_content=line_content)
-        std_prod = float(std_val)
-
-    return str(name), {
-        "kind": kind,
-        "energy": (ej, "J/mol"),
-        "degeneracy": degeneracy,
-        "standard_state": standard_state,
-        "members": members,
-        "std_conc_product_M": std_prod,
-    }
-
-
-def _parse_edge_step(
-    rest: str,
-    *,
-    line_number: Optional[int] = None,
-    line_content: Optional[str] = None,
-) -> Tuple[str, str]:
-    rest = rest.strip()
-    if "," in rest:
-        parts = rest.split(",")
-    elif "-" in rest:
-        parts = rest.split("-")
-    else:
-        raise DSLError(f"edge must be 'A,B' or 'A-B', got: {rest}",
-                       line_number=line_number, line_content=line_content)
-
-    if len(parts) != 2:
-        raise DSLError(f"edge must connect exactly 2 states, got: {rest}",
-                       line_number=line_number, line_content=line_content)
-
-    a = parts[0].strip()
-    b = parts[1].strip()
-    return a, b
+        return validate_c0(_float_or_none(raw, "C0"), field="C0")
+    except ValueError as exc:
+        raise _DSLError(str(exc)) from exc
 
 
 def _split_stoich_and_params(
@@ -880,6 +1307,8 @@ def _split_stoich_and_params(
     reject_duplicate_canonical_keys: bool = False,
     line_number: int | None = None,
     line_content: str | None = None,
+    coordinate_spans: list[tuple[str, int, int]] | None = None,
+    source_offset: int = 0,
 ) -> Tuple[str, Dict[str, str]]:
     stoich_part, *tail = _SEMI_SPLIT_RE.split(text, maxsplit=1)
     params = (
@@ -888,6 +1317,8 @@ def _split_stoich_and_params(
             reject_duplicate_canonical_keys=reject_duplicate_canonical_keys,
             line_number=line_number,
             line_content=line_content,
+            coordinate_spans=coordinate_spans,
+            source_offset=source_offset + len(stoich_part) + 1,
         )
         if tail
         else {}
@@ -905,13 +1336,13 @@ def _reject_per_step_globals(
 ) -> None:
     """Reject per-reaction T= and energy= overrides."""
     if "T" in params:
-        raise DSLError(
-            "Per-reaction T= is not supported; use a global T= directive",
+        raise _DSLError(
+            "T= cannot be set on a reaction line. Write T= on its own line.",
             line_number=line_number, line_content=line_content,
         )
     if "energy" in params:
-        raise DSLError(
-            "Per-reaction energy= is not supported; use a global energy= directive",
+        raise _DSLError(
+            "energy= cannot be set on a reaction line. Write energy= on its own line.",
             line_number=line_number, line_content=line_content,
         )
 
@@ -919,7 +1350,6 @@ def _reject_per_step_globals(
 def _reject_unknown_params(
     params: Dict[str, str],
     known_keys: frozenset,
-    step_label: str,
     *,
     line_number: Optional[int],
     line_content: Optional[str],
@@ -927,48 +1357,10 @@ def _reject_unknown_params(
     """Reject parameter keys not in known_keys."""
     unknown = set(params) - known_keys
     if unknown:
-        raise DSLError(
-            f"Unknown {step_label} parameter(s): {', '.join(sorted(unknown))}",
+        raise _DSLError(
+            f"Unknown reaction field{'s' * (len(unknown) > 1)}: {', '.join(sorted(unknown))}.",
             line_number=line_number, line_content=line_content,
         )
-
-
-def _resolve_Keq_from_params(
-    params: Dict[str, str],
-    *,
-    energy_unit: str,
-    T: float,
-    line_number: Optional[int],
-    line_content: Optional[str],
-) -> Tuple[float, Optional[float]]:
-    """Resolve equilibrium constant Keq from explicit K/Keq input or dG_eq=.
-
-    Precondition: at least one of "Keq" or "dG_eq" must be present in params.
-    Returns (Keq, dG_eqJ_or_None). Raises DSLError on numeric/overflow/underflow issues.
-    """
-    from .kinetics import K_from_deltaG_eq, normalize_energy_to_J_per_mol
-
-    Keq = _float_or_none(params.get("Keq"))
-    dG_eqJ: Optional[float] = None
-    if Keq is None:
-        dG_eq_val = _float_or_none(params["dG_eq"])
-        if dG_eq_val is None:
-            raise DSLError("dG_eq must be numeric", line_number=line_number, line_content=line_content)
-        dG = normalize_energy_to_J_per_mol(dG_eq_val, energy_unit)
-        dG_eqJ = dG
-        try:
-            Keq = K_from_deltaG_eq(dG, T)
-        except OverflowError as exc:
-            raise DSLError(
-                "Equilibrium constant overflow (dG_eq too large for given T)",
-                line_number=line_number, line_content=line_content,
-            ) from exc
-        if Keq <= 0:
-            raise DSLError(
-                "Equilibrium constant underflowed to zero (dG_eq too large for given T)",
-                line_number=line_number, line_content=line_content,
-            )
-    return Keq, dG_eqJ
 
 
 def _parse_reaction_like_step(
@@ -976,207 +1368,131 @@ def _parse_reaction_like_step(
     stoich_part: str,
     params: Dict[str, str],
     energy_unit: str,
-    T: float,
     C0: float,
-    kappa_global: float,
-    missing_eyring_message: str,
     line_number: int | None,
     line_content: str | None,
-) -> ParsedStep:
-    from .common import molecularity
-    from .kinetics import arrhenius_rate, eyring_rate, normalize_energy_to_J_per_mol
-
-    try:
-        react, prod, arrow = _parse_stoich(stoich_part)
-    except DSLError as exc:
-        if exc.line_number is None:
-            raise DSLError(str(exc.message), suggestion=exc.suggestion, examples=exc.examples,
-                           line_number=line_number, line_content=line_content) from exc
-        raise
+) -> DslBuildStep:
+    react, prod, arrow = _parse_stoich(stoich_part)
     reversible = arrow in ("<->", "<=>")
+    if reversible and not (react and prod):
+        raise _DSLError(
+            "A reversible step needs species on both sides.",
+            line_number=line_number,
+            line_content=line_content,
+        )
+    if not reversible and react == prod:
+        raise _DSLError(
+            "This step leaves every species unchanged.",
+            line_number=line_number,
+            line_content=line_content,
+        )
 
     _reject_per_step_globals(params, line_number=line_number, line_content=line_content)
-    _reject_unknown_params(params, _REACTION_KNOWN_KEYS, "reaction",
+    _reject_unknown_params(params, _REACTION_KNOWN_KEYS,
                            line_number=line_number, line_content=line_content)
+    reverse_only = [key for key in ("kr", "Keq", "dG_eq") if key in params]
+    if not reversible and reverse_only:
+        raise _DSLError(
+            f"An irreversible step cannot have {', '.join(reverse_only)}. "
+            "Use <-> for a reversible step, or remove the field.",
+            line_number=line_number,
+            line_content=line_content,
+        )
 
-    model = "Eyring"
-    if "A" in params or "Ea" in params:
-        model = "Arrhenius"
-    kappa_raw = _float_or_none(params.get("κ"))
-    if kappa_raw is not None:
-        kappa = kappa_raw
-    else:
-        kappa = kappa_global
-    n = molecularity(react)
+    model = _forward_rate_family_from_params(
+        params,
+        reversible=reversible,
+        line_number=line_number,
+        line_content=line_content,
+    )
+    degeneracy = 1
+    if "degeneracy" in params:
+        if model != "Eyring" or "dG_act" not in params:
+            raise _DSLError(
+                "degeneracy is valid only with an Eyring dG_act forward rate.",
+                line_number=line_number,
+                line_content=line_content,
+            )
+        degeneracy = _parse_degeneracy(
+            params["degeneracy"],
+            line_number=line_number,
+            line_content=line_content,
+        )
+    kappa = _float_or_none(params["kappa"], "kappa") if "kappa" in params else 1.0
+    n = float(
+        directional_order_fraction(
+            react,
+        )
+    )
 
-    kf = _float_or_none(params.get("kf") or params.get("k"))
-    kr = _float_or_none(params.get("kr"))
-    if params.get("kf") or params.get("k"):
+    forward_rate_raw = params.get("kf") if "kf" in params else params.get("k")
+    kf = _float_or_none(forward_rate_raw, "kf" if "kf" in params else "k")
+    kr = _float_or_none(params.get("kr"), "kr")
+    has_forward_authority = any(
+        key in params for key in ("kf", "k", "A", "Ea", "dG_act")
+    )
+    if reversible:
+        _validate_equilibrium_rate_authority_for_dsl(
+            has_kf=has_forward_authority,
+            has_kr=("kr" in params),
+            has_Keq=("Keq" in params),
+            has_dG_eq=("dG_eq" in params),
+            line_number=line_number,
+            line_content=line_content,
+        )
+    if "kf" in params or "k" in params:
         _validate_rate_or_K(kf, "kf" if "kf" in params else "k",
                             line_number=line_number, line_content=line_content)
-    if params.get("kr"):
+    if "kr" in params:
         _validate_rate_or_K(kr, "kr", line_number=line_number, line_content=line_content)
+        if kf is not None and kf == 0.0:
+            raise _DSLError(
+                "Explicit kf+kr reversible steps require both directional rates to be positive.",
+                line_number=line_number,
+                line_content=line_content,
+            )
+    explicit_keq = _float_or_none(params.get("Keq"), "Keq")
     if "Keq" in params:
-        _Keq_early = _float_or_none(params["Keq"])
-        if _Keq_early is not None and _Keq_early <= 0:
-            raise DSLError(
-                f"Keq must be positive, got {_Keq_early}",
-                line_number=line_number, line_content=line_content,
-            )
-    arrhenius_A = None
-    arrhenius_EaJ = None
-    eyring_dGJ = None
-    dG_eqJ_for_step = None
-    Keq_input = None
-    explicit_rates: List[float] = []
+        _validate_rate_or_K(explicit_keq, "Keq", line_number=line_number, line_content=line_content)
 
-    if model == "Arrhenius":
-        A = _float_or_none(params.get("A"))
-        Ea = params.get("Ea")
-        if A is None or Ea is None:
-            raise DSLError(
-                "Arrhenius requires A and Ea",
-                examples=["A -> B ; A=1e13 ; Ea=50"],
-                line_number=line_number, line_content=line_content,
-            )
-        if A <= 0:
-            raise DSLError(
-                f"Arrhenius pre-exponential factor A must be positive, got {A}",
-                line_number=line_number, line_content=line_content,
-            )
-        Ea_val = _float_or_none(Ea)
-        if Ea_val is None:
-            raise DSLError("Ea must be numeric", line_number=line_number, line_content=line_content)
-        EaJ = normalize_energy_to_J_per_mol(Ea_val, energy_unit)
-        arrhenius_A = A
-        arrhenius_EaJ = EaJ
-        try:
-            kf = arrhenius_rate(A, EaJ, T)
-        except OverflowError as exc:
-            raise DSLError(
-                "Arrhenius rate computation overflowed (A and Ea produce an unrepresentable rate)",
-                line_number=line_number, line_content=line_content,
-            ) from exc
-        explicit_rates.append(kf)
-        if reversible and kr is None:
-            if "Keq" in params or "dG_eq" in params:
-                Keq, dG_eqJ_for_step = _resolve_Keq_from_params(
-                    params, energy_unit=energy_unit, T=T,
-                    line_number=line_number, line_content=line_content,
-                )
-                kr = kf / Keq
-                Keq_input = Keq if "Keq" in params else None
-            else:
-                raise DSLError(
-                    "reversible Arrhenius step needs kr or Keq/dG_eq",
-                    examples=["A <-> B ; A=1e10 ; Ea=50 ; K=2.0"],
-                    line_number=line_number, line_content=line_content,
-                )
-    else:
-        # Eyring
-        if kf is None:
-            if "dG_act" not in params:
-                raise DSLError(
-                    missing_eyring_message,
-                    examples=["A -> B ; dG_act=75.5", "A -> B ; k=1.5"],
-                    line_number=line_number, line_content=line_content,
-                )
-            dG_act_val = _float_or_none(params["dG_act"])
-            if dG_act_val is None:
-                raise DSLError("dG_act must be numeric", line_number=line_number, line_content=line_content)
-            dGJ = normalize_energy_to_J_per_mol(dG_act_val, energy_unit)
-            eyring_dGJ = dGJ
-            if kappa <= 0:
-                raise DSLError(
-                    f"Per-step kappa must be positive for Eyring rate computation, got {kappa}",
-                    line_number=line_number, line_content=line_content,
-                )
-            try:
-                kf = eyring_rate(dGJ, T, kappa=kappa, molecularity=n, standard_conc_M=C0)
-            except OverflowError as exc:
-                raise DSLError(
-                    "Eyring rate computation overflowed (dG_act too large for given T)",
-                    line_number=line_number, line_content=line_content,
-                ) from exc
-            explicit_rates.append(kf)
-        if reversible and kr is None:
-            if "Keq" in params or "dG_eq" in params:
-                Keq, dG_eqJ_for_step = _resolve_Keq_from_params(
-                    params, energy_unit=energy_unit, T=T,
-                    line_number=line_number, line_content=line_content,
-                )
-                kr = kf / Keq
-                Keq_input = Keq if "Keq" in params else None
-            else:
-                dG_eq_fallback_J_per_mol = None
-                dG_eq_raw = params.get("dG_eq")
-                if dG_eq_raw is not None:
-                    dG_eq_val = _float_or_none(dG_eq_raw)
-                    if dG_eq_val is None:
-                        raise DSLError("dG_eq must be numeric", line_number=line_number, line_content=line_content)
-                    dG_eq_fallback_J_per_mol = normalize_energy_to_J_per_mol(dG_eq_val, energy_unit)
-                fe = _derive_equilibrium_rates_with_context(
-                    Keq=_float_or_none(params.get("Keq")),
-                    dG_eq_J_per_mol=dG_eq_fallback_J_per_mol,
-                    T=T,
-                    explicit_rates=[kf] if kf is not None else None,
-                    line_number=line_number,
-                    line_content=line_content,
-                )
-                kr = fe.kr
+    def energy(key: str) -> float:
+        return admit_energy_j_per_mol(
+            energy_to_j_per_mol(_float_or_none(params[key], key), energy_unit), field=key
+        )
 
-    if kr is not None:
-        explicit_rates.append(kr)
+    try:
+        if model == "Arrhenius":
+            prefactor = _float_or_none(params["A"], "A")
+            activation = energy("Ea")
+            forward_model = ArrheniusRateModel(
+                A=admit_arrhenius_prefactor(prefactor, field="Arrhenius A"), Ea_J_per_mol=activation,
+            )
+        elif model == "Eyring":
+            activation = energy("dG_act")
+            forward_model = EyringRateModel(
+                dG_act_J_per_mol=activation,
+                kappa=admit_role_value(kappa, role="kappa", unit="1", allow_exact_zero=False, field="Eyring kappa"),
+                molecularity=n, standard_conc_M=C0, degeneracy=degeneracy,
+            )
+        else:
+            forward_model = ConstantRateModel(k=kf)
+        delta_g = energy("dG_eq") if "dG_eq" in params else None
+    except _DSLError:
+        raise
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
 
-    return ParsedStep(
-        reactants=react,
-        products=prod,
+    return DslBuildStep(
+        reactants=tuple((str(name), float(value)) for name, value in react.items()),
+        products=tuple((str(name), float(value)) for name, value in prod.items()),
         reversible=reversible,
-        kf=kf,
+        forward_model=forward_model,
         kr=kr,
-        model=model,
-        is_equilibrium=False,
-        arrhenius_A=arrhenius_A,
-        arrhenius_Ea_J_per_mol=arrhenius_EaJ,
-        eyring_dG_act_J_per_mol=eyring_dGJ,
-        kappa=kappa,
         standard_conc_M=C0,
-        dG_eq_J_per_mol=dG_eqJ_for_step,
-        Keq_input=Keq_input,
-        explicit_rates=explicit_rates,
-        user_kf_explicit=bool(
-            params.get("kf") or params.get("k") or params.get("A") or params.get("Ea") or params.get("dG_act")
-        ),
-        user_kr_explicit=bool(params.get("kr")),
-    )
-
-
-def _parse_reaction_step(
-    rest: str,
-    *,
-    energy_unit: str,
-    T: float,
-    C0: float,
-    kappa_global: float,
-    line_number: int,
-    line_content: str,
-) -> ParsedStep:
-    stoich_part, params = _split_stoich_and_params(
-        rest,
-        reject_duplicate_canonical_keys=True,
-        line_number=line_number,
-        line_content=line_content,
-    )
-    return _parse_reaction_like_step(
-        stoich_part=stoich_part,
-        params=params,
-        energy_unit=energy_unit,
-        T=T,
-        C0=C0,
-        kappa_global=kappa_global,
-        missing_eyring_message="Eyring step requires dG_act or explicit k",
-        line_number=line_number,
-        line_content=line_content,
+        dG_eq_J_per_mol=delta_g,
+        Keq_input=explicit_keq,
+        line=line_number,
+        line_text=line_content,
     )
 
 
@@ -1184,233 +1500,341 @@ def _parse_bare_arrow_step(
     line: str,
     *,
     energy_unit: str,
-    T: float,
     C0: float,
-    kappa_global: float,
     line_number: int,
     line_content: str,
-) -> ParsedStep:
+    physical_line_index: int = 0,
+    step_index: int = 1,
+    source_offset: int = 0,
+) -> DslBuildStep:
+    coordinate_spans: list[tuple[str, int, int]] = []
     stoich_part, params = _split_stoich_and_params(
         line,
         reject_duplicate_canonical_keys=True,
         line_number=line_number,
         line_content=line_content,
-    )
-    return _parse_reaction_like_step(
-        stoich_part=stoich_part,
-        params=params,
-        energy_unit=energy_unit,
-        T=T,
-        C0=C0,
-        kappa_global=kappa_global,
-        missing_eyring_message="Bare arrow syntax requires k (or kf), or dG_act for Eyring",
-        line_number=line_number,
-        line_content=line_content,
-    )
-
-
-def _parse_equilibrium_step(
-    rest: str,
-    *,
-    energy_unit: str,
-    T: float,
-    C0: float,
-    kappa_global: float,
-    line_number: int,
-    line_content: str,
-) -> ParsedStep:
-    from .common import molecularity
-    from .kinetics import normalize_energy_to_J_per_mol
-
-    stoich_part, params = _split_stoich_and_params(
-        rest,
-        reject_duplicate_canonical_keys=True,
-        line_number=line_number,
-        line_content=line_content,
+        coordinate_spans=coordinate_spans,
+        source_offset=source_offset,
     )
     try:
-        react, prod, arrow = _parse_stoich(stoich_part)
-    except DSLError as exc:
-        if exc.line_number is None:
-            raise DSLError(str(exc.message), suggestion=exc.suggestion, examples=exc.examples,
-                           line_number=line_number, line_content=line_content) from exc
-        raise
-    if arrow not in ("<->", "<=>"):
-        raise DSLError(
-            "equilibrium must use '<->' or '<=>'",
-            examples=["equilibrium: A <-> B ; Keq=2.0 ; kf=10"],
-            line_number=line_number, line_content=line_content,
-        )
-    _ = molecularity(react)
-
-    _reject_per_step_globals(params, line_number=line_number, line_content=line_content)
-    _reject_unknown_params(params, _EQUILIBRIUM_KNOWN_KEYS, "equilibrium",
-                           line_number=line_number, line_content=line_content)
-
-    has_explicit_Keq = "Keq" in params
-    Keq = _float_or_none(params.get("Keq"))
-    if has_explicit_Keq and Keq is None:
-        raise DSLError(
-            "Keq must be numeric",
+        parsed_step = _parse_reaction_like_step(
+            stoich_part=stoich_part,
+            params=params,
+            energy_unit=energy_unit,
+            C0=C0,
             line_number=line_number,
             line_content=line_content,
         )
-    if has_explicit_Keq and Keq is not None:
-        _validate_rate_or_K(Keq, "Keq", line_number=line_number, line_content=line_content)
-    dG_eqJ = None
-
-    exp_rates: List[float] = []
-    kf_explicit = None
-    kr_explicit = None
-    if "kf" in params:
-        kfv = _float_or_none(params["kf"])
-        if kfv is None:
-            raise DSLError("kf must be numeric", line_number=line_number, line_content=line_content)
-        _validate_rate_or_K(kfv, "kf", line_number=line_number, line_content=line_content)
-        kf_explicit = kfv
-        exp_rates.append(kfv)
-    if "kr" in params:
-        krv = _float_or_none(params["kr"])
-        if krv is None:
-            raise DSLError("kr must be numeric", line_number=line_number, line_content=line_content)
-        _validate_rate_or_K(krv, "kr", line_number=line_number, line_content=line_content)
-        kr_explicit = krv
-        exp_rates.append(krv)
-
-    if has_explicit_Keq and kf_explicit is None and kr_explicit is None:
-        raise DSLError(
-            "equilibrium with Keq=... requires at least one of kf or kr to anchor the rates",
-            suggestion="Provide either kf=...; Keq=... or kr=...; Keq=... (or specify both kf and kr without Keq).",
-            examples=[
-                "equilibrium: A <-> B; kf=10.0; Keq=5.0",
-                "equilibrium: A <-> B; kr=2.0; Keq=5.0",
-                "equilibrium: A <-> B; kf=4.0; kr=2.0",
-            ],
-            line_number=line_number,
+    except _DSLError as exc:
+        # Stoichiometry and number parsing refuse without the line; show it.
+        if exc.line_number is not None:
+            raise
+        raise _DSLError(exc.message, line_number=line_number, line_content=line_content) from exc
+    return replace(
+        parsed_step,
+        source_coordinates=_source_coordinates_from_key_value_spans(
+            tuple(coordinate_spans),
+            physical_line_index=physical_line_index,
+            step_index=step_index,
+            step=parsed_step,
             line_content=line_content,
-        )
-
-    if has_explicit_Keq and kf_explicit is not None and kr_explicit is not None:
-        if abs(kr_explicit) < 1e-30:
-            raise DSLError(
-                "kr must be non-zero when validating Keq against kf/kr",
-                line_number=line_number,
-                line_content=line_content,
-            )
-        implied_K = float(kf_explicit) / float(kr_explicit)
-        tol_rel = 1e-6
-        tol_abs = 1e-12
-        diff = abs(implied_K - float(Keq))
-        scale = max(abs(implied_K), abs(float(Keq)), 1.0)
-        if diff > (tol_abs + tol_rel * scale):
-            raise DSLError(
-                f"Inconsistent equilibrium parameters: Keq={float(Keq):.6g} but kf/kr={implied_K:.6g}",
-                suggestion="Adjust Keq or kf/kr so that Keq ≈ kf/kr (within tolerance).",
-                line_number=line_number,
-                line_content=line_content,
-            )
-
-    if Keq is None and kf_explicit is not None and kr_explicit is not None and kr_explicit != 0:
-        Keq = kf_explicit / kr_explicit
-
-    if Keq is None:
-        dG_eq = params.get("dG_eq") or params.get("dg_eq")
-        if dG_eq is None:
-            raise DSLError(
-                "equilibrium requires Keq, dG_eq, or both kf and kr. "
-                "Examples: 'Keq=2.0' or 'kf=1.5; kr=0.25' or 'dG_eq=-10 kJ/mol'",
-                line_number=line_number,
-                line_content=line_content,
-            )
-        dG_eq_val = _float_or_none(dG_eq)
-        if dG_eq_val is None:
-            raise DSLError("dG_eq must be numeric", line_number=line_number, line_content=line_content)
-        dG_eqJ = normalize_energy_to_J_per_mol(dG_eq_val, energy_unit)
-
-    fe = _derive_equilibrium_rates_with_context(
-        Keq=Keq,
-        dG_eq_J_per_mol=dG_eqJ,
-        T=T,
-        explicit_rates=exp_rates or None,
-        line_number=line_number,
-        line_content=line_content,
-    )
-    kf = fe.kf if kf_explicit is None else kf_explicit
-    kr = fe.kr if kr_explicit is None else kr_explicit
-
-    return ParsedStep(
-        reactants=react,
-        products=prod,
-        reversible=True,
-        kf=kf,
-        kr=kr,
-        model="Eyring",
-        is_equilibrium=True,
-        eyring_dG_act_J_per_mol=None,
-        kappa=kappa_global,
-        standard_conc_M=C0,
-        dG_eq_J_per_mol=dG_eqJ,
-        Keq_input=(Keq if has_explicit_Keq else None),
-        explicit_rates=exp_rates,
-        user_kf_explicit=("kf" in params),
-        user_kr_explicit=("kr" in params),
+        ),
     )
 
 
-def parse_dsl_to_mechanism(
+def _source_origins(
     text: str,
     *,
-    initials: Optional[Dict[str, float]] = None,
-    units: UnitsModel | None = None
-) -> Mechanism:
-    """
-    Parse DSL text and build a Mechanism object ready for simulation.
+    steps: tuple[DslBuildStep, ...] | list[DslBuildStep] = (),
+    parameter_algebra_spec: object | None = None,
+) -> tuple[DslSourceOrigin, ...]:
+    """Retain exact admitted line origins and their typed value spans."""
 
-    This function uses the full DSL parser with all advanced features
-    (Eyring/Arrhenius, state networks, fast equilibrium, etc.) and
-    converts the result into a Mechanism object.
+    coordinates_by_line: dict[int, list[DslSourceCoordinate]] = {}
+    step_by_line: dict[int, int] = {}
+    for step_index, step in enumerate(steps, start=1):
+        for coordinate in step.source_coordinates:
+            coordinates_by_line.setdefault(
+                coordinate.physical_line_index,
+                [],
+            ).append(coordinate)
+            step_by_line[coordinate.physical_line_index] = step_index
+    if parameter_algebra_spec is not None:
+        for statement in parameter_algebra_spec.param_statements:
+            coordinate = statement.source_coordinate
+            if coordinate is not None:
+                coordinates_by_line.setdefault(
+                    coordinate.physical_line_index,
+                    [],
+                ).append(coordinate)
+    origins: list[DslSourceOrigin] = []
+    for physical_line_index, raw_line in enumerate(text.splitlines(keepends=True)):
+        source_line = _line_content(raw_line)
+        stripped = source_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        origins.append(
+            DslSourceOrigin(
+                authored_ordinal=len(origins),
+                source_text=source_line,
+                physical_line_index=physical_line_index,
+                step_index=step_by_line.get(physical_line_index),
+                coordinates=tuple(
+                    coordinates_by_line.get(physical_line_index, ())
+                ),
+            )
+        )
+    return tuple(origins)
 
-    Parameters
-    ----------
-    text : str
-        DSL content supporting all features:
-        - reaction: A -> B; dG_act=80, energy=kJ/mol
-        - reaction: A + B -> C; Ea=50, A=1e13, energy=kJ/mol
-        - equilibrium: A <-> B; K=4.0
-        - equilibrium: A <-> B; dG_eq=-5, energy=kJ/mol
-        - Global settings: T=310, energy=kJ/mol, κ=0.8, C0=1.0
-        - State networks: state: A, kind=GS, energy=0
-        - Edges: edge: A,TS1
-    initials : dict, optional
-        Initial concentrations {species: value}. Treated as input-only (this
-        function does not mutate the caller's mapping). When the DSL also
-        specifies an initial concentration for the same species, the DSL value
-        takes precedence.
-    units : UnitsModel, optional
-        Units context (energy unit, T, C0). If None, defaults are used.
 
-    Returns
-    -------
-    Mechanism
-        Mechanism object populated with species, reactions, and equilibria
+def _mechanism_build_input(ir: DSLIR):
+    """Freeze the private parse accumulator into the sole builder input."""
 
-    Raises
-    ------
-    DSLError
-        If parsing or validation fails
+    from kindred.core.simulator.dsl_build_input import DslMechanismBuildInput
 
-    Examples
-    --------
-    >>> dsl_text = '''
-    ... T=310
-    ... reaction: A -> B; dG_act=80, energy=kJ/mol
-    ... equilibrium: B <-> C; K=4.0
-    ... '''
-    >>> mech = parse_dsl_to_mechanism(dsl_text, initials={'A': 1.0, 'B': 0.0, 'C': 0.0})
-    >>> print(mech.species_names())
-    ['A', 'B', 'C']
-    """
+    return DslMechanismBuildInput(
+        energy_unit=ir.energy_unit,
+        temperature_K=ir.temperature_K,
+        standard_conc_M=ir.standard_conc_M,
+        temperature_schedule=ir.temperature_schedule,
+        steps=tuple(ir.steps),
+    )
+
+
+def prepare_dsl_request_set(
+    text: str,
+    *,
+    units: UnitsModel | None = None,
+) -> PreparedDslRequestSet:
+    """Admit source once and publish its one immutable typed analysis."""
+
+    from kindred.core.intervention_schedule_compiler import (
+        compile_intervention_schedule,
+    )
+    from kindred.core.simulator.dsl_build import build_mechanism_from_ir
+    from kindred.core.simulator.parameter_algebra_spec import (
+        parse_parameter_algebra_spec_from_dsl_text,
+    )
+    from kindred.core.algebra.errors import AlgebraError
+    from kindred.core.algebra.simulation_series import (
+        reject_unknown_species_references,
+    )
+
+    units = units or UnitsModel()
     ir = _parse_dsl_ir(text, units=units)
-    from .dsl_build import build_mechanism_from_ir
+    # Directive admission returns a nonempty typed schedule or None.
+    intervention_schedule = ir.intervention_schedule
+    mechanism = build_mechanism_from_ir(_mechanism_build_input(ir))
+    mechanism_namespace = build_namespace_from_mechanism(mechanism)
+    parameter_algebra_spec = parse_parameter_algebra_spec_from_dsl_text(
+        text,
+        mechanism_namespace=mechanism_namespace,
+    )
+    from .parameter_algebra_spec import admit_parameter_evaluation_graph
+    parameter_algebra_spec = admit_parameter_evaluation_graph(parameter_algebra_spec, mechanism)
+    from .parameter_algebra import apply_parameter_algebra_spec_to_mechanism
+    from .parameter_coordinates import build_parameter_target_map
+    apply_parameter_algebra_spec_to_mechanism(
+        parameter_algebra_spec, mechanism=mechanism,
+        parameter_target_map=build_parameter_target_map(mechanism),
+    )
+    # The retained spec is the sole admitted Algebra program.  Compile the
+    # observable partition from its retained ASTs; passing raw source here (or
+    # in the builder) would reparse the same Algebra text and violate the
+    # parse-once boundary.
+    try:
+        reject_unknown_species_references(
+            parameter_algebra_spec.observable_block,
+            species_names={str(item) for item in mechanism.species_names()},
+        )
+    except AlgebraError as exc:
+        raise _DSLError(exc.message, line_number=exc.line, line_content=exc.line_text) from exc
+    species_names = tuple(str(item) for item in mechanism.species_names())
+    parameterized_intervention_schedule = (
+        intervention_schedule
+        if intervention_schedule is not None
+        and intervention_schedule.is_parameterized
+        else None
+    )
+    for statement in parameter_algebra_spec.observable_block.lines:
+        if statement.name in species_names:
+            raise _DSLError(
+                f"{statement.name} is a species, so a let line cannot define it.",
+                line_number=statement.line,
+                line_content=statement.line_text,
+            )
+    if intervention_schedule is not None:
+        from kindred.core.intervention_schedule import (
+            InterventionScheduleError,
+            ObservableTriggerCondition,
+            admit_intervention_parameter_units,
+            declaration_line,
+            intervention_schedule_parameter_dependencies,
+        )
+        try:
+            intervention_schedule.validate_species(species_names)
+            observable_names = {statement.name for statement in parameter_algebra_spec.observable_block.lines}
+            for trigger in intervention_schedule.triggers:
+                if isinstance(trigger.condition, ObservableTriggerCondition) and trigger.condition.name not in observable_names:
+                    raise InterventionScheduleError(
+                        f"Unknown stopping observable: {trigger.condition.name}.",
+                        operation="trigger", declaration_ordinal=trigger.declaration_ordinal, field="watch_observable",
+                    )
+            for (declaration, _nested, field), (name,) in intervention_schedule_parameter_dependencies(
+                intervention_schedule
+            ).items():
+                if name not in parameter_algebra_spec.evaluation_dependencies:
+                    raise InterventionScheduleError(
+                        f"Unknown intervention parameter {name!r} in {field}_param. "
+                        f"Declare it with 'param {name} = ...' or use a rate constant such as k1.",
+                        declaration_ordinal=declaration, field=f"{field}_param",
+                    )
+            admit_intervention_parameter_units(
+                intervention_schedule,
+                dict(parameter_algebra_spec.quantity_units),
+                dict(parameter_algebra_spec.input_units),
+            )
+            intervention_execution = (
+                None
+                if parameterized_intervention_schedule is not None
+                else compile_intervention_schedule(intervention_schedule)
+            )
+        except InterventionScheduleError as exc:
+            # Each of these refusals names its declaration, or the declarations
+            # that conflict.
+            line_number, line_content = declaration_line(exc, ir.intervention_lines)
+            raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
+    else:
+        intervention_execution = compile_intervention_schedule(None)
+    analysis = DslAnalysis(
+        origins=_source_origins(
+            text,
+            steps=ir.steps,
+            parameter_algebra_spec=parameter_algebra_spec,
+        ),
+        species_names=species_names,
+        observable_names=tuple(sorted(parameter_algebra_spec.observable_names)),
+        inline_initial_conditions=ir.inline_initial_conditions,
+        temperature_K=float(ir.temperature_K),
+        standard_conc_M=float(ir.standard_conc_M),
+        energy_unit=str(ir.energy_unit),
+        intervention_lines=ir.intervention_lines,
+    )
+    return PreparedDslRequestSet(
+        analysis=analysis,
+        mechanism=mechanism,
+        intervention_schedule=parameterized_intervention_schedule,
+        intervention_execution=intervention_execution,
+        parameter_algebra_spec=parameter_algebra_spec,
+    )
 
-    return build_mechanism_from_ir(ir, initials=initials)
+
+def _analysis_source_coordinates(
+    analysis: DslAnalysis,
+) -> tuple[tuple[DslSourceCoordinate, DslSourceOrigin], ...]:
+    """Return each admitted coordinate with its retained line owner."""
+
+    return tuple(
+        (coordinate, origin)
+        for origin in analysis.origins
+        for coordinate in origin.coordinates
+    )
+
+
+def derive_source_with_parameter_updates(
+    source_text: str,
+    base: PreparedDslRequestSet,
+    updates: tuple[DslParameterCoordinateUpdate, ...],
+) -> str:
+    """Authenticate typed coordinates and rewrite the visible source bytes."""
+
+    if base.analysis.inline_initial_conditions.has_declarations:
+        raise ValueError(
+            "Typed parameter derivation requires canonical materialized "
+            "initial conditions."
+        )
+    if not updates:
+        raise ValueError("Typed DSL parameter derivation requires updates.")
+    names = tuple(item.name for item in updates)
+    if len(names) != len(set(names)):
+        raise ValueError("DSL parameter update names must be unique.")
+
+    spec = base.parameter_algebra_spec_for_execution()
+    raw_lines = source_text.splitlines(keepends=True)
+    source_lines = [_line_content(line) for line in raw_lines]
+    line_endings = [
+        line[len(content):]
+        for line, content in zip(raw_lines, source_lines)
+    ]
+    if not raw_lines and source_text:
+        source_lines = [source_text]
+        line_endings = [""]
+
+    # Coordinates retain their physical line index and exact half-open span in
+    # the source this analysis was admitted from.
+    # A mechanism parameter can own two spans: its reaction-line field and
+    # its param line. The admitted assignment kind selects the writable one.
+    source_coordinates: dict[str, dict[str, DslSourceCoordinate]] = {}
+    for coordinate, _origin in _analysis_source_coordinates(base.analysis):
+        source_coordinates.setdefault(coordinate.canonical_name, {})[coordinate.role] = coordinate
+    replacements: dict[int, list[tuple[int, int, str]]] = {}
+
+    def retain_replacement(
+        coordinate: DslSourceCoordinate,
+        replacement: str,
+    ) -> None:
+        replacements.setdefault(int(coordinate.physical_line_index), []).append(
+            (coordinate.value_start, coordinate.value_end, replacement)
+        )
+
+    for update in updates:
+        spans = source_coordinates.get(update.name)
+        if spans is None:
+            raise LookupError(
+                f"Parameter {update.name!r} is absent from retained DSL."
+            )
+        try:
+            assignment_kind = spec.parameter_assignment_kind(update.name)
+        except KeyError:
+            assignment_kind = None
+        # Classify from the admitted Algebra dependency map before inspecting
+        # the coordinate role.  Algebra-owned assignments are never rewritten
+        # as if their source spelling were an independent mechanism value.
+        if assignment_kind in {"derived scalar", "mechanism-bound"}:
+            raise ValueError(
+                f"Scalar parameter {update.name!r} is not writable."
+            )
+        if assignment_kind in {"independent scalar", "mechanism input"}:
+            coordinate = spans.get("param")
+            if coordinate is None:
+                raise ValueError(
+                    f"Scalar parameter {update.name!r} is not writable."
+                )
+            retain_replacement(coordinate, six_digit_source_text(update.value))
+            continue
+        # A source identity's param line only restates its reaction field,
+        # which stays the writable coordinate.
+        # Callers send only enumerated writable coordinates.
+        (coordinate,) = (item for role, item in spans.items() if role != "param")
+        # Physical and authored indexed source coordinates are already in the
+        # exact units and representation expected by their retained span.
+        retain_replacement(coordinate, six_digit_source_text(update.value))
+
+    # Parser spans are unique and never overlap.
+    for line_index, line_replacements in replacements.items():
+        ordered_replacements = sorted(
+            line_replacements,
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        for start, end, replacement in ordered_replacements:
+            source_lines[line_index] = (
+                source_lines[line_index][:start]
+                + replacement
+                + source_lines[line_index][end:]
+            )
+    updated_text = "".join(
+        content + ending
+        for content, ending in zip(source_lines, line_endings)
+    )
+    return updated_text

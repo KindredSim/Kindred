@@ -4,11 +4,12 @@ Kindred GUI package.
 Contracts
 ---------
 - Contains all PySide6 UI wiring: main window, widgets, dialogs, controllers.
-- Entry point is `kindred.__main__:main` (via `kindred` or `python -m kindred`),
-  which boots QApplication and shows `kindred.gui.main_window.MainWindow`.
+- Console scripts and `python -m kindred` share the canonical
+  `kindred.__main__:main` route, which boots QApplication and shows
+  `kindred.gui.main_window.MainWindow`.
 - Feature set: simulation + plotting, sliders, statistics/CTC, global fit,
-  solver settings, temperature schedules, species registry, templates/profiles,
-  and CSV export (only).
+  solver settings, templates, dataset import,
+  original-data export, and generated XLSX result export.
 - This __init__ does not import PySide6 at module import time to avoid
   side-effects in import-sensitive contexts (for example tests).
 - Bundled `kindred/data` resources are accessed through `kindred.io.resources`
@@ -17,7 +18,7 @@ Contracts
 Structure
 ---------
 main_window.py   : QMainWindow, menus, docks, signals and slots
-controllers/     : auxiliary controllers such as DatasetManager
+controllers/     : configuration, project-disposition, and simulation-job ownership
 widgets/         : editors, dialogs, and PyQtGraph-backed plot widgets
 """
 

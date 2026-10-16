@@ -6,7 +6,7 @@ from pathlib import Path
 from openpyxl import Workbook
 
 ROW_COUNT = 50
-SPECIES_COLUMNS = ["A", "B", "C", "Int", "Water", "PBMPBPIN", "PBMP", "pinBOH"]
+SPECIES_COLUMNS = ["A", "B", "C", "Int", "Water", "PB", "PH", "BOH"]
 
 
 def _repo_root() -> Path:

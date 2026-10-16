@@ -1,113 +1,140 @@
-"""
-GUI-facing enumeration of canonical solver parameters.
+"""Typed GUI coordinates for mechanism parameters.
 
-This is intentionally Qt-free so it can be unit-tested without launching a GUI.
+The GUI never scans DSL text to invent parameter ownership.  This module
+parses the accepted source once, projects the core's typed rate families, and
+returns the one coordinate representation consumed by Slider and Fit; each
+coordinate carries its Slider range and its independent default Fit range.
 """
 
 from __future__ import annotations
 
-from collections import OrderedDict
-from typing import Dict, Tuple
+from dataclasses import dataclass
+import math
 
-from kindred.core.simulator.step_indexing import get_step_index_map
-from kindred.core.validation import try_parse_finite_float, try_parse_int
+from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
+from kindred.core.quantity_units import parse_unit, scientific_unit, convert_value
+from kindred.core.simulation_parameters import enumerate_simulation_parameters
+from kindred.core.validation import six_digit_value
+from kindred.core.units import admit_role_value, UnitsModel
+from kindred.gui.display_name_policy import reaction_text
 
-__all__ = ["enumerate_step_parameters_for_gui"]
+__all__ = [
+    "GuiParameterCoordinate",
+    "admit_gui_parameter_value",
+    "enumerate_parameter_coordinates",
+]
 
 
-def _try_finite_float(x: object) -> tuple[float, bool]:
-    try:
-        raw = x() if callable(x) else x
-    except Exception:
-        return 0.0, False
-    return try_parse_finite_float(raw)
+def admit_gui_parameter_value(
+    value: float,
+    *,
+    allow_exact_zero: bool,
+    role: str,
+    unit: str,
+    field: str,
+) -> float:
+    """Admit one GUI/Fit value, held in ``unit``, against its role's scientific domain."""
+
+    input_unit = parse_unit(unit)
+    scientific = convert_value(value, input_unit, scientific_unit(input_unit.dimensions))
+    admit_role_value(scientific, role=role, unit=unit, allow_exact_zero=allow_exact_zero, field=field)
+    return value
 
 
-def enumerate_step_parameters_for_gui(mechanism: object) -> Tuple["OrderedDict[str, float]", Dict[str, Dict[str, object]]]:
-    """
-    Return (variables, metadata) for canonical step-index parameters only.
+def _positive_bounds(value: float, *, minimum: float, maximum: float) -> tuple[float, float]:
+    if value > 0.0:
+        low = max(value * 0.01, minimum)
+        high = min(value * 100.0, maximum)
+        if high > low:
+            return float(low), float(high)
+    return 0.0, min(max(1.0, abs(value) * 10.0), maximum)
 
-    - variables maps canonical parameter name -> current numeric value
-    - metadata includes:
-        type: 'reaction' or 'equilibrium'
-        index: canonical step index (1-based)
-        role: 'k'/'kf'/'kr'/'Keq'
-        label: 'Step N: <context>'
-        editable/derived for Keq-implied constraints (kr or kf derived when Keq is explicit)
-    """
-    variables: "OrderedDict[str, float]" = OrderedDict()
-    metadata: Dict[str, Dict[str, object]] = {}
 
-    step_map = get_step_index_map(mechanism)
-    rxns = list(getattr(mechanism, "reactions", []) or [])
-    eqs = list(getattr(mechanism, "equilibria", []) or [])
-    for entry in step_map:
-        kind = str(entry.get("kind") or "")
-        n, ok = try_parse_int(entry.get("step_index"))
-        if not ok:
-            continue
-        context = str(entry.get("context") or "")
-        label = f"Step {n}: {context}".strip()
-        if kind == "reaction":
-            idx, ok = try_parse_int(entry.get("reaction_index", -1))
-            if not ok:
-                continue
-            if not (0 <= idx < len(rxns)):
-                continue
-            name = f"k{n}"
-            value, ok = _try_finite_float(getattr(rxns[idx], "rate", None))
-            variables[name] = float(value)
-            metadata[name] = {"type": "reaction", "index": n, "role": "k", "label": label, "value_valid": bool(ok)}
-        elif kind == "equilibrium":
-            idx, ok = try_parse_int(entry.get("equilibrium_index", -1))
-            if not ok:
-                continue
-            if not (0 <= idx < len(eqs)):
-                continue
-            eq = eqs[idx]
-            has_K = bool(entry.get("has_Keq_param"))
-            derive_rate = str(entry.get("derive_rate") or "")
+def _signed_bounds(value: float) -> tuple[float, float]:
+    span = max(1.0, abs(value) * 0.5)
+    low = value - span
+    high = value + span
+    if not math.isfinite(low) or low >= value:
+        low = value
+    if not math.isfinite(high) or high <= value:
+        high = value
+    if low == high:
+        low = math.nextafter(value, -math.inf)
+        high = math.nextafter(value, math.inf)
+    if not math.isfinite(low):
+        low = value
+    if not math.isfinite(high):
+        high = value
+    if not low < high:
+        raise ValueError("Finite scalar has no representable finite Fit interval.")
+    return float(low), float(high)
 
-            kf_name = f"kf{n}"
-            kr_name = f"kr{n}"
-            kf_value, kf_ok = _try_finite_float(getattr(eq, "kf", None))
-            kr_value, kr_ok = _try_finite_float(getattr(eq, "kr", None))
-            variables[kf_name] = float(kf_value)
-            variables[kr_name] = float(kr_value)
-            metadata[kf_name] = {
-                "type": "equilibrium",
-                "index": n,
-                "role": "kf",
-                "label": label,
-                "value_valid": bool(kf_ok),
-            }
-            metadata[kr_name] = {
-                "type": "equilibrium",
-                "index": n,
-                "role": "kr",
-                "label": label,
-                "value_valid": bool(kr_ok),
-            }
 
-            if has_K:
-                K_name = f"Keq{n}"
-                meta = getattr(eq, "metadata", {}) or {}
-                k_value, k_ok = _try_finite_float(meta.get("Keq_input"))
-                variables[K_name] = float(k_value)
-                metadata[K_name] = {
-                    "type": "equilibrium",
-                    "index": n,
-                    "role": "Keq",
-                    "label": label,
-                    "value_valid": bool(k_ok),
-                }
+@dataclass(frozen=True, slots=True)
+class GuiParameterCoordinate:
+    """One stable GUI/Fit coordinate backed by a typed scientific owner."""
 
-                # Mark one rate as derived so Keq always has semantics.
-                if derive_rate == "kf":
-                    metadata[kf_name]["editable"] = False
-                    metadata[kf_name]["derived"] = True
-                else:
-                    metadata[kr_name]["editable"] = False
-                    metadata[kr_name]["derived"] = True
+    name: str
+    display_name: str
+    value: float
+    minimum: float
+    maximum: float
+    fit_minimum: float
+    fit_maximum: float
+    log10_allowed: bool
+    family: str
+    role: str
+    allow_exact_zero: bool
+    unit: str = "1"
+    context: str = ""
 
-    return variables, metadata
+
+def enumerate_parameter_coordinates(
+    prepared_dsl: PreparedDslRequestSet,
+) -> tuple[GuiParameterCoordinate, ...]:
+    """Add GUI bounds and labels to the core's admitted parameter facts."""
+    coordinates: list[GuiParameterCoordinate] = []
+    for item in enumerate_simulation_parameters(prepared_dsl):
+        value = item.value
+        floor, limit = item.domain
+        if not item.signed:
+            low, high = _positive_bounds(value, minimum=floor, maximum=limit)
+        elif item.role in {"Ea", "dG_act", "dG_eq"}:
+            energy = UnitsModel(energy_unit=item.unit)
+            if item.role == "dG_eq":
+                # Equilibrium energies are signed; the Slider crosses zero.
+                half = max(2.0 * abs(value), energy.from_jmol(10_000.0))
+                low, high = -half, half
+            else:
+                # Barriers run from zero to twice the accepted value.
+                width = max(2.0 * abs(value), energy.from_jmol(1_000.0))
+                low, high = (0.0, width) if value >= 0.0 else (-width, 0.0)
+            low, high = max(low, -limit), min(high, limit)
+            span = energy.from_jmol(10_000.0)
+            fit_low, fit_high = max(value - span, -limit), min(value + span, limit)
+        else:
+            low, high = _signed_bounds(value)
+            low, high = max(low, -limit), min(high, limit)
+            if 0.0 < abs(low) < floor:
+                low = 0.0
+            if 0.0 < abs(high) < floor:
+                high = 0.0
+            if low == high:
+                low, high = -floor, floor
+        if item.role not in {"Ea", "dG_act", "dG_eq"}:
+            fit_low, fit_high = low, high
+        display_name = item.name
+        if item.context:
+            display_name = f"{display_name} — {reaction_text(item.context)}"
+        coordinates.append(GuiParameterCoordinate(
+            name=item.name, display_name=display_name, value=value,
+            minimum=low, maximum=high,
+            # Generated Fit bounds are authored at six significant digits.
+            fit_minimum=six_digit_value(fit_low), fit_maximum=six_digit_value(fit_high),
+            # Positive quantities (rates, Keq, A, kappa) span decades; energies and
+            # plain scalars are signed, linear quantities.
+            log10_allowed=not item.signed and value > 0.0 and low > 0.0,
+            family=item.family, role=item.role,
+            allow_exact_zero=item.allow_exact_zero, unit=item.unit, context=item.context,
+        ))
+    return tuple(coordinates)

@@ -4,44 +4,17 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6 import QtGui, QtWidgets
+from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Signal
 
-
-class _ValidationForegroundDelegate(QtWidgets.QStyledItemDelegate):
-    """Paints item text using ForegroundRole color, bypassing stylesheet overrides."""
-
-    def paint(self, painter, option, index):
-        opt = QtWidgets.QStyleOptionViewItem(option)
-        self.initStyleOption(opt, index)
-        fg_variant = index.data(Qt.ForegroundRole)
-        if isinstance(fg_variant, QtGui.QBrush) and fg_variant.style() != Qt.BrushStyle.NoBrush:
-            text = opt.text
-            opt.text = ""
-            style = option.widget.style() if option.widget else QtWidgets.QApplication.style()
-            style.drawControl(QtWidgets.QStyle.ControlElement.CE_ItemViewItem, opt, painter, option.widget)
-            painter.save()
-            if opt.state & QtWidgets.QStyle.StateFlag.State_Selected:
-                painter.setPen(opt.palette.color(QtGui.QPalette.ColorRole.HighlightedText))
-            else:
-                painter.setPen(fg_variant.color())
-            text_rect = style.subElementRect(QtWidgets.QStyle.SubElement.SE_ItemViewItemText, opt, option.widget)
-            alignment = opt.displayAlignment
-            metrics = QtGui.QFontMetrics(opt.font)
-            elided = metrics.elidedText(text, Qt.ElideRight, text_rect.width())
-            painter.drawText(text_rect, alignment, elided)
-            painter.restore()
-        else:
-            super().paint(painter, option, index)
+from kindred.gui.display_name_policy import DATASET_LIST_LABEL_MAX_CHARS, compact_dataset_label, literal_tooltip
 
 
 class UnifiedDatasetList(QtWidgets.QWidget):
-    """Checkable dataset list with Add/Remove buttons for unified navigation."""
+    """Checkable dataset list for unified dataset navigation."""
 
     currentDatasetChanged = Signal(str)
     datasetIncludeChanged = Signal(int, str, bool)
-    addRequested = Signal()
-    removeRequested = Signal(list)
 
     def __init__(self, *, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -58,24 +31,12 @@ class UnifiedDatasetList(QtWidgets.QWidget):
 
         self._list = QtWidgets.QListWidget(self)
         self._list.setObjectName("global_fit_unified_dataset_list")
-        self._list.setItemDelegate(_ValidationForegroundDelegate(self._list))
+        self._list.setUniformItemSizes(True)
+        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         self._list.currentItemChanged.connect(self._on_current_item_changed)
         self._list.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self._list, stretch=1)
-
-        button_row = QtWidgets.QHBoxLayout()
-        self._add_button = QtWidgets.QPushButton("Add\u2026")
-        self._add_button.setObjectName("global_fit_unified_datasets_add")
-        self._add_button.clicked.connect(self.addRequested)
-        self._remove_button = QtWidgets.QPushButton("Remove")
-        self._remove_button.setObjectName("global_fit_unified_datasets_remove")
-        self._remove_button.setEnabled(False)
-        self._remove_button.clicked.connect(self._on_remove_clicked)
-        button_row.addWidget(self._add_button)
-        button_row.addWidget(self._remove_button)
-        button_row.addStretch(1)
-        layout.addLayout(button_row)
 
         # Track previous check states to detect toggle vs. other itemChanged triggers.
         self._check_states: dict[int, Qt.CheckState] = {}
@@ -85,32 +46,66 @@ class UnifiedDatasetList(QtWidgets.QWidget):
     # Public API
     # ------------------------------------------------------------------
 
-    def populate(self, dataset_entries: list) -> None:
+    def populate(
+        self,
+        dataset_entries: list,
+        *,
+        emit_selection: bool = True,
+    ) -> None:
         old_id = self.selected_dataset_id()
-        self._list.blockSignals(True)
-        self._list.clear()
-        self._check_states.clear()
+        normalized: list[tuple[str, str, str, bool]] = []
         for entry in dataset_entries:
-            ds_id = str(entry.get("id") or "").strip()
-            label = str(entry.get("label", "") or "").strip() or str(ds_id)
-            include = entry.get("include", True)
-            item = QtWidgets.QListWidgetItem(label)
-            item.setData(Qt.UserRole, ds_id)
-            item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            item.setCheckState(Qt.Checked if include else Qt.Unchecked)
-            self._list.addItem(item)
-            self._check_states[self._list.count() - 1] = item.checkState()
-        # Re-select previous active dataset if still present, otherwise first.
-        if old_id and self._select_by_id(old_id):
-            pass
-        elif self._list.count() > 0:
-            self._list.setCurrentRow(0)
-        self._list.blockSignals(False)
+            ds_id = entry["id"]
+            compact = compact_dataset_label(entry["label"], max_chars=DATASET_LIST_LABEL_MAX_CHARS)
+            normalized.append((ds_id, compact.display, compact.full, entry["include"]))
 
-        self._remove_button.setEnabled(self._list.count() > 0 and not self._running)
+        existing_ids = tuple(
+            str(self._list.item(index).data(Qt.UserRole) or "").strip()
+            for index in range(self._list.count())
+            if self._list.item(index) is not None
+        )
+        incoming_ids = tuple(item[0] for item in normalized)
+        self._list.blockSignals(True)
+        try:
+            if existing_ids != incoming_ids:
+                self._list.clear()
+                self._check_states.clear()
+                for ds_id, display, full, include in normalized:
+                    item = QtWidgets.QListWidgetItem(display)
+                    item.setToolTip(literal_tooltip(full))
+                    item.setData(Qt.UserRole, ds_id)
+                    item.setData(Qt.UserRole + 1, full)
+                    item.setFlags(
+                        Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable
+                    )
+                    item.setCheckState(Qt.Checked if include else Qt.Unchecked)
+                    self._list.addItem(item)
+                    self._check_states[self._list.count() - 1] = item.checkState()
+            else:
+                # Keep the QListWidgetItems (and their selection/current index)
+                # when the roster is stable.  Accepted include/label changes
+                # only update the affected item in place.
+                for row, (_ds_id, display, full, include) in enumerate(normalized):
+                    item = self._list.item(row)
+                    if item is None:
+                        continue
+                    item.setText(display)
+                    item.setToolTip(literal_tooltip(full))
+                    item.setData(Qt.UserRole + 1, full)
+                    state = Qt.Checked if include else Qt.Unchecked
+                    if item.checkState() != state:
+                        item.setCheckState(state)
+                    self._check_states[row] = state
+            # Re-select previous active dataset if still present, otherwise first.
+            if old_id and self._select_by_id(old_id):
+                pass
+            elif self._list.count() > 0:
+                self._list.setCurrentRow(0)
+        finally:
+            self._list.blockSignals(False)
 
         new_id = self.selected_dataset_id()
-        if new_id != old_id:
+        if emit_selection and new_id != old_id:
             self.currentDatasetChanged.emit(new_id or "")
 
     def selected_dataset_id(self) -> Optional[str]:
@@ -120,43 +115,48 @@ class UnifiedDatasetList(QtWidgets.QWidget):
         ds_id = str(item.data(Qt.UserRole) or "").strip()
         return ds_id if ds_id else None
 
-    def select_dataset(self, dataset_id: str) -> None:
-        if dataset_id == self.selected_dataset_id():
-            return
-        self._list.blockSignals(True)
-        found = self._select_by_id(dataset_id)
-        self._list.blockSignals(False)
-        if found:
-            self.currentDatasetChanged.emit(dataset_id)
+    def set_data_edit_issues(self, issues: dict[str, str]) -> None:
+        """Mark rows whose Fit Data settings are in error, without changing identity or inclusion."""
 
-    def set_validation_state(self, dataset_id: str, state: str) -> None:
-        ds_id = str(dataset_id or "").strip()
-        for i in range(self._list.count()):
-            item = self._list.item(i)
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            dataset_id = item.data(Qt.UserRole)
+            full = item.data(Qt.UserRole + 1)
+            display = compact_dataset_label(full, max_chars=DATASET_LIST_LABEL_MAX_CHARS).display
+            issue = issues.get(dataset_id, "")
+            item.setText(f"Data error — {display}" if issue else display)
+            detail = f"{full}\n{issue}" if issue else full
+            item.setData(Qt.AccessibleTextRole, detail)
+            item.setToolTip(literal_tooltip(detail))
+
+    def dataset_display_name(self, dataset_id: str | None = None) -> str | None:
+        """Return the full bounded-row source label, never the stable ID role."""
+
+        requested = str(dataset_id or self.selected_dataset_id() or "").strip()
+        if not requested:
+            return None
+        for index in range(self._list.count()):
+            item = self._list.item(index)
             if item is None:
                 continue
-            if str(item.data(Qt.UserRole) or "").strip() == ds_id:
-                if state == "invalid_applied":
-                    item.setBackground(QtGui.QBrush(QtGui.QColor(255, 225, 225)))
-                    item.setForeground(QtGui.QBrush(QtGui.QColor(80, 0, 0)))
-                elif state == "invalid_pending":
-                    item.setBackground(QtGui.QBrush(QtGui.QColor(255, 245, 210)))
-                    item.setForeground(QtGui.QBrush(QtGui.QColor(80, 60, 0)))
-                else:
-                    item.setBackground(QtGui.QBrush())
-                    item.setForeground(QtGui.QBrush())
-                break
+            if str(item.data(Qt.UserRole) or "").strip() == requested:
+                return str(item.data(Qt.UserRole + 1))
+        return None
 
-    def set_remove_button_enabled(self, enabled: bool) -> None:
-        self._remove_button.setEnabled(enabled)
+    def content_width(self) -> int:
+        """Width that shows the longest dataset name without scrolling."""
+
+        return (
+            self._list.sizeHintForColumn(0)
+            + 2 * self._list.frameWidth()
+            + self._list.verticalScrollBar().sizeHint().width()
+        )
 
     def set_running_state(self, running: bool) -> None:
-        self._running = running
-        self._add_button.setEnabled(not running)
-        if running:
-            self._remove_button.setEnabled(False)
-        else:
-            self._remove_button.setEnabled(self._list.currentItem() is not None)
+        """Preserve the historical disabled/locked running-state visual."""
+
+        self._running = bool(running)
+        self._list.setEnabled(not self._running)
 
     # ------------------------------------------------------------------
     # Internal handlers
@@ -167,7 +167,6 @@ class UnifiedDatasetList(QtWidgets.QWidget):
         current: QtWidgets.QListWidgetItem | None,
         _previous: QtWidgets.QListWidgetItem | None,
     ) -> None:
-        self._remove_button.setEnabled(current is not None and not self._running)
         if current is None:
             return
         ds_id = str(current.data(Qt.UserRole) or "").strip()
@@ -183,11 +182,6 @@ class UnifiedDatasetList(QtWidgets.QWidget):
         self._check_states[row] = new_state
         ds_id = str(item.data(Qt.UserRole) or "").strip()
         self.datasetIncludeChanged.emit(row, ds_id, new_state == Qt.Checked)
-
-    def _on_remove_clicked(self) -> None:
-        ds_id = self.selected_dataset_id()
-        if ds_id:
-            self.removeRequested.emit([ds_id])
 
     def _select_by_id(self, dataset_id: str | None) -> bool:
         if not dataset_id:

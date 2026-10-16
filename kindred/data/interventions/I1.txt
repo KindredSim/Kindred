@@ -1,0 +1,13 @@
+# Run from 0 to 600 s.
+
+A + B -> C ; k=0.02
+
+# set assigns a concentration at a specified time.
+# The default time unit is seconds and the default concentration unit is M.
+intervention: op=set; species=B; time=60.0; value=0.5
+
+intervention_set1 = {
+  [A] = 1.0
+  [B] = 0.0
+  [C] = 0.0
+}

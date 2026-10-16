@@ -1,0 +1,84 @@
+"""Calculator-only symbolic chemistry, projected from admitted source coordinates."""
+from __future__ import annotations
+
+from fractions import Fraction
+from collections.abc import Mapping
+from typing import Any
+
+from kindred.core.equilibrium_rate_authority import equilibrium_rate_symbolic_relations
+from kindred.core.kinetics import forward_rate_symbolic_relation
+from kindred.core.mechanism import Mechanism
+from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
+from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
+from kindred.core.simulator.step_indexing import get_step_index_map
+
+from .backend import require_sympy
+
+
+def build_calculator_chemistry_relations(
+    mechanism: Mechanism, *, parameter_spec: ParameterAlgebraSpec,
+    symbols: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Lower chemistry readouts without evaluating Algebra or independent inputs."""
+
+    sympy = require_sympy()
+
+    def exact_literal(value: object) -> Any:
+        if isinstance(value, Fraction):
+            return sympy.Rational(value.numerator, value.denominator)
+        return sympy.Rational(str(value))
+
+    temperature = symbols["T"]
+    readouts_by_source: dict[int, dict[str, str]] = {}
+    for item in parameter_spec.mechanism_namespace.ordered_items:
+        readouts_by_source.setdefault(item.source_index, {})[
+            item.info.role
+        ] = item.canonical_name
+
+    derived = parameter_spec.chemistry_dependencies
+    chemistry_relations: dict[str, Any] = {}
+    for source_index, entry in enumerate(get_step_index_map(mechanism)):
+        reaction = entry["kind"] == "reaction"
+        step = (
+            mechanism.reactions[entry["reaction_index"]]
+            if reaction
+            else mechanism.equilibria[entry["equilibrium_index"]]
+        )
+        source_coordinates = entry["source_coordinates"]
+        readouts = readouts_by_source[source_index]
+        forward_name = readouts["k" if reaction else "kf"]
+
+        def source_coordinate(role: str) -> Any:
+            # Constant's forward helper uses kf for both kinds of step; the
+            # kinetics helper decides which roles are required.
+            name = source_coordinates.get("k" if reaction and role == "kf" else role)
+            return None if name is None else symbols[name]
+
+        forward = forward_rate_symbolic_relation(
+            step.forward_model,
+            temperature=temperature,
+            literal=exact_literal,
+            exponential=sympy.exp,
+            source_coordinate=source_coordinate,
+            constant=symbols.__getitem__,
+        )
+        if forward_name in derived:
+            chemistry_relations[forward_name] = forward
+        if reaction:
+            continue
+        standard_concentration = step.metadata[EquilibriumMetadataKeys.STANDARD_CONC_M]
+        relations = equilibrium_rate_symbolic_relations(
+            step,
+            forward_relation=symbols[forward_name],
+            temperature=temperature,
+            literal=exact_literal,
+            exponential=sympy.exp,
+            source_coordinate=source_coordinate,
+            standard_concentration=exact_literal(float(standard_concentration)),
+            constant=symbols.__getitem__,
+        )
+        for role, expression in (("kr", relations.kr), ("Keq", relations.Keq)):
+            name = readouts[role]
+            if name in derived:
+                chemistry_relations[name] = expression
+    return chemistry_relations

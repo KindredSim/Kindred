@@ -1,69 +1,21 @@
+"""Deterministic selection of existing experimental observation rows."""
+
 from __future__ import annotations
 
-from typing import Optional
-
-import numpy as np
-
-__all__ = ["compute_sampled_indices", "compute_windowed_indices"]
+__all__ = ["compute_sampled_indices"]
 
 
-def compute_windowed_indices(*, t: np.ndarray, t_min: float, t_max: float) -> np.ndarray:
+def compute_sampled_indices(*, count: int, n_points: int) -> tuple[int, ...]:
+    """Select ``n_points`` of ``count`` rows evenly, including both endpoints.
+
+    Existing rows are selected; nothing is interpolated, averaged, or
+    fabricated. ``n_points`` is at least 2.
     """
-    Return indices of points within the inclusive time window [t_min, t_max].
-
-    The returned indices are strictly increasing and refer to the original `t` array.
-    """
-    t_values = np.asarray(t, dtype=float).reshape(-1)
-    if t_values.size == 0:
-        return np.asarray([], dtype=int)
-    mask = (t_values >= float(t_min)) & (t_values <= float(t_max))
-    return np.nonzero(mask)[0].astype(int, copy=False)
-
-
-def compute_sampled_indices(
-    *,
-    t: np.ndarray,
-    t_min: float,
-    t_max: float,
-    n_points: Optional[int],
-) -> np.ndarray:
-    """
-    Compute deterministic sampling indices for a time axis.
-
-    Rules:
-    - Window: keep indices where t_min <= t <= t_max (inclusive).
-    - Downsample: after windowing, if n_points is None/0/"All" keep all windowed points.
-      Otherwise select exactly n_points *existing* points evenly across the windowed
-      index list, always including the window endpoints. No averaging, no fabrication.
-    """
-    if float(t_min) > float(t_max):
-        raise ValueError("t_min must be <= t_max.")
-
-    windowed = compute_windowed_indices(t=t, t_min=float(t_min), t_max=float(t_max))
-    if windowed.size == 0:
-        raise ValueError("Sampling window contains no points.")
-
-    if n_points is None:
-        return windowed
-    try:
-        n_int = int(n_points)
-    except Exception as exc:  # pragma: no cover
-        raise ValueError("n_points must be an int or None.") from exc
-
-    if n_int <= 0 or n_int >= int(windowed.size):
-        return windowed
-    if n_int < 2:
-        raise ValueError("n_points must be All/None or >= 2.")
-    if n_int > int(windowed.size):
-        raise ValueError("n_points must be <= the number of windowed points.")
-
-    m = int(windowed.size)
-    denom = n_int - 1
-    max_pos = m - 1
-    positions = np.fromiter(
-        ((2 * k * max_pos + denom) // (2 * denom) for k in range(n_int)),
-        dtype=int,
-        count=n_int,
+    if n_points >= count:
+        return tuple(range(count))
+    denominator = n_points - 1
+    last = count - 1
+    return tuple(
+        (2 * index * last + denominator) // (2 * denominator)
+        for index in range(n_points)
     )
-    return windowed[positions]
-

@@ -1,12 +1,19 @@
-# Preset M5 — Consecutive A → B → C
-# Mechanism
-A -> B ; kf = 1.0
-B -> C ; kf = 0.5
+# Run from 0 to 10 s.
 
-# Initials
-[A] = 1.0
-[B] = 0.0
-[C] = 0.0
+A <-> B ; kf=1.5 ; kr=0.25
+B -> C ; k=0.1
 
-# Algebra
-let mass = [A] + [B] + [C]
+preset_set1 = {
+  [A] = 1.0
+  [B] = 0.0
+  [C] = 0.0
+}
+
+# Parameter numbers follow the order of the reaction lines.
+# The first step has kf1 and kr1. The second has k2.
+param concentration_floor = 1e-30; unit = M
+let net_rate_AB = kf1*[A] - kr1*[B]
+let rate_C = k2*[B]
+
+# [A]_0 refers to the initial concentration of A.
+let yield_C = [C] / max([A]_0, concentration_floor)

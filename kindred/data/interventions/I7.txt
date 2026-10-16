@@ -1,0 +1,18 @@
+# Run from 0 to 600 s.
+
+A + B <-> C ; kf=0.02 ; kr=0.002
+C + D -> E ; k=0.02
+
+# stop finishes the simulation at the threshold crossing.
+# It has no species or value fields.
+# Stopping triggers do not use max_count or min_interval.
+# Enable Use Authored Stopping Interventions in Simulation Settings.
+intervention: op=trigger; watch_species=A; threshold=0.1; direction=falling; then={op=stop}
+
+intervention_set1 = {
+  [A] = 1.0
+  [B] = 2.0
+  [C] = 0.0
+  [D] = 2.0
+  [E] = 0.0
+}

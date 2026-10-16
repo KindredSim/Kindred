@@ -1,834 +1,793 @@
-"""
-Results tab widget for the fitting window.
+"""Physical Fit Results and Summary views.
 
-Extracted from FittingWindow — owns the run-stamp data and statistics
-(displayed via a non-modal popup dialog triggered from the footer).
-Read-only display with one-way data flow from fit-completion results.
+The session owner retains the admitted Fit candidate and Apply policy. These
+views retain only rendered text and immutable curve projections for display
+and copying; actions remain ordinary requests to the owner.
 """
 
 from __future__ import annotations
 
-import json
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
+import math
+import html
+from collections.abc import Callable, Mapping, Sequence
 
-import numpy as np
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, Signal
 
+from kindred.core.analysis.fit_evaluation_outcome import ScientificUnavailable
+from kindred.core.exceptions import located
+from kindred.core.simulation_failure import FactualCause
+from kindred.core.quantity_units import format_unit_for_display
+from kindred.core.validation import six_digit_text
+from kindred.gui.display_name_policy import (
+    TAB_LABEL_MAX_CHARS,
+    compact_dataset_label,
+)
+from kindred.gui.fitting.reporting import (
+    FitValueEntry, fit_candidate_presentation, fit_live_presentation, fit_overview,
+)
+from kindred.gui.fitting.launch import FitExecutionRequest, FitSetupSnapshot
+from kindred.gui.ui_helpers import ControlRowsLayout
+from kindred.gui.fitting.execution import FitCandidate, FitCurveDataset, FitLiveUpdate
 from kindred.gui.widgets.grid_plot_view import GridPlotView
 
-if TYPE_CHECKING:
-    from kindred.core.analysis.global_fitting import GlobalFitResult
+__all__ = ["FitTrackerPanel", "ResultsSummaryDialog", "RunResultsTab"]
+
+ColorResolver = Callable[[str], object]
+STALE_RESULTS_TEXT = "Setup edited since this run. Run to update."
 
 
-def _get_clipboard():
-    """
-    Clipboard accessor seam (monkeypatchable in tests).
 
-    Returns a Qt clipboard-like object with `setText(str)` / `text()` when available,
-    otherwise returns None.
-    """
-    try:
-        app = QtWidgets.QApplication.instance()
-        return app.clipboard() if app is not None else None
-    except Exception:
-        return None
+class _FitValueLabel(QtWidgets.QLabel):
+    """Copy literal selections without the wrapping characters we inserted."""
+
+    def __init__(self, parent: QtWidgets.QWidget) -> None:
+        super().__init__(parent)
+        self.copy_break_positions: list[int] = []
+
+    def _copy_selection(self) -> None:
+        if not self.hasSelectedText():
+            return
+        start = self.selectionStart()
+        # QTextCursor and QLabel selection offsets count UTF-16 code units.
+        selected = self.selectedText().encode("utf-16-le")
+        end = start + len(selected) // 2
+        for position in reversed(self.copy_break_positions):
+            if start <= position < end:
+                offset = (position - start) * 2
+                selected = selected[:offset] + selected[offset + 2:]
+        mime = QtCore.QMimeData()
+        mime.setText(selected.decode("utf-16-le"))
+        QtWidgets.QApplication.clipboard().setMimeData(mime)
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.matches(QtGui.QKeySequence.StandardKey.Copy):
+            self._copy_selection()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+    def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
+        if not self.copy_break_positions:
+            super().contextMenuEvent(event)
+            for menu in self.findChildren(
+                QtWidgets.QMenu,
+                options=QtCore.Qt.FindChildOption.FindDirectChildrenOnly,
+            ):
+                if menu.isVisible():
+                    menu.setToolTipsVisible(True)
+                    copy, select_all = (
+                        action for action in menu.actions() if not action.isSeparator()
+                    )
+                    copy.setToolTip("Copy the selected result text.")
+                    select_all.setToolTip("Select all text in this result entry.")
+            return
+        menu = QtWidgets.QMenu()
+        menu.setToolTipsVisible(True)
+        copy = menu.addAction("Copy", self._copy_selection)
+        copy.setEnabled(self.hasSelectedText())
+        copy.setToolTip("Copy the selected result text.")
+        select_all = menu.addAction("Select All", self._select_all)
+        select_all.setToolTip("Select all text in this result entry.")
+        menu.exec(event.globalPos())
+
+    def _select_all(self) -> None:
+        document = QtGui.QTextDocument()
+        document.setHtml(self.text())
+        self.setSelection(0, document.characterCount() - 1)
 
 
 class ResultsSummaryDialog(QtWidgets.QDialog):
-    """Non-modal popup displaying fit run stamp and statistics."""
-
-    statusMessage = Signal(str)
+    """A Summary popup with Results and Provenance tabs, each a selectable document."""
 
     def __init__(
         self,
-        stamp: dict,
-        stamp_hash: str,
-        stamp_short: str,
-        stats: Optional[Dict[str, Any]] = None,
-        fitted_params: Optional[Dict[str, float]] = None,
-        dataset_fitted_params: Optional[List[tuple]] = None,
+        documents: tuple[str, str] = ("", ""),
+        *,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowTitle("Results Summary")
-        self.resize(480, 360)
-
-        self._stamp = dict(stamp)
-        self._stamp_hash = str(stamp_hash)
-        self._stamp_short = str(stamp_short)
-
+        self.resize(560, 480)
         layout = QtWidgets.QVBoxLayout(self)
+        self._info_label = QtWidgets.QLabel("Review the most recent fit run.")
+        self._info_label.setWordWrap(True)
+        layout.addWidget(self._info_label)
+        self._tabs = QtWidgets.QTabWidget(self)
+        self._browsers: list[QtWidgets.QTextBrowser] = []
+        self._displayed_html = ["", ""]
+        self._pending_html: list[str | None] = [None, None]
+        for index, title in enumerate(("Results", "Provenance")):
+            browser = QtWidgets.QTextBrowser(self)
+            browser.setOpenLinks(False)
+            browser.setOpenExternalLinks(False)
+            browser.setObjectName(f"results_summary_{title.lower()}")
+            browser.setReadOnly(True)
+            browser.setWordWrapMode(QtGui.QTextOption.WrapMode.WordWrap)
+            browser.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            browser.selectionChanged.connect(lambda index=index: self._flush_pending(index))
+            browser.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+                | Qt.TextInteractionFlag.TextSelectableByKeyboard
+            )
+            self._tabs.addTab(browser, title)
+            self._browsers.append(browser)
+        layout.addWidget(self._tabs, stretch=1)
+        self.refresh(documents)
 
-        info_label = QtWidgets.QLabel("Review and copy the most recent fit run stamp.")
-        info_label.setWordWrap(True)
-        info_label.setStyleSheet("font-size: 11px;")
-        layout.addWidget(info_label)
-
-        row = QtWidgets.QHBoxLayout()
-        self._run_stamp_label = QtWidgets.QLabel(f"Stamp: {stamp_short}")
-        self._run_stamp_label.setObjectName("global_fit_run_stamp_label")
-        self._run_stamp_label.setStyleSheet("font-size: 11px;")
-
-        self._copy_stamp_button = QtWidgets.QPushButton("Copy")
-        self._copy_stamp_button.setObjectName("global_fit_copy_stamp_button")
-        self._copy_stamp_button.clicked.connect(self._on_copy_run_stamp_short)
-
-        self._copy_stamp_json_button = QtWidgets.QPushButton("Copy JSON")
-        self._copy_stamp_json_button.setObjectName("global_fit_copy_stamp_json_button")
-        self._copy_stamp_json_button.clicked.connect(self._on_copy_run_stamp_json)
-
-        row.addWidget(self._run_stamp_label, stretch=1)
-        row.addWidget(self._copy_stamp_button)
-        row.addWidget(self._copy_stamp_json_button)
-        layout.addLayout(row)
-
-        # Statistics form
-        stats_group = QtWidgets.QGroupBox("Fit Statistics")
-        form = QtWidgets.QFormLayout(stats_group)
-        self._stats_labels: Dict[str, QtWidgets.QLabel] = {}
-        for label_text in ["Datasets", "Series", "Points", "Parameters", "DF", "SSQ", "Weighted SSQ", "-logL"]:
-            value_label = QtWidgets.QLabel("\u2014")
-            form.addRow(f"{label_text}:", value_label)
-            self._stats_labels[label_text] = value_label
-        layout.addWidget(stats_group)
-
-        # Fitted parameters section
-        params_group = QtWidgets.QGroupBox("Fitted Parameters")
-        params_group.setObjectName("fitted_params_group")
-        params_layout = QtWidgets.QVBoxLayout(params_group)
-        params_layout.setContentsMargins(0, 0, 0, 0)
-        self._params_content_label = QtWidgets.QLabel()
-        self._params_content_label.setObjectName("fitted_params_content_label")
-        self._params_content_label.setWordWrap(True)
-        self._params_content_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self._params_content_label.setStyleSheet("font-size: 11px;")
-        self._params_content_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        params_scroll = QtWidgets.QScrollArea()
-        params_scroll.setObjectName("fitted_params_scroll")
-        params_scroll.setWidgetResizable(True)
-        params_scroll.setMaximumHeight(200)
-        params_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        params_scroll.setWidget(self._params_content_label)
-        params_layout.addWidget(params_scroll)
-        self._params_group = params_group
-        layout.addWidget(params_group)
-
-        if stats:
-            self._update_stats(stats)
-        self._update_fitted_params(fitted_params, dataset_fitted_params)
-
-    # ------------------------------------------------------------------
-    # Stats
-    # ------------------------------------------------------------------
-
-    def _update_fitted_params(
-        self,
-        fitted_params: Optional[Dict[str, float]],
-        dataset_fitted_params: Optional[List[tuple]] = None,
-    ) -> None:
-        shared = dict(fitted_params) if fitted_params else {}
-        ds_entries = list(dataset_fitted_params) if dataset_fitted_params else []
-        if not shared and not ds_entries:
-            self._params_content_label.setText("No fitted parameters available.")
-            self._params_content_label.setStyleSheet("font-size: 11px; color: #888;")
-            return
-        self._params_content_label.setStyleSheet("font-size: 11px;")
-        lines: List[str] = []
-        if shared:
-            for name, value in sorted(shared.items(), key=lambda kv: str(kv[0])):
-                lines.append(f"{name} = {value:.6g}")
-        for ds_label, vals in ds_entries:
-            if not isinstance(vals, dict) or not vals:
-                continue
-            if lines:
-                lines.append("")
-            lines.append(f"{ds_label}:")
-            for name, value in sorted(vals.items(), key=lambda kv: str(kv[0])):
-                lines.append(f"  {name} = {value:.6g}")
-        self._params_content_label.setText("\n".join(lines))
-
-    def _update_stats(self, stats: Dict[str, Any]) -> None:
-        for key, label in self._stats_labels.items():
-            value = stats.get(key)
-            if value is None:
-                label.setText("\u2014")
-            elif isinstance(value, float):
-                label.setText(f"{value:.6g}")
+    def refresh(self, documents: tuple[str, str], *, reset: bool = False) -> None:
+        """Keep each reader's position; defer only the latest update during a selection."""
+        for index, document in enumerate(documents):
+            document = document or "<p>No summary available.</p>"
+            browser = self._browsers[index]
+            if reset:
+                self._pending_html[index] = None
+                self._replace_document(index, document, preserve_scroll=False)
+            elif document == self._displayed_html[index]:
+                self._pending_html[index] = None
+            elif browser.textCursor().hasSelection():
+                self._pending_html[index] = document
             else:
-                label.setText(str(value))
+                self._pending_html[index] = None
+                self._replace_document(index, document, preserve_scroll=True)
+        self._info_label.setText("An update is waiting. Clear the selection to show it."
+                                 if any(item is not None for item in self._pending_html)
+                                 else "Review the most recent fit run.")
 
-    # ------------------------------------------------------------------
-    # Copy handlers
-    # ------------------------------------------------------------------
+    def _replace_document(self, index: int, document: str, *, preserve_scroll: bool) -> None:
+        browser = self._browsers[index]
+        horizontal = browser.horizontalScrollBar()
+        vertical = browser.verticalScrollBar()
+        positions = (horizontal.value(), vertical.value()) if preserve_scroll else (0, 0)
+        # setHtml clears selection; block that signal during this synchronous replacement.
+        with QtCore.QSignalBlocker(browser):
+            browser.setHtml(document)
+        self._displayed_html[index] = document
+        horizontal.setValue(positions[0])
+        vertical.setValue(positions[1])
 
-    def _on_copy_run_stamp_short(self) -> None:
-        stamp_short = self._stamp_short.strip()
-        if not stamp_short:
-            return
-        clipboard = _get_clipboard()
-        if clipboard is None:
-            self.statusMessage.emit("Clipboard unavailable")
-            return
-        try:
-            clipboard.setText(stamp_short)
-        except Exception:
-            self.statusMessage.emit("Failed to copy stamp")
-            return
-        self.statusMessage.emit("Copied stamp hash")
-
-    def refresh(
-        self,
-        stamp: dict,
-        stamp_hash: str,
-        stamp_short: str,
-        stats: Optional[Dict[str, Any]] = None,
-        fitted_params: Optional[Dict[str, float]] = None,
-        dataset_fitted_params: Optional[List[tuple]] = None,
-    ) -> None:
-        """Update all stamp and stats content from the owning tab."""
-        self._stamp = dict(stamp)
-        self._stamp_hash = str(stamp_hash)
-        self._stamp_short = str(stamp_short)
-        self._run_stamp_label.setText(f"Stamp: {stamp_short}")
-        self._update_stats(stats or {})
-        self._update_fitted_params(fitted_params, dataset_fitted_params)
-
-    def _on_copy_run_stamp_json(self) -> None:
-        stamp = self._stamp
-        if not isinstance(stamp, dict) or not stamp:
-            return
-        clipboard = _get_clipboard()
-        if clipboard is None:
-            self.statusMessage.emit("Clipboard unavailable")
-            return
-        try:
-            text = json.dumps(stamp, sort_keys=True, indent=2, ensure_ascii=True)
-        except Exception:
-            self.statusMessage.emit("Failed to serialize stamp")
-            return
-        try:
-            clipboard.setText(text)
-        except Exception:
-            self.statusMessage.emit("Failed to copy stamp")
-            return
-        self.statusMessage.emit("Copied stamp JSON")
-
-
-# Keep old name importable for tests that reference it directly.
-RunStampDialog = ResultsSummaryDialog
-
-
-def _as_float_array(values: object) -> np.ndarray:
-    try:
-        return np.asarray(values, dtype=float).reshape(-1)
-    except Exception:
-        return np.asarray([], dtype=float)
-
-
-def _normalize_species_names(names: Sequence[object]) -> List[str]:
-    return [str(name).strip() for name in names if str(name).strip()]
-
-
-def _format_metric(value: object) -> str:
-    try:
-        return f"{float(value):.2e}"
-    except Exception:
-        return "nan"
-
-
-def _objective_cost_from_result(result: "GlobalFitResult") -> float:
-    objective = _as_float_array(getattr(result, "objective_residuals", None))
-    if objective.size:
-        return float(np.sum(objective**2))
-    return float(
-        sum(
-            np.sum(_as_float_array(getattr(info, "residuals", None)) ** 2)
-            for info in (getattr(result, "dataset_info", None) or [])
-        )
-    )
+    def _flush_pending(self, index: int) -> None:
+        if not self._browsers[index].textCursor().hasSelection() and self._pending_html[index] is not None:
+            self.refresh(tuple(
+                pending if pending is not None else displayed
+                for pending, displayed in zip(self._pending_html, self._displayed_html)
+            ))
 
 
 class FitTrackerPanel(QtWidgets.QWidget):
-    """Compact text-only fit tracker surface for the Results tab."""
+    """Wrapping fit facts and a bounded viewport of complete fitted values."""
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("global_fit_tracker_panel")
-        self.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Fixed,
-        )
-        self.setMinimumHeight(88)
-        self.setMaximumHeight(124)
-        self._previous_cost: Optional[float] = None
-
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        self._overview: tuple[str, ...] = ()
+        self._outcome = self._phase = self._model = self._stale_text = ""
+        self._fitted_value_count = self._dataset_count = self._calls = 0
+        self._objective = "not evaluated"
+        self._values_html = ""
+        self._setup: FitSetupSnapshot | None = None
+        self._entries: tuple[FitValueEntry, ...] = ()
+        self._entry_labels: list[_FitValueLabel] = []
+        self._entry_layout_key: tuple | None = None
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(4)
-
-        self._summary_label = QtWidgets.QLabel(self)
-        self._summary_label.setObjectName("global_fit_tracker_summary_label")
-        self._summary_label.setWordWrap(True)
-        self._summary_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self._summary_label)
-
-        self._params_label = QtWidgets.QLabel(self)
-        self._params_label.setObjectName("global_fit_tracker_params_label")
-        self._params_label.setWordWrap(True)
-        self._params_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self._params_label, stretch=1)
-
+        layout.setContentsMargins(8, 2, 8, 2)
+        layout.setSpacing(2)
+        self._summary_widget = QtWidgets.QWidget(self)
+        self._summary_layout = ControlRowsLayout(self._summary_widget)
+        self._summary_labels: list[QtWidgets.QLabel] = []
+        layout.addWidget(self._summary_widget)
+        self._warnings_label = QtWidgets.QLabel(self)
+        self._warnings_label.setObjectName("global_fit_tracker_warnings")
+        self._warnings_label.setTextFormat(Qt.TextFormat.RichText)
+        self._warnings_label.setWordWrap(True)
+        self._warnings_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self._warnings_label)
+        self._values_scroll = QtWidgets.QScrollArea(self)
+        self._values_scroll.setObjectName("global_fit_tracker_values")
+        self._values_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self._values_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._values_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._values_scroll.setStyleSheet("QScrollArea#global_fit_tracker_values { border: 0; padding: 0; margin: 0; }")
+        self._values_scroll.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._values_scroll.setAccessibleName("Fitted values. Use the arrow or Page keys to scroll.")
+        self._values_widget = QtWidgets.QWidget()
+        self._values_layout = ControlRowsLayout(self._values_widget)
+        self._values_layout.setSpacing(8)
+        self._values_layout.setContentsMargins(0, 4, 0, 4)
+        self._values_scroll.setWidget(self._values_widget)
+        self._values_scroll.viewport().installEventFilter(self)
+        layout.addWidget(self._values_scroll)
         self.clear()
 
     def clear(self) -> None:
-        self._previous_cost = None
-        self._summary_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._summary_label.setStyleSheet("color: #888; font-size: 12px;")
-        self._summary_label.setText("Run a fit to see results here.")
-        self._params_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._params_label.setStyleSheet("color: #888; font-size: 11px;")
-        self._params_label.setText("")
+        self._overview = ()
+        self._outcome = self._phase = self._values_html = self._stale_text = ""
+        self._objective = "not evaluated"
+        self._calls = 0
+        self._warnings_label.clear()
+        self._warnings_label.hide()
+        self._set_entries(())
+        self._layout_entries()
+        for label in self._summary_labels:
+            label.hide()
+        self.hide()
 
-    def update_from_best(self, payload_dict: Dict[str, Any]) -> None:
-        iteration = int(payload_dict.get("iteration", 0))
-        try:
-            cost = float(payload_dict.get("cost"))
-        except Exception:
-            cost = float("nan")
-        delta_text = ""
-        if self._previous_cost is not None and np.isfinite(cost):
-            delta_text = f" (delta {cost - self._previous_cost:.2e})"
-        self._previous_cost = cost if np.isfinite(cost) else self._previous_cost
-        self._set_live_text(
-            f"Iter {iteration} | Cost {_format_metric(cost)}{delta_text}",
-            dict(payload_dict.get("shared_params") or {}),
-        )
+    def start(self, setup: FitSetupSnapshot, dataset_count: int, fitted_value_count: int) -> None:
+        self.clear()
+        self._model, self._setup = setup.origin.tab_name, setup
+        self._fitted_value_count, self._dataset_count = fitted_value_count, dataset_count
+        self._values_scroll.verticalScrollBar().setValue(0)
+        self.set_phase("Starting", "Waiting for the first complete candidate")
 
-    def update_final(self, iteration: int, cost: float, shared_params: Dict[str, float]) -> None:
-        self._previous_cost = float(cost) if np.isfinite(float(cost)) else self._previous_cost
-        self._set_live_text(
-            f"Iter {int(iteration)} | Cost {_format_metric(cost)}",
-            dict(shared_params or {}),
-        )
+    def restart(self) -> None:
+        """Start again with the setup and counts of the current run."""
+        self.start(self._setup, self._dataset_count, self._fitted_value_count)
 
-    def _set_live_text(self, summary_text: str, shared_params: Dict[str, float]) -> None:
-        self._summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self._summary_label.setStyleSheet("font-size: 12px; font-weight: 600;")
-        self._summary_label.setText(summary_text)
-        self._params_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        self._params_label.setStyleSheet("font-size: 11px;")
-        if shared_params:
-            parts = [f"{name}={value:.6g}" for name, value in sorted(shared_params.items(), key=lambda item: str(item[0]))]
-            self._params_label.setText(" | ".join(parts))
-        else:
-            self._params_label.setText("")
+    def set_phase(self, phase: str, detail: str) -> None:
+        self._phase = phase
+        self._overview = fit_overview(phase, self._model, self._objective,
+                                     self._dataset_count, self._fitted_value_count)
+        self._outcome = detail
+        self._render()
+
+    def update_from_best(self, update: FitLiveUpdate, *, dataset_labels: Mapping[str, str],
+                         initial_labels: Mapping[str, str]) -> None:
+        entries, self._values_html = fit_live_presentation(update, self._setup, dataset_labels, initial_labels)
+        self._set_entries(entries)
+        self._objective = six_digit_text(update.cost)
+        self._calls = update.iteration
+        phase, detail = self._phase, self._outcome
+        if phase in {"Starting", "Running"}:
+            phase, detail = "Running", f"Objective calls {update.iteration} · Best complete candidate"
+        self.set_phase(phase, detail)
+
+    def set_summary(self, overview: tuple[str, ...], entries: tuple[FitValueEntry, ...], warnings: str) -> None:
+        self._overview, self._outcome = overview, ""
+        self._phase = ""
+        self._warnings_label.setText(warnings)
+        self._warnings_label.setVisible(bool(warnings))
+        self._set_entries(entries)
+        self._render()
+
+    def mark_stale(self, text: str) -> None:
+        """State that the setup changed since this run, beside its own outcome."""
+        self._stale_text = text
+        self._render()
+
+    def summary_html(self) -> str:
+        if not self._overview:
+            return "<h2>Fit Ready</h2><p>Run a fit to obtain results.</p>"
+        return (f"<h2>{html.escape(" | ".join(self._overview))}</h2><p>{html.escape(self._outcome)}</p>"
+                f"<p>Objective calls: {self._calls}</p>" + self._values_html)
+
+    def _set_entries(self, entries: tuple[FitValueEntry, ...]) -> None:
+        same_identity = tuple(entry[0] for entry in entries) == tuple(entry[0] for entry in self._entries)
+        self._entries = entries
+        if not same_identity:
+            self._entry_layout_key = None
+            while self._values_layout.count():
+                self._values_layout.takeAt(0).widget().deleteLater()
+            self._entry_labels = []
+            for _entry in entries:
+                label = _FitValueLabel(self._values_widget)
+                label.setTextFormat(Qt.TextFormat.RichText)
+                label.setWordWrap(True)
+                label.setMargin(0)
+                label.setIndent(0)
+                label.setStyleSheet("border: 0; padding: 0; margin: 0;")
+                label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+                self._values_layout.addWidget(label)
+                label.show()
+                self._entry_labels.append(label)
+        self._values_scroll.setVisible(bool(entries))
+
+    def _layout_entries(self) -> None:
+        if not self._entries:
+            self._values_scroll.setFixedHeight(0)
+            return
+        scroll = self._values_scroll.verticalScrollBar()
+        position = scroll.value()
+        gutter = self._values_scroll.style().pixelMetric(QtWidgets.QStyle.PixelMetric.PM_ScrollBarExtent)
+        width = max(1, self._values_scroll.maximumViewportSize().width() - gutter)
+        key = (self._entries, width, gutter,
+               tuple(label.font().toString() for label in self._entry_labels))
+        if key == self._entry_layout_key:
+            return
+        self._entry_layout_key = key
+        row_height = max(label.fontMetrics().lineSpacing() + 6 for label in self._entry_labels)
+        for label, (_identity, symbol, plain_symbol, context, value, unit) in zip(self._entry_labels, self._entries):
+            label.copy_break_positions.clear()
+            metrics = label.fontMetrics()
+            number = six_digit_text(value)
+            suffix = "" if unit == "1" else " " + format_unit_for_display(unit)
+            document = QtGui.QTextDocument()
+            document.setDefaultFont(label.font())
+            document.setDocumentMargin(0)
+            document.setHtml(suffix)
+            numeric_width = (
+                metrics.horizontalAdvance("−8.88888e+308")
+                + math.ceil(document.idealWidth())
+            )
+            document.setHtml(symbol + " = ")
+            symbol_width = math.ceil(document.idealWidth()) + 4
+            context_budget = max(0, min(metrics.horizontalAdvance("M" * 28), width - symbol_width - numeric_width - 24))
+            compact = metrics.elidedText(" ".join(context.splitlines()), Qt.TextElideMode.ElideRight, context_budget)
+            prefix = html.escape(compact) + " " if compact else ""
+            numeric_html = ' = <span style="white-space: nowrap">' + html.escape(number) + suffix + '</span>'
+            if symbol_width + numeric_width > width:
+                # Rich text retains scientific formatting; explicit opportunities
+                # let an authored unbroken name wrap without splitting its number.
+                document.setHtml(symbol)
+                cursor = QtGui.QTextCursor(document)
+                while cursor.movePosition(QtGui.QTextCursor.MoveOperation.NextCharacter):
+                    label.copy_break_positions.append(cursor.position())
+                    cursor.insertText("\u200b")
+                cursor.insertHtml(numeric_html)
+                label.setText(document.toHtml())
+            else:
+                label.setText(prefix + symbol + numeric_html)
+            accessible_unit = f" {unit}" if unit != "1" else ""
+            label.setAccessibleName(f"{context} {plain_symbol} = {number}{accessible_unit}")
+            label.setToolTip(label.accessibleName())
+            entry_width = min(width, metrics.horizontalAdvance(compact + (" " if compact else "")) + symbol_width + numeric_width)
+            label.setFixedWidth(entry_width)
+            label.setMinimumHeight(0)
+            label.setMaximumHeight(16777215)
+            label.setFixedHeight(max(row_height, label.heightForWidth(entry_width)))
+        self._values_layout.invalidate()
+        height = self._values_layout.heightForWidth(width)
+        cap = 3 * row_height + 2 * self._values_layout.spacing() + 8
+        self._values_widget.resize(width, height)
+        self._values_layout.setGeometry(QtCore.QRect(0, 0, width, height))
+        self._values_scroll.setFixedHeight(min(height, cap))
+        scroll.setValue(position)
+
+    def _render(self) -> None:
+        if not self._overview:
+            self.hide()
+            return
+        width = max(1, self.contentsRect().width() - 16)
+        fragments = list(self._overview)
+        model_index = len(fragments) - 1
+        if self._phase and self._calls:
+            fragments[2:2] = [f"Objective calls {self._calls}", "Best complete candidate"]
+            model_index += 2
+        if self._outcome and self._outcome != f"Objective calls {self._calls} · Best complete candidate":
+            fragments.append(self._outcome)
+        if self._stale_text:
+            fragments.append(self._stale_text)
+        while len(self._summary_labels) < len(fragments):
+            label = QtWidgets.QLabel(self._summary_widget)
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setWordWrap(True)
+            label.setMargin(0)
+            label.setIndent(0)
+            label.setStyleSheet("border: 0; padding: 0; margin: 0;")
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            self._summary_layout.addWidget(label)
+            self._summary_labels.append(label)
+        for index, label in enumerate(self._summary_labels):
+            label.setVisible(index < len(fragments))
+            if index >= len(fragments):
+                continue
+            text = fragments[index]
+            metrics = label.fontMetrics()
+            # Bind only the authored model context; decisive facts wrap intact.
+            shown = metrics.elidedText(" ".join(text.splitlines()), Qt.TextElideMode.ElideRight,
+                                      min(width, metrics.horizontalAdvance("M" * 24))) if index == model_index else text
+            label.setText(shown)
+            label.setAccessibleName(text)
+            label.setToolTip(text)
+            label.setFixedWidth(min(width, metrics.horizontalAdvance(shown) + 4))
+            label.setMinimumHeight(0)
+            label.setMaximumHeight(16777215)
+            label.setFixedHeight(max(metrics.lineSpacing(), label.heightForWidth(label.width())))
+        self._summary_widget.setAccessibleName(" | ".join(fragments))
+        self._summary_layout.invalidate()
+        height = self._summary_layout.heightForWidth(width)
+        self._summary_widget.setFixedHeight(height)
+        self._summary_layout.setGeometry(QtCore.QRect(0, 0, width, height))
+        self.show()
+        self._layout_entries()
+
+    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if watched is self._values_scroll.viewport() and event.type() == QtCore.QEvent.Type.Resize:
+            self._layout_entries()
+        return super().eventFilter(watched, event)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._render()
+
+    def changeEvent(self, event: QtCore.QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() == QtCore.QEvent.Type.FontChange and hasattr(self, "_summary_widget"):
+            self._render()
 
 
 class RunResultsTab(QtWidgets.QWidget):
-    """Drop-in replacement for FittingWindow._create_run_results_tab()."""
+    """Physical Results action surface with no scientific custody."""
 
-    statusMessage = Signal(str)
-    _ALL_DATASETS_TAB_KEY = "__all_datasets__"
+    copyAvailableChanged = Signal(bool)
 
-    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None = None,
+        *,
+        color_resolver: ColorResolver | None = None,
+        observation_style: tuple[str, float, float],
+    ) -> None:
         super().__init__(parent)
-        self._last_run_stamp: dict = {}
-        self._last_run_stamp_hash: str = ""
-        self._last_run_stamp_short: str = ""
-        self._last_stats: Dict[str, Any] = {}
-        self._last_fitted_params: Dict[str, float] = {}
-        self._last_dataset_fitted_params: Dict[str, Dict[str, float]] = {}
-        self._stamp_dialog: Optional[ResultsSummaryDialog] = None
+        self._observation_style = observation_style
+        self._color_resolver = color_resolver
+        self._summary_dialog: ResultsSummaryDialog | None = None
+        self._summary_body = ""
+        self._summary_provenance = ""
+        self._stale = False
+        self._progress = 0
         self._dark_mode = False
-        self._dataset_entries: List[Dict[str, Any]] = []
-        self._dataset_tab_ids: List[str] = []
-        self._fit_targets_by_dataset: Dict[str, List[str]] = {}
-        self._dataset_plot_views: Dict[str, GridPlotView] = {}
-        self._all_datasets_plot_view: Optional[GridPlotView] = None
-        self._latest_model_series_by_dataset: Dict[str, Dict[str, np.ndarray]] = {}
-        self._latest_model_x_by_dataset: Dict[str, np.ndarray] = {}
-        self._latest_dataset_stats_by_dataset: Dict[str, Dict[str, float]] = {}
-        self._stale_plot_view_keys: set[str] = set()
+        self._copy_allowed = True
+        self._curves: tuple[FitCurveDataset, ...] = ()
+        self._dataset_tab_ids: list[tuple[str, str]] = []
+        self._dataset_labels: dict[str, str] = {}
+        self._dataset_plot_views: dict[tuple[str, str], GridPlotView] = {}
+        self._all_datasets_plot_view: GridPlotView | None = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(8)
-
         self._tracker_panel = FitTrackerPanel(self)
-        layout.addWidget(self._tracker_panel, stretch=0)
+        layout.addWidget(self._tracker_panel)
+        self._empty_label = QtWidgets.QLabel("Run a fit to see results here.", self)
+        self._empty_label.setWordWrap(True)
+        layout.addWidget(self._empty_label)
 
         self._subtabs = QtWidgets.QTabBar(self)
         self._subtabs.setObjectName("global_fit_results_subtabs")
         self._subtabs.setDocumentMode(True)
         self._subtabs.setDrawBase(False)
         self._subtabs.hide()
-        layout.addWidget(self._subtabs, stretch=0)
-
+        layout.addWidget(self._subtabs)
         self._subtab_stack = QtWidgets.QStackedWidget(self)
         self._subtab_stack.setObjectName("global_fit_results_subtab_stack")
         layout.addWidget(self._subtab_stack, stretch=1)
-
-        self._subtabs.currentChanged.connect(self._subtab_stack.setCurrentIndex)
         self._subtabs.currentChanged.connect(self._on_subtab_changed)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    def set_live_best(self, update: FitLiveUpdate, *, dataset_labels: Mapping[str, str],
+                      initial_labels: Mapping[str, str]) -> None:
+        self._empty_label.hide()
+        self._tracker_panel.update_from_best(update, dataset_labels=dataset_labels,
+                                             initial_labels=initial_labels)
+        self._refresh_summary()
 
-    def set_run_stamp(self, stamp: dict, stamp_hash: str, stamp_short: str) -> None:
-        """Store stamp data for later display via the popup dialog."""
-        self._last_run_stamp = dict(stamp)
-        self._last_run_stamp_hash = str(stamp_hash)
-        self._last_run_stamp_short = str(stamp_short)
-        self._last_stats = {}
-        self._last_fitted_params = {}
-        self._last_dataset_fitted_params = {}
-        self._latest_model_series_by_dataset = {}
-        self._latest_model_x_by_dataset = {}
-        self._latest_dataset_stats_by_dataset = {}
-        self._stale_plot_view_keys.clear()
-        self._tracker_panel.clear()
-        self._refresh_plot_views(refresh_all=True)
-        if self._stamp_dialog is not None and self._stamp_dialog.isVisible():
-            self._stamp_dialog.refresh(
-                self._last_run_stamp,
-                self._last_run_stamp_hash,
-                self._last_run_stamp_short,
-                None,
-                fitted_params=None,
-                dataset_fitted_params=None,
+    def set_live_curves(self, curves: Sequence[FitCurveDataset]) -> None:
+        self._install_plot_projection(curves)
+        self._refresh_summary()
+
+    def set_terminal_presentation(
+        self,
+        candidate: FitCandidate | None,
+        *,
+        curves: Sequence[FitCurveDataset] = (),
+    ) -> bool:
+        """Consume one call-local typed terminal presentation."""
+        if candidate is None:
+            self._summary_body = self._summary_provenance = ""
+            self._tracker_panel.clear()
+        else:
+            overview, self._summary_body, self._summary_provenance, entries, warnings = (
+                fit_candidate_presentation(candidate)
             )
+            self._tracker_panel.set_summary(overview, entries, warnings)
+        self._install_plot_projection(curves)
+        self._refresh_summary()
+        return self.copy_eligible()
 
-    def clear_fitted_params(self) -> None:
-        """Clear stored fitted params (e.g. after an invalid/failed fit)."""
-        self._last_fitted_params = {}
-        self._last_dataset_fitted_params = {}
+    def set_progress(self, value: int) -> None:
+        self._progress = value
+        self._refresh_summary()
 
-    def _dataset_label_for_id(self, dataset_id: str) -> str:
-        ds_id = str(dataset_id or "").strip()
-        for entry in self._dataset_entries or []:
-            if str(entry.get("id") or "").strip() == ds_id:
-                return str(entry.get("label", "") or "").strip() or str(dataset_id)
-        return str(dataset_id)
+    def _summary_html(self) -> tuple[str, str]:
+        """The Results and Provenance documents."""
+        body = self._summary_body or self._tracker_panel.summary_html()
+        if not self._summary_body:
+            body += f"<p>Progress: {self._progress}%</p>"
+        if self._stale:
+            body = f"<p><b>{html.escape(STALE_RESULTS_TEXT)}</b></p>" + body
+        return body, self._summary_provenance
 
-    def open_results_summary_dialog(self) -> None:
-        """Show the results summary popup dialog."""
-        if not self._last_run_stamp:
+    def _refresh_summary(self) -> None:
+        if self._summary_dialog is not None and self._summary_dialog.isVisible():
+            self._summary_dialog.refresh(self._summary_html())
+
+    def render_results_summary(self) -> None:
+        """Show the current physical execution/terminal projection in one document."""
+        if self._summary_dialog is not None and self._summary_dialog.isVisible():
+            self._refresh_summary()
+            self._summary_dialog.raise_()
+            self._summary_dialog.activateWindow()
             return
-        if self._stamp_dialog is not None and self._stamp_dialog.isVisible():
-            self._stamp_dialog.raise_()
-            self._stamp_dialog.activateWindow()
-            return
-        dialog = ResultsSummaryDialog(
-            self._last_run_stamp,
-            self._last_run_stamp_hash,
-            self._last_run_stamp_short,
-            stats=self._last_stats or None,
-            fitted_params=self._last_fitted_params or None,
-            dataset_fitted_params=self._format_dataset_params_for_dialog(),
-            parent=self,
+        dialog = ResultsSummaryDialog(self._summary_html(), parent=self)
+        dialog.destroyed.connect(
+            lambda: setattr(self, "_summary_dialog", None)
+            if self._summary_dialog is dialog else None
         )
-        dialog.statusMessage.connect(self.statusMessage)
-        dialog.destroyed.connect(lambda: setattr(self, '_stamp_dialog', None))
-        self._stamp_dialog = dialog
+        self._summary_dialog = dialog
         dialog.show()
 
-    def _format_dataset_params_for_dialog(self) -> Optional[List[tuple]]:
-        """Return [(display_label, {name: value}), ...] keyed by dataset ID order.
+    def clear_candidate(self) -> None:
+        """Clear the result presentation; plots and their view settings stay for the next Run."""
 
-        Uses display labels with disambiguation when two datasets share a label.
-        Returns None when there are no dataset-specific fitted parameters.
-        """
-        if not self._last_dataset_fitted_params:
-            return None
-        ids = sorted(
-            (ds_id for ds_id, vals in self._last_dataset_fitted_params.items()
-             if isinstance(vals, dict) and vals),
-            key=str,
-        )
-        if not ids:
-            return None
-        raw_labels = {ds_id: self._dataset_label_for_id(ds_id) for ds_id in ids}
-        label_counts: Dict[str, int] = {}
-        for lbl in raw_labels.values():
-            label_counts[lbl] = label_counts.get(lbl, 0) + 1
-        result: List[tuple] = []
-        for ds_id in ids:
-            lbl = raw_labels[ds_id]
-            display = f"{lbl} ({ds_id})" if label_counts[lbl] > 1 else lbl
-            result.append((display, dict(self._last_dataset_fitted_params[ds_id])))
-        return result
-
-    def update_statistics(self, stats: Dict[str, Any]) -> None:
-        """Store stat values; update dialog if open."""
-        self._last_stats = dict(stats)
-        if self._stamp_dialog is not None and self._stamp_dialog.isVisible():
-            self._stamp_dialog.refresh(
-                self._last_run_stamp,
-                self._last_run_stamp_hash,
-                self._last_run_stamp_short,
-                self._last_stats,
-                fitted_params=self._last_fitted_params or None,
-                dataset_fitted_params=self._format_dataset_params_for_dialog(),
-            )
-
-    def rebuild_subtabs(
-        self,
-        dataset_entries: Sequence[Dict[str, Any]],
-        fit_targets_by_dataset: Dict[str, Sequence[str]],
-    ) -> None:
-        self._dataset_entries = [
-            entry for entry in list(dataset_entries or [])
-            if bool(entry.get("include", True))
-        ]
-        self._fit_targets_by_dataset = {
-            str(ds_id): _normalize_species_names(list(species or []))
-            for ds_id, species in (fit_targets_by_dataset or {}).items()
-        }
         self._tracker_panel.clear()
-        self._clear_subtabs()
-        self._dataset_plot_views = {}
-        self._dataset_tab_ids = []
+        self._summary_body = self._summary_provenance = ""
+        self._stale = False
+        self._empty_label.setText("Run a fit to see results here.")
+        self._empty_label.show()
+        self._install_plot_projection(())
+        self._refresh_summary()
 
-        for entry in self._dataset_entries:
-            ds_id = str(entry.get("id") or "").strip()
-            if not ds_id:
-                continue
-            title = str(entry.get("label") or ds_id)
-            plot_view = self._create_plot_view(f"global_fit_results_plot_{ds_id}")
-            self._dataset_tab_ids.append(ds_id)
-            self._dataset_plot_views[ds_id] = plot_view
-            self._subtab_stack.addWidget(plot_view)
-            self._subtabs.addTab(title)
+    def mark_stale(self) -> None:
+        """Keep showing results whose setup has since changed, and say so."""
+        if not self._subtab_stack.count() or self._stale:
+            return
+        self._stale = True
+        self._tracker_panel.mark_stale(STALE_RESULTS_TEXT)
+        self._refresh_summary()
 
-        self._all_datasets_plot_view = None
-        if self._dataset_entries:
-            self._all_datasets_plot_view = self._create_plot_view("global_fit_results_plot_all_datasets")
-            self._subtab_stack.addWidget(self._all_datasets_plot_view)
-            self._subtabs.addTab("All Datasets")
+    def mark_current(self) -> None:
+        """The setup is back to the one these results ran with."""
+        if not self._stale:
+            return
+        self._stale = False
+        self._tracker_panel.mark_stale("")
+        self._refresh_summary()
 
-        self._subtabs.setVisible(self._subtabs.count() > 0)
-        if self._subtabs.count() > 0:
-            self._subtabs.setCurrentIndex(0)
-            self._subtab_stack.setCurrentIndex(0)
-        self._refresh_plot_views(refresh_all=True)
+    def set_terminal_failure(self, failure: FactualCause) -> None:
+        self._present_terminal_cause("Failed", "Fit Failed", failure)
 
-    def push_live_update(
-        self,
-        payload: Dict[str, Any],
-        *,
-        refresh_all: bool = False,
-        update_tracker: bool = True,
-    ) -> None:
-        if update_tracker and any(key in payload for key in ("iteration", "cost", "shared_params")):
-            self._tracker_panel.update_from_best(payload)
-        plot_model_series = payload.get("plot_model_series")
-        model_series = plot_model_series if isinstance(plot_model_series, dict) and plot_model_series else (payload.get("model_series") or {})
-        plot_model_x = payload.get("plot_model_x") if isinstance(plot_model_series, dict) and plot_model_series else {}
-        dataset_stats = payload.get("dataset_stats") or {}
-        self._refresh_plot_views(
-            model_series_by_dataset=model_series if isinstance(model_series, dict) else {},
-            model_x_by_dataset=plot_model_x if isinstance(plot_model_x, dict) else {},
-            dataset_stats_by_dataset=dataset_stats if isinstance(dataset_stats, dict) else {},
-            refresh_all=bool(refresh_all),
-        )
+    def set_terminal_unavailable(self, cause: ScientificUnavailable) -> None:
+        self._present_terminal_cause("No valid candidate found", "No Valid Candidate Found", cause.factual_cause)
 
-    def push_final_result(self, result: "GlobalFitResult", dataset_entries: Sequence[Dict[str, Any]]) -> None:
-        current_ids = [str(entry.get("id") or "").strip() for entry in self._dataset_entries]
-        incoming_ids = [
-            str(entry.get("id") or "").strip()
-            for entry in list(dataset_entries or [])
-            if bool(entry.get("include", True))
-        ]
-        if current_ids != incoming_ids:
-            self.rebuild_subtabs(dataset_entries, self._fit_targets_by_dataset)
-
-        self._last_fitted_params = dict(getattr(result, "shared_params", {}) or {})
-        raw_ds_params = getattr(result, "dataset_params", None) or {}
-        self._last_dataset_fitted_params = {
-            str(ds_id): dict(vals)
-            for ds_id, vals in raw_ds_params.items()
-            if isinstance(vals, dict) and vals
-        }
-        dataset_stats = {
-            str(info.dataset_id): {
-                "chi_squared": float(info.chi_squared),
-                "r_squared": float(info.r_squared),
-            }
-            for info in (getattr(result, "dataset_info", None) or [])
-        }
-        plot_series = getattr(result, "plot_model_series", None) or {}
-        use_plot_x = bool(isinstance(plot_series, dict) and plot_series)
-        model_series = plot_series if use_plot_x else (getattr(result, "model_series", None) or {})
-        model_x_by_dataset = (getattr(result, "plot_model_x", None) or {}) if use_plot_x else {}
-        self._tracker_panel.update_final(
-            iteration=int(getattr(result, "nfev", 0)),
-            cost=_objective_cost_from_result(result),
-            shared_params=dict(getattr(result, "shared_params", {}) or {}),
-        )
-        self._refresh_plot_views(
-            model_series_by_dataset=model_series if isinstance(model_series, dict) else {},
-            model_x_by_dataset=model_x_by_dataset if isinstance(model_x_by_dataset, dict) else {},
-            dataset_stats_by_dataset=dataset_stats,
-            refresh_all=True,
-        )
-
-    def clear(self) -> None:
-        self._dataset_entries = []
-        self._dataset_tab_ids = []
-        self._fit_targets_by_dataset = {}
-        self._dataset_plot_views = {}
-        self._all_datasets_plot_view = None
-        self._latest_model_series_by_dataset = {}
-        self._latest_model_x_by_dataset = {}
-        self._latest_dataset_stats_by_dataset = {}
-        self._last_fitted_params = {}
-        self._last_dataset_fitted_params = {}
-        self._stale_plot_view_keys.clear()
+    def _present_terminal_cause(self, phase: str, heading: str, cause: FactualCause) -> None:
+        """One located sentence, captioned with the datasets the cause names."""
+        self._empty_label.hide()
         self._tracker_panel.clear()
-        self._clear_subtabs()
+        dataset_ids = cause.details.get("datasets") or (
+            (cause.details["dataset"],) if "dataset" in cause.details else ()
+        )
+        labels = [self._dataset_labels[dataset_id] for dataset_id in dataset_ids]
+        caption = f"Dataset{'s' if len(labels) > 1 else ''}: {', '.join(sorted(labels))}" if labels else ""
+        message = located(cause.message, *cause.location())
+        self.set_execution_status(phase, f"{caption}: {message}" if caption else message)
+        self._summary_body = (
+            f"<h2>{heading}</h2>" + (f"<p>{html.escape(caption)}</p>" if caption else "")
+            + "<p>" + html.escape(message) + "</p>"
+        )
+        self._summary_provenance = ""
+        self._refresh_summary()
 
-    def set_view_autorange_locked(self, running: bool) -> None:
-        for plot_view in list(self._dataset_plot_views.values()):
-            plot_view.set_autorange_locked(bool(running))
+    def copy_eligible(self) -> bool:
+        return self._copy_allowed and bool(self._curves)
+
+    def set_copy_allowed(self, allowed: bool) -> None:
+        self._copy_allowed = bool(allowed)
+        for plot_view in self._dataset_plot_views.values():
+            plot_view.set_copy_allowed(self._copy_allowed)
         if self._all_datasets_plot_view is not None:
-            self._all_datasets_plot_view.set_autorange_locked(bool(running))
+            self._all_datasets_plot_view.set_copy_allowed(self._copy_allowed)
+        self.copyAvailableChanged.emit(self.copy_eligible())
+
+    def copy_active_to_clipboard(self) -> None:
+        """Copy only the dataset scope represented by the active Results tab."""
+
+        view_id = self._active_plot_view_id()
+        if view_id[0] == "aggregate":
+            view = self._all_datasets_plot_view
+            curves = self._curves
+        else:
+            view = self._dataset_plot_views.get(view_id)
+            curves = tuple(
+                curve for curve in self._curves if curve.dataset_id == view_id[1]
+            )
+        view.copy_projection_to_clipboard(curves)
+
+    def copy_dataset_to_clipboard(self, dataset_id: str, all_simulated: bool) -> None:
+        """Copy the one dataset represented by a clicked Fit plot."""
+
+        identity = str(dataset_id or "").strip()
+        curves = tuple(
+            curve for curve in self._curves if curve.dataset_id == identity
+        )
+        view = self._subtab_stack.currentWidget()
+        view.copy_projection_to_clipboard(curves, all_simulated=all_simulated)
+
+    def set_observation_style(self, shape: str, size: float, opacity: float) -> None:
+        self._observation_style = (shape, size, opacity)
+        for plot_view in self._dataset_plot_views.values():
+            plot_view.set_observation_style(shape, size, opacity)
+        if self._all_datasets_plot_view is not None:
+            self._all_datasets_plot_view.set_observation_style(shape, size, opacity)
+        self._refresh_summary()
+
+    def set_waiting(self, request: FitExecutionRequest) -> None:
+        self.clear_candidate()
+        self._progress = 0
+        self._tracker_panel.start(
+            request.setup,
+            len(request.dispatch.included_dataset_ids),
+            len(request.dispatch.ordinary_optimizer_layout.opt_param_keys()),
+        )
+        if self._summary_dialog is not None and self._summary_dialog.isVisible():
+            self._summary_dialog.refresh(self._summary_html(), reset=True)
+
+    def restart_waiting(self) -> None:
+        """Wait again for the running request the tracker already holds."""
+        self.clear_candidate()
+        self._progress = 0
+        self._tracker_panel.restart()
+        if self._summary_dialog is not None and self._summary_dialog.isVisible():
+            self._summary_dialog.refresh(self._summary_html(), reset=True)
+
+    def set_execution_status(self, phase: str, detail: str) -> None:
+        self._empty_label.hide()
+        self._tracker_panel.set_phase(phase, detail)
+        self._refresh_summary()
 
     def set_dark_mode(self, enabled: bool) -> None:
         self._dark_mode = bool(enabled)
-        for plot_view in list(self._dataset_plot_views.values()):
+        for plot_view in self._dataset_plot_views.values():
             plot_view.set_dark_mode(self._dark_mode)
         if self._all_datasets_plot_view is not None:
             self._all_datasets_plot_view.set_dark_mode(self._dark_mode)
+        self._refresh_summary()
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    def prepare(self, request: FitExecutionRequest) -> None:
+        self._ensure_subtabs(request)
+        ids = request.dispatch.included_dataset_ids
+        for identity in self._dataset_tab_ids + ([("aggregate", "all")] if len(ids) > 1 else []):
+            aggregate = identity[0] == "aggregate"
+            view = self._all_datasets_plot_view if aggregate else self._dataset_plot_views.get(identity)
+            if view is None:
+                view = self._create_plot_view(f"global_fit_results_plot_{identity[1]}")
+                if aggregate:
+                    self._all_datasets_plot_view = view
+                else:
+                    self._dataset_plot_views[identity] = view
+                self._subtab_stack.addWidget(view)
+            view.prepare(request, ids if aggregate else (identity[1],))
+        self._empty_label.hide()
+        for index in range(self._subtabs.count()):
+            if self._subtabs.tabData(index)["view_identity"] == ("aggregate", "all"):
+                self._subtabs.setCurrentIndex(index)
+                break
+        self._refresh_active_plot_view()
 
-    def _clear_subtabs(self) -> None:
+    def finish_preparation(self) -> None:
+        self.layout().activate()
+        size = self._subtab_stack.contentsRect().size()
+        for index in range(self._subtab_stack.count()):
+            view = self._subtab_stack.widget(index)
+            view.resize(size)
+            view.finish_preparation()
+        # Paint the selected, displayed canvas before the owner queues launch.
+        view = self._subtab_stack.currentWidget()
+        if view is not None:
+            view._canvas.viewport().repaint()
+
+    def _ensure_subtabs(self, request: FitExecutionRequest) -> None:
+        mapped = {item.dataset_id: item for item in request.setup.origin.mapped_datasets}
+        curves = tuple(mapped[identity] for identity in request.dispatch.included_dataset_ids)
+        ids = [("dataset", curve.dataset_id) for curve in curves]
+        labels = {curve.dataset_id: curve.display_name for curve in curves}
+        if ids == self._dataset_tab_ids and labels == self._dataset_labels:
+            return
+        selected = self._active_plot_view_id()
+        self._dataset_tab_ids = ids
+        self._dataset_labels = labels
+        for identity in tuple(self._dataset_plot_views):
+            if identity not in ids:
+                self._remove_plot_view(self._dataset_plot_views.pop(identity))
+        if len(curves) < 2 and self._all_datasets_plot_view is not None:
+            self._remove_plot_view(self._all_datasets_plot_view)
+            self._all_datasets_plot_view = None
+        blocker = QtCore.QSignalBlocker(self._subtabs)
         while self._subtabs.count():
             self._subtabs.removeTab(self._subtabs.count() - 1)
-        while self._subtab_stack.count():
-            widget = self._subtab_stack.widget(0)
-            self._subtab_stack.removeWidget(widget)
-            widget.deleteLater()
-        self._stale_plot_view_keys.clear()
-        self._subtabs.hide()
+        for curve, view_identity in zip(curves, ids, strict=True):
+            compact_label = compact_dataset_label(curve.display_name, max_chars=TAB_LABEL_MAX_CHARS)
+            tab_index = self._subtabs.addTab(compact_label.display)
+            self._subtabs.setTabToolTip(
+                tab_index, f"{compact_label.full}\nDataset ID: {curve.dataset_id}"
+            )
+            self._subtabs.setTabData(tab_index, {"view_identity": view_identity})
+        if len(curves) > 1:
+            index = self._subtabs.addTab("All Datasets")
+            self._subtabs.setTabData(index, {"view_identity": ("aggregate", "all")})
+        self._subtabs.setVisible(len(curves) > 1)
+        identities = ids + ([("aggregate", "all")] if len(curves) > 1 else [])
+        self._subtabs.setCurrentIndex(identities.index(selected) if selected in identities else 0)
+        del blocker
 
     def _create_plot_view(self, object_name: str) -> GridPlotView:
-        plot_view = GridPlotView(self)
+        plot_view = GridPlotView(
+            color_resolver=self._color_resolver,
+            observation_style=self._observation_style,
+            parent=self,
+        )
         plot_view.setObjectName(object_name)
-        plot_view.set_controls_visible(False)
+        plot_view.copyFitDataRequested.connect(self.copy_dataset_to_clipboard)
         plot_view.set_dark_mode(self._dark_mode)
+        plot_view.set_copy_allowed(self._copy_allowed)
         return plot_view
 
-    def _refresh_plot_views(
-        self,
-        *,
-        model_series_by_dataset: Optional[Dict[str, Dict[str, np.ndarray]]] = None,
-        model_x_by_dataset: Optional[Dict[str, np.ndarray]] = None,
-        dataset_stats_by_dataset: Optional[Dict[str, Dict[str, float]]] = None,
-        refresh_all: bool = True,
-    ) -> None:
-        self._latest_model_series_by_dataset = {
-            str(ds_id): {
-                str(name): _as_float_array(values)
-                for name, values in (series or {}).items()
-            }
-            for ds_id, series in (model_series_by_dataset or {}).items()
-            if isinstance(series, dict)
-        }
-        self._latest_model_x_by_dataset = {
-            str(ds_id): _as_float_array(values)
-            for ds_id, values in (model_x_by_dataset or {}).items()
-        }
-        self._latest_dataset_stats_by_dataset = {
-            str(ds_id): dict(stats)
-            for ds_id, stats in (dataset_stats_by_dataset or {}).items()
-            if isinstance(stats, dict)
-        }
+    def _install_plot_projection(self, curves: Sequence[FitCurveDataset]) -> None:
+        values = tuple(curves)
+        for index in range(self._subtab_stack.count()):
+            self._subtab_stack.widget(index).cancel_copy()
+        self._curves = values
+        if values:
+            self._empty_label.hide()
+            self._refresh_active_plot_view()
+        else:
+            for index in range(self._subtab_stack.count()):
+                self._subtab_stack.widget(index).set_projection(())
+        self.copyAvailableChanged.emit(self.copy_eligible())
 
-        plot_keys = self._all_plot_view_keys()
-        if refresh_all:
-            for key in plot_keys:
-                self._refresh_plot_view_for_key(key)
-            self._stale_plot_view_keys.clear()
-            return
-
-        visible_key = self._current_plot_view_key()
-        if visible_key is None:
-            self._stale_plot_view_keys.update(plot_keys)
-            return
-
-        self._refresh_plot_view_for_key(visible_key)
-        self._stale_plot_view_keys.update(plot_keys)
-        self._stale_plot_view_keys.discard(visible_key)
-
-    def _apply_plot_species_selection(self, plot_view: GridPlotView, species_names: Sequence[str]) -> None:
-        species = [str(name).strip() for name in species_names if str(name).strip()]
-        if not species:
-            return
-
-        def _safe_set() -> None:
-            try:
-                plot_view.set_species_selection(species)
-            except RuntimeError:
-                return
-            except Exception:
-                return
-
-        redraw_timer = getattr(plot_view, "_redraw_timer", None)
-        if redraw_timer is not None and getattr(redraw_timer, "isActive", lambda: False)():
-            def _apply_after_redraw() -> None:
-                try:
-                    redraw_timer.timeout.disconnect(_apply_after_redraw)
-                except (RuntimeError, TypeError):
-                    pass
-                _safe_set()
-
-            redraw_timer.timeout.connect(_apply_after_redraw)
-            return
-
-        _safe_set()
-
-    def _all_plot_view_keys(self) -> List[str]:
-        keys = list(self._dataset_tab_ids)
-        if self._all_datasets_plot_view is not None:
-            keys.append(self._ALL_DATASETS_TAB_KEY)
-        return keys
-
-    def _current_plot_view_key(self) -> Optional[str]:
-        return self._plot_view_key_for_index(self._subtabs.currentIndex())
-
-    def _plot_view_key_for_index(self, index: int) -> Optional[str]:
+    def _active_plot_view_id(self) -> tuple[str, str] | None:
+        index = self._subtabs.currentIndex()
         if index < 0:
             return None
-        if 0 <= index < len(self._dataset_tab_ids):
-            return self._dataset_tab_ids[index]
-        if (
-            index == len(self._dataset_tab_ids)
-            and self._all_datasets_plot_view is not None
-        ):
-            return self._ALL_DATASETS_TAB_KEY
-        return None
+        return self._subtabs.tabData(index)["view_identity"]
 
-    def _dataset_entry_for_id(self, dataset_id: str) -> Optional[Dict[str, Any]]:
-        for entry in self._dataset_entries:
-            if str(entry.get("id") or "").strip() == str(dataset_id or "").strip():
-                return entry
-        return None
+    def _refresh_active_plot_view(self) -> None:
+        view_id = self._active_plot_view_id()
+        if view_id is not None:
+            self._refresh_plot_view(view_id)
 
-    def _refresh_plot_view_for_key(self, key: str) -> None:
-        if key == self._ALL_DATASETS_TAB_KEY:
+    def _refresh_plot_view(self, view_id: tuple[str, str]) -> None:
+        if view_id[0] == "aggregate":
             plot_view = self._all_datasets_plot_view
-            if plot_view is None:
-                return
-            overlay_payloads: List[Dict[str, Any]] = []
-            overlay_species: set[str] = set()
-            for ds_id in self._dataset_tab_ids:
-                entry = self._dataset_entry_for_id(ds_id)
-                if entry is None:
-                    continue
-                payload = self._build_grid_dataset_payload(
-                    entry,
-                    self._fit_targets_by_dataset.get(ds_id, []),
-                    model_series=self._latest_model_series_by_dataset.get(ds_id),
-                    model_x=self._latest_model_x_by_dataset.get(ds_id),
-                    dataset_stats=self._latest_dataset_stats_by_dataset.get(ds_id),
-                )
-                if payload is None:
-                    continue
-                overlay_payloads.append(payload)
-                overlay_species.update((payload.get("all_species") or {}).keys())
-            plot_view.set_datasets(overlay_payloads)
-            self._apply_plot_species_selection(plot_view, sorted(overlay_species))
+            curves = self._curves
+        else:
+            plot_view = self._dataset_plot_views.get(view_id)
+            curves = tuple(
+                curve for curve in self._curves if curve.dataset_id == view_id[1]
+            )
+        if plot_view is None:
             return
-
-        plot_view = self._dataset_plot_views.get(key)
-        entry = self._dataset_entry_for_id(key)
-        if plot_view is None or entry is None:
-            return
-        payload = self._build_grid_dataset_payload(
-            entry,
-            self._fit_targets_by_dataset.get(key, []),
-            model_series=self._latest_model_series_by_dataset.get(key),
-            model_x=self._latest_model_x_by_dataset.get(key),
-            dataset_stats=self._latest_dataset_stats_by_dataset.get(key),
-        )
-        species_names = sorted((payload or {}).get("all_species", {}).keys())
-        plot_view.set_datasets([payload] if payload is not None else [])
-        self._apply_plot_species_selection(plot_view, species_names)
+        self._subtab_stack.setCurrentWidget(plot_view)
+        plot_view.set_projection(curves)
+        self.copyAvailableChanged.emit(self.copy_eligible())
 
     def _on_subtab_changed(self, index: int) -> None:
-        key = self._plot_view_key_for_index(int(index))
-        if key is None or key not in self._stale_plot_view_keys:
-            return
-        self._refresh_plot_view_for_key(key)
-        self._stale_plot_view_keys.discard(key)
+        self._refresh_active_plot_view()
+        self._refresh_summary()
+        self.copyAvailableChanged.emit(self.copy_eligible())
 
-    def _build_grid_dataset_payload(
-        self,
-        entry: Dict[str, Any],
-        fitted_species_list: Sequence[str],
-        *,
-        model_series: Optional[Dict[str, np.ndarray]],
-        model_x: Optional[np.ndarray],
-        dataset_stats: Optional[Dict[str, float]],
-    ) -> Optional[Dict[str, Any]]:
-        species_data = entry.get("species_data") or entry.get("species") or {}
-        if not isinstance(species_data, dict):
-            return None
-        fitted_species = sorted(
-            [
-                str(name).strip()
-                for name in fitted_species_list
-                if str(name).strip() and str(name).strip() in species_data
-            ]
-        )
-        if not fitted_species:
-            return None
-
-        all_species = {
-            name: _as_float_array(species_data.get(name))
-            for name in fitted_species
-        }
-        current_species = fitted_species[0]
-        data_x = _as_float_array(entry.get("x_obs", entry.get("t")))
-        data_y = all_species.get(current_species, np.asarray([], dtype=float))
-        filtered_model_series = None
-        if isinstance(model_series, dict):
-            filtered_model_series = {
-                name: _as_float_array(values)
-                for name, values in model_series.items()
-                if str(name).strip() in all_species
-            }
-            if not filtered_model_series:
-                filtered_model_series = None
-        chi_squared = None
-        r_squared = None
-        if isinstance(dataset_stats, dict):
-            try:
-                chi_squared = float(dataset_stats.get("chi_squared")) if dataset_stats.get("chi_squared") is not None else None
-            except Exception:
-                chi_squared = None
-            try:
-                r_squared = float(dataset_stats.get("r_squared")) if dataset_stats.get("r_squared") is not None else None
-            except Exception:
-                r_squared = None
-        x_name = str(entry.get("x_name") or "t").strip() or "t"
-        return {
-            "name": str(entry.get("label") or entry.get("id") or ""),
-            "data_x": data_x,
-            "data_y": data_y,
-            "model_x": _as_float_array(model_x) if model_x is not None else None,
-            "model_y": None if filtered_model_series is None else filtered_model_series.get(current_species),
-            "model_series": filtered_model_series,
-            "chi_squared": chi_squared,
-            "r_squared": r_squared,
-            "all_species": all_species,
-            "current_species": current_species,
-            "x_label": "Time" if x_name == "t" else x_name,
-            "x_units": "s" if x_name == "t" else None,
-        }
+    def _remove_plot_view(self, view: GridPlotView) -> None:
+        view.set_projection(())
+        self._subtab_stack.removeWidget(view)
+        view.deleteLater()

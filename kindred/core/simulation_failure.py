@@ -1,154 +1,195 @@
+"""Canonical immutable factual causes for simulation and fitting boundaries.
+
+``FactualCause`` is the internal terminal/report cause tree.  The object is
+deliberately not a mapping: callers inspect typed attributes and call
+``to_payload`` only at the JSON boundary.
+"""
+
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, MutableMapping, Optional
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Any
 
-from kindred.core.exceptions import KindredError, ErrorContext, SimulationCancelled
+from kindred.core.exceptions import ErrorContext
 
-
-SimulationFailure = Dict[str, Any]
-
-
-def serialize_error_context(context: ErrorContext | Mapping[str, Any] | None) -> Optional[Dict[str, Any]]:
-    if context is None:
-        return None
-    if isinstance(context, Mapping):
-        line = context.get("line")
-        col = context.get("col")
-        line_text = context.get("line_text")
-        file_path = context.get("file_path")
-        stack_trace = context.get("stack_trace")
-    else:
-        line = getattr(context, "line", None)
-        col = getattr(context, "col", None)
-        line_text = getattr(context, "line_text", None)
-        file_path = getattr(context, "file_path", None)
-        stack_trace = getattr(context, "stack_trace", None)
-    payload = {
-        "line": int(line) if line is not None else None,
-        "col": int(col) if col is not None else None,
-        "line_text": str(line_text) if line_text is not None else None,
-        "file_path": str(file_path) if file_path is not None else None,
-        "stack_trace": str(stack_trace) if stack_trace is not None else None,
-    }
-    if not any(value is not None for value in payload.values()):
-        return None
-    return payload
+__all__ = [
+    "FactualCause",
+    "factual_cause_from_exception",
+]
 
 
-def build_simulation_failure(
-    kind: str,
-    message: str,
-    *,
-    code: Optional[str] = None,
-    context: ErrorContext | Mapping[str, Any] | None = None,
-    details: Mapping[str, Any] | None = None,
-    exc_type: Optional[str] = None,
-) -> SimulationFailure:
-    return {
-        "kind": str(kind or "simulation_error"),
-        "code": str(code) if code is not None else None,
-        "message": str(message or ""),
-        "context": serialize_error_context(context),
-        "details": dict(details or {}),
-        "exc_type": str(exc_type) if exc_type is not None else None,
-    }
+def freeze_factual_value(value: object) -> object:
+    """Recursively freeze factual metadata without inventing a schema."""
 
-
-def simulation_failure_from_exception(
-    exc: BaseException,
-    *,
-    kind: Optional[str] = None,
-    details: Mapping[str, Any] | None = None,
-) -> SimulationFailure:
-    if isinstance(exc, SimulationCancelled):
-        resolved_kind = "cancelled"
-    elif kind is not None:
-        resolved_kind = str(kind)
-    elif isinstance(exc, KindredError):
-        resolved_kind = "simulation_error"
-    else:
-        resolved_kind = "simulation_error"
-
-    combined_details: MutableMapping[str, Any] = {}
-    if isinstance(exc, KindredError):
-        combined_details.update(dict(getattr(exc, "details", {}) or {}))
-    combined_details.update(dict(details or {}))
-
-    message = str(getattr(exc, "message", None) or str(exc) or exc.__class__.__name__)
-    code = getattr(exc, "code", None)
-    context = getattr(exc, "context", None)
-    return build_simulation_failure(
-        resolved_kind,
-        message,
-        code=str(code) if code is not None else None,
-        context=context,
-        details=combined_details,
-        exc_type=exc.__class__.__name__,
-    )
-
-
-def coerce_simulation_failure(value: object) -> SimulationFailure:
-    if isinstance(value, dict) and "kind" in value and "message" in value:
-        return build_simulation_failure(
-            str(value.get("kind") or "simulation_error"),
-            str(value.get("message") or ""),
-            code=str(value.get("code")) if value.get("code") is not None else None,
-            context=value.get("context") if isinstance(value.get("context"), Mapping) else None,
-            details=value.get("details") if isinstance(value.get("details"), Mapping) else None,
-            exc_type=str(value.get("exc_type")) if value.get("exc_type") is not None else None,
-        )
-    if isinstance(value, BaseException):
-        return simulation_failure_from_exception(value)
-    text = str(value or "")
-    legacy_kind = "cancelled" if "cancelled" in text.lower() else "simulation_error"
-    return build_simulation_failure(legacy_kind, text)
-
-
-def is_cancelled_failure(value: object) -> bool:
-    payload = coerce_simulation_failure(value)
-    return str(payload.get("kind") or "") == "cancelled"
-
-
-def simulation_failure_user_message(value: object) -> str:
-    payload = coerce_simulation_failure(value)
-    kind = str(payload.get("kind") or "")
-    message = str(payload.get("message") or "").strip()
-    details = payload.get("details") if isinstance(payload.get("details"), Mapping) else {}
-    stage = str(details.get("stage") or "").strip().lower()
-    if kind == "cancelled":
-        return message or "Simulation cancelled by user"
-    if kind == "preparation_error":
-        prefixes = {
-            "parse": "Failed to parse mechanism",
-            "prepared_payload": "Prepared simulation payload invalid",
-            "solver_config": "Invalid solver configuration",
-            "parameter_algebra": "Parameter algebra failed",
-            "ode_build": "Failed to build ODE system",
-            "temperature_schedule": "Invalid temperature schedule",
-        }
-        prefix = prefixes.get(stage, "Simulation preparation failed")
-        return f"{prefix}:\n\n{message}" if message else prefix
-    return message or "Simulation failed"
-
-
-def serialize_algebra_error(error: object, *, name: Optional[str] = None) -> Dict[str, Any]:
-    context = serialize_error_context(getattr(error, "context", None))
-    if context is None:
-        context = serialize_error_context(
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return value
+    if isinstance(value, Mapping):
+        return MappingProxyType(
             {
-                "line": getattr(error, "line", None),
-                "col": getattr(error, "col", None),
-                "line_text": getattr(error, "line_text", None),
+                str(key): freeze_factual_value(item)
+                for key, item in value.items()
             }
         )
-    return {
-        "kind": "algebra_error",
-        "name": str(name) if name is not None else getattr(error, "name", None),
-        "exc_type": getattr(error, "exc_type", error.__class__.__name__),
-        "message": str(getattr(error, "message", None) or str(error)),
-        "code": getattr(error, "code", None),
-        "context": context,
-        "line": context.get("line") if isinstance(context, Mapping) else None,
-        "col": context.get("col") if isinstance(context, Mapping) else None,
-        "line_text": context.get("line_text") if isinstance(context, Mapping) else None,
+    if isinstance(value, (list, tuple)):
+        return tuple(freeze_factual_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(
+            freeze_factual_value(item)
+            for item in sorted(value, key=repr)
+        )
+    return str(value)
+
+
+def _plain_value(value: object) -> object:
+    """Convert frozen metadata at the one explicit JSON boundary."""
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _plain_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return [_plain_value(item) for item in value]
+    return value
+
+
+def _context_values(context: ErrorContext | Mapping[str, Any] | None) -> Mapping[str, object]:
+    if context is None:
+        return {}
+    if isinstance(context, Mapping):
+        source = context
+    else:
+        source = {
+            "line": getattr(context, "line", None),
+            "line_text": getattr(context, "line_text", None),
+        }
+    def value_for(key: str) -> object:
+        return source[key] if key in source else None
+
+    values = {
+        "line": (
+            int(value_for("line"))
+            if value_for("line") is not None
+            else None
+        ),
+        "line_text": (
+            str(value_for("line_text"))
+            if value_for("line_text") is not None
+            else None
+        ),
     }
+    return {
+        key: value
+        for key, value in values.items()
+        if value is not None
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class FactualCause:
+    """Immutable factual cause tree shared by simulation and Fit reports."""
+
+    domain: str
+    origin: str
+    code: str | None
+    message: str
+    context: Mapping[str, object] = field(default_factory=dict)
+    details: Mapping[str, object] = field(default_factory=dict)
+    cause: "FactualCause | None" = None
+
+    def location(self) -> tuple[object, object]:
+        """The first authored line named along this cause chain, as (line, text)."""
+        cause: FactualCause | None = self
+        while cause is not None:
+            if cause.context.get("line") is not None and cause.context.get("line_text") is not None:
+                return cause.context["line"], cause.context["line_text"]
+            cause = cause.cause
+        return None, None
+
+    def __post_init__(self) -> None:
+        # Producers pass literal domains and origins and a message (an
+        # exception's own text); exception attributes are normalized here.
+        domain = str(self.domain).strip()
+        origin = str(self.origin).strip()
+        message = str(self.message).strip()
+        normalized_code = (
+            str(self.code).strip()
+            if self.code is not None and str(self.code).strip()
+            else None
+        )
+        object.__setattr__(self, "domain", domain)
+        object.__setattr__(self, "origin", origin)
+        object.__setattr__(self, "code", normalized_code)
+        object.__setattr__(self, "message", message)
+        object.__setattr__(self, "context", freeze_factual_value(self.context))
+        object.__setattr__(self, "details", freeze_factual_value(self.details))
+
+    def to_payload(self) -> dict[str, object]:
+        """Serialize this cause tree to mutable JSON-ready data."""
+
+        return {
+            "domain": self.domain,
+            "origin": self.origin,
+            "code": self.code,
+            "message": self.message,
+            "context": _plain_value(self.context),
+            "details": _plain_value(self.details),
+            "cause": (
+                self.cause.to_payload()
+                if self.cause is not None
+                else None
+            ),
+        }
+
+
+def _linked_exception(exc: BaseException) -> BaseException | None:
+    """Select the strongest available Python causal link."""
+
+    explicit = exc.__cause__
+    if isinstance(explicit, BaseException):
+        return explicit
+    contextual = exc.__context__
+    return contextual if isinstance(contextual, BaseException) else None
+
+
+def factual_cause_from_exception(
+    exc: BaseException,
+    *,
+    domain: str = "simulation",
+    origin: str = "exception",
+    _seen: frozenset[int] | None = None,
+) -> FactualCause:
+    """Capture typed exception facts and one complete causal chain safely.
+
+    ``__cause__`` takes precedence over ``__context__``.  Every link is visited
+    at most once, so malformed custom exception graphs cannot recurse forever.
+    """
+
+    seen = frozenset() if _seen is None else _seen
+    identity = id(exc)
+    linked = _linked_exception(exc)
+    nested = (
+        factual_cause_from_exception(
+            linked,
+            domain=domain,
+            origin=origin,
+            _seen=seen | {identity},
+        )
+        if linked is not None
+        and id(linked) not in seen
+        and id(linked) != identity
+        else None
+    )
+    raw_details = getattr(exc, "details", None)
+    details = raw_details if isinstance(raw_details, Mapping) else {}
+    return FactualCause(
+        domain=domain,
+        origin=origin,
+        code=getattr(exc, "code", None),
+        message=str(getattr(exc, "message", None) or "").strip() or str(exc).strip(),
+        context=_context_values(getattr(exc, "context", None)),
+        details=details,
+        cause=nested,
+    )

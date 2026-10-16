@@ -8,14 +8,14 @@ Current contract
 - Helpers:
     heaviside(x) with heaviside(0)=0.0, clip(x, lo, hi), ifelse(cond, a, b)
 - Protected read-only symbols:
-    k_B, h, ħ, N_A, R, Rkcal, T
-- No shadowing of species or builtins; parser/evaluator must emit E120.
+    k_B, h, h_bar, N_A, R, T
+- Mechanism admission refuses Algebra names that redefine a protected symbol
+  or built-in function.
 
 Notes
 -----
 - This module performs no I/O and keeps zero global mutable state.
-- `T` exists in the table and is protected against user redefinition. The
-  application or simulator may update it through `SymbolTable.update_temperature`.
+- `T` exists in the table and is protected against user redefinition.
 """
 
 from __future__ import annotations
@@ -23,9 +23,9 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Mapping, Optional, Set
+from typing import Any, Callable, Dict, Mapping, Set
 
-from ..constants import k_B, h, hbar as ħ, N_A, R, Rkcal
+from ..constants import k_B, h, h_bar, N_A, R
 
 logger = logging.getLogger(__name__)
 
@@ -80,33 +80,70 @@ def ifelse(cond: Any, a: float, b: float) -> float:
 
 # ----------------------------- builtins catalog ------------------------------
 
-BUILTIN_FUNCTIONS: Dict[str, Callable[..., float]] = {
-    # Math core
-    "sqrt": lambda x: math.sqrt(float(x)),
-    "ln": lambda x: math.log(float(x)),
-    "log10": lambda x: math.log10(float(x)),
-    "log1p": lambda x: math.log1p(float(x)),
-    "exp": lambda x: math.exp(float(x)),
-    "expm1": lambda x: math.expm1(float(x)),
-    "sin": lambda x: math.sin(float(x)),
-    "cos": lambda x: math.cos(float(x)),
-    "tan": lambda x: math.tan(float(x)),
-    "abs": lambda x: abs(float(x)),
-    "min": lambda *xs: float(min(float(v) for v in xs)),
-    "max": lambda *xs: float(max(float(v) for v in xs)),
-    "pow": lambda x, y: float(math.pow(float(x), float(y))),
-    "erf": lambda x: math.erf(float(x)),
-    # Helpers
-    "heaviside": heaviside,
-    "clip": clip,
-    "ifelse": ifelse,
+_COUNTS = {1: "one argument", 2: "two arguments", 3: "three arguments"}
+
+
+@dataclass(frozen=True)
+class BuiltinFunction:
+    """One builtin: its evaluation, unit rule and argument count (None: one or more).
+
+    The parser admits its argument count; a call outside its domain raises
+    ValueError stating that domain.
+    """
+
+    evaluate: Callable[..., float]
+    unit_rule: str
+    arity: int | None = 1
+
+    def admits(self, count: int) -> bool:
+        return count >= 1 if self.arity is None else count == self.arity
+
+    def expected(self) -> str:
+        return "at least one argument" if self.arity is None else _COUNTS[self.arity]
+
+    def __call__(self, *args):
+        return self.evaluate(*args)
+
+
+def _domain(function: Callable[..., float], domain: str) -> Callable[..., float]:
+    """A math-module function whose out-of-domain refusal states its domain, not Python's text."""
+
+    def evaluate(*args):
+        try:
+            return function(*(float(arg) for arg in args))
+        except ValueError:
+            raise ValueError(domain) from None
+
+    return evaluate
+
+
+_POSITIVE = "{} needs a positive argument."
+POWER_DOMAIN = "needs a nonnegative base for a fractional exponent and a nonzero base for a negative exponent."
+
+
+BUILTIN_FUNCTIONS: Dict[str, BuiltinFunction] = {
+    "sqrt": BuiltinFunction(_domain(math.sqrt, "sqrt needs a nonnegative argument."), "sqrt"),
+    "ln": BuiltinFunction(_domain(math.log, _POSITIVE.format("ln")), "dimensionless"),
+    "log10": BuiltinFunction(_domain(math.log10, _POSITIVE.format("log10")), "dimensionless"),
+    "log1p": BuiltinFunction(_domain(math.log1p, "log1p needs an argument greater than -1."), "dimensionless"),
+    "exp": BuiltinFunction(lambda x: math.exp(float(x)), "dimensionless"),
+    "expm1": BuiltinFunction(lambda x: math.expm1(float(x)), "dimensionless"),
+    "sin": BuiltinFunction(lambda x: math.sin(float(x)), "dimensionless"),
+    "cos": BuiltinFunction(lambda x: math.cos(float(x)), "dimensionless"),
+    "tan": BuiltinFunction(lambda x: math.tan(float(x)), "dimensionless"),
+    "abs": BuiltinFunction(lambda x: abs(float(x)), "preserve"),
+    "min": BuiltinFunction(lambda *xs: float(min(float(v) for v in xs)), "compatible", None),
+    "max": BuiltinFunction(lambda *xs: float(max(float(v) for v in xs)), "compatible", None),
+    "pow": BuiltinFunction(_domain(math.pow, "pow " + POWER_DOMAIN), "power", 2),
+    "erf": BuiltinFunction(lambda x: math.erf(float(x)), "dimensionless"),
+    "heaviside": BuiltinFunction(heaviside, "predicate"),
+    "clip": BuiltinFunction(clip, "compatible", 3),
+    "ifelse": BuiltinFunction(ifelse, "branches", 3),
 }
 
 # Protected names are read-only within Algebra
-PROTECTED_NAMES: Set[str] = {"k_B", "h", "ħ", "N_A", "R", "Rkcal", "T"}
+PROTECTED_NAMES: Set[str] = {"k_B", "h", "h_bar", "N_A", "R", "T"}
 
-# Names that cannot be defined by users either (functions)
-PROTECTED_FUNCTION_NAMES: Set[str] = set(BUILTIN_FUNCTIONS.keys())
 
 
 # ----------------------------- symbol table ----------------------------------
@@ -114,80 +151,36 @@ PROTECTED_FUNCTION_NAMES: Set[str] = set(BUILTIN_FUNCTIONS.keys())
 @dataclass
 class SymbolTable:
     """
-    Symbol table exposing protected builtins and a space for user symbols.
-
-    Parameters
-    ----------
-    temperature_K : float
-        Initial temperature for protected symbol `T`. Default 298.15.
+    Symbol table exposing protected builtins.
 
     Behavior
     --------
     - Protected names (constants and T) cannot be shadowed by user code.
     - Built-in function names cannot be used as symbols.
-    - The table stores only scalars for values (evaluator enforces this).
-    - `update_temperature` is the sanctioned way for the application to change T.
     """
 
-    temperature_K: float = 298.15
     _values: Dict[str, float] = field(default_factory=dict, init=False, repr=False)
-    _user: Dict[str, float] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Initialize protected constants and T
         self._values = {
             "k_B": float(k_B),
             "h": float(h),
-            "ħ": float(ħ),
+            "h_bar": float(h_bar),
             "N_A": float(N_A),
             "R": float(R),
-            "Rkcal": float(Rkcal),
-            "T": float(self.temperature_K),
+            "T": 298.15,
         }
-        # User namespace starts empty
-        self._user = {}
 
     # --- lookup --------------------------------------------------------------
 
     def has(self, name: str) -> bool:
-        """Return True if a symbol (protected or user-defined) exists."""
-        return name in self._values or name in self._user
+        """Return True if a protected symbol exists."""
+        return name in self._values
 
     def get(self, name: str) -> float:
         """Get a symbol value, raising KeyError if unknown."""
-        if name in self._values:
-            return self._values[name]
-        return self._user[name]  # raises KeyError as desired
-
-    # --- mutation ------------------------------------------------------------
-
-    def define_user(self, name: str, value: float, *, species_names: Optional[Set[str]] = None) -> None:
-        """
-        Define or overwrite a user symbol.
-
-        Guards
-        ------
-        - Cannot use protected constant names or 'T'.
-        - Cannot use built-in function names.
-        - Cannot shadow a declared species.
-        """
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("symbol name must be a non-empty string")
-        if name in PROTECTED_NAMES:
-            raise ValueError(f"attempted shadowing of protected symbol {name!r}")
-        if name in PROTECTED_FUNCTION_NAMES:
-            raise ValueError(f"attempted shadowing of builtin function {name!r}")
-        if species_names and name in species_names:
-            raise ValueError(f"attempted shadowing of species {name!r}")
-        self._user[name] = float(value)
-
-    def update_temperature(self, T: float) -> None:
-        """
-        System-only: update protected temperature `T`.
-
-        This is not exposed to user algebra; evaluators should not allow 'let T = ...'.
-        """
-        self._values["T"] = float(T)
+        return self._values[name]
 
     # --- function exposure ---------------------------------------------------
 
@@ -200,7 +193,3 @@ class SymbolTable:
     def protected_names(self) -> Set[str]:
         """Return the set of protected symbol names."""
         return set(PROTECTED_NAMES)
-
-    def user_names(self) -> Set[str]:
-        """Return names of currently defined user symbols."""
-        return set(self._user.keys())

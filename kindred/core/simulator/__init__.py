@@ -1,1 +1,1 @@
-"""Simulation components: DSL parser, solvers, and state networks."""
+"""Simulation components: DSL parser and solvers."""

@@ -1,0 +1,17 @@
+# Run from 0 to 600 s.
+
+A + B -> C ; k=0.02
+C + B -> D ; k=0.01
+
+# A repeat protocol repeats a sequence of operations.
+# start_time sets the first start and every sets the time between starts.
+# count sets the number of repetitions.
+# before contains the operations performed at each start.
+intervention: op=protocol; kind=repeat; start_time=30.0; every=90.0; count=4; before={op=jump,species=B,delta=0.5}
+
+intervention_set1 = {
+  [A] = 1.0
+  [B] = 0.0
+  [C] = 0.0
+  [D] = 0.0
+}

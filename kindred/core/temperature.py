@@ -1,79 +1,42 @@
 """
 Temperature schedule support for Kindred simulations.
 
-Supports constant and piecewise temperature profiles:
-- Constant: T = 298.15 K
-- Piecewise: T(t) defined over time intervals
+Supports the two authored temperature profiles:
+- Piecewise: T(t) constant over time intervals
+- Response: first-order approach to a piecewise setpoint
 
 Usage:
     from kindred.core.temperature import TemperatureSchedule
 
-    # Constant temperature
-    T_const = TemperatureSchedule.constant(298.15)
-
-    # Piecewise temperature
     intervals = [(0, 50, 298), (50, 100, 320)]
     T_piece = TemperatureSchedule.piecewise(intervals)
-
-    # Evaluate
-    temperature = T_const(25.0)  # Returns 298.15
     temperature = T_piece(75.0)  # Returns 320
+
+The temperature DSL admits authored times and temperatures through these
+constructors; the nominal temperature arrives admitted by DSL parsing.
+Evaluation receives execution times inside the admitted span.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 from dataclasses import dataclass
-from typing import Callable, List, Mapping, Optional, Protocol, Tuple, runtime_checkable
+from typing import Callable, List, Literal, Mapping, Optional, Tuple
+
+from kindred.core.species import (
+    validate_input_time_seconds,
+    validate_temperature,
+)
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "TemperatureSchedule",
     "TemperatureScheduleError",
-    "TemperatureScheduleProtocol",
-    "TemperatureScheduleDictProtocol",
-    "coerce_temperature_schedule",
+    "declared_temperature_step_boundaries",
+    "temperature_at_execution_time",
 ]
-
-
-@runtime_checkable
-class TemperatureScheduleProtocol(Protocol):
-    def __call__(self, t: float) -> float: ...
-
-
-@runtime_checkable
-class TemperatureScheduleDictProtocol(TemperatureScheduleProtocol, Protocol):
-    def to_dict(self) -> Mapping[str, object]: ...
-
-
-def coerce_temperature_schedule(value: object) -> TemperatureScheduleProtocol | None:
-    """
-    Normalize a temperature schedule value coming from module boundaries.
-
-    Accepted inputs:
-    - None
-    - A callable schedule object (e.g., TemperatureSchedule instance)
-    - A mapping produced by TemperatureSchedule.to_dict() (converted via from_dict)
-
-    Raises TypeError for non-callable, non-mapping values to avoid silent
-    mismatches across parsing/metadata/solver boundaries.
-    """
-    if value is None:
-        return None
-    if isinstance(value, Mapping):
-        if "type" not in value:
-            raise TypeError(
-                "temperature_schedule mapping must contain a 'type' key (expected TemperatureSchedule.to_dict() format)"
-            )
-        return TemperatureSchedule.from_dict(dict(value))
-    if callable(value):
-        return value  # type: ignore[return-value]
-    raise TypeError(
-        f"temperature_schedule must be callable or a mapping (TemperatureSchedule.to_dict()), got {type(value)!r}"
-    )
 
 
 class TemperatureScheduleError(Exception):
@@ -101,14 +64,16 @@ class TimeInterval:
 
     def __post_init__(self):
         """Validate interval."""
-        if self.t_start < 0:
-            raise TemperatureScheduleError(f"Interval start time must be non-negative, got {self.t_start}")
+        try:
+            self.t_start = validate_input_time_seconds(self.t_start, field="interval start time")
+            self.t_end = validate_input_time_seconds(self.t_end, field="interval end time")
+            self.temperature = validate_temperature(self.temperature)
+        except (TypeError, ValueError) as exc:
+            raise TemperatureScheduleError(str(exc)) from exc
         if self.t_end <= self.t_start:
             raise TemperatureScheduleError(
-                f"Interval end time ({self.t_end}) must be greater than start time ({self.t_start})"
+                f"The end time ({self.t_end:g} s) must be greater than the start time ({self.t_start:g} s)."
             )
-        if self.temperature <= 0:
-            raise TemperatureScheduleError(f"Temperature must be positive, got {self.temperature} K")
 
     def contains(self, t: float) -> bool:
         """Check if time is in this interval."""
@@ -124,17 +89,11 @@ class TemperatureSchedule:
     Temperature schedule T(t) for simulations.
 
     Supports:
-    - Constant temperature (default)
     - Piecewise constant temperature over time intervals
+    - First-order response to a piecewise setpoint
 
     Examples
     --------
-    Constant temperature:
-    >>> T = TemperatureSchedule.constant(298.15)
-    >>> T(10.0)
-    298.15
-
-    Piecewise temperature:
     >>> intervals = [(0, 50, 298), (50, 100, 320)]
     >>> T = TemperatureSchedule.piecewise(intervals)
     >>> T(25.0)
@@ -143,7 +102,7 @@ class TemperatureSchedule:
     320.0
     """
 
-    def __init__(self, T_func: Callable[[float], float], schedule_type: str = "constant"):
+    def __init__(self, T_func: Callable[[float], float], schedule_type: str):
         """
         Initialize temperature schedule.
 
@@ -152,7 +111,7 @@ class TemperatureSchedule:
         T_func : callable
             Function T(t) that returns temperature in Kelvin
         schedule_type : str
-            Type of schedule: "constant" or "piecewise"
+            Type of schedule: "piecewise" or "response"
         """
         self._T_func = T_func
         self.schedule_type = schedule_type
@@ -160,12 +119,11 @@ class TemperatureSchedule:
         self._response_times: List[float] = []
         self._response_temperatures: List[float] = []
         self._response_tau: Optional[float] = None
+        self._baseline_temperature: Optional[float] = None
 
     @staticmethod
     def _validated_intervals(intervals: List[Tuple[float, float, float]]) -> List[TimeInterval]:
-        if not intervals:
-            raise TemperatureScheduleError("At least one interval required for piecewise schedule")
-
+        # The DSL builds at least one contiguous interval from its time list.
         sorted_intervals = sorted(intervals, key=lambda x: x[0])
         time_intervals: List[TimeInterval] = []
         for i, (t_start, t_end, temp) in enumerate(sorted_intervals):
@@ -173,29 +131,7 @@ class TemperatureSchedule:
                 interval = TimeInterval(t_start, t_end, temp)
                 time_intervals.append(interval)
             except TemperatureScheduleError as e:
-                raise TemperatureScheduleError(f"Invalid interval {i+1} ({t_start}, {t_end}, {temp}): {e}")
-
-        for i in range(len(time_intervals) - 1):
-            current = time_intervals[i]
-            next_interval = time_intervals[i + 1]
-
-            if current.t_end != next_interval.t_start:
-                if current.t_end < next_interval.t_start:
-                    raise TemperatureScheduleError(
-                        f"Gap in intervals: [{current.t_start}, {current.t_end}) and "
-                        f"[{next_interval.t_start}, {next_interval.t_end}). "
-                        f"Missing coverage for t ∈ [{current.t_end}, {next_interval.t_start})"
-                    )
-                raise TemperatureScheduleError(
-                    f"Overlapping intervals: [{current.t_start}, {current.t_end}) and "
-                    f"[{next_interval.t_start}, {next_interval.t_end})"
-                )
-
-        if time_intervals[0].t_start != 0:
-            raise TemperatureScheduleError(
-                f"First interval must start at t=0, got t={time_intervals[0].t_start}"
-            )
-
+                raise TemperatureScheduleError(f"Interval {i+1}: {e}")
         return time_intervals
 
     def __call__(self, t: float) -> float:
@@ -214,19 +150,6 @@ class TemperatureSchedule:
         """
         return self._T_func(t)
 
-    @property
-    def fingerprint(self) -> str:
-        """
-        Deterministic, serialization-friendly fingerprint for caching/metadata.
-
-        Prefer this over `repr(self)` when building cache keys.
-        """
-        try:
-            payload = self.to_dict()
-            return json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        except Exception:
-            return repr(self)
-
     def __reduce__(self):
         """
         Make TemperatureSchedule picklable by round-tripping through `to_dict`.
@@ -236,37 +159,12 @@ class TemperatureSchedule:
         return (type(self).from_dict, (self.to_dict(),))
 
     @classmethod
-    def constant(cls, temperature: float) -> TemperatureSchedule:
-        """
-        Create constant temperature schedule.
-
-        Parameters
-        ----------
-        temperature : float
-            Constant temperature in Kelvin
-
-        Returns
-        -------
-        TemperatureSchedule
-            Constant temperature schedule
-
-        Raises
-        ------
-        TemperatureScheduleError
-            If temperature is non-positive
-        """
-        if temperature <= 0:
-            raise TemperatureScheduleError(f"Temperature must be positive, got {temperature} K")
-
-        def T_const(t: float) -> float:
-            return temperature
-
-        schedule = cls(T_const, schedule_type="constant")
-        logger.debug(f"Created constant temperature schedule: T = {temperature} K")
-        return schedule
-
-    @classmethod
-    def piecewise(cls, intervals: List[Tuple[float, float, float]]) -> TemperatureSchedule:
+    def piecewise(
+        cls,
+        intervals: List[Tuple[float, float, float]],
+        *,
+        baseline_temperature: float = 298.15,
+    ) -> TemperatureSchedule:
         """
         Create piecewise constant temperature schedule.
 
@@ -277,6 +175,8 @@ class TemperatureSchedule:
             - t_start: interval start time (inclusive)
             - t_end: interval end time (exclusive, except last)
             - temperature: temperature in Kelvin
+        baseline_temperature : float
+            Nominal tab temperature used before the first authored interval.
 
         Returns
         -------
@@ -300,11 +200,12 @@ class TemperatureSchedule:
         310.0
         """
         time_intervals = cls._validated_intervals(intervals)
+        baseline = baseline_temperature
 
         # Create lookup function
         def T_piecewise(t: float) -> float:
-            if t < 0:
-                raise ValueError(f"Time must be non-negative, got t={t}")
+            if t < time_intervals[0].t_start:
+                return baseline
 
             # Find matching interval
             for i, interval in enumerate(time_intervals):
@@ -316,21 +217,13 @@ class TemperatureSchedule:
                     if interval.contains(t):
                         return interval.temperature
 
-            # If t is beyond last interval, extrapolate with last temperature
-            last_interval = time_intervals[-1]
-            if t >= last_interval.t_end:
-                logger.warning(
-                    f"Time t={t} exceeds piecewise schedule range "
-                    f"[{time_intervals[0].t_start}, {last_interval.t_end}]. "
-                    f"Using last temperature: {last_interval.temperature} K"
-                )
-                return last_interval.temperature
-
-            # Should never reach here if validation is correct
-            raise TemperatureScheduleError(f"No interval found for t={t}")
+            # Contiguous intervals leave only the tail, where the final
+            # authored temperature continues.
+            return time_intervals[-1].temperature
 
         schedule = cls(T_piecewise, schedule_type="piecewise")
         schedule._intervals = time_intervals
+        schedule._baseline_temperature = baseline
 
         logger.debug(f"Created piecewise temperature schedule with {len(intervals)} intervals:")
         for interval in time_intervals:
@@ -345,6 +238,7 @@ class TemperatureSchedule:
         temperatures: List[float],
         *,
         tau: float,
+        baseline_temperature: float = 298.15,
     ) -> TemperatureSchedule:
         """
         Create first-order response schedule driven by a step setpoint schedule.
@@ -353,17 +247,16 @@ class TemperatureSchedule:
         temperatures[i]. The actual runtime temperature evolves as:
 
             dT/dt = (T_set(t) - T(t)) / tau
+
+        The response begins from ``baseline_temperature`` at the first authored
+        setpoint; it never extrapolates an authored setpoint backward in time.
         """
-        if not math.isfinite(float(tau)) or float(tau) <= 0.0:
-            raise TemperatureScheduleError(f"tau must be positive and finite, got {tau}")
+        try:
+            tau_f = validate_input_time_seconds(tau, field="tau", allow_zero=False)
+        except (TypeError, ValueError) as exc:
+            raise TemperatureScheduleError(str(exc)) from exc
 
-        if len(times) < 2:
-            raise TemperatureScheduleError(f"At least 2 time points required, got {len(times)}")
-        if len(temperatures) != len(times) - 1:
-            raise TemperatureScheduleError(
-                f"Temperature count mismatch: {len(temperatures)} temperatures for {len(times)} time points"
-            )
-
+        # The temperature DSL admits the time and temperature counts.
         time_points = [float(t) for t in times]
         setpoints = [float(T) for T in temperatures]
         time_intervals = cls._validated_intervals(
@@ -372,9 +265,9 @@ class TemperatureSchedule:
                 for i in range(len(setpoints))
             ]
         )
-        tau_f = float(tau)
+        baseline = baseline_temperature
 
-        start_actuals = [float(setpoints[0])]
+        start_actuals = [baseline]
         for interval in time_intervals:
             start_actual = float(start_actuals[-1])
             duration = float(interval.t_end - interval.t_start)
@@ -383,8 +276,8 @@ class TemperatureSchedule:
             start_actuals.append(float(end_actual))
 
         def T_response(t: float) -> float:
-            if t < 0:
-                raise ValueError(f"Time must be non-negative, got t={t}")
+            if t < time_intervals[0].t_start:
+                return baseline
 
             for i, interval in enumerate(time_intervals):
                 if i == len(time_intervals) - 1:
@@ -397,20 +290,19 @@ class TemperatureSchedule:
                         float(start_actuals[i]) - float(interval.temperature)
                     ) * math.exp(-dt / tau_f)
 
+            # Contiguous intervals leave only the tail.
             last_interval = time_intervals[-1]
-            if t >= last_interval.t_end:
-                dt = float(t - last_interval.t_end)
-                last_setpoint = float(last_interval.temperature)
-                start_actual = float(start_actuals[-1])
-                return last_setpoint + (start_actual - last_setpoint) * math.exp(-dt / tau_f)
-
-            raise TemperatureScheduleError(f"No interval found for t={t}")
+            dt = float(t - last_interval.t_end)
+            last_setpoint = float(last_interval.temperature)
+            start_actual = float(start_actuals[-1])
+            return last_setpoint + (start_actual - last_setpoint) * math.exp(-dt / tau_f)
 
         schedule = cls(T_response, schedule_type="response")
         schedule._intervals = time_intervals
         schedule._response_times = list(time_points)
         schedule._response_temperatures = list(setpoints)
         schedule._response_tau = tau_f
+        schedule._baseline_temperature = baseline
 
         logger.debug(
             "Created response temperature schedule with %d intervals and tau=%s",
@@ -430,19 +322,6 @@ class TemperatureSchedule:
         """
         return self._intervals.copy()
 
-    def get_time_range(self) -> Optional[Tuple[float, float]]:
-        """
-        Get time range covered by schedule.
-
-        Returns
-        -------
-        tuple of (float, float) or None
-            (t_min, t_max) for piecewise schedules, None for constant
-        """
-        if self.schedule_type in {"piecewise", "response"} and self._intervals:
-            return (self._intervals[0].t_start, self._intervals[-1].t_end)
-        return None
-
     def to_dict(self) -> dict:
         """
         Convert schedule to dictionary (for serialization).
@@ -452,16 +331,10 @@ class TemperatureSchedule:
         dict
             Dictionary representation
         """
-        if self.schedule_type == "constant":
-            # Get constant temperature by evaluating at t=0
-            T = self._T_func(0.0)
-            return {
-                "type": "constant",
-                "temperature": T
-            }
         if self.schedule_type == "piecewise":
             return {
                 "type": "piecewise",
+                "baseline_temperature": float(self._baseline_temperature),
                 "intervals": [
                     {
                         "t_start": interval.t_start,
@@ -471,62 +344,116 @@ class TemperatureSchedule:
                     for interval in self._intervals
                 ]
             }
-        if self.schedule_type == "response":
-            return {
-                "type": "response",
-                "times": list(self._response_times),
-                "temperatures": list(self._response_temperatures),
-                "tau": float(self._response_tau if self._response_tau is not None else 0.0),
-            }
-        raise TemperatureScheduleError(f"Unknown schedule type: {self.schedule_type}")
+        return {
+            "type": "response",
+            "times": list(self._response_times),
+            "temperatures": list(self._response_temperatures),
+            "tau": self._response_tau,
+            "baseline_temperature": float(self._baseline_temperature),
+        }
 
     @classmethod
-    def from_dict(cls, data: dict) -> TemperatureSchedule:
-        """
-        Create schedule from dictionary.
-
-        Parameters
-        ----------
-        data : dict
-            Dictionary with schedule data
-
-        Returns
-        -------
-        TemperatureSchedule
-            Temperature schedule
-        """
-        schedule_type = data.get("type", "constant")
-
-        if schedule_type == "constant":
-            temperature = data.get("temperature", 298.15)
-            return cls.constant(temperature)
-
-        elif schedule_type == "piecewise":
-            intervals_data = data.get("intervals", [])
-            intervals = [
-                (item["t_start"], item["t_end"], item["temperature"])
-                for item in intervals_data
-            ]
-            return cls.piecewise(intervals)
-        elif schedule_type == "response":
-            times = data.get("times", [])
-            temperatures = data.get("temperatures", [])
-            tau = data.get("tau", None)
-            return cls.response(times, temperatures, tau=float(tau))
-
-        else:
-            raise TemperatureScheduleError(f"Unknown schedule type: {schedule_type}")
+    def from_dict(cls, data: Mapping[str, object]) -> TemperatureSchedule:
+        """Rebuild a schedule from its own ``to_dict`` payload (pickling)."""
+        if data["type"] == "piecewise":
+            return cls.piecewise(
+                [
+                    (item["t_start"], item["t_end"], item["temperature"])
+                    for item in data["intervals"]
+                ],
+                baseline_temperature=data["baseline_temperature"],
+            )
+        return cls.response(
+            data["times"],
+            data["temperatures"],
+            tau=data["tau"],
+            baseline_temperature=data["baseline_temperature"],
+        )
 
     def __repr__(self) -> str:
         """String representation."""
-        if self.schedule_type == "constant":
-            T = self._T_func(0.0)
-            return f"TemperatureSchedule.constant({T} K)"
+        n = len(self._intervals)
         if self.schedule_type == "piecewise":
-            n = len(self._intervals)
             return f"TemperatureSchedule.piecewise({n} intervals)"
-        if self.schedule_type == "response":
-            n = len(self._intervals)
-            tau = self._response_tau
-            return f"TemperatureSchedule.response({n} intervals, tau={tau})"
-        return f"TemperatureSchedule({self.schedule_type})"
+        return f"TemperatureSchedule.response({n} intervals, tau={self._response_tau})"
+
+
+def temperature_at_execution_time(
+    schedule: TemperatureSchedule | None,
+    reference_temperature_K: float,
+    time: float,
+    *,
+    side: Literal["preceding", "following"] = "following",
+) -> float:
+    """Resolve an execution-selected side without changing the scientific clock.
+
+    Only declared piecewise steps have distinct sides. Response schedules
+    retain their ordinary evaluation at the actual time.
+    """
+    if schedule is None:
+        return reference_temperature_K
+    if side == "preceding":
+        identity = temperature_schedule_execution_identity(schedule)
+        if identity["type"] == "piecewise_steps":
+            temperature = float(identity["baseline_temperature"])
+            for step in identity["steps"]:
+                if float(step["time"]) >= time:
+                    break
+                temperature = float(step["temperature"])
+            return temperature
+    return float(schedule(time))
+
+
+def declared_temperature_step_boundaries(
+    schedule: TemperatureSchedule | None,
+    *,
+    t_start: float,
+    t_end: float,
+) -> tuple[float, ...]:
+    """Return only authored finite piecewise-temperature discontinuities."""
+
+    # The execution span arrives admitted with its simulation request.
+    if schedule is None:
+        return ()
+    identity = temperature_schedule_execution_identity(schedule)
+    if identity["type"] != "piecewise_steps":
+        return ()
+    boundaries = {
+        float(item["time"])
+        for item in identity["steps"]
+        if t_start < float(item["time"]) <= t_end
+    }
+    return tuple(sorted(boundaries))
+
+
+def temperature_schedule_execution_identity(
+    schedule: TemperatureSchedule,
+) -> Mapping[str, object]:
+    """Return declared piecewise steps with authored semantic no-ops removed.
+
+    Other schedules report only their type; callers act on piecewise steps.
+    """
+
+    if schedule.schedule_type != "piecewise":
+        return {"type": schedule.schedule_type}
+    baseline = float(schedule._baseline_temperature)
+    steps: list[dict[str, float]] = []
+    current = baseline
+    for interval in schedule.get_intervals():
+        temperature = float(interval.temperature)
+        time = float(interval.t_start)
+        if time == 0.0 and not steps:
+            baseline = temperature
+            current = temperature
+            continue
+        if temperature == current:
+            continue
+        steps.append({"time": time, "temperature": temperature})
+        current = temperature
+    if not steps:
+        return {"type": "constant"}
+    return {
+        "type": "piecewise_steps",
+        "baseline_temperature": baseline,
+        "steps": tuple(steps),
+    }

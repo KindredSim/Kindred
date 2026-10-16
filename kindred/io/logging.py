@@ -1,583 +1,160 @@
-"""
-Canonical logging API for Kindred.
-
-PUBLIC API
-----------
-This is the official logging module for Kindred. All external code should import
-logging functionality from this module (or from `kindred.io` which re-exports it).
-
-**DO NOT** import from `kindred.io.logging_config` directly - that module is for
-internal use only.
-
-Features
---------
-- **Basic logging**: Simple setup with rotating file handlers
-- **Structured logging**: JSON-formatted logs for production/analysis
-- **Operation tracking**: Automatic timing and success/failure logging
-- **Per-module levels**: Fine-grained log level control
-- **Lazy evaluation**: Performance-optimized debug logging
-
-Usage Examples
---------------
-Basic logging::
-
-    from kindred.io.logging import setup_logging, get_logger
-    # or: from kindred.io import setup_logging, get_logger
-
-    setup_logging(level="INFO")
-    logger = get_logger(__name__)
-    logger.info("Starting simulation")
-    logger.debug("Parameter values", extra={"params": {"k": 1.5}})
-
-Structured logging (JSON)::
-
-    from kindred.io.logging import setup_structured_logging, get_logger
-
-    setup_structured_logging(level="INFO")
-    logger = get_logger(__name__)
-    logger.info("Simulation complete", extra={
-        "duration": 2.5,
-        "n_species": 10,
-        "solver": "LSODA"
-    })
-
-Operation tracking::
-
-    from kindred.io.logging import log_operation, get_logger
-
-    logger = get_logger(__name__)
-    with log_operation("Parameter fitting", logger, level="INFO"):
-        # Fitting code here
-        pass
-    # Automatically logs start, duration, and success/failure
-
-Per-module levels::
-
-    from kindred.io.logging import configure_module_levels
-
-    configure_module_levels({
-        "kindred.core": "DEBUG",
-        "kindred.gui": "WARNING",
-    })
-"""
+"""Canonical logging setup for Kindred."""
 
 from __future__ import annotations
 
-import json
 import logging
+import logging.handlers
+import os
 import sys
-import time
-import traceback
-from contextlib import contextmanager
-from dataclasses import dataclass, asdict
-from datetime import datetime
-from typing import Any, Dict, Optional, Iterator
+import tempfile
+import threading
+from pathlib import Path
 
-from kindred.io.logging_config import (
-    setup_logging as _setup_basic_logging,
-    get_log_dir,
-    get_logger as _get_basic_logger,
-    DEFAULT_LOG_LEVEL,
-)
+__all__ = ["diagnostic_log_path", "setup_logging"]
 
-__all__ = [
-    # Basic logging
-    "get_logger",
-    "setup_logging",
-    "get_log_dir",
-    # Structured logging
-    "setup_structured_logging",
-    "JSONFormatter",
-    "StructuredMessage",
-    # Configuration
-    "configure_module_levels",
-    "set_log_level",
-    # Operation tracking
-    "log_operation",
-    "OperationTimer",
-    # Performance
-    "LazyMessage",
-]
+_DEFAULT_LOG_LEVEL = "INFO"
+_DEFAULT_LOG_FILENAME = "kindred.log"
+_MAX_LOG_SIZE = 10 * 1024 * 1024
+_BACKUP_COUNT = 5
+_VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
-# ----------------------------- Structured Logging ------------------------------
+def _get_normal_log_dir() -> Path:
+    """Return the platform log directory, honoring the supported override."""
 
+    configured_dir = os.environ.get("KINDRED_LOG_DIR")
+    if configured_dir:
+        return Path(configured_dir).expanduser()
 
-@dataclass
-class StructuredMessage:
-    """
-    Structured log message with typed fields.
-
-    Attributes
-    ----------
-    message : str
-        Human-readable message
-    timestamp : str
-        ISO 8601 timestamp
-    level : str
-        Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-    logger_name : str
-        Logger name
-    module : str
-        Module name
-    function : str
-        Function name
-    line : int
-        Line number
-    extra : dict, optional
-        Additional structured data
-    exception : dict, optional
-        Exception information (type, message, traceback)
-    """
-    message: str
-    timestamp: str
-    level: str
-    logger_name: str
-    module: str
-    function: str
-    line: int
-    extra: Optional[Dict[str, Any]] = None
-    exception: Optional[Dict[str, Any]] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary, omitting None values."""
-        data = asdict(self)
-        return {k: v for k, v in data.items() if v is not None}
-
-
-class JSONFormatter(logging.Formatter):
-    """
-    JSON formatter for structured logging.
-
-    Outputs log records as JSON with structured fields for:
-    - Standard log fields (timestamp, level, message)
-    - Module/function context
-    - Custom extra data
-    - Exception information
-
-    Compatible with log aggregation tools (ELK, Splunk, CloudWatch).
-    """
-
-    def __init__(self, indent: Optional[int] = None):
-        """
-        Initialize JSON formatter.
-
-        Parameters
-        ----------
-        indent : int, optional
-            JSON indentation (None for compact, 2/4 for pretty)
-        """
-        super().__init__()
-        self.indent = indent
-
-    def format(self, record: logging.LogRecord) -> str:
-        """Format log record as JSON."""
-        # Build structured message
-        message = StructuredMessage(
-            message=record.getMessage(),
-            timestamp=datetime.utcnow().isoformat() + "Z",
-            level=record.levelname,
-            logger_name=record.name,
-            module=record.module,
-            function=record.funcName,
-            line=record.lineno,
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Logs" / "kindred"
+    if sys.platform == "win32":
+        local_app_data = os.getenv(
+            "LOCALAPPDATA",
+            str(Path.home() / "AppData" / "Local"),
         )
-
-        # Add extra fields (exclude standard record attributes)
-        standard_attrs = {
-            "name", "msg", "args", "created", "filename", "funcName",
-            "levelname", "levelno", "lineno", "module", "msecs", "message",
-            "pathname", "process", "processName", "relativeCreated",
-            "thread", "threadName", "exc_info", "exc_text", "stack_info",
-        }
-        extra = {
-            k: v for k, v in record.__dict__.items()
-            if k not in standard_attrs and not k.startswith("_")
-        }
-        if extra:
-            message.extra = extra
-
-        # Add exception info if present
-        if record.exc_info:
-            exc_type, exc_value, exc_tb = record.exc_info
-            message.exception = {
-                "type": exc_type.__name__ if exc_type else None,
-                "message": str(exc_value),
-                "traceback": traceback.format_exception(*record.exc_info),
-            }
-
-        # Serialize to JSON
-        return json.dumps(message.to_dict(), indent=self.indent)
+        return Path(local_app_data) / "kindred" / "logs"
+    xdg_cache = os.getenv("XDG_CACHE_HOME", str(Path.home() / ".cache"))
+    return Path(xdg_cache) / "kindred" / "logs"
 
 
-def setup_structured_logging(
-    level: Optional[str] = None,
-    log_file: Optional[str] = None,
-    console: bool = True,
-    indent: Optional[int] = None,
-) -> None:
+def _get_fallback_log_dir() -> Path:
+    """Return the system temporary-directory log location."""
+
+    return Path(tempfile.gettempdir()) / "kindred" / "logs"
+
+
+def _usable_stderr() -> object | None:
+    """Return a usable stderr stream, if this process has one."""
+
+    for stream in (getattr(sys, "stderr", None), getattr(sys, "__stderr__", None)):
+        if stream is None or getattr(stream, "closed", False):
+            continue
+        if callable(getattr(stream, "write", None)) and callable(
+            getattr(stream, "flush", None)
+        ):
+            return stream
+    return None
+
+
+def _get_log_level_from_env() -> str:
+    """Resolve a valid configured log level or use the default."""
+
+    for variable in ("LOG_LEVEL", "KINDRED_LOG_LEVEL"):
+        configured_level = os.environ.get(variable, "").upper()
+        if configured_level in _VALID_LOG_LEVELS:
+            return configured_level
+    return _DEFAULT_LOG_LEVEL
+
+
+def diagnostic_log_path() -> Path:
+    """Return the active diagnostic log path."""
+
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, logging.handlers.RotatingFileHandler):
+            handler.flush()
+            return Path(handler.baseFilename)
+    raise RuntimeError("The diagnostic log is not available.")
+
+
+def setup_logging() -> None:
+    """Configure bounded rotating-file logging and usable terminal diagnostics.
+
+    Calling this function replaces and closes all existing root handlers. The
+    platform log file is always attempted first, followed by a system
+    temporary-directory file when the normal location cannot be opened.
     """
-    Configure structured (JSON) logging.
 
-    Parameters
-    ----------
-    level : str, optional
-        Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-    log_file : str, optional
-        JSON log file path. If None, uses default location.
-    console : bool
-        Enable console output
-    indent : int, optional
-        JSON indentation (None=compact, 2/4=pretty)
+    resolved_level = _get_log_level_from_env()
+    numeric_level = getattr(logging, resolved_level)
 
-    Examples
-    --------
-    >>> setup_structured_logging(level="INFO")
-    >>> logger = get_logger(__name__)
-    >>> logger.info("Event occurred", extra={"user_id": 123})
-    """
-    # Determine log level
-    if level is None:
-        level = DEFAULT_LOG_LEVEL
-    level = level.upper()
-    numeric_level = getattr(logging, level, logging.INFO)
-
-    # Get root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(numeric_level)
 
-    # Remove existing handlers
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-        handler.close()
+    for existing_handler in root_logger.handlers[:]:
+        root_logger.removeHandler(existing_handler)
+        existing_handler.close()
 
-    # Create JSON formatter
-    formatter = JSONFormatter(indent=indent)
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
-    # Console handler
-    if console:
-        # Use the original stderr stream to avoid recursion when sys.stderr
-        # is replaced by wrappers that feed messages back into logging.
-        console_stream = sys.__stderr__ if sys.__stderr__ is not None else sys.stderr
+    console_stream = _usable_stderr()
+    if console_stream is not None:
         console_handler = logging.StreamHandler(console_stream)
         console_handler.setLevel(numeric_level)
         console_handler.setFormatter(formatter)
         root_logger.addHandler(console_handler)
 
-    # File handler
-    if log_file or console:
-        if log_file is None and not console:
-            log_dir = get_log_dir()
-            log_file = str(log_dir / "kindred_structured.jsonl")
+    normal_log = _get_normal_log_dir() / _DEFAULT_LOG_FILENAME
+    fallback_log = _get_fallback_log_dir() / _DEFAULT_LOG_FILENAME
+    log_paths = tuple(dict.fromkeys((normal_log, fallback_log)))
+    file_error: OSError | None = None
+    log_path: Path | None = None
+    for candidate in log_paths:
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            rotating_handler = logging.handlers.RotatingFileHandler(
+                candidate,
+                maxBytes=_MAX_LOG_SIZE,
+                backupCount=_BACKUP_COUNT,
+                encoding="utf-8",
+            )
+            rotating_handler.setLevel(numeric_level)
+            rotating_handler.setFormatter(formatter)
+            root_logger.addHandler(rotating_handler)
+            log_path = candidate
+            root_logger.info(
+                "Logging configured: level=%s, file=%s",
+                resolved_level,
+                candidate,
+            )
+            if candidate != normal_log:
+                root_logger.warning(
+                    "Normal log location %s is unavailable; using temporary log %s",
+                    normal_log,
+                    candidate,
+                )
+            break
+        except OSError as error:
+            file_error = error
 
-        if log_file:
-            try:
-                file_handler = logging.FileHandler(log_file, encoding="utf-8")
-                file_handler.setLevel(numeric_level)
-                file_handler.setFormatter(formatter)
-                root_logger.addHandler(file_handler)
-            except (OSError, PermissionError) as e:
-                if console:
-                    root_logger.warning(f"Failed to create log file: {e}")
-                else:
-                    raise
+    if log_path is None:
+        message = f"Failed to set up normal and temporary log files: {file_error}"
+        raise RuntimeError(message) from file_error
 
+    # Errors that escape a Qt slot or a thread would otherwise vanish when
+    # Kindred runs without a console; record them in the log.
+    sys.excepthook = _log_unhandled
+    threading.excepthook = lambda args: _log_unhandled(args.exc_type, args.exc_value, args.exc_traceback)
 
-# ------------------------------- Configuration ---------------------------------
-
-
-def configure_module_levels(module_levels: Dict[str, str]) -> None:
-    """
-    Configure per-module log levels.
-
-    Parameters
-    ----------
-    module_levels : dict
-        Mapping of module names to log levels
-        Example: {"kindred.core": "DEBUG", "kindred.gui": "WARNING"}
-
-    Examples
-    --------
-    >>> configure_module_levels({
-    ...     "kindred.core": "DEBUG",
-    ...     "kindred.core.simulator": "INFO",
-    ...     "kindred.gui": "WARNING",
-    ... })
-    """
-    for module_name, level_str in module_levels.items():
-        level = getattr(logging, level_str.upper(), logging.INFO)
-        logger = logging.getLogger(module_name)
-        logger.setLevel(level)
-
-
-def set_log_level(level: str, module: Optional[str] = None) -> None:
-    """
-    Set log level for a specific module or root logger.
-
-    Parameters
-    ----------
-    level : str
-        Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-    module : str, optional
-        Module name. If None, sets root logger level.
-
-    Examples
-    --------
-    >>> set_log_level("DEBUG")  # All modules
-    >>> set_log_level("WARNING", "kindred.gui")  # Specific module
-    """
-    numeric_level = getattr(logging, level.upper(), logging.INFO)
-    if module:
-        logger = logging.getLogger(module)
-    else:
-        logger = logging.getLogger()
-    logger.setLevel(numeric_level)
+    root_logger.debug("Log level: %s", resolved_level)
+    root_logger.debug("Console handler: %s", console_stream is not None)
+    root_logger.debug("Log file: %s", log_path)
+    root_logger.debug("Max log size: %.1f MB", _MAX_LOG_SIZE / (1024 * 1024))
+    root_logger.debug("Backup count: %s", _BACKUP_COUNT)
 
 
-# ----------------------------- Operation Tracking ------------------------------
-
-
-@dataclass
-class OperationTimer:
-    """
-    Timer for tracking operation duration.
-
-    Attributes
-    ----------
-    name : str
-        Operation name
-    start_time : float
-        Start timestamp
-    end_time : float, optional
-        End timestamp
-    success : bool
-        Whether operation succeeded
-    error : Exception, optional
-        Exception if operation failed
-    metadata : dict
-        Additional operation metadata
-    """
-    name: str
-    start_time: float
-    end_time: Optional[float] = None
-    success: bool = True
-    error: Optional[Exception] = None
-    metadata: Optional[Dict[str, Any]] = None
-
-    def __post_init__(self):
-        if self.metadata is None:
-            self.metadata = {}
-
-    @property
-    def duration(self) -> Optional[float]:
-        """Duration in seconds."""
-        if self.end_time is None:
-            return None
-        return self.end_time - self.start_time
-
-    def stop(self, success: bool = True, error: Optional[Exception] = None) -> None:
-        """
-        Stop the timer.
-
-        Parameters
-        ----------
-        success : bool
-            Whether operation succeeded
-        error : Exception, optional
-            Exception if operation failed
-        """
-        self.end_time = time.time()
-        self.success = success
-        self.error = error
-
-    def to_log_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for logging."""
-        data = {
-            "operation": self.name,
-            "duration_ms": int(self.duration * 1000) if self.duration else None,
-            "success": self.success,
-        }
-        if self.error:
-            data["error"] = str(self.error)
-        if self.metadata:
-            data.update(self.metadata)
-        return data
-
-
-@contextmanager
-def log_operation(
-    name: str,
-    logger: logging.Logger,
-    level: str = "INFO",
-    metadata: Optional[Dict[str, Any]] = None,
-) -> Iterator[OperationTimer]:
-    """
-    Context manager for logging operation duration and success/failure.
-
-    Parameters
-    ----------
-    name : str
-        Operation name
-    logger : logging.Logger
-        Logger instance
-    level : str
-        Log level (INFO, DEBUG, etc.)
-    metadata : dict, optional
-        Additional metadata to include in logs
-
-    Yields
-    ------
-    OperationTimer
-        Timer object (can be used to add metadata during operation)
-
-    Examples
-    --------
-    >>> logger = get_logger(__name__)
-    >>> with log_operation("Parameter fitting", logger) as timer:
-    ...     # Do fitting
-    ...     timer.metadata["n_params"] = 5
-    # Logs: "Parameter fitting started"
-    # Logs: "Parameter fitting completed in 1.23s" (with metadata)
-
-    >>> with log_operation("Simulation", logger):
-    ...     raise ValueError("Solver failed")
-    # Logs: "Simulation started"
-    # Logs: "Simulation failed after 0.01s: Solver failed"
-    """
-    timer = OperationTimer(name=name, start_time=time.time(), metadata=metadata or {})
-
-    log_level = getattr(logging, level.upper(), logging.INFO)
-    logger.log(log_level, f"{name} started")
-
-    try:
-        yield timer
-        timer.stop(success=True)
-
-        # Log completion
-        logger.log(
-            log_level,
-            f"{name} completed in {timer.duration:.3f}s",
-            extra=timer.to_log_dict()
-        )
-
-    except Exception as e:
-        timer.stop(success=False, error=e)
-
-        # Log failure
-        logger.log(
-            logging.ERROR,
-            f"{name} failed after {timer.duration:.3f}s: {e}",
-            extra=timer.to_log_dict(),
-            exc_info=True
-        )
-        raise
-
-
-# ---------------------------- Performance Utilities ----------------------------
-
-
-class LazyMessage:
-    """
-    Lazy log message evaluation for performance.
-
-    Delays expensive string formatting until message is actually logged.
-    Useful for DEBUG-level logs with complex formatting that won't be shown
-    in production.
-
-    Examples
-    --------
-    >>> logger = get_logger(__name__)
-    >>> logger.debug(LazyMessage(lambda: f"Complex data: {expensive_operation()}"))
-    # expensive_operation() only called if DEBUG level is enabled
-    """
-
-    def __init__(self, func):
-        """
-        Initialize lazy message.
-
-        Parameters
-        ----------
-        func : callable
-            Function returning message string
-        """
-        self.func = func
-
-    def __str__(self):
-        """Evaluate message when needed."""
-        return str(self.func())
-
-
-# ------------------------------- Public API ------------------------------------
-
-
-def get_logger(name: str) -> logging.Logger:
-    """
-    Get a logger instance with the given name.
-
-    Parameters
-    ----------
-    name : str
-        Logger name (typically __name__)
-
-    Returns
-    -------
-    logging.Logger
-        Logger instance
-
-    Examples
-    --------
-    >>> logger = get_logger(__name__)
-    >>> logger.info("Message")
-    >>> logger.debug("Debug info", extra={"data": value})
-    """
-    return _get_basic_logger(name)
-
-
-def setup_logging(
-    level: Optional[str] = None,
-    log_file: Optional[str] = None,
-    console: bool = True,
-    file_handler: bool = True,
-    structured: bool = False,
-    **kwargs,
-) -> None:
-    """
-    Configure logging for Kindred.
-
-    Parameters
-    ----------
-    level : str, optional
-        Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-    log_file : str, optional
-        Log file path
-    console : bool
-        Enable console output
-    file_handler : bool
-        Enable file handler
-    structured : bool
-        Use JSON structured logging (default: False)
-    **kwargs : dict
-        Additional arguments passed to underlying setup functions
-
-    Examples
-    --------
-    >>> setup_logging()  # Basic logging
-    >>> setup_logging(level="DEBUG")  # Debug mode
-    >>> setup_logging(structured=True)  # JSON logging
-    >>> setup_logging(level="INFO", structured=True, indent=2)  # Pretty JSON
-    """
-    if structured:
-        setup_structured_logging(
-            level=level,
-            log_file=log_file,
-            console=console,
-            **kwargs
-        )
-    else:
-        _setup_basic_logging(
-            level=level,
-            log_file=log_file,
-            console=console,
-            file_handler=file_handler,
-            **kwargs
-        )
+def _log_unhandled(exc_type, exc, traceback) -> None:
+    logging.getLogger("kindred").critical("Unhandled error", exc_info=(exc_type, exc, traceback))

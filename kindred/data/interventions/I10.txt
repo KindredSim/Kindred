@@ -1,0 +1,19 @@
+# Run from 0 to 600 s.
+
+A + B <-> C ; kf=0.02 ; kr=0.004
+C -> D ; k=0.01
+
+param feed_start = 60.0; unit = s
+param feed_rate = 0.3; unit = M/min
+
+# during contains operations applied throughout each repetition.
+# duration sets how long they remain active.
+# Here, feeding lasts 60 s and starts again every 120 s.
+intervention: op=protocol; kind=repeat; start_time_param=feed_start; every=120.0; count=3; duration=60.0; during={op=flux,species=B,flux_rate_param=feed_rate}
+
+intervention_set1 = {
+  [A] = 1.0
+  [B] = 0.0
+  [C] = 0.0
+  [D] = 0.0
+}

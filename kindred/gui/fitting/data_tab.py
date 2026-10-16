@@ -1,601 +1,571 @@
-"""
-Data tab widget for the fitting window.
-
-Extracted from FittingWindow — owns the dataset table (with Use/Dataset/Species
-columns, Add/Remove buttons) and the sampling configuration panel.
-Communicates with FittingWindow via signals (outbound events) and public
-methods (inbound queries/commands).
-"""
+"""Fit-local simulation interval and retained-observation controls."""
 
 from __future__ import annotations
 
 import math
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from collections.abc import Callable, Iterable, Mapping
 
-import numpy as np
-from PySide6 import QtWidgets
-from PySide6.QtCore import Qt, Signal
+from PySide6 import QtCore, QtGui, QtWidgets
 
-from kindred.gui.widgets.config_panel_footer import ConfigPanelFooter
-from kindred.core.analysis.dataset_sampling import compute_windowed_indices
-from kindred.gui.fitting.constants import _SAMPLING_ALL_POINTS_SENTINEL
+from kindred.core.validation import parse_finite_numeric_text, six_digit_text
+from kindred.gui.fitting.launch import fit_execution_span
+from kindred.gui.ui_helpers import (
+    INVALID_EDITOR_STYLE,
+    ChoicesComboBox,
+    ControlRowsLayout,
+    configure_compact_numeric_edit,
+    ignore_wheel,
+    set_bounded_label_text,
+)
+
+
+_POINTS = "maximum_observations_per_target"
+_RANGE_FIELDS = ("data_range_min", "data_range_max")
+
+_FIELD_LABELS = {
+    "t_start": "Simulation start",
+    "simulation_end": "Simulation end",
+    "data_range_min": "Data Range minimum",
+    "data_range_max": "Data Range maximum",
+}
 
 
 class DataTab(QtWidgets.QWidget):
-    """Drop-in replacement for FittingWindow._create_data_tab().
+    """Presentation for one dataset's retained-observation controls.
 
-    Owns the dataset table and sampling configuration panel.  Read/write
-    interaction with shared session state goes through callable getters
-    (constructor-injected) and outbound signals.
+    Each valid edit applies at once.  An edit that cannot apply keeps its
+    text, blocks Run, and stays until corrected or discarded with Escape.
     """
 
-    # ------------------------------------------------------------------
-    # Signals (DataTab -> FittingWindow)
-    # ------------------------------------------------------------------
-    datasetIncludeChanged = Signal(int, str, bool)    # row, ds_id, included
-    addDatasetsRequested = Signal()                    # Add button clicked
-    removeDatasetsRequested = Signal(list)             # Remove clicked; payload = [ds_id, ...]
-    samplingApplied = Signal(str, dict)                # ds_id, config dict
-    statusMessage = Signal(str)                        # status bar text
+    _OWNED_FIELDS = (
+        "t_start",
+        "data_range_min",
+        "data_range_max",
+        "maximum_observations_per_target",
+        "parametric_x",
+        "simulation_end",
+    )
+
+    fitSettingsApplied = QtCore.Signal(str, dict)
+    statusMessage = QtCore.Signal(str)
+    validityChanged = QtCore.Signal()
 
     def __init__(
         self,
         *,
-        sampling_applied_config_getter: Callable[[str], Dict[str, float | int | str]],
-        sampling_default_config_getter: Callable[[np.ndarray], Dict[str, float | int | str]],
-        fit_targets_full_t_getter: Callable[[str], np.ndarray],
-        fit_targets_available_getter: Callable[[str], List[str]],
-        fit_targets_full_series_getter: Callable[[str], Dict[str, np.ndarray]],
-        fit_targets_selection_applied_getter: Callable[[str], List[str]],
-        modeled_series_getter: Callable[[], set[str]],
-        worker_running_getter: Callable[[], bool],
+        settings_getter: Callable[[str], Mapping[str, object]],
+        default_settings_getter: Callable[[str], Mapping[str, object]],
+        retained_observations_getter: Callable[
+            [str, Mapping[str, object]], tuple[object, ...]
+        ],
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self._settings_getter = settings_getter
+        self._default_settings_getter = default_settings_getter
+        self._retained_observations_getter = retained_observations_getter
+        self._current_dataset_id = ""
+        self._display_names: dict[str, str] = {}
+        # Settings that could not apply, by dataset.
+        self._held: dict[str, dict[str, object]] = {}
+        self._invalid_raw: dict[tuple[str, str], str] = {}
+        self._changed_fields: dict[str, set[str]] = {}
+        self._refreshing = False
 
-        # Store callable getters for shared state access.
-        self._sampling_applied_config_getter = sampling_applied_config_getter
-        self._sampling_default_config_getter = sampling_default_config_getter
-        self._fit_targets_full_t_getter = fit_targets_full_t_getter
-        self._fit_targets_available_getter = fit_targets_available_getter
-        self._fit_targets_full_series_getter = fit_targets_full_series_getter
-        self._fit_targets_selection_applied_getter = fit_targets_selection_applied_getter
-        self._modeled_series_getter = modeled_series_getter
-        self._worker_running_getter = worker_running_getter
+        self._build_ui()
 
-        # Private UI state.
-        self._sampling_current_dataset_id: Optional[str] = None
-        self._sampling_is_refreshing = False
+    def select_dataset(self, dataset_id: str, display_name: str | None = None) -> None:
+        if display_name is not None:
+            self._display_names[dataset_id] = display_name
+        self._current_dataset_id = dataset_id
+        self._project_controls()
 
-        # Build layout.
+    def data_edit_issues(self, dataset_ids: Iterable[str]) -> dict[str, str]:
+        """Return each listed dataset's Fit Data error; omit valid datasets."""
+
+        issues = {}
+        for dataset_id in dataset_ids:
+            config = self._held.get(dataset_id)
+            if config is None:
+                config = self._settings_getter(dataset_id)
+            error = self._validation_error(dataset_id, self._owned_settings(config))
+            if error:
+                issues[dataset_id] = error
+        return issues
+
+    def clear_pending_edits(self) -> None:
+        """Discard every held Fit Data edit and refresh the visible controls."""
+
+        self._held.clear()
+        self._changed_fields.clear()
+        self._invalid_raw.clear()
+        self._project_controls()
+
+    def _build_ui(self) -> None:
+        # The title and Reset sit above the wrapping fields and the error
+        # below them, so all three stay in view.
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(10)
-
-        # --- Dataset table group ---
-        self._dataset_group = QtWidgets.QGroupBox("Datasets")
-        dataset_layout = QtWidgets.QVBoxLayout(self._dataset_group)
-        self._dataset_table = QtWidgets.QTableWidget()
-        self._dataset_table.setColumnCount(3)
-        self._dataset_table.setHorizontalHeaderLabels(["Use", "Dataset", "Species"])
-        self._dataset_table.horizontalHeader().setStretchLastSection(True)
-        self._dataset_table.setAlternatingRowColors(True)
-        self._dataset_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self._dataset_table.itemChanged.connect(self._on_dataset_table_item_changed)
-        self._dataset_table.itemSelectionChanged.connect(self._on_selection_changed)
-        self._dataset_table.itemSelectionChanged.connect(self._load_sampling_for_selected_dataset_row)
-        dataset_layout.addWidget(self._dataset_table, stretch=1)
-
-        dataset_buttons = QtWidgets.QHBoxLayout()
-        self._dataset_add_button = QtWidgets.QPushButton("Add\u2026")
-        self._dataset_add_button.setObjectName("global_fit_datasets_add")
-        self._dataset_add_button.clicked.connect(self.addDatasetsRequested)
-        self._dataset_remove_button = QtWidgets.QPushButton("Remove")
-        self._dataset_remove_button.setObjectName("global_fit_datasets_remove")
-        self._dataset_remove_button.setEnabled(False)
-        self._dataset_remove_button.clicked.connect(self._on_remove_clicked)
-        dataset_buttons.addWidget(self._dataset_add_button)
-        dataset_buttons.addWidget(self._dataset_remove_button)
-        dataset_buttons.addStretch(1)
-        dataset_layout.addLayout(dataset_buttons)
-
-        layout.addWidget(self._dataset_group, stretch=3)
-        self._sampling_panel_widget = self._create_sampling_panel()
-        layout.addWidget(self._sampling_panel_widget, stretch=2)
-
-    # ------------------------------------------------------------------
-    # Public API (FittingWindow -> DataTab)
-    # ------------------------------------------------------------------
-
-    def select_dataset(self, dataset_id: str) -> None:
-        """Load sampling controls for the given dataset (public entry point)."""
-        ds_id = str(dataset_id or "").strip()
-        if not ds_id:
-            self._load_sampling_controls_for_dataset("")
-            return
-        row = None
-        for r in range(self._dataset_table.rowCount()):
-            item = self._dataset_table.item(r, 0)
-            if item is not None and str(item.data(Qt.UserRole) or "").strip() == ds_id:
-                row = r
-                break
-        if row is None:
-            return
-        self._dataset_table.blockSignals(True)
-        self._dataset_table.selectRow(row)
-        self._dataset_table.blockSignals(False)
-        self._load_sampling_controls_for_dataset(ds_id)
-
-    def populate_table(self, entries: List[Dict[str, Any]]) -> None:
-        """Fill the dataset table from the given entry list."""
-        self._dataset_table.blockSignals(True)
-        self._dataset_table.setRowCount(len(entries))
-        for row, entry in enumerate(entries):
-            check_item = QtWidgets.QTableWidgetItem()
-            check_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            check_item.setCheckState(Qt.Checked if entry.get("include", True) else Qt.Unchecked)
-            check_item.setData(Qt.UserRole, entry["id"])
-            self._dataset_table.setItem(row, 0, check_item)
-
-            name_item = QtWidgets.QTableWidgetItem(entry["label"])
-            name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            self._dataset_table.setItem(row, 1, name_item)
-
-            species_text = ", ".join(entry["selected_species"])
-            species_item = QtWidgets.QTableWidgetItem(species_text)
-            species_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            self._dataset_table.setItem(row, 2, species_item)
-        self._dataset_table.blockSignals(False)
-
-    def included_dataset_ids(self) -> List[str]:
-        """Return IDs of datasets whose Use checkbox is checked."""
-        included: List[str] = []
-        for row in range(self._dataset_table.rowCount()):
-            item = self._dataset_table.item(row, 0)
-            if item is None:
-                continue
-            ds_id = str(item.data(Qt.UserRole) or "").strip()
-            if not ds_id:
-                continue
-            if item.checkState() == Qt.Checked:
-                included.append(ds_id)
-        return included
-
-    def dataset_label_for_id(self, dataset_id: str) -> str:
-        """Return the human-readable label for a dataset ID from the table."""
-        ds_id = str(dataset_id or "").strip()
-        if not ds_id:
-            return "dataset"
-        for row in range(self._dataset_table.rowCount()):
-            item = self._dataset_table.item(row, 0)
-            if item is None:
-                continue
-            if str(item.data(Qt.UserRole) or "").strip() == ds_id:
-                name_item = self._dataset_table.item(row, 1)
-                if name_item is not None:
-                    label = str(name_item.text()).strip()
-                    if label:
-                        return label
-                return ds_id
-        return ds_id
-
-    def selected_dataset_id(self) -> Optional[str]:
-        """Return the ID of the first selected dataset row, or None."""
-        table = self._dataset_table
-        rows = sorted({index.row() for index in table.selectionModel().selectedRows()}) if table.selectionModel() else []
-        if not rows:
-            return None
-        item = table.item(int(rows[0]), 0)
-        ds_id = str(item.data(Qt.UserRole) or "").strip() if item is not None else ""
-        return ds_id or None
-
-    def set_sampling_secondary_error(self, message: Optional[str]) -> None:
-        """Set or clear the secondary error message on the sampling footer."""
-        if hasattr(self, "_sampling_footer"):
-            self._sampling_footer.set_secondary_error(message)
-
-    def load_sampling_for_selected_row(self) -> None:
-        """Load sampling controls for whichever dataset row is currently selected."""
-        ds_id = self.selected_dataset_id()
-        self._load_sampling_controls_for_dataset(ds_id)
-
-    def refresh_remove_button_state(self) -> None:
-        """Update the Remove button enabled state from live worker status."""
-        self._update_remove_button()
-
-    def sampling_validation_error(self, *, dataset_id: str, config: Dict[str, float | int | str]) -> Optional[str]:
-        """Pure-computation validation of a sampling config. No UI side-effects."""
-        return self._sampling_pending_validation_error(dataset_id=dataset_id, pending=config)
-
-    # ------------------------------------------------------------------
-    # Layout construction (moved from FittingWindow factories)
-    # ------------------------------------------------------------------
-
-    def _create_sampling_panel(self) -> QtWidgets.QWidget:
-        container = QtWidgets.QWidget()
-        container.setObjectName("global_fit_sampling_panel")
-        layout = QtWidgets.QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
-
-        self._sampling_header_label = QtWidgets.QLabel("Sampling (selected dataset: \u2014)")
-        self._sampling_header_label.setStyleSheet("font-weight: bold;")
-        layout.addWidget(self._sampling_header_label)
-
-        self._sampling_footer = ConfigPanelFooter(
-            container,
-            show_divider=False,
-            show_reset=True,
-            show_secondary_error=True,
-            messages_position="after_body",
-            apply_requires_no_error=True,
-            button_order=("reset", "revert", "apply"),
-            error_object_name="global_fit_sampling_error",
-            secondary_error_object_name="global_fit_sampling_run_blocked",
-            apply_object_name="global_fit_sampling_apply",
-            revert_object_name="global_fit_sampling_revert",
-            reset_object_name="global_fit_sampling_reset",
+        header = QtWidgets.QHBoxLayout()
+        self._header = QtWidgets.QLabel(self)
+        set_bounded_label_text(self._header, "Fit Data", max_width=16777215)
+        self._header.setStyleSheet("font-weight: bold;")
+        header.addWidget(self._header, 1)
+        self._reset_button = QtWidgets.QPushButton("Reset", self)
+        self._reset_button.setObjectName("global_fit_data_range_reset")
+        self._reset_button.setToolTip(
+            "Restore this dataset's default Simulation interval, Data Range "
+            "and points per target."
         )
-        layout.addWidget(self._sampling_footer, stretch=1)
-        self._sampling_footer.applyRequested.connect(self._apply_sampling_changes)
-        self._sampling_footer.revertRequested.connect(self._revert_sampling_changes)
-        self._sampling_footer.resetRequested.connect(self._reset_sampling_pending_to_defaults)
+        header.addWidget(self._reset_button)
+        layout.addLayout(header)
 
-        # Stacked label-above-control layout for narrow (~240px) left panel.
-        controls_layout = QtWidgets.QVBoxLayout()
-        controls_layout.setSpacing(4)
+        # Each setting is one label and its controls; the settings fill each
+        # line and wrap onto the next as the panel narrows, as Fit Settings do.
+        fields = QtWidgets.QWidget(self)
+        fields.setObjectName("global_fit_data_range_panel")
+        self._fields = ControlRowsLayout(fields)
+        self._start_edit = self._number_edit("global_fit_t_start", 11, "Simulation start")
+        self._end_edit = self._number_edit("global_fit_simulation_end", 11, "Simulation end")
+        self._min_edit = self._number_edit("global_fit_data_range_min", 11, "Data Range minimum")
+        self._max_edit = self._number_edit("global_fit_data_range_max", 11, "Data Range maximum")
+        self.setFocusProxy(self._start_edit)
+        self._maximum_edit = self._number_edit(
+            "global_fit_maximum_observations",
+            6,
+            "Observations used per target, sampled evenly including both ends. "
+            "The full count uses every observation.",
+        )
+        self._maximum_total = QtWidgets.QLabel("/ 0", fields)
+        self._x_combo = ChoicesComboBox(fields)
+        self._x_combo.setObjectName("global_fit_parametric_x")
+        self._x_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self._x_combo.setMinimumContentsLength(12)
+        ignore_wheel(self._x_combo)
+        self._used_label = QtWidgets.QLabel("Used: —", fields)
+        self._used_label.setObjectName("global_fit_used_count")
+        self.add_group("Simulation time (s)", self._row(fields, self._start_edit, "to", self._end_edit))
+        self._range_group = self.add_group(
+            "Data Range (s)", self._row(fields, self._min_edit, "to", self._max_edit),
+        )
+        self.add_group("Points per target", self._row(fields, self._maximum_edit, self._maximum_total))
+        self.add_group("Fit against", self._x_combo)
+        self._fields.addWidget(self._used_label)
+        layout.addWidget(fields)
+        layout.addStretch(1)
 
-        self._sampling_x_axis_combo = QtWidgets.QComboBox(container)
-        self._sampling_x_axis_combo.setObjectName("global_fit_sampling_x_axis")
-        self._sampling_x_axis_combo.setEnabled(False)
-        controls_layout.addWidget(QtWidgets.QLabel("X axis:"))
-        controls_layout.addWidget(self._sampling_x_axis_combo)
+        self._error_label = QtWidgets.QLabel(self)
+        self._error_label.setObjectName("global_fit_data_range_error")
+        self._error_label.setWordWrap(True)
+        self._error_label.setVisible(False)
+        layout.addWidget(self._error_label)
 
-        self._sampling_x_mode_combo = QtWidgets.QComboBox(container)
-        self._sampling_x_mode_combo.setObjectName("global_fit_sampling_x_mode")
-        self._sampling_x_mode_combo.setEnabled(False)
-        self._sampling_x_mode_combo.setVisible(False)
-        self._sampling_x_mode_combo.addItem("Auto", "auto")
-        self._sampling_x_mode_combo.addItem("Monotone only (fast)", "monotone")
-        self._sampling_x_mode_combo.addItem("Time-guided (non-monotone)", "time_guided")
-        self._sampling_x_mode_label = QtWidgets.QLabel("X mapping:")
-        self._sampling_x_mode_label.setVisible(False)
-        controls_layout.addWidget(self._sampling_x_mode_label)
-        controls_layout.addWidget(self._sampling_x_mode_combo)
+        self._editors = editors = (
+            ("t_start", self._start_edit),
+            ("simulation_end", self._end_edit),
+            ("data_range_min", self._min_edit),
+            ("data_range_max", self._max_edit),
+            (_POINTS, self._maximum_edit),
+        )
+        # Escape discards held edits in these controls only; a row another
+        # owner adds keeps its own Escape.
+        self._discard_shortcuts = []
+        for control in (*(editor for _field, editor in editors), self._x_combo):
+            shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Escape), control)
+            shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetShortcut)
+            shortcut.setEnabled(False)
+            shortcut.activated.connect(self._discard)
+            self._discard_shortcuts.append(shortcut)
+        for field, editor in editors:
+            editor.textChanged.connect(
+                lambda *_args, changed=field: self._mark_changed(changed)
+            )
+            editor.editingFinished.connect(self._commit)
+        self._x_combo.currentIndexChanged.connect(
+            lambda *_args: self._commit("parametric_x")
+        )
+        self._reset_button.clicked.connect(self._reset)
 
-        self._sampling_t_min_spin = QtWidgets.QDoubleSpinBox(container)
-        self._sampling_t_min_spin.setObjectName("global_fit_sampling_t_min")
-        self._sampling_t_min_spin.setDecimals(6)
-        self._sampling_t_min_spin.setRange(-1e18, 1e18)
-        self._sampling_t_min_spin.setSingleStep(1.0)
-        self._sampling_t_min_spin.setEnabled(False)
-        controls_layout.addWidget(QtWidgets.QLabel("t_min:"))
-        controls_layout.addWidget(self._sampling_t_min_spin)
+    def add_group(self, label: str, widget: QtWidgets.QWidget) -> QtWidgets.QWidget:
+        """Add one labelled setting to the wrapping fields, before Used."""
 
-        self._sampling_t_max_spin = QtWidgets.QDoubleSpinBox(container)
-        self._sampling_t_max_spin.setObjectName("global_fit_sampling_t_max")
-        self._sampling_t_max_spin.setDecimals(6)
-        self._sampling_t_max_spin.setRange(-1e18, 1e18)
-        self._sampling_t_max_spin.setSingleStep(1.0)
-        self._sampling_t_max_spin.setEnabled(False)
-        controls_layout.addWidget(QtWidgets.QLabel("t_max:"))
-        controls_layout.addWidget(self._sampling_t_max_spin)
+        group = QtWidgets.QWidget(self)
+        form = QtWidgets.QFormLayout(group)
+        # The right margin separates neighbouring settings on a line.
+        form.setContentsMargins(0, 0, 12, 0)
+        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+        form.addRow(label, widget)
+        used = self._fields.indexOf(self._used_label)
+        self._fields.addWidget(group)
+        if used >= 0:
+            # Keep Used last.
+            self._fields.addItem(self._fields.takeAt(used))
+        return group
 
-        self._sampling_n_points_spin = QtWidgets.QSpinBox(container)
-        self._sampling_n_points_spin.setObjectName("global_fit_sampling_n_points")
-        self._sampling_n_points_spin.setRange(0, 0)
-        self._sampling_n_points_spin.setSpecialValueText("All")
-        self._sampling_n_points_spin.setValue(0)
-        self._sampling_n_points_spin.setEnabled(False)
-        controls_layout.addWidget(QtWidgets.QLabel("N:"))
-        controls_layout.addWidget(self._sampling_n_points_spin)
+    def event(self, event: QtCore.QEvent) -> bool:
+        # The panel is never shorter than its wrapped settings need, so its
+        # divider cannot hide them.
+        if event.type() in (QtCore.QEvent.Type.Resize, QtCore.QEvent.Type.LayoutRequest):
+            self.setMinimumHeight(self.layout().totalHeightForWidth(self.width()))
+        return super().event(event)
 
-        self._sampling_footer.body_layout.addLayout(controls_layout)
+    @staticmethod
+    def _row(parent: QtWidgets.QWidget, *parts: QtWidgets.QWidget | str) -> QtWidgets.QWidget:
+        row = QtWidgets.QWidget(parent)
+        layout = QtWidgets.QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        for part in parts:
+            layout.addWidget(QtWidgets.QLabel(part, row) if isinstance(part, str) else part)
+        layout.addStretch(1)
+        return row
 
-        self._sampling_used_label = QtWidgets.QLabel("Used: \u2014")
-        self._sampling_used_label.setObjectName("global_fit_sampling_used_label")
-        self._sampling_used_label.setStyleSheet("font-size: 11px;")
-        self._sampling_footer.body_layout.addWidget(self._sampling_used_label)
+    def _number_edit(self, object_name: str, characters: int, tooltip: str) -> QtWidgets.QLineEdit:
+        edit = QtWidgets.QLineEdit(self)
+        edit.setObjectName(object_name)
+        configure_compact_numeric_edit(edit, characters=characters)
+        edit.setToolTip(tooltip)
+        return edit
 
-        self._sampling_t_min_spin.valueChanged.connect(self._on_sampling_controls_changed)
-        self._sampling_t_max_spin.valueChanged.connect(self._on_sampling_controls_changed)
-        self._sampling_n_points_spin.valueChanged.connect(self._on_sampling_controls_changed)
-        self._sampling_x_axis_combo.currentIndexChanged.connect(self._on_sampling_controls_changed)
-        self._sampling_x_mode_combo.currentIndexChanged.connect(self._on_sampling_controls_changed)
-
-        return container
-
-    # ------------------------------------------------------------------
-    # Internal event handlers (boundary — emit signals for FittingWindow)
-    # ------------------------------------------------------------------
-
-    def _on_dataset_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+    def _project_controls(self) -> None:
+        enabled = bool(self._current_dataset_id)
+        label = self._display_names.get(self._current_dataset_id, self._current_dataset_id)
+        set_bounded_label_text(self._header,
+                               f"Fit Data — {label}" if enabled else "Fit Data — No Dataset Selected",
+                               max_width=16777215)
+        self._header.setEnabled(enabled)
+        for editor in (
+            self._start_edit,
+            self._end_edit,
+            self._min_edit,
+            self._max_edit,
+        ):
+            editor.setEnabled(enabled)
+        self._x_combo.setEnabled(enabled)
+        self._reset_button.setEnabled(enabled)
+        if not enabled:
+            self._maximum_edit.setEnabled(False)
+            self._maximum_edit.clear()
+            self._maximum_total.setText("/ 0")
+            self._used_label.setText("Used: —")
+            for _field, editor in self._editors:
+                editor.setStyleSheet("")
+            self._show_error(None)
+            return
+        held = self._held.get(self._current_dataset_id)
+        config = self._owned_settings(
+            held if held is not None else self._settings_getter(self._current_dataset_id)
+        )
+        self._refreshing = True
         try:
-            col = int(item.column())
-        except Exception:
-            return
-        if col == 0:
-            row = int(item.row())
-            ds_id_item = self._dataset_table.item(row, 0)
-            ds_id = str(ds_id_item.data(Qt.UserRole) or "").strip() if ds_id_item is not None else ""
-            included = item.checkState() == Qt.Checked
-            self.datasetIncludeChanged.emit(row, ds_id, included)
-            return
-
-    def _on_selection_changed(self) -> None:
-        self._update_remove_button()
-
-    def _on_remove_clicked(self) -> None:
-        rows = sorted({item.row() for item in self._dataset_table.selectedItems()})
-        if not rows:
-            return
-        ids: List[str] = []
-        for row in rows:
-            item = self._dataset_table.item(int(row), 0)
-            if item is None:
-                continue
-            ds_id = str(item.data(Qt.UserRole) or "").strip()
-            if ds_id:
-                ids.append(ds_id)
-        if ids:
-            self.removeDatasetsRequested.emit(ids)
-
-    def _update_remove_button(self) -> None:
-        if self._worker_running_getter():
-            self._dataset_remove_button.setEnabled(False)
-            return
-        rows = {item.row() for item in self._dataset_table.selectedItems()}
-        self._dataset_remove_button.setEnabled(bool(rows))
-
-    # ------------------------------------------------------------------
-    # Sampling — internal helpers (moved from FittingWindow)
-    # ------------------------------------------------------------------
-
-    def _load_sampling_for_selected_dataset_row(self) -> None:
-        ds_id = self.selected_dataset_id()
-        self._load_sampling_controls_for_dataset(ds_id)
-
-    def _load_sampling_controls_for_dataset(self, dataset_id: Optional[str]) -> None:
-        if not hasattr(self, "_sampling_t_min_spin"):
-            return
-        if not hasattr(self, "_sampling_footer"):
-            return
-        ds_id = str(dataset_id or "").strip()
-        enabled = bool(ds_id)
-
-        if hasattr(self, "_sampling_header_label") and self._sampling_header_label is not None:
-            title = "Sampling (selected dataset: \u2014)" if not enabled else f"Sampling (selected dataset: {self.dataset_label_for_id(ds_id)})"
-            self._sampling_header_label.setText(title)
-
-        self._sampling_is_refreshing = True
-        try:
-            for widget in (
-                self._sampling_x_axis_combo,
-                self._sampling_x_mode_combo,
-                self._sampling_t_min_spin,
-                self._sampling_t_max_spin,
-                self._sampling_n_points_spin,
+            for field, editor in (
+                ("t_start", self._start_edit),
+                ("simulation_end", self._end_edit),
+                ("data_range_min", self._min_edit),
+                ("data_range_max", self._max_edit),
             ):
-                widget.setEnabled(enabled)
-            if self._sampling_footer.reset_button is not None:
-                self._sampling_footer.reset_button.setEnabled(enabled)
-            if not enabled:
-                self._sampling_current_dataset_id = None
-                self._sampling_used_label.setText("Used: \u2014")
-                self._sampling_footer.set_error(None)
-                self._sampling_footer.set_secondary_error(None)
-                self._sampling_footer.set_dirty(False)
-                self._sampling_x_mode_combo.setVisible(False)
-                self._sampling_x_mode_label.setVisible(False)
-                try:
-                    self._sampling_x_axis_combo.clear()
-                    self._sampling_x_mode_combo.setCurrentIndex(0)
-                except Exception:
-                    return
-                return
-
-            full_t = self._fit_targets_full_t_getter(ds_id)
-            t_axis = np.asarray(full_t, dtype=float).reshape(-1)
-            if t_axis.size:
-                t_min_full = float(np.min(t_axis))
-                t_max_full = float(np.max(t_axis))
-            else:
-                t_min_full = 0.0
-                t_max_full = 0.0
-
-            cfg = self._sampling_applied_config_getter(ds_id)
-            t_min_val = float(cfg.get("t_min", t_min_full))
-            t_max_val = float(cfg.get("t_max", t_max_full))
-            n_points = int(cfg.get("n_points", int(_SAMPLING_ALL_POINTS_SENTINEL)))
-            x_name = str(cfg.get("x_name") or "t").strip() or "t"
-            x_mode = str(cfg.get("x_mapping_mode") or "auto").strip().lower().replace("-", "_").replace(" ", "_") or "auto"
-            if x_mode in ("monotone_only", "monotoneonly"):
-                x_mode = "monotone"
-            if x_mode not in ("auto", "monotone", "time_guided"):
-                x_mode = "auto"
-
-            observed = set(self._fit_targets_available_getter(ds_id))
-            modeled = self._modeled_series_getter()
-            candidates = sorted({name for name in observed & modeled if name})
-
-            self._sampling_x_axis_combo.blockSignals(True)
-            try:
-                self._sampling_x_axis_combo.clear()
-                self._sampling_x_axis_combo.addItem("Time (t)", "t")
-                for name in candidates:
-                    self._sampling_x_axis_combo.addItem(str(name), str(name))
-                idx_x = int(self._sampling_x_axis_combo.findData(x_name))
-                if idx_x < 0:
-                    idx_x = 0
-                self._sampling_x_axis_combo.setCurrentIndex(idx_x)
-            finally:
-                self._sampling_x_axis_combo.blockSignals(False)
-
-            self._sampling_x_mode_combo.blockSignals(True)
-            try:
-                idx_mode = int(self._sampling_x_mode_combo.findData(x_mode))
-                if idx_mode < 0:
-                    idx_mode = 0
-                self._sampling_x_mode_combo.setCurrentIndex(idx_mode)
-            finally:
-                self._sampling_x_mode_combo.blockSignals(False)
-            show_mode = x_name != "t"
-            self._sampling_x_mode_combo.setVisible(bool(show_mode))
-            self._sampling_x_mode_label.setVisible(bool(show_mode))
-            self._sampling_x_mode_combo.setEnabled(bool(show_mode))
-
-            self._sampling_t_min_spin.setRange(t_min_full, t_max_full)
-            self._sampling_t_max_spin.setRange(t_min_full, t_max_full)
-            self._sampling_t_min_spin.setValue(max(t_min_full, min(t_max_full, t_min_val)))
-            self._sampling_t_max_spin.setValue(max(t_min_full, min(t_max_full, t_max_val)))
-
-            total = int(t_axis.size)
-            self._sampling_n_points_spin.setRange(int(_SAMPLING_ALL_POINTS_SENTINEL), max(int(_SAMPLING_ALL_POINTS_SENTINEL), total))
-            self._sampling_n_points_spin.setValue(max(int(_SAMPLING_ALL_POINTS_SENTINEL), min(total, n_points)))
-
-            self._sampling_current_dataset_id = ds_id
-            self._sampling_footer.set_error(None)
+                editor.setText(
+                    self._invalid_raw.get(
+                        (self._current_dataset_id, field),
+                        self._format(config.get(field)),
+                    )
+                )
+            selected_x = config["parametric_x"]
+            options = self._settings_getter(self._current_dataset_id)["eligible_parametric_x"]
+            self._x_combo.clear()
+            self._x_combo.addItem("Time", "t")
+            for option in options:
+                self._x_combo.addItem(option, option)
+            selected_index = self._x_combo.findData(selected_x)
+            if selected_index < 0 and selected_x != "t":
+                # Preserve an accepted-but-no-longer-eligible value as an
+                # explicit invalid projection.  Never silently change it to
+                # Time; the owner must fail closed until the setup is fixed.
+                self._x_combo.addItem(
+                    f"{selected_x} (unavailable)",
+                    selected_x,
+                )
+                selected_index = self._x_combo.count() - 1
+            self._x_combo.setCurrentIndex(selected_index)
         finally:
-            self._sampling_is_refreshing = False
-        self._on_sampling_controls_changed()
+            self._refreshing = False
+        self._refresh_feedback(config)
 
-    def _sampling_pending_values(self) -> Optional[Dict[str, float | int | str]]:
-        ds_id = str(getattr(self, "_sampling_current_dataset_id", "") or "").strip()
-        if not ds_id:
-            return None
-        return {
-            "t_min": float(self._sampling_t_min_spin.value()),
-            "t_max": float(self._sampling_t_max_spin.value()),
-            "n_points": int(self._sampling_n_points_spin.value()),
-            "x_name": str(self._sampling_x_axis_combo.currentData() or "t").strip() or "t",
-            "x_mapping_mode": str(self._sampling_x_mode_combo.currentData() or "auto").strip() or "auto",
-        }
+    @staticmethod
+    def _format(value: object) -> str:
+        return "" if value is None else repr(float(value))
 
-    def _sampling_pending_validation_error(self, *, dataset_id: str, pending: Dict[str, float | int | str]) -> Optional[str]:
-        ds_id = str(dataset_id or "").strip()
-        full_t = np.asarray(self._fit_targets_full_t_getter(ds_id), dtype=float).reshape(-1)
-        t_min = float(pending.get("t_min", 0.0))
-        t_max = float(pending.get("t_max", 0.0))
-        n_points = int(pending.get("n_points", int(_SAMPLING_ALL_POINTS_SENTINEL)))
-        if t_min > t_max:
-            return "t_min must be \u2264 t_max."
-        windowed = compute_windowed_indices(t=full_t, t_min=t_min, t_max=t_max)
-        m = int(windowed.size)
-        if m < 2:
-            return "Sampling window must contain at least 2 points."
-        if n_points != int(_SAMPLING_ALL_POINTS_SENTINEL):
-            if n_points < 2:
-                return "N must be All or \u2265 2."
-            if n_points > m:
-                return f"N must be \u2264 {m} (windowed points)."
+    def _available_observation_limit(
+        self,
+        dataset_id: str,
+        config: Mapping[str, object],
+    ) -> int:
+        """Return the largest actually available per-target observation count."""
 
-        x_name = str(pending.get("x_name") or "t").strip() or "t"
-        if x_name != "t":
-            full_series = self._fit_targets_full_series_getter(ds_id) if ds_id else {}
-            if not (isinstance(full_series, dict) and x_name in full_series):
-                return f"X axis '{x_name}' is not available as an observed column for this dataset."
-            modeled = self._modeled_series_getter()
-            if modeled and x_name not in modeled:
-                return f"X axis '{x_name}' is not a modeled series (species or algebra observable)."
-            applied_targets = set(self._fit_targets_selection_applied_getter(ds_id) or [])
-            if x_name in applied_targets:
-                return f"X axis '{x_name}' cannot also be a fitted series. Remove it from Fit Targets or choose a different X."
+        unlimited = dict(config)
+        unlimited["maximum_observations_per_target"] = None
+        try:
+            retained = self._retained_observations_getter(dataset_id, unlimited)
+        except ValueError:
+            return 0
+        return max((len(item.y) for item in retained), default=0)
+
+    def _show_points(self, config: Mapping[str, object]) -> int:
+        """Show the cap beside the available count; the full count means no cap."""
+
+        dataset_id = self._current_dataset_id
+        maximum = config.get("maximum_observations_per_target")
+        limit = self._available_observation_limit(dataset_id, config)
+        self._maximum_edit.setText(self._invalid_raw.get(
+            (dataset_id, "maximum_observations_per_target"),
+            str(limit if maximum is None else min(int(maximum), limit)),
+        ))
+        self._maximum_total.setText(f"/ {limit}")
+        # Sampling keeps at least two observations per target.
+        self._maximum_edit.setEnabled(limit > 2)
+        return limit
+
+    @classmethod
+    def _owned_settings(
+        cls,
+        settings: Mapping[str, object],
+    ) -> dict[str, object]:
+        return {field: settings.get(field) for field in cls._OWNED_FIELDS}
+
+    def _mark_changed(self, field: str) -> None:
+        if not self._refreshing and self._current_dataset_id:
+            self._changed_fields.setdefault(self._current_dataset_id, set()).add(field)
+
+    def _capture(self) -> dict[str, object]:
+        dataset_id = self._current_dataset_id
+        held = self._held.get(dataset_id)
+        config = self._owned_settings(
+            held if held is not None else self._settings_getter(dataset_id)
+        )
+        changed = self._changed_fields.get(dataset_id, set())
+        controls = (
+            ("t_start", self._start_edit),
+            ("simulation_end", self._end_edit),
+            ("data_range_min", self._min_edit),
+            ("data_range_max", self._max_edit),
+        )
+        for field, editor in controls:
+            if field not in changed:
+                continue
+            raw = editor.text()
+            if not raw.strip() and field in {"t_start", "simulation_end"}:
+                config[field] = None
+                self._invalid_raw.pop((dataset_id, field), None)
+                continue
+            try:
+                value = (
+                    parse_finite_numeric_text(raw, field=field)
+                    if field in {"t_start", "simulation_end"} else float(raw)
+                )
+                if not math.isfinite(value):
+                    raise ValueError
+            except ValueError:
+                self._invalid_raw[(dataset_id, field)] = raw
+            else:
+                self._invalid_raw.pop((dataset_id, field), None)
+                config[field] = value
+        if "parametric_x" in changed:
+            config["parametric_x"] = str(self._x_combo.currentData() or "t")
+        if _POINTS in changed:
+            # The available count depends on the other settings just read.
+            key = (dataset_id, _POINTS)
+            raw = self._maximum_edit.text()
+            try:
+                config[_POINTS] = self._parse_points(
+                    raw, self._available_observation_limit(dataset_id, config)
+                )
+            except ValueError:
+                self._invalid_raw[key] = raw
+            else:
+                self._invalid_raw.pop(key, None)
+        return config
+
+    @staticmethod
+    def _parse_points(raw: str, limit: int) -> int | None:
+        """Read a typed points count against the available count; all means no cap."""
+
+        value = int(raw.strip())
+        if not 2 <= value <= limit:
+            raise ValueError
+        return None if value == limit else value
+
+    @staticmethod
+    def _signature(config: Mapping[str, object]) -> tuple[object, ...]:
+        return (
+            config.get("t_start"),
+            config.get("data_range_min"),
+            config.get("data_range_max"),
+            config.get("maximum_observations_per_target"),
+            config.get("parametric_x", "t"),
+            config.get("simulation_end"),
+        )
+
+    def _validation_error(self, dataset_id: str, config: Mapping[str, object]) -> str | None:
+        accepted = self._settings_getter(dataset_id)
+        is_time = str(config.get("parametric_x", "t") or "t") == "t"
+        active_fields = ("t_start", "simulation_end")
+        if is_time:
+            active_fields += ("data_range_min", "data_range_max")
+        for field in active_fields:
+            if (dataset_id, field) in self._invalid_raw:
+                return f"{_FIELD_LABELS[field]} must be a finite number."
+        raw_points = self._invalid_raw.get((dataset_id, _POINTS))
+        if raw_points is not None:
+            # Rechecked each time: other targets can change the available count.
+            limit = self._available_observation_limit(dataset_id, config)
+            try:
+                self._parse_points(raw_points, limit)
+            except ValueError:
+                return f"Points per target must be a whole number from 2 to {limit}."
+        try:
+            start, end = fit_execution_span(config["t_start"], config["simulation_end"])
+        except ValueError as exc:
+            return str(exc)
+        try:
+            retained = self._retained_observations_getter(dataset_id, config)
+        except ValueError as exc:
+            return str(exc)
+        times = [value for item in retained for value in item.t] if is_time else []
+        if times and (min(times) < start or max(times) > end):
+            return (
+                "Simulation start and end must cover the selected data times, "
+                f"{six_digit_text(min(times))} to {six_digit_text(max(times))}."
+            )
+        selected_x = str(config.get("parametric_x", "t") or "t")
+        if selected_x != "t" and selected_x not in tuple(
+            str(item) for item in accepted.get("eligible_parametric_x", ())
+        ):
+            return "Fit against must be a measured series of this dataset."
         return None
 
-    def _sampling_used_count_for_pending(self, *, dataset_id: str, pending: Dict[str, float | int | str]) -> Tuple[int, int]:
-        ds_id = str(dataset_id or "").strip()
-        full_t = np.asarray(self._fit_targets_full_t_getter(ds_id), dtype=float).reshape(-1)
-        total = int(full_t.size)
-        t_min = float(pending.get("t_min", 0.0))
-        t_max = float(pending.get("t_max", 0.0))
-        n_points = int(pending.get("n_points", int(_SAMPLING_ALL_POINTS_SENTINEL)))
-        if t_min > t_max:
-            return 0, total
-        windowed = compute_windowed_indices(t=full_t, t_min=t_min, t_max=t_max)
-        m = int(windowed.size)
-        if m == 0:
-            return 0, total
-        if n_points == int(_SAMPLING_ALL_POINTS_SENTINEL) or n_points >= m:
-            return m, total
-        if 2 <= n_points <= m:
-            return int(n_points), total
-        return 0, total
+    def _commit(self, changed_field: str | None = None) -> None:
+        """Apply the shown settings when valid; otherwise hold them."""
 
-    def _on_sampling_controls_changed(self) -> None:
-        if self._sampling_is_refreshing:
+        if self._refreshing or not self._current_dataset_id:
             return
-        ds_id = str(getattr(self, "_sampling_current_dataset_id", "") or "").strip()
-        if not ds_id:
-            return
-        pending = self._sampling_pending_values()
-        if not isinstance(pending, dict):
-            return
-        x_name = str(pending.get("x_name") or "t").strip() or "t"
-        show_mode = x_name != "t"
-        self._sampling_x_mode_combo.setVisible(bool(show_mode))
-        self._sampling_x_mode_label.setVisible(bool(show_mode))
-        self._sampling_x_mode_combo.setEnabled(bool(show_mode))
-        used, total = self._sampling_used_count_for_pending(dataset_id=ds_id, pending=pending)
-        self._sampling_used_label.setText(f"Used: {used}/{total} points")
+        dataset_id = self._current_dataset_id
+        if changed_field is not None:
+            self._mark_changed(changed_field)
+        self._apply_or_hold(dataset_id, self._capture())
 
-        error = self._sampling_pending_validation_error(dataset_id=ds_id, pending=pending)
-        if hasattr(self, "_sampling_footer"):
-            self._sampling_footer.set_error(error)
-
-        applied = self._sampling_applied_config_getter(ds_id)
-        dirty = (
-            (not math.isclose(float(applied.get("t_min", 0.0)), float(pending.get("t_min", 0.0)), rel_tol=1e-9, abs_tol=1e-12))
-            or (not math.isclose(float(applied.get("t_max", 0.0)), float(pending.get("t_max", 0.0)), rel_tol=1e-9, abs_tol=1e-12))
-            or int(applied.get("n_points", int(_SAMPLING_ALL_POINTS_SENTINEL))) != int(pending.get("n_points", int(_SAMPLING_ALL_POINTS_SENTINEL)))
-            or str(applied.get("x_name") or "t").strip() != str(pending.get("x_name") or "t").strip()
-            or str(applied.get("x_mapping_mode") or "auto").strip() != str(pending.get("x_mapping_mode") or "auto").strip()
+    def _apply_or_hold(self, dataset_id: str, config: dict[str, object]) -> None:
+        if self._validation_error(dataset_id, config) is not None:
+            self._held[dataset_id] = config
+            self._refresh_feedback(config)
+            return
+        config = self._accept(dataset_id, config)
+        applied = self._signature(config) != self._signature(
+            self._owned_settings(self._settings_getter(dataset_id))
         )
-        if hasattr(self, "_sampling_footer"):
-            self._sampling_footer.set_dirty(bool(dirty))
+        if applied:
+            # The owner projects the accepted settings back into the controls.
+            self.fitSettingsApplied.emit(dataset_id, dict(config))
+        else:
+            self._project_controls()
 
-    def _apply_sampling_changes(self) -> None:
-        ds_id = str(getattr(self, "_sampling_current_dataset_id", "") or "").strip()
-        if not ds_id:
-            return
-        pending = self._sampling_pending_values()
-        if not isinstance(pending, dict):
-            return
-        error = self._sampling_pending_validation_error(dataset_id=ds_id, pending=pending)
-        if error:
-            if hasattr(self, "_sampling_footer"):
-                self._sampling_footer.set_error(error)
-            return
+    def apply_valid_held_settings(self) -> None:
+        """Apply each held edit that another setup change has made valid."""
 
-        # ORDERING: samplingApplied must use a direct (synchronous) connection so
-        # FittingWindow updates _sampling_applied before _on_sampling_controls_changed
-        # reads it back via the getter. Do not use Qt.QueuedConnection.
-        self.samplingApplied.emit(ds_id, dict(pending))
-        self._on_sampling_controls_changed()
+        for dataset_id, config in tuple(self._held.items()):
+            if self._validation_error(dataset_id, config) is None:
+                self.fitSettingsApplied.emit(dataset_id, dict(self._accept(dataset_id, config)))
 
-    def _revert_sampling_changes(self) -> None:
-        ds_id = str(getattr(self, "_sampling_current_dataset_id", "") or "").strip()
-        if not ds_id:
-            return
-        self._load_sampling_controls_for_dataset(ds_id)
+    def _accept(self, dataset_id: str, config: dict[str, object]) -> dict[str, object]:
+        """Settle valid settings for applying; keep text the settings do not use.
 
-    def _reset_sampling_pending_to_defaults(self) -> None:
-        ds_id = str(getattr(self, "_sampling_current_dataset_id", "") or "").strip()
-        if not ds_id:
+        A held points count is read into the settings.  Measured X ignores the
+        Data Range, so its held text stays for a return to Time.
+        """
+
+        raw_points = self._invalid_raw.get((dataset_id, _POINTS))
+        if raw_points is not None:
+            config[_POINTS] = self._parse_points(
+                raw_points, self._available_observation_limit(dataset_id, config)
+            )
+        inactive = {} if str(config.get("parametric_x") or "t") == "t" else {
+            key: text for key, text in self._invalid_raw.items()
+            if key[0] == dataset_id and key[1] in _RANGE_FIELDS
+        }
+        self._discard_held(dataset_id)
+        self._invalid_raw.update(inactive)
+        if inactive:
+            self._changed_fields[dataset_id] = {field for _dataset_id, field in inactive}
+        return config
+
+    def _discard_held(self, dataset_id: str) -> None:
+        self._held.pop(dataset_id, None)
+        self._changed_fields.pop(dataset_id, None)
+        for key in tuple(self._invalid_raw):
+            if key[0] == dataset_id:
+                self._invalid_raw.pop(key, None)
+
+    def _discard(self) -> None:
+        dataset_id = self._current_dataset_id
+        if dataset_id not in self._held:
             return
-        full_t = np.asarray(self._fit_targets_full_t_getter(ds_id), dtype=float).reshape(-1)
-        defaults = self._sampling_default_config_getter(full_t)
-        self._sampling_is_refreshing = True
+        self._discard_held(dataset_id)
+        self._project_controls()
+        self.statusMessage.emit(
+            f"Invalid Fit Data values for {self._display_names.get(dataset_id, dataset_id)} discarded."
+        )
+
+    def _reset(self) -> None:
+        if not self._current_dataset_id:
+            return
+        dataset_id = self._current_dataset_id
+        defaults = self._owned_settings(self._default_settings_getter(dataset_id))
+        defaults["parametric_x"] = str(self._x_combo.currentData() or "t")
+        self._discard_held(dataset_id)
+        self._apply_or_hold(dataset_id, defaults)
+        if dataset_id in self._held:
+            self._project_controls()
+
+    def _refresh_feedback(self, config: Mapping[str, object]) -> None:
+        """Show the shown settings' points, invalid fields, error and observation count."""
+
+        dataset_id = self._current_dataset_id
+        refreshing, self._refreshing = self._refreshing, True
         try:
-            self._sampling_t_min_spin.setValue(float(defaults.get("t_min", 0.0)))
-            self._sampling_t_max_spin.setValue(float(defaults.get("t_max", 0.0)))
-            self._sampling_n_points_spin.setValue(int(defaults.get("n_points", int(_SAMPLING_ALL_POINTS_SENTINEL))))
-            idx_mode = int(self._sampling_x_mode_combo.findData("auto"))
-            if idx_mode < 0:
-                idx_mode = 0
-            self._sampling_x_mode_combo.setCurrentIndex(idx_mode)
-            idx = int(self._sampling_x_axis_combo.findData("t"))
-            if idx < 0:
-                idx = 0
-            self._sampling_x_axis_combo.setCurrentIndex(idx)
+            # Held settings change the available count too.
+            limit = self._show_points(config)
         finally:
-            self._sampling_is_refreshing = False
-        self._on_sampling_controls_changed()
+            self._refreshing = refreshing
+        for field, editor in self._editors:
+            raw = self._invalid_raw.get((dataset_id, field))
+            if raw is not None and field == _POINTS:
+                try:
+                    self._parse_points(raw, limit)
+                except ValueError:
+                    pass
+                else:
+                    raw = None
+            editor.setStyleSheet(INVALID_EDITOR_STYLE if raw is not None else "")
+        self._refresh_parametric_presentation()
+        try:
+            used = sum(len(item.y) for item in self._retained_observations_getter(dataset_id, config))
+            self._used_label.setText(f"Used: {used} observations")
+        except ValueError:
+            self._used_label.setText("Used: —")
+        held = dataset_id in self._held
+        error = self._validation_error(dataset_id, config)
+        self._show_error(
+            f"{error}\nPress Esc in these fields to discard the invalid values."
+            if error and held else error
+        )
+        for shortcut in self._discard_shortcuts:
+            shortcut.setEnabled(held)
+        self.validityChanged.emit()
+
+    def _show_error(self, text: str | None) -> None:
+        self._error_label.setText(text or "")
+        self._error_label.setVisible(bool(text))
+
+    def _refresh_parametric_presentation(self) -> None:
+        is_time = str(self._x_combo.currentData() or "t") == "t"
+        self._range_group.setVisible(is_time)

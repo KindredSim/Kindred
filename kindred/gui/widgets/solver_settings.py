@@ -1,535 +1,482 @@
-"""
-Simulation Settings dialog.
-
-Current dialog contract
------------------------
-- Exposes SciPy `solve_ivp` solver selection restricted to `LSODA`, `Radau`,
-  and `BDF`, plus tolerances (rtol/atol) and the sparse-J toggle for
-  supported stiff solvers.
-- Exposes slider-preview defaults separately from the main run controls:
-  preview solver, preview point count, and preview debounce timings.
-- Does NOT expose temperature, t_end, or point-grid controls (those are surfaced
-  directly in the main layout / DSL).
-
-Returned schema
----------------
-{
-  "solver": str,
-  "rtol": float,
-  "atol": float,
-  "use_sparse_jacobian": bool,
-  "wegscheider_cyclicity_enabled": bool,
-  "max_parallel_batch_workers": int,
-  "limit_blas_threads_per_worker": bool,
-  "slider_preview_solver": str,
-  "slider_preview_points": int,
-  "parameter_preview_debounce_ms": int,
-  "equilibrium_preview_debounce_ms": int,
-}
-"""
+"""Complete execution-settings editor for one exact IC set."""
 
 from __future__ import annotations
 
-import logging
-from typing import Dict, Optional, Tuple
+from kindred.gui.display_name_policy import scientific_symbol_html, scientific_symbol_spoken
 
 from PySide6 import QtCore, QtWidgets
 
-from kindred.core.validation import try_parse_int
-from kindred.gui.ports import SimulationCacheControlsPort, SimulationCacheOpResult
+from kindred.core.project_document import (
+    TEMPERATURE_RANGE_K,
+    SimulationExecutionSettings,
+    SUPPORTED_SOLVERS,
+    TabScientificSettings,
+    parse_points_text,
+    validate_simulation_execution_settings,
+    validate_tab_scientific_settings,
+)
+from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
+from kindred.core.validation import parse_finite_numeric_text
+from kindred.gui.ui_helpers import SOLVER_TOOLTIP, clamp_initial_size, ignore_wheel, make_scroll_area
 
-logger = logging.getLogger(__name__)
+__all__ = [
+    "SimulationSettingsDialog",
+    "SolverSettingsDialog",
+]
 
-__all__ = ["SolverSettingsDialog"]
 
+class _RunSettingsFields:
+    """The four Run-setting editors shared by both settings dialogs."""
 
-_SOLVERS = ["LSODA", "Radau", "BDF"]
+    def __init__(self, form: QtWidgets.QFormLayout, parent: QtWidgets.QWidget) -> None:
+        self.solver_combo = QtWidgets.QComboBox(parent)
+        self.solver_combo.addItems(list(SUPPORTED_SOLVERS))
+        self.solver_combo.setToolTip(SOLVER_TOOLTIP)
+        self.t_start_edit = self._time_edit(parent, "", "Absolute Run start time")
+        self.t_end_edit = self._time_edit(parent, "", "Absolute Run end time")
+        self.points_edit = self._time_edit(
+            parent,
+            "",
+            "Number of evenly spaced base samples over the completed interval, "
+            "including both endpoints. Intervention boundary rows are additional. "
+            "A stop at the start returns one sample.",
+        )
+        for label, widget in (
+            ("Solver", self.solver_combo),
+            ("t_start", self.t_start_edit),
+            ("t_end", self.t_end_edit),
+            ("Points", self.points_edit),
+        ):
+            form.addRow(label, widget)
+            name_label = form.labelForField(widget)
+            if label in {"t_start", "t_end"}:
+                name_label.setTextFormat(QtCore.Qt.RichText)
+                name_label.setText(scientific_symbol_html(label, family="time", role=label))
+            widget.setAccessibleName(scientific_symbol_spoken(label, family="time", role=label))
+
+    @staticmethod
+    def _time_edit(
+        parent: QtWidgets.QWidget, value: str, tooltip: str,
+    ) -> QtWidgets.QLineEdit:
+        edit = QtWidgets.QLineEdit(str(value), parent)
+        edit.setToolTip(str(tooltip))
+        edit.setMaximumWidth(190)
+        return edit
+
+    def set_settings(self, settings: SimulationExecutionSettings) -> None:
+        self.solver_combo.setCurrentText(settings.solver)
+        self.t_start_edit.setText(repr(float(settings.t_start)))
+        self.t_end_edit.setText(repr(float(settings.t_end)))
+        self.points_edit.setText(str(settings.integration_points))
+
+    def settings(self) -> SimulationExecutionSettings:
+        t_start, t_end = self.t_start_edit.text(), self.t_end_edit.text()
+        candidate = SimulationExecutionSettings(
+            solver=str(self.solver_combo.currentText()),
+            t_start=parse_finite_numeric_text(t_start, field=f"Start time {t_start!r}"),
+            t_end=parse_finite_numeric_text(t_end, field=f"End time {t_end!r}"),
+            integration_points=parse_points_text(self.points_edit.text()),
+        )
+        return validate_simulation_execution_settings(candidate)
 
 
 class SolverSettingsDialog(QtWidgets.QDialog):
-    settingsAccepted = QtCore.Signal(dict)
+    """Edit one complete override; partial values never leave the dialog."""
 
     def __init__(
         self,
-        parent: Optional[QtWidgets.QWidget] = None,
+        parent: QtWidgets.QWidget | None = None,
         *,
-        cache_port: Optional[SimulationCacheControlsPort] = None,
+        title: str = "Custom Run Settings",
     ) -> None:
         super().__init__(parent)
-        self._cache_port = cache_port
-        self.setWindowTitle("Simulation Settings")
+        self.setWindowTitle(str(title))
         self.setModal(True)
-        self._cache_controls_ready = False
 
         layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+        self._fields = _RunSettingsFields(form, self)
+        layout.addLayout(form)
 
-        max_input_width = 160
-
-        def _make_header(text: str) -> QtWidgets.QLabel:
-            label = QtWidgets.QLabel(str(text))
-            font = label.font()
-            font.setBold(True)
-            label.setFont(font)
-            return label
-
-        solver_section = QtWidgets.QWidget(self)
-        solver_section_layout = QtWidgets.QVBoxLayout(solver_section)
-        solver_section_layout.setContentsMargins(0, 0, 0, 0)
-        solver_section_layout.setSpacing(6)
-
-        solver_section_layout.addWidget(_make_header("Solver"))
-
-        self._combo_solver = QtWidgets.QComboBox(self)
-        self._combo_solver.addItems(_SOLVERS)
-        self._combo_solver.setCurrentText("Radau")
-        self._combo_solver.setMaximumWidth(max_input_width)
-        self._combo_solver.setToolTip("ODE integration method. Radau and BDF are implicit (stiff-capable). LSODA auto-switches.")
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Solver:", self))
-        row.addWidget(self._combo_solver)
-        row.addStretch(1)
-        solver_section_layout.addLayout(row)
-
-        self._spin_rtol = QtWidgets.QDoubleSpinBox(self)
-        self._spin_rtol.setDecimals(12)
-        self._spin_rtol.setRange(1e-16, 1.0)
-        self._spin_rtol.setValue(1e-6)
-        self._spin_rtol.setSingleStep(1e-6)
-        self._spin_rtol.setMaximumWidth(180)
-        self._spin_rtol.setToolTip("Relative error tolerance. Smaller values give more accurate but slower simulations.")
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Relative tolerance (rtol):", self))
-        row.addWidget(self._spin_rtol)
-        row.addStretch(1)
-        solver_section_layout.addLayout(row)
-
-        self._spin_atol = QtWidgets.QDoubleSpinBox(self)
-        self._spin_atol.setDecimals(12)
-        self._spin_atol.setRange(1e-20, 1.0)
-        self._spin_atol.setValue(1e-12)
-        self._spin_atol.setSingleStep(1e-9)
-        self._spin_atol.setMaximumWidth(180)
-        self._spin_atol.setToolTip("Absolute error tolerance. Smaller values give more accurate but slower simulations.")
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Absolute tolerance (atol):", self))
-        row.addWidget(self._spin_atol)
-        row.addStretch(1)
-        solver_section_layout.addLayout(row)
-
-        self._sparse_checkbox = QtWidgets.QCheckBox("Use sparse Jacobian (Radau/BDF only)")
-        self._sparse_checkbox.setChecked(False)
-        self._sparse_checkbox.setToolTip("Use sparse matrix format for the Jacobian. Faster for large mechanisms.")
-        solver_section_layout.addWidget(self._sparse_checkbox)
-
-        self._wegscheider_checkbox = QtWidgets.QCheckBox("Thermodynamic cyclicity (Wegscheider)")
-        self._wegscheider_checkbox.setChecked(False)
-        self._wegscheider_checkbox.setToolTip("Enforce detailed balance by deriving some reverse rates from thermodynamic constraints.")
-        solver_section_layout.addWidget(self._wegscheider_checkbox)
-        self._wegscheider_help = QtWidgets.QLabel(
-            "Enforce ln(kf/kr) cycle constraints by deriving some reversible rates."
+        self._buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
         )
-        self._wegscheider_help.setStyleSheet("font-size: 11px;")
-        self._wegscheider_help.setWordWrap(True)
-        solver_section_layout.addWidget(self._wegscheider_help)
+        self._buttons.accepted.connect(self._accept_candidate)
+        self._buttons.rejected.connect(self.reject)
+        layout.addWidget(self._buttons)
 
-        self._max_parallel_workers_spin = QtWidgets.QSpinBox(self)
-        self._max_parallel_workers_spin.setRange(1, 256)
-        self._max_parallel_workers_spin.setValue(12)
-        self._max_parallel_workers_spin.setMaximumWidth(max_input_width)
-        self._max_parallel_workers_spin.setMinimumWidth(80)
-        self._max_parallel_workers_spin.setToolTip("Number of sets to simulate simultaneously.")
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Max parallel workers:", self))
-        row.addWidget(self._max_parallel_workers_spin)
-        row.addStretch(1)
-        solver_section_layout.addLayout(row)
+    def set_execution_settings(self, settings: SimulationExecutionSettings) -> None:
+        self._fields.set_settings(settings)
 
-        self._limit_blas_checkbox = QtWidgets.QCheckBox("Limit BLAS threads per worker (recommended)")
-        self._limit_blas_checkbox.setChecked(True)
-        self._limit_blas_checkbox.setToolTip("Restrict each worker to one BLAS thread to prevent CPU oversubscription.")
-        solver_section_layout.addWidget(self._limit_blas_checkbox)
+    def execution_settings(self) -> SimulationExecutionSettings:
+        return self._fields.settings()
 
-        solver_section_layout.addWidget(_make_header("Slider preview"))
-
-        self._combo_slider_preview_solver = QtWidgets.QComboBox(self)
-        self._combo_slider_preview_solver.addItems(_SOLVERS)
-        self._combo_slider_preview_solver.setCurrentText("LSODA")
-        self._combo_slider_preview_solver.setMaximumWidth(max_input_width)
-        self._combo_slider_preview_solver.setToolTip("ODE solver used for fast slider preview simulations.")
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Slider preview solver:", self))
-        row.addWidget(self._combo_slider_preview_solver)
-        row.addStretch(1)
-        solver_section_layout.addLayout(row)
-
-        self._spin_slider_preview_points = QtWidgets.QSpinBox(self)
-        self._spin_slider_preview_points.setRange(50, 20000)
-        self._spin_slider_preview_points.setSingleStep(50)
-        self._spin_slider_preview_points.setValue(100)
-        self._spin_slider_preview_points.setMaximumWidth(max_input_width)
-        self._spin_slider_preview_points.setToolTip("Number of time points for slider preview output.")
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Slider preview points:", self))
-        row.addWidget(self._spin_slider_preview_points)
-        row.addStretch(1)
-        solver_section_layout.addLayout(row)
-
-        self._spin_parameter_preview_debounce_ms = QtWidgets.QSpinBox(self)
-        self._spin_parameter_preview_debounce_ms.setRange(0, 1000)
-        self._spin_parameter_preview_debounce_ms.setValue(80)
-        self._spin_parameter_preview_debounce_ms.setSuffix(" ms")
-        self._spin_parameter_preview_debounce_ms.setMaximumWidth(max_input_width)
-        self._spin_parameter_preview_debounce_ms.setToolTip("Delay before launching a preview after a parameter slider change.")
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Parameter slider debounce:", self))
-        row.addWidget(self._spin_parameter_preview_debounce_ms)
-        row.addStretch(1)
-        solver_section_layout.addLayout(row)
-
-        self._spin_equilibrium_preview_debounce_ms = QtWidgets.QSpinBox(self)
-        self._spin_equilibrium_preview_debounce_ms.setRange(0, 1000)
-        self._spin_equilibrium_preview_debounce_ms.setValue(150)
-        self._spin_equilibrium_preview_debounce_ms.setSuffix(" ms")
-        self._spin_equilibrium_preview_debounce_ms.setMaximumWidth(max_input_width)
-        self._spin_equilibrium_preview_debounce_ms.setToolTip("Delay before launching a preview after an equilibrium constant slider change.")
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Equilibrium K slider debounce:", self))
-        row.addWidget(self._spin_equilibrium_preview_debounce_ms)
-        row.addStretch(1)
-        solver_section_layout.addLayout(row)
-
-        layout.addWidget(solver_section)
-
-        cache_section = QtWidgets.QWidget(self)
-        cache_section.setObjectName("simulationCachingSection")
-        cache_section.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Minimum,
-        )
-        cache_layout = QtWidgets.QVBoxLayout(cache_section)
-        cache_layout.setContentsMargins(0, 0, 0, 0)
-        cache_layout.setSpacing(6)
-
-        cache_layout.addWidget(_make_header("Simulation caching"))
-
-        self._spin_result_cache_cap = QtWidgets.QSpinBox(self)
-        self._spin_result_cache_cap.setRange(0, 1_000_000_000)
-        self._spin_result_cache_cap.setValue(100)
-        self._spin_result_cache_cap.setMaximumWidth(max_input_width)
-        self._spin_result_cache_cap.setToolTip("Maximum number of full simulation results to keep in memory.")
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Result cache cap:", self))
-        row.addWidget(self._spin_result_cache_cap)
-        row.addStretch(1)
-        cache_layout.addLayout(row)
-
-        self._spin_preview_cache_cap = QtWidgets.QSpinBox(self)
-        self._spin_preview_cache_cap.setRange(0, 1_000_000_000)
-        self._spin_preview_cache_cap.setValue(3)
-        self._spin_preview_cache_cap.setMaximumWidth(max_input_width)
-        self._spin_preview_cache_cap.setToolTip("Maximum number of slider preview results to keep in memory.")
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Preview cache cap:", self))
-        row.addWidget(self._spin_preview_cache_cap)
-        row.addStretch(1)
-        cache_layout.addLayout(row)
-
-        self._label_result_cache_status = QtWidgets.QLabel("Result cache: 0/0, 0.0 MB", self)
-        self._label_preview_cache_status = QtWidgets.QLabel("Preview cache: 0/0, 0.0 MB", self)
-        cache_layout.addWidget(self._label_result_cache_status)
-        cache_layout.addWidget(self._label_preview_cache_status)
-        self._label_cache_status_error = QtWidgets.QLabel("", self)
-        self._label_cache_status_error.setWordWrap(True)
-        self._label_cache_status_error.setStyleSheet("font-weight: bold; font-size: 11px;")
-        self._label_cache_status_error.hide()
-        cache_layout.addWidget(self._label_cache_status_error)
-
-        purge_row = QtWidgets.QHBoxLayout()
-        self._btn_purge_results = QtWidgets.QPushButton("Purge result cache", self)
-        self._btn_purge_results.setToolTip("Clear all cached full simulation results to free memory.")
-        self._btn_purge_preview = QtWidgets.QPushButton("Purge preview cache", self)
-        self._btn_purge_preview.setToolTip("Clear all cached slider preview results to free memory.")
-        self._btn_purge_all = QtWidgets.QPushButton("Purge all caches", self)
-        self._btn_purge_all.setToolTip("Clear all cached results and previews to free memory.")
-        purge_row.addWidget(self._btn_purge_results)
-        purge_row.addWidget(self._btn_purge_preview)
-        purge_row.addWidget(self._btn_purge_all)
-        purge_row.addItem(
-            QtWidgets.QSpacerItem(
-                0,
-                0,
-                QtWidgets.QSizePolicy.Policy.Expanding,
-                QtWidgets.QSizePolicy.Policy.Minimum,
+    @QtCore.Slot()
+    def _accept_candidate(self) -> None:
+        try:
+            self.execution_settings()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Invalid Run Settings",
+                str(exc),
             )
-        )
-        cache_layout.addLayout(purge_row)
-
-        layout.addWidget(cache_section)
-
-        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        button_box.accepted.connect(self._on_accept)
-        button_box.rejected.connect(self.reject)
-        spacer = QtWidgets.QSpacerItem(
-            0,
-            0,
-            QtWidgets.QSizePolicy.Policy.Minimum,
-            QtWidgets.QSizePolicy.Policy.Expanding,
-        )
-        layout.addItem(spacer)
-        layout.setStretch(layout.count() - 1, 1)
-        layout.addWidget(button_box)
-
-        self._wire_cache_controls()
-        self._cache_controls_ready = True
-        self._refresh_cache_status()
-
-    def _wire_cache_controls(self) -> None:
-        def _apply_caps() -> None:
-            if not bool(getattr(self, "_cache_controls_ready", False)):
-                return
-            ctrl = self._cache_port
-            if ctrl is None:
-                return
-            result = ctrl.set_simulation_cache_caps(
-                result_cap=int(self._spin_result_cache_cap.value()),
-                preview_cap=int(self._spin_preview_cache_cap.value()),
-                persist=True,
-            )
-            self._handle_cache_action_outcome(result)
-
-        self._spin_result_cache_cap.valueChanged.connect(lambda _v: _apply_caps())
-        self._spin_preview_cache_cap.valueChanged.connect(lambda _v: _apply_caps())
-
-        self._btn_purge_results.clicked.connect(lambda: self._confirm_and_purge(which="result"))
-        self._btn_purge_preview.clicked.connect(lambda: self._confirm_and_purge(which="preview"))
-        self._btn_purge_all.clicked.connect(lambda: self._confirm_and_purge(which="all"))
-
-    def _confirm_and_purge(self, *, which: str) -> None:
-        ctrl = self._cache_port
-        if ctrl is None:
             return
-        which = str(which or "").strip().lower()
-        if which not in {"result", "preview", "all"}:
-            return
+        self.accept()
 
-        if which == "result":
-            title = "Purge result cache"
-            message = "Purge the result cache?\n\nEvicted results must be recomputed by pressing Run."
-        elif which == "preview":
-            title = "Purge preview cache"
-            message = "Purge the preview cache?\n\nEvicted previews will be recomputed on the next slider update."
-        else:
-            title = "Purge all caches"
-            message = "Purge all simulation caches?\n\nResults and previews will need to be recomputed."
 
-        resp = QtWidgets.QMessageBox.question(
+class SimulationSettingsDialog(QtWidgets.QDialog):
+    """Passive editor for the supported application and tab settings.
+
+    The dialog stores only widget draft state.  MainWindow publishes the
+    accepted values through the existing tab-action and ConfigController
+    owners after the modal returns.
+    """
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None = None,
+        *,
+        preview_points: int,
+        preview_delay_ms: int,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("simulationSettingsDialog")
+        self.setWindowTitle("Simulation Settings")
+        self.setModal(True)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        scroll = make_scroll_area(self)
+        scroll.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        body = QtWidgets.QWidget(scroll)
+        body_layout = QtWidgets.QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        science_box = QtWidgets.QGroupBox("Mechanism Settings", body)
+        science_form = QtWidgets.QFormLayout(science_box)
+        factory = TabScientificSettings()
+        self.temperature_spin = self._positive_spin(
+            minimum=TEMPERATURE_RANGE_K[0],
+            maximum=TEMPERATURE_RANGE_K[1],
+            value=factory.temperature,
+            decimals=2,
+        )
+        self.standard_conc_edit = QtWidgets.QLineEdit(str(factory.standard_conc_M), science_box)
+        self.energy_unit_combo = QtWidgets.QComboBox(science_box)
+        self.energy_unit_combo.addItems(["J/mol", "kJ/mol", "kcal/mol"])
+        self.energy_unit_combo.setCurrentText(factory.energy_unit)
+        self.rtol_edit = QtWidgets.QLineEdit("1e-6", science_box)
+        self.atol_edit = QtWidgets.QLineEdit("1e-12", science_box)
+        self.temperature_spin.setToolTip(
+            "Default nominal temperature for this mechanism. An explicit T= directive "
+            "overrides it. Temperature schedules start from the resolved nominal temperature."
+        )
+        self.standard_conc_edit.setToolTip(
+            "Default standard-state concentration in M for Eyring rates and thermodynamic "
+            "equilibrium constants. An explicit C0= directive overrides it."
+        )
+        self.energy_unit_combo.setToolTip(
+            "Default units for authored energies. An explicit energy= directive overrides "
+            "this setting. Changing the units changes how existing energy numbers are interpreted."
+        )
+        self.rtol_edit.setToolTip(
+            "Controls solver error relative to the magnitude of each concentration."
+        )
+        self.atol_edit.setToolTip(
+            "Controls solver error when concentrations are near zero."
+        )
+        self.analytic_jacobian_check = QtWidgets.QCheckBox(
+            "Prefer Analytic Jacobian When Supported",
+            science_box,
+        )
+        self.analytic_jacobian_check.setToolTip(
+            "Uses the symbolic analytic Jacobian when supported. If any "
+            "individual reaction-order or equilibrium concentration exponent "
+            "is non-integral, Kindred uses the numerical Jacobian of the solver "
+            "from the start. Supported intervention schedules retain analytic "
+            "Jacobian handling. If analytic Jacobian evaluation fails after "
+            "execution begins, the execution fails and is not retried."
+        )
+        self.scientific_defaults_check = QtWidgets.QCheckBox(
+            "Use These Settings as Defaults for New Projects and Tabs",
+            science_box,
+        )
+        self.scientific_defaults_check.setChecked(False)
+        self.scientific_defaults_check.setToolTip(
+            "Save all settings in this group, including the Jacobian and stopping "
+            "preferences, as defaults for new projects and tabs. "
+            "Existing tabs keep their settings."
+        )
+        science_form.addRow("Default temperature (K)", self.temperature_spin)
+        science_form.addRow("Default standard concentration (M)", self.standard_conc_edit)
+        science_form.addRow("Default energy units", self.energy_unit_combo)
+        science_form.addRow("Relative tolerance", self.rtol_edit)
+        science_form.addRow("Absolute tolerance", self.atol_edit)
+        science_form.addRow("", self.analytic_jacobian_check)
+
+        self.use_authored_stops_check = QtWidgets.QCheckBox(
+            "Use Authored Stopping Interventions", science_box
+        )
+        self.use_authored_stops_check.setToolTip(
+            "Apply stopping interventions authored in this mechanism to Run and Preview "
+            "for every initial-condition set, and to Fit datasets with a measured X. "
+            "When enabled, a rule may end integration before t_end. When disabled, "
+            "runs continue to t_end. Fitting against time always ignores stopping interventions."
+        )
+        self._stopping_declarations: tuple[str, ...] = ()
+        self.stopping_info_button = QtWidgets.QPushButton("Authored Rules…", science_box)
+        self.stopping_info_button.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        self.stopping_info_button.clicked.connect(self._show_stopping_declarations)
+        stopping_row = QtWidgets.QHBoxLayout()
+        stopping_row.addWidget(self.use_authored_stops_check)
+        stopping_row.addWidget(self.stopping_info_button)
+        stopping_row.addStretch()
+        science_form.addRow("", stopping_row)
+        science_form.addRow("", self.scientific_defaults_check)
+        self.set_stopping_declarations(())
+        body_layout.addWidget(science_box)
+
+        run_box = QtWidgets.QGroupBox("Run Defaults for New Projects and Tabs", body)
+        run_box.setToolTip(
+            "Run settings that new projects and tabs start with. Existing tabs "
+            "keep their settings. Edit those in the Run panel of each tab."
+        )
+        run_form = QtWidgets.QFormLayout(run_box)
+        self._run_default_fields = _RunSettingsFields(run_form, run_box)
+        body_layout.addWidget(run_box)
+
+        preview_box = QtWidgets.QGroupBox("Preview", body)
+        preview_form = QtWidgets.QFormLayout(preview_box)
+        self.preview_points_edit = QtWidgets.QLineEdit(str(int(preview_points)), preview_box)
+        self.preview_points_edit.setMaximumWidth(190)
+        self.preview_delay_spin = self._integer_spin(
+            0, 1000, preview_delay_ms, preview_box,
+        )
+        self.preview_points_edit.setToolTip(
+            "Output points for all slider previews, including release and typed changes."
+        )
+        self.preview_delay_spin.setToolTip(
+            "Delay before requesting a preview while dragging any slider. "
+            "Release, clicks, and typed changes request a preview immediately."
+        )
+        preview_form.addRow("Preview points", self.preview_points_edit)
+        preview_form.addRow("Preview delay (ms)", self.preview_delay_spin)
+        body_layout.addWidget(preview_box)
+
+        parallel_box = QtWidgets.QGroupBox("Parallel Execution", body)
+        parallel_form = QtWidgets.QFormLayout(parallel_box)
+        self.run_maximum_automatic_check = QtWidgets.QCheckBox(
+            "Automatic (CPU Fallback)",
+            parallel_box,
+        )
+        self.run_maximum_spin = self._integer_spin(
+            1,
+            MAX_PARALLEL_WORKERS_CEILING,
+            1,
+            parallel_box,
+        )
+        self.run_maximum_automatic_check.setToolTip(
+            "Choose parallel execution capacity from the available logical CPUs, "
+            "reserving one when possible and using at most 16 simultaneous simulations."
+        )
+        self.run_maximum_spin.setToolTip(
+            "Maximum number of initial-condition sets simulated simultaneously. "
+            "Execution also respects available CPU capacity and the number of sets. "
+            "Set to 1 for sequential execution."
+        )
+        self.run_maximum_automatic_check.toggled.connect(
+            self.run_maximum_spin.setDisabled
+        )
+        parallel_form.addRow("Run user maximum", self.run_maximum_automatic_check)
+        parallel_form.addRow("Explicit maximum", self.run_maximum_spin)
+        body_layout.addWidget(parallel_box)
+
+        cache_box = QtWidgets.QGroupBox("Result Cache", body)
+        cache_form = QtWidgets.QFormLayout(cache_box)
+        self.cache_capacity_spin = self._integer_spin(
+            1,
+            (1 << 31) - 1,
+            32,
+            cache_box,
+        )
+        self.cache_capacity_spin.setToolTip(
+            "Number of past simulation results kept in memory per mechanism tab. "
+            "Matching results can be restored when enabled for plotting. Larger "
+            "values use more memory. When the cache is full, the least recently "
+            "used results are removed."
+        )
+        cache_form.addRow(
+            "Explicit-result cache capacity",
+            self.cache_capacity_spin,
+        )
+        body_layout.addWidget(cache_box)
+        scroll.setWidget(body)
+        layout.addWidget(scroll, 1)
+        for control in (
+            self.temperature_spin, self.energy_unit_combo, self._run_default_fields.solver_combo,
+            self.preview_delay_spin, self.run_maximum_spin, self.cache_capacity_spin,
+        ):
+            ignore_wheel(control)
+
+        for form in (science_form, run_form, preview_form, parallel_form, cache_form):
+            for row in range(form.rowCount()):
+                field = form.itemAt(row, QtWidgets.QFormLayout.ItemRole.FieldRole).widget()
+                label = form.labelForField(field)
+                if label is not None:
+                    label.setToolTip(field.toolTip())
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setToolTip(
+            "Apply these settings and close."
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Cancel).setToolTip(
+            "Close without applying changes."
+        )
+        buttons.accepted.connect(self._accept_candidate)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        # Scroll only vertically, and open at the groups' natural height when
+        # the screen allows; QScrollArea caps its own size hint.
+        self.ensurePolished()  # the theme style sheet sets the scroll frame
+        chrome = 2 * scroll.frameWidth()
+        scroll.setMinimumWidth(
+            body.minimumSizeHint().width()
+            + scroll.verticalScrollBar().sizeHint().width()
+            + chrome
+        )
+        clamp_initial_size(
             self,
-            title,
-            message,
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.Cancel,
-            QtWidgets.QMessageBox.StandardButton.Cancel,
-        )
-        if resp != QtWidgets.QMessageBox.StandardButton.Yes:
-            return
-
-        if which == "result":
-            result = ctrl.purge_simulation_result_cache()
-        elif which == "preview":
-            result = ctrl.purge_simulation_preview_cache()
-        else:
-            result = ctrl.purge_simulation_all_caches()
-        self._handle_cache_action_outcome(result)
-
-    def _format_cache_line(self, *, label: str, used: int, cap: int, nbytes: int) -> str:
-        mb = float(max(0, int(nbytes))) / (1024.0 * 1024.0)
-        return f"{label} cache: {int(used)}/{int(cap)}, {mb:.1f} MB"
-
-    def _set_cache_status_unavailable(self) -> None:
-        self._label_result_cache_status.setText("Result cache: unavailable")
-        self._label_preview_cache_status.setText("Preview cache: unavailable")
-
-    def _set_cache_status_error(self, message: str, *, overwrite_status_labels: bool) -> None:
-        if overwrite_status_labels:
-            self._set_cache_status_unavailable()
-        text = str(message or "").strip()
-        self._label_cache_status_error.setText(text)
-        self._label_cache_status_error.setVisible(bool(text))
-
-    def _clear_cache_status_error(self) -> None:
-        self._label_cache_status_error.setText("")
-        self._label_cache_status_error.hide()
-
-    def _handle_cache_action_outcome(self, outcome: SimulationCacheOpResult) -> None:
-        if outcome.ok:
-            self._refresh_cache_status()
-            return
-        if outcome.cache_state_changed:
-            refreshed = self._refresh_cache_status()
-            self._set_cache_status_error(
-                outcome.message or "Cache action failed.",
-                overwrite_status_labels=not refreshed,
-            )
-            return
-        self._set_cache_status_error(
-            outcome.message or "Cache action failed.",
-            overwrite_status_labels=True,
+            self.sizeHint().width(),
+            self.sizeHint().height() - scroll.sizeHint().height()
+            + body.sizeHint().height() + chrome,
         )
 
-    def _cache_caps_from_controller(self) -> Optional[Tuple[int, int]]:
-        ctrl = self._cache_port
-        if ctrl is None:
+    @staticmethod
+    def _integer_spin(
+        minimum: int,
+        maximum: int,
+        value: int,
+        parent: QtWidgets.QWidget,
+    ) -> QtWidgets.QSpinBox:
+        spin = QtWidgets.QSpinBox(parent)
+        spin.setRange(int(minimum), int(maximum))
+        spin.setValue(int(value))
+        return spin
+
+    @staticmethod
+    def _positive_spin(
+        *,
+        minimum: float,
+        maximum: float,
+        value: float,
+        decimals: int,
+    ) -> QtWidgets.QDoubleSpinBox:
+        spin = QtWidgets.QDoubleSpinBox()
+        spin.setDecimals(int(decimals))
+        spin.setRange(float(minimum), float(maximum))
+        spin.setValue(float(value))
+        spin.setMaximumWidth(190)
+        return spin
+
+    def set_stopping_declarations(self, declarations: tuple[str, ...]) -> None:
+        self._stopping_declarations = declarations
+        self.stopping_info_button.setEnabled(bool(declarations))
+
+    def _show_stopping_declarations(self) -> None:
+        message = QtWidgets.QMessageBox(self)
+        message.setWindowTitle("Authored Stopping Interventions")
+        message.setTextFormat(QtCore.Qt.PlainText)
+        message.setText("\n".join(self._stopping_declarations))
+        message.setStandardButtons(QtWidgets.QMessageBox.Ok)
+        message.exec()
+
+    def set_scientific_settings(self, settings: TabScientificSettings) -> None:
+        self.temperature_spin.setValue(settings.temperature)
+        self.standard_conc_edit.setText(repr(float(settings.standard_conc_M)))
+        self.energy_unit_combo.setCurrentText(settings.energy_unit)
+        self.rtol_edit.setText(repr(float(settings.rtol)))
+        self.atol_edit.setText(repr(float(settings.atol)))
+        self.analytic_jacobian_check.setChecked(settings.analytic_jacobian_policy)
+        self.use_authored_stops_check.setChecked(settings.use_authored_stops)
+
+    def scientific_settings(self) -> TabScientificSettings:
+        candidate = TabScientificSettings(
+            temperature=float(self.temperature_spin.value()),
+            standard_conc_M=parse_finite_numeric_text(
+                self.standard_conc_edit.text(), field="Default standard concentration"
+            ),
+            energy_unit=self.energy_unit_combo.currentText(),
+            rtol=parse_finite_numeric_text(
+                self.rtol_edit.text(), field="Relative tolerance"
+            ),
+            atol=parse_finite_numeric_text(
+                self.atol_edit.text(), field="Absolute tolerance"
+            ),
+            analytic_jacobian_policy=bool(self.analytic_jacobian_check.isChecked()),
+            use_authored_stops=self.use_authored_stops_check.isChecked(),
+        )
+        return validate_tab_scientific_settings(candidate)
+
+    def persist_scientific_defaults_requested(self) -> bool:
+        """Return the passive application-default persistence intent."""
+
+        return bool(self.scientific_defaults_check.isChecked())
+
+    def set_new_tab_run_defaults(self, settings: SimulationExecutionSettings) -> None:
+        self._run_default_fields.set_settings(settings)
+
+    def new_tab_run_defaults(self) -> SimulationExecutionSettings:
+        return self._run_default_fields.settings()
+
+    def preview_settings(self) -> tuple[int, int]:
+        return (
+            parse_points_text(self.preview_points_edit.text(), field="Preview points"),
+            self.preview_delay_spin.value(),
+        )
+
+    def set_run_user_maximum(self, value: int | None) -> None:
+        self.run_maximum_spin.setRange(1, MAX_PARALLEL_WORKERS_CEILING)
+        automatic = value is None
+        blocker = QtCore.QSignalBlocker(self.run_maximum_automatic_check)
+        try:
+            self.run_maximum_automatic_check.setChecked(automatic)
+        finally:
+            del blocker
+        self.run_maximum_spin.setDisabled(automatic)
+        if not automatic:
+            self.run_maximum_spin.setValue(int(value))
+
+    def run_user_maximum(self) -> int | None:
+        if self.run_maximum_automatic_check.isChecked():
             return None
-        stats_outcome = ctrl.simulation_cache_stats()
-        if not stats_outcome.ok or stats_outcome.stats is None:
-            return None
-        stats = stats_outcome.stats
-        try:
-            r_cap = int((stats.get("result") or {}).get("cap", 0))
-            p_cap = int((stats.get("preview") or {}).get("cap", 0))
-        except Exception:
-            return None
-        return r_cap, p_cap
+        return int(self.run_maximum_spin.value())
 
-    def _refresh_cache_status(self) -> bool:
-        ctrl = self._cache_port
-        if ctrl is None:
-            self._set_cache_status_unavailable()
-            self._set_cache_status_error("Simulation cache controls are unavailable.", overwrite_status_labels=False)
-            return False
-        stats_outcome = ctrl.simulation_cache_stats()
-        if not stats_outcome.ok or stats_outcome.stats is None:
-            self._set_cache_status_error(
-                stats_outcome.message or "Failed to read simulation cache status.",
-                overwrite_status_labels=True,
+    def set_result_cache_capacity(self, value: int) -> None:
+        self.cache_capacity_spin.setValue(int(value))
+
+    def result_cache_capacity(self) -> int:
+        return int(self.cache_capacity_spin.value())
+
+    @QtCore.Slot()
+    def _accept_candidate(self) -> None:
+        try:
+            self.scientific_settings()
+            self.new_tab_run_defaults()
+            self.preview_settings()
+            self.run_user_maximum()
+            self.result_cache_capacity()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Invalid Simulation Settings",
+                str(exc),
             )
-            return False
-
-        stats = stats_outcome.stats
-        r = stats.get("result") or {}
-        p = stats.get("preview") or {}
-        self._label_result_cache_status.setText(
-            self._format_cache_line(
-                label="Result",
-                used=int(r.get("used", 0) or 0),
-                cap=int(r.get("cap", 0) or 0),
-                nbytes=int(r.get("bytes", 0) or 0),
-            )
-        )
-        self._label_preview_cache_status.setText(
-            self._format_cache_line(
-                label="Preview",
-                used=int(p.get("used", 0) or 0),
-                cap=int(p.get("cap", 0) or 0),
-                nbytes=int(p.get("bytes", 0) or 0),
-            )
-        )
-        self._clear_cache_status_error()
-        return True
-
-    def get_settings(self) -> Dict:
-        solver = self._combo_solver.currentText()
-        rtol = float(self._spin_rtol.value())
-        atol = float(self._spin_atol.value())
-        if not (rtol > 0.0):
-            raise ValueError("rtol must be positive")
-        if not (atol > 0.0):
-            raise ValueError("atol must be positive")
-        return {
-            "solver": solver,
-            "rtol": rtol,
-            "atol": atol,
-            "use_sparse_jacobian": bool(self._sparse_checkbox.isChecked()),
-            "wegscheider_cyclicity_enabled": bool(self._wegscheider_checkbox.isChecked()),
-            "max_parallel_batch_workers": int(self._max_parallel_workers_spin.value()),
-            "limit_blas_threads_per_worker": bool(self._limit_blas_checkbox.isChecked()),
-            "slider_preview_solver": str(self._combo_slider_preview_solver.currentText()),
-            "slider_preview_points": int(self._spin_slider_preview_points.value()),
-            "parameter_preview_debounce_ms": int(self._spin_parameter_preview_debounce_ms.value()),
-            "equilibrium_preview_debounce_ms": int(self._spin_equilibrium_preview_debounce_ms.value()),
-            "result_cache_cap": int(self._spin_result_cache_cap.value()),
-            "preview_cache_cap": int(self._spin_preview_cache_cap.value()),
-        }
-
-    def set_settings(self, cfg: Dict) -> None:
-        cfg = dict(cfg or {})
-        from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
-
-        cfg.setdefault("solver", str(DEFAULT_SOLVER_NAME))
-        cfg.setdefault("rtol", 1e-6)
-        cfg.setdefault("atol", 1e-12)
-        cfg.setdefault("use_sparse_jacobian", False)
-        cfg.setdefault("wegscheider_cyclicity_enabled", False)
-        cfg.setdefault("max_parallel_batch_workers", 12)
-        cfg.setdefault("limit_blas_threads_per_worker", True)
-        cfg.setdefault("slider_preview_solver", "LSODA")
-        cfg.setdefault("slider_preview_points", 100)
-        cfg.setdefault("parameter_preview_debounce_ms", 80)
-        cfg.setdefault("equilibrium_preview_debounce_ms", 150)
-        cfg.setdefault("result_cache_cap", None)
-        cfg.setdefault("preview_cache_cap", None)
-        solver = cfg.get("solver")
-        if solver in _SOLVERS:
-            self._combo_solver.setCurrentText(str(solver))
-
-        rtol = cfg.get("rtol")
-        if isinstance(rtol, (int, float)) and rtol > 0:
-            self._spin_rtol.setValue(float(rtol))
-        atol = cfg.get("atol")
-        if isinstance(atol, (int, float)) and atol > 0:
-            self._spin_atol.setValue(float(atol))
-
-        self._sparse_checkbox.setChecked(bool(cfg.get("use_sparse_jacobian")))
-        self._wegscheider_checkbox.setChecked(bool(cfg.get("wegscheider_cyclicity_enabled")))
-        try:
-            workers = int(cfg.get("max_parallel_batch_workers", 12))
-        except Exception:
-            workers = 12
-        self._max_parallel_workers_spin.setValue(max(1, workers))
-        self._limit_blas_checkbox.setChecked(bool(cfg.get("limit_blas_threads_per_worker", True)))
-        slider_preview_solver = cfg.get("slider_preview_solver")
-        if slider_preview_solver in _SOLVERS:
-            self._combo_slider_preview_solver.setCurrentText(str(slider_preview_solver))
-        try:
-            slider_preview_points = int(cfg.get("slider_preview_points", 100))
-        except Exception:
-            slider_preview_points = 100
-        self._spin_slider_preview_points.setValue(max(50, min(20000, slider_preview_points)))
-        try:
-            parameter_preview_debounce_ms = int(cfg.get("parameter_preview_debounce_ms", 80))
-        except Exception:
-            parameter_preview_debounce_ms = 80
-        self._spin_parameter_preview_debounce_ms.setValue(max(0, min(1000, parameter_preview_debounce_ms)))
-        try:
-            equilibrium_preview_debounce_ms = int(cfg.get("equilibrium_preview_debounce_ms", 150))
-        except Exception:
-            equilibrium_preview_debounce_ms = 150
-        self._spin_equilibrium_preview_debounce_ms.setValue(max(0, min(1000, equilibrium_preview_debounce_ms)))
-
-        result_cap = cfg.get("result_cache_cap")
-        preview_cap = cfg.get("preview_cache_cap")
-        if isinstance(result_cap, int) and result_cap >= 0:
-            self._spin_result_cache_cap.setValue(int(result_cap))
-        if isinstance(preview_cap, int) and preview_cap >= 0:
-            self._spin_preview_cache_cap.setValue(int(preview_cap))
-
-        # Align spinboxes with controller state if available (covers persisted settings).
-        caps = self._cache_caps_from_controller()
-        if caps is not None:
-            r_cap, p_cap = caps
-            r_parsed, r_ok = try_parse_int(r_cap)
-            if r_ok:
-                self._spin_result_cache_cap.setValue(int(r_parsed))
-            p_parsed, p_ok = try_parse_int(p_cap)
-            if p_ok:
-                self._spin_preview_cache_cap.setValue(int(p_parsed))
-        self._refresh_cache_status()
-
-    def _on_accept(self) -> None:
-        try:
-            cfg = self.get_settings()
-        except Exception as exc:
-            logger.warning("Invalid simulation settings: %s", exc, exc_info=True)
-            QtWidgets.QMessageBox.critical(self, "Invalid settings", str(exc))
             return
-        self.settingsAccepted.emit(cfg)
         self.accept()

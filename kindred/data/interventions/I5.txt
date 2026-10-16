@@ -1,0 +1,20 @@
+# Run from 0 to 600 s.
+
+A -> B ; k=0.005
+B -> C ; k=0.002
+B + D -> E ; k=0.02
+
+# watch_species names the species used to detect a threshold crossing.
+# direction accepts rising, falling, or either.
+# then contains one action. max_count=1 permits one firing.
+# Use commas between fields inside an operation.
+# A crossing is required. Starting above the threshold does not fire it.
+intervention: op=trigger; watch_species=B; threshold=0.25; direction=rising; max_count=1; min_interval=0.0; then={op=jump,species=D,delta=0.5}
+
+intervention_set1 = {
+  [A] = 1.0
+  [B] = 0.0
+  [C] = 0.0
+  [D] = 0.0
+  [E] = 0.0
+}

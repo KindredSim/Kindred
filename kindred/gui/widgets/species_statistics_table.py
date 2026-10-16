@@ -3,53 +3,48 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Mapping, Optional
 
 import numpy as np
 from PySide6 import QtCore, QtWidgets
-try:
-    from scipy.integrate import trapezoid as _scipy_trapezoid
-except Exception:  # pragma: no cover - scipy is a dependency but keep a safe fallback
-    _scipy_trapezoid = None
+
+from kindred.core.quantity_units import (
+    MOLAR,
+    SECOND,
+    Unit,
+    convert_value,
+    format_unit_for_display,
+)
+from kindred.gui.ui_helpers import SCIENTIFIC_NAME_HTML_ROLE, ScientificNameHeaderView
+from kindred.core.intervention_schedule_compiler import (
+    InterventionExecutionContract,
+)
+from kindred.core.results import integrate_ctc
+from kindred.core.simulator.solver_types import SimulationPresentationBoundary
 
 __all__ = ["SpeciesStatisticsTable"]
 
-# P3 ENHANCEMENT: Named constants for CTC calculation thresholds
-# Minimum absolute threshold for considering a species "converged to zero"
-CTC_ABSOLUTE_THRESHOLD = 1e-10
 
-# Relative threshold as fraction of maximum concentration
-CTC_RELATIVE_THRESHOLD = 0.01  # 1% of max concentration
-
-
-def _trapezoid_integral(y: np.ndarray, x: np.ndarray) -> float:
-    """Integrate y(x) using the best available trapezoid implementation."""
-    for fn in (getattr(np, "trapezoid", None), getattr(np, "trapz", None), _scipy_trapezoid):
-        if callable(fn):
-            return float(fn(y, x))
-    raise AttributeError(
-        "No trapezoid integration function available; expected numpy.trapezoid, "
-        "numpy.trapz, or scipy.integrate.trapezoid."
-    )
+def _display_statistic(value: float, source: Unit, target: Unit) -> str:
+    try:
+        return f"{convert_value(value, source, target):.6g}"
+    except ValueError:
+        return "Unavailable"
 
 
 class SpeciesStatisticsTable(QtWidgets.QTableWidget):
     """
-    Bottom panel showing final concentrations, max values, equilibrium times, and fit stats.
+    Bottom panel showing simulation-owned species statistics.
 
     Displays per-species statistics including:
     - Species name
     - Final concentration at t_end
     - Maximum concentration reached
     - Time at which maximum occurs
-    - Chi-squared goodness of fit (from fitting)
-    - CTC (Concentration-Time Curve) - baseline-corrected integral
+    - CTC (Concentration-Time Curve) - fixed-policy scalar integral
 
-    The CTC calculation uses smart logic:
-    - For species converging to ~0: CTC = ∫C dt (area under curve)
-    - For species converging to C_final: CTC = ∫|C - C_final| dt (deviation from equilibrium)
-
-    This prevents infinite growth for species with non-zero equilibrium values.
+    CTC uses one deterministic native-grid trapezoid policy. A nonfinite
+    numerical result is rendered as unavailable by the typed result owner.
     """
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
@@ -62,113 +57,142 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
             Parent widget
         """
         super().__init__(parent)
+        self.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
 
         # Configure table
-        self.setColumnCount(6)
+        self.setColumnCount(5)
+        self.setHorizontalHeader(
+            ScientificNameHeaderView(QtCore.Qt.Orientation.Horizontal, self)
+        )
         self.setHorizontalHeaderLabels([
-            "Species", "Final", "Max", "t@Max", "χ²", "CTC"
+            "Species", "Final", "Max", "t@Max", "CTC"
         ])
 
         # Add tooltips to explain each column
         header = self.horizontalHeader()
-        header.setToolTip("Species: Chemical species name")
-        self.horizontalHeaderItem(0).setToolTip("Species name")
-        self.horizontalHeaderItem(1).setToolTip("Final concentration at t_end")
-        self.horizontalHeaderItem(2).setToolTip("Maximum concentration reached")
-        self.horizontalHeaderItem(3).setToolTip("Time at which maximum concentration occurs")
-        self.horizontalHeaderItem(4).setToolTip("Chi-squared goodness of fit (from fitting)")
-        self.horizontalHeaderItem(5).setToolTip(
-            "Concentration-Time Curve (baseline-corrected):\n"
-            "• Species → 0: ∫C dt (area under curve)\n"
-            "• Species → C_final: ∫|C - C_final| dt (deviation from equilibrium)"
+        self.horizontalHeaderItem(0).setToolTip("Species name.")
+        self.horizontalHeaderItem(1).setToolTip("Concentration at the last returned simulation sample.")
+        self.horizontalHeaderItem(2).setToolTip("Maximum concentration reached.")
+        self.horizontalHeaderItem(3).setToolTip("Time at which maximum concentration occurs.")
+        self.horizontalHeaderItem(4).setToolTip(
+            "Concentration-time integral. If the final concentration is zero, "
+            "integrate the concentration over time. Otherwise, integrate its "
+            "absolute difference from the final concentration. Unavailable for "
+            "simulations with interventions or when the calculation produces a "
+            "nonfinite result."
         )
 
-        header.setStretchLastSection(False)
+        header.setStretchLastSection(True)
         for col in range(self.columnCount()):
             header.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(0, QtWidgets.QHeaderView.Interactive)  # Species
-        self.setColumnWidth(0, 140)
         self.setAlternatingRowColors(True)
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Expanding,
         )
 
-    def update_results(self, t: np.ndarray, species_data: Dict[str, np.ndarray],
-                       chi_squared: Optional[float] = None):
+    def sizeHintForColumn(self, column: int) -> int:
+        width = super().sizeHintForColumn(column)
+        # Qt also accounts for the header, so "Species" always fits.
+        return min(width, 140) if column == 0 else width
+
+    def update_results(
+        self,
+        canonical_time: np.ndarray,
+        species_data: Mapping[str, np.ndarray],
+        *,
+        intervention_execution: InterventionExecutionContract,
+        presentation_boundaries: tuple[SimulationPresentationBoundary, ...],
+        concentration_display_unit: Unit,
+        time_display_unit: Unit,
+    ) -> None:
         """
         Update table with simulation results.
 
         Parameters
         ----------
-        t : np.ndarray
-            Time array
+        canonical_time : np.ndarray
+            Canonical ``SimulationResultValue.t`` array. Display X is invalid
+            at this scientific-statistics boundary.
         species_data : dict
             Dictionary of {species_name: concentration_array}
-        chi_squared : float, optional
-            Chi-squared value for fitting results
+        intervention_execution : InterventionExecutionContract
+            Accepted Run intervention truth. Any intervention makes CTC
+            inapplicable for the complete result.
+        presentation_boundaries : tuple, optional
+            Every retained intervention boundary state of the primary result;
+            these contribute to Max and t@Max without becoming table rows.
         """
-        # Clear existing rows
-        self.setRowCount(0)
-
-        # Add row for each species
-        for i, (species_name, concentrations) in enumerate(sorted(species_data.items())):
-            self.insertRow(i)
-
-            # Column 0: Species name
-            _item0 = QtWidgets.QTableWidgetItem(species_name)
-            _item0.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.setItem(i, 0, _item0)
-
-            # Column 1: Final concentration
+        ctc_unit = concentration_display_unit.multiply(time_display_unit)
+        for column, label, unit in (
+            (1, "Final", concentration_display_unit),
+            (2, "Max", concentration_display_unit),
+            (3, "t@Max", time_display_unit),
+            (4, "CTC", ctc_unit),
+        ):
+            header_item = self.horizontalHeaderItem(column)
+            unit_text = unit.symbol
+            header_item.setText(f"{label} ({unit_text})")
+            header_item.setData(
+                SCIENTIFIC_NAME_HTML_ROLE,
+                f"{label} ({format_unit_for_display(unit)})",
+            )
+            header_item.setToolTip(
+                f"{label} in {format_unit_for_display(unit)}."
+            )
+        ctc_applicable = intervention_execution.is_empty
+        projected_roster = tuple(sorted(species_data))
+        calculated: list[tuple[str, ...]] = []
+        for species_name in projected_roster:
+            concentrations = species_data[species_name]
             final_conc = concentrations[-1]
-            _item1 = QtWidgets.QTableWidgetItem(f"{final_conc:.6g}")
-            _item1.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.setItem(i, 1, _item1)
-
-            # Column 2: Maximum concentration
             max_conc = np.max(concentrations)
-            _item2 = QtWidgets.QTableWidgetItem(f"{max_conc:.6g}")
-            _item2.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.setItem(i, 2, _item2)
-
-            # Column 3: Time at maximum (t@Max)
             idx_max = np.argmax(concentrations)
-            t_at_max = t[idx_max]
-            _item3 = QtWidgets.QTableWidgetItem(f"{t_at_max:.6g}")
-            _item3.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.setItem(i, 3, _item3)
+            max_time = canonical_time[idx_max]
+            for boundary in presentation_boundaries:
+                for state in boundary.states:
+                    boundary_value = dict(state.concentrations).get(species_name)
+                    if boundary_value is not None and boundary_value > max_conc:
+                        max_conc = boundary_value
+                        max_time = boundary.time
+            final_text = _display_statistic(final_conc, MOLAR, concentration_display_unit)
+            maximum_text = _display_statistic(max_conc, MOLAR, concentration_display_unit)
+            time_text = _display_statistic(max_time, SECOND, time_display_unit)
+            ctc_text = "—"
+            if ctc_applicable:
+                integrand = (
+                    concentrations
+                    if final_conc == 0.0
+                    else np.abs(concentrations - final_conc)
+                )
+                ctc = integrate_ctc(canonical_time, integrand)
+                ctc_text = "Unavailable"
+                if ctc.available:
+                    source_unit = MOLAR.multiply(SECOND)
+                    ctc_text = _display_statistic(ctc.value, source_unit, ctc_unit)
+            calculated.append(
+                (
+                    species_name,
+                    final_text,
+                    maximum_text,
+                    time_text,
+                    ctc_text,
+                )
+            )
+        rows = tuple(calculated)
 
-            # Column 4: χ² (only if provided, from fitting)
-            if chi_squared is not None:
-                _item4 = QtWidgets.QTableWidgetItem(f"{chi_squared:.6g}")
-            else:
-                _item4 = QtWidgets.QTableWidgetItem("—")
-            _item4.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.setItem(i, 4, _item4)
-
-            # Column 5: CTC (Concentration-Time Curve)
-            # Baseline-corrected integral measuring deviation from equilibrium:
-            # - Species → 0: ∫C dt (area under curve)
-            # - Species → C_final ≠ 0: ∫|C - C_final| dt (deviation from baseline)
-
-            # P3 FIX: Use named constants instead of magic numbers
-            # Check if species converges to near-zero
-            threshold = max(CTC_ABSOLUTE_THRESHOLD,
-                          CTC_RELATIVE_THRESHOLD * np.max(np.abs(concentrations)))
-
-            if abs(final_conc) < threshold:
-                # Converges to zero → area under curve (no baselining needed)
-                ctc = _trapezoid_integral(concentrations, t)
-            else:
-                # Converges to non-zero → baseline-corrected area
-                # Measures total deviation from equilibrium (finite even for long times)
-                deviation = np.abs(concentrations - final_conc)
-                ctc = _trapezoid_integral(deviation, t)
-
-            _item5 = QtWidgets.QTableWidgetItem(f"{ctc:.6g}")
-            _item5.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.setItem(i, 5, _item5)
-
-        # Force immediate visual update for WSL/X11 environments
-        self.viewport().repaint()
+        names = tuple(row[0] for row in rows)
+        current_names = tuple(
+            self.item(row, 0).text() if self.item(row, 0) is not None else ""
+            for row in range(self.rowCount())
+        )
+        if current_names != names:
+            self.setRowCount(len(rows))
+            for row in range(len(rows)):
+                for column in range(self.columnCount()):
+                    item = QtWidgets.QTableWidgetItem()
+                    item.setTextAlignment(QtCore.Qt.AlignCenter)
+                    self.setItem(row, column, item)
+        for row, values in enumerate(rows):
+            for column, value in enumerate(values):
+                self.item(row, column).setText(value)

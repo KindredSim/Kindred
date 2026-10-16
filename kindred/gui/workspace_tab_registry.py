@@ -1,0 +1,755 @@
+"""Active mechanism-tab lifecycle and noncanonical per-tab state."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Callable, Iterable, Mapping
+
+from kindred.core.mechanism_source import MechanismAuthoringSource
+from kindred.core.project_document import (
+    InitialConditionSet,
+    MechanismTabDocument,
+    ProjectDocument,
+    SimulationExecutionSettings,
+    TabScientificSettings,
+    canonical_initial_values,
+    new_set_id,
+    new_tab_id,
+    prepare_tab_scientific_settings,
+)
+from kindred.core.project_session import ProjectContentToken, ProjectSession
+from kindred.core.project_presentation_state import (
+    ProjectPresentationState,
+    WorkspacePresentationState,
+    default_project_presentation_state,
+    reconcile_workspace_presentation_state,
+    validate_project_presentation_state,
+)
+
+if TYPE_CHECKING:
+    from kindred.core.result_repository import ResultRepository
+
+__all__ = [
+    "ScientificDocumentDelta",
+    "TabRuntimeState",
+    "WorkspaceTabRegistry",
+]
+
+
+@dataclass(slots=True)
+class TabRuntimeState:
+    """Noncanonical authoring and transient view state for exactly one tab."""
+
+    result_repository: ResultRepository
+    reactions_draft: MechanismAuthoringSource | None = None
+    notes_draft: str | None = None
+    # Raw authored concentration text which has not yet crossed the normal
+    # cell-settlement boundary.  Entries intentionally include both valid and
+    # invalid text; validity is derived at the owner that admits a value.
+    initial_text_by_set_id: dict[str, dict[str, str]] = field(
+        default_factory=dict
+    )
+    selected_run_set_ids: tuple[str, ...] = ()
+    slider_parameter_draft: dict[str, float] = field(default_factory=dict)
+    slider_species_drafts_by_set_id: dict[str, dict[str, float]] = field(
+        default_factory=dict
+    )
+
+    @property
+    def has_slider_draft(self) -> bool:
+        # Species drafts exist only for the current Slider targets.
+        return bool(
+            self.slider_parameter_draft or self.slider_species_drafts_by_set_id
+        )
+
+    @property
+    def has_dirty_drafts(self) -> bool:
+        return bool(
+            self.reactions_draft is not None
+            or self.notes_draft is not None
+            or self.initial_text_by_set_id
+            or self.has_slider_draft
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ScientificDocumentDelta:
+    """The surviving and retired targets in one canonical document delta.
+
+    ``affected_targets_by_tab`` is deliberately limited to set identities that
+    survive in the replacement document.  ``removed_targets_by_tab`` contains
+    identities that must be retired from the old physical result owners.
+    """
+
+    affected_targets_by_tab: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    removed_targets_by_tab: tuple[tuple[str, tuple[str, ...]], ...] = ()
+
+    def targets_by_tab(self) -> dict[str, tuple[str, ...]]:
+        """Return affected and removed set IDs per tab; the two are disjoint."""
+
+        merged: dict[str, tuple[str, ...]] = {}
+        for tab_id, set_ids in (
+            *self.affected_targets_by_tab, *self.removed_targets_by_tab,
+        ):
+            merged[tab_id] = (*merged.get(tab_id, ()), *set_ids)
+        return merged
+
+
+class WorkspaceTabRegistry:
+    """Sole live active-tab ID plus presentation and transient tab state."""
+
+    def __init__(
+        self,
+        session: ProjectSession,
+        *,
+        computation_fence: Callable[[ScientificDocumentDelta], None],
+        post_document_publication: Callable[[ScientificDocumentDelta], None],
+        runtime_factory: Callable[[str], TabRuntimeState],
+    ) -> None:
+        self._session = session
+        self._computation_fence = computation_fence
+        self._post_document_publication = post_document_publication
+        self._runtime_factory = runtime_factory
+        self._active_tab_id = ""
+        self._presentation_by_tab_id: tuple[
+            tuple[str, ProjectPresentationState], ...
+        ] = ()
+        presentation = session.saved_baseline.presentation
+        self._assign_workspace_state(
+            presentation, self._fresh_runtimes(presentation),
+        )
+
+    def _fresh_runtimes(
+        self, presentation: WorkspacePresentationState,
+    ) -> tuple[tuple[str, TabRuntimeState], ...]:
+        """Fresh per-tab runtime; each restored current row is the Run selection."""
+
+        runtimes = []
+        for tab_id, state in presentation.presentation_by_tab_id:
+            runtime = self._runtime_factory(tab_id)
+            if state.current_set_id is not None:
+                runtime.selected_run_set_ids = (state.current_set_id,)
+            runtimes.append((tab_id, runtime))
+        return tuple(runtimes)
+
+    def _assign_workspace_state(
+        self,
+        presentation: WorkspacePresentationState,
+        runtime_by_tab_id: tuple[tuple[str, TabRuntimeState], ...],
+    ) -> None:
+        """Assign the registry's direct presentation/runtime owners once."""
+
+        self._active_tab_id = presentation.active_tab_id
+        self._presentation_by_tab_id = presentation.presentation_by_tab_id
+        self._runtime_by_tab_id = runtime_by_tab_id
+
+    @property
+    def active_tab_id(self) -> str:
+        return self._active_tab_id
+
+    @property
+    def document(self) -> ProjectDocument:
+        """Expose current canonical truth to staged physical consumers."""
+
+        return self._session.document
+
+    def tab(self, tab_id: str) -> MechanismTabDocument:
+        """Return canonical truth for exactly one caller-supplied tab ID."""
+
+        return self._session.document.tab(tab_id)
+
+    def capture_content_token(self) -> ProjectContentToken:
+        return self._session.capture_content_token()
+
+    def presentation(self, tab_id: str) -> ProjectPresentationState:
+        return dict(self._presentation_by_tab_id)[tab_id]
+
+    def tab_runtime(self, tab_id: str) -> TabRuntimeState:
+        return dict(self._runtime_by_tab_id)[tab_id]
+
+    def presentation_items(self) -> tuple[tuple[str, ProjectPresentationState], ...]:
+        return self._presentation_by_tab_id
+
+    def workspace_presentation(self) -> WorkspacePresentationState:
+        return WorkspacePresentationState(
+            active_tab_id=self.active_tab_id,
+            presentation_by_tab_id=self.presentation_items(),
+        )
+
+    def replace_project(
+        self,
+        document: ProjectDocument,
+        presentation: WorkspacePresentationState,
+        *,
+        path: str | None,
+        baseline_document: ProjectDocument,
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        """Commit one admitted complete project and its workspace state."""
+
+        if not self._session.is_content_token_current(expected_token):
+            return None
+        runtime_by_tab_id = self._fresh_runtimes(presentation)
+        token = self._session.replace_project(
+            document,
+            presentation,
+            path=path,
+            baseline_document=baseline_document,
+            expected_token=expected_token,
+        )
+        if token is None:
+            return None
+        self._assign_workspace_state(presentation, runtime_by_tab_id)
+        return token
+
+    def replace_document(
+        self,
+        document: ProjectDocument,
+        *,
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        """Publish one admitted document mutation directly."""
+
+        if not self._session.is_content_token_current(expected_token):
+            return None
+        previous = self._session.document
+        changed = document != previous
+        existing_presentation = dict(self._presentation_by_tab_id)
+        active_tab_id = (
+            self.active_tab_id
+            if any(tab.tab_id == self.active_tab_id for tab in document.tabs)
+            else document.tabs[0].tab_id
+        )
+        next_workspace = WorkspacePresentationState(
+            active_tab_id=active_tab_id,
+            presentation_by_tab_id=tuple(
+                (
+                    tab.tab_id,
+                    existing_presentation[tab.tab_id]
+                    if tab.tab_id in existing_presentation
+                    else default_project_presentation_state(tab),
+                )
+                for tab in document.tabs
+            ),
+        )
+        # One reconcile pass also validates the complete workspace state.
+        next_workspace = reconcile_workspace_presentation_state(
+            document,
+            next_workspace,
+        )
+        existing_runtime = dict(self._runtime_by_tab_id)
+        next_runtime = tuple(
+            (
+                tab.tab_id,
+                existing_runtime[tab.tab_id]
+                if tab.tab_id in existing_runtime
+                else self._runtime_factory(tab.tab_id),
+            )
+            for tab in document.tabs
+        )
+        delta = self.scientific_document_delta(previous, document)
+        if changed and (
+            delta.affected_targets_by_tab or delta.removed_targets_by_tab
+        ):
+            self._prepare_document_delta(delta, previous, document)
+        token = self._session.replace_document(
+            document,
+            expected_token=expected_token,
+        )
+        if token is None:
+            return None
+        self._assign_workspace_state(next_workspace, next_runtime)
+        if changed:
+            self._post_document_publication(delta)
+        return token
+
+    def _prepare_document_delta(
+        self,
+        delta: ScientificDocumentDelta,
+        previous: ProjectDocument,
+        replacement: ProjectDocument,
+    ) -> None:
+        """Retire computation and old results before publication."""
+
+        self._computation_fence(delta)
+
+        existing_runtime = dict(self._runtime_by_tab_id)
+        previous_by_tab_id = {tab.tab_id: tab for tab in previous.tabs}
+        replacement_by_tab_id = {tab.tab_id: tab for tab in replacement.tabs}
+        # Unapplied Slider values belong to the parsed mechanism they were set
+        # on; any accepted change to a tab's mechanism discards them.
+        for tab_id, runtime in existing_runtime.items():
+            old_tab, new_tab = previous_by_tab_id.get(tab_id), replacement_by_tab_id.get(tab_id)
+            if old_tab is not None and new_tab is not None and old_tab.prepared_dsl is not new_tab.prepared_dsl:
+                runtime.slider_parameter_draft.clear()
+                runtime.slider_species_drafts_by_set_id.clear()
+        for tab_id, affected_ids in delta.affected_targets_by_tab:
+            runtime = existing_runtime.get(tab_id)
+            if runtime is not None:
+                repository = runtime.result_repository
+                previous_tab = previous_by_tab_id.get(tab_id)
+                replacement_tab = replacement_by_tab_id.get(tab_id)
+                if (
+                    previous_tab is not None
+                    and replacement_tab is not None
+                    and previous_tab.prepared_dsl is not replacement_tab.prepared_dsl
+                ):
+                    repository.purge_sets(affected_ids)
+                else:
+                    repository.deauthorize_sets(affected_ids)
+        for tab_id, removed_ids in delta.removed_targets_by_tab:
+            runtime = existing_runtime.get(tab_id)
+            if runtime is not None:
+                removed = set(removed_ids)
+                runtime.selected_run_set_ids = tuple(
+                    set_id
+                    for set_id in runtime.selected_run_set_ids
+                    if set_id not in removed
+                )
+                for set_id in removed:
+                    runtime.initial_text_by_set_id.pop(set_id, None)
+                    runtime.slider_species_drafts_by_set_id.pop(set_id, None)
+                runtime.result_repository.purge_sets(removed_ids)
+
+    def select_tab(
+        self,
+        tab_id: str,
+    ) -> None:
+        target = tab_id
+        self._session.document.tab(target)
+        if target == self.active_tab_id:
+            return
+        self._active_tab_id = target
+
+    def set_presentation(
+        self,
+        tab_id: str,
+        state: ProjectPresentationState,
+    ) -> None:
+        tab = self._session.document.tab(tab_id)
+        candidate = validate_project_presentation_state(
+            self._session.document,
+            tab,
+            state.reconciled(self._session.document, tab),
+        )
+        current = self.presentation(tab.tab_id)
+        if candidate == current:
+            return
+        self._presentation_by_tab_id = tuple(
+            (current_id, candidate if current_id == tab.tab_id else current)
+            for current_id, current in self._presentation_by_tab_id
+        )
+
+    def set_intervention_annotations_visible(
+        self,
+        tab_id: str,
+        visible: bool,
+    ) -> None:
+        state = self.presentation(tab_id)
+        self.set_presentation(
+            tab_id,
+            replace(
+                state,
+                intervention_annotations_visible=visible,
+                intervention_labels_visible=visible,
+            ),
+        )
+
+    def set_intervention_labels_visible(
+        self,
+        tab_id: str,
+        visible: bool,
+    ) -> None:
+        state = self.presentation(tab_id)
+        self.set_presentation(
+            tab_id,
+            replace(
+                state,
+                intervention_annotations_visible=(
+                    visible or state.intervention_annotations_visible
+                ),
+                intervention_labels_visible=visible,
+            ),
+        )
+
+    def create_tab(
+        self,
+        *,
+        run_defaults: SimulationExecutionSettings,
+        scientific_settings: TabScientificSettings,
+        expected_token: ProjectContentToken,
+    ) -> MechanismTabDocument | None:
+        candidate = self._session.document.add_tab(
+            run_defaults=run_defaults,
+            scientific_settings=scientific_settings,
+        )
+        created = candidate.tabs[-1]
+        if self.replace_document(
+            candidate,
+            expected_token=expected_token,
+        ) is None:
+            return None
+        self._active_tab_id = created.tab_id
+        # A new tab starts like a replaced project: its current row is the
+        # sole Run selection.
+        current_set_id = self.presentation(created.tab_id).current_set_id
+        if current_set_id is not None:
+            self.tab_runtime(created.tab_id).selected_run_set_ids = (current_set_id,)
+        return created
+
+    def copy_tab(
+        self,
+        tab_id: str,
+        *,
+        expected_token: ProjectContentToken,
+    ) -> MechanismTabDocument | None:
+        """Copy accepted setup and retained results without touching source drafts."""
+
+        document, copied, set_ids = self.prepare_tab_copy(tab_id, name_suffix="Copy")
+        return self.publish_tab_copy(
+            tab_id, copied, set_ids, document,
+            expected_token=expected_token, activate=True,
+        )
+
+    def prepare_tab_copy(
+        self,
+        tab_id: str,
+        *,
+        name_suffix: str,
+    ) -> tuple[ProjectDocument, MechanismTabDocument, dict[str, str]]:
+        """Prepare an accepted-state copy with fresh identities, without publication."""
+
+        document = self.document
+        source = document.tab(tab_id)
+        names = {tab.name.casefold() for tab in document.tabs}
+        base_name = f"{source.name} — {name_suffix}"
+        name, suffix = base_name, 2
+        while name.casefold() in names:
+            name = f"{base_name} {suffix}"
+            suffix += 1
+        set_ids = {
+            item.set_id: new_set_id() for item in source.initial_condition_sets
+        }
+        copied = replace(
+            source,
+            tab_id=new_tab_id(),
+            name=name,
+            initial_condition_sets=tuple(
+                replace(item, set_id=set_ids[item.set_id])
+                for item in source.initial_condition_sets
+            ),
+            run_overrides_by_set_id=tuple(
+                (set_ids[sid], settings)
+                for sid, settings in source.run_overrides_by_set_id
+            ),
+            dataset_links=tuple(
+                (
+                    did,
+                    replace(link, set_id=set_ids[link.set_id] if link.set_id else None),
+                )
+                for did, link in source.dataset_links
+            ),
+        )
+        index = next(
+            i for i, tab in enumerate(document.tabs) if tab.tab_id == tab_id
+        ) + 1
+        candidate = replace(
+            document, tabs=(*document.tabs[:index], copied, *document.tabs[index:])
+        )
+        return candidate, copied, set_ids
+
+    def publish_tab_copy(
+        self,
+        tab_id: str,
+        copied: MechanismTabDocument,
+        set_ids: Mapping[str, str],
+        document: ProjectDocument,
+        *,
+        expected_token: ProjectContentToken,
+        activate: bool,
+    ) -> MechanismTabDocument | None:
+        """Publish a prepared copy, retaining only Runs matching its final inputs."""
+
+        if not self._session.is_content_token_current(expected_token):
+            return None
+        final_copy = document.tab(copied.tab_id)
+        state = self.presentation(tab_id)
+        presentation = replace(
+            state,
+            current_set_id=(
+                set_ids[state.current_set_id] if state.current_set_id else None
+            ),
+            plot_set_ids=tuple(set_ids[sid] for sid in state.plot_set_ids),
+            pinned_slider_set_ids=(),
+        )
+        presentation = validate_project_presentation_state(
+            document, final_copy, presentation.reconciled(document, final_copy),
+        )
+        delta = self.scientific_document_delta(document.replace_tab(copied), document)
+        changed_ids = set(delta.targets_by_tab().get(copied.tab_id, ()))
+        matching_set_ids = {
+            source_id: destination_id for source_id, destination_id in set_ids.items()
+            if destination_id not in changed_ids
+        }
+        source_runtime = self.tab_runtime(tab_id)
+        repository = source_runtime.result_repository
+        if self.replace_document(document, expected_token=expected_token) is None:
+            return None
+        self._presentation_by_tab_id = tuple(
+            (current_id, presentation if current_id == copied.tab_id else current)
+            for current_id, current in self._presentation_by_tab_id
+        )
+        runtime = self.tab_runtime(copied.tab_id)
+        runtime.selected_run_set_ids = tuple(
+            set_ids[sid] for sid in source_runtime.selected_run_set_ids
+        )
+        runtime.result_repository.copy_accepted_runs_from(repository, matching_set_ids)
+        if activate:
+            self.select_tab(copied.tab_id)
+        return final_copy
+
+    def reorder_tabs(
+        self,
+        tab_ids: tuple[str, ...],
+        *,
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        document = self.document
+        candidate = replace(
+            document, tabs=tuple(document.tab(tab_id) for tab_id in tab_ids)
+        )
+        return self.replace_document(candidate, expected_token=expected_token)
+
+    def rename_tab(
+        self,
+        tab_id: str,
+        name: str,
+        *,
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        candidate = self._session.document.rename_tab(tab_id, name)
+        return self.replace_document(candidate, expected_token=expected_token)
+
+    def close_tab(
+        self,
+        tab_id: str,
+        *,
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        """Close an eligible tab and return its successor content token.
+
+        Return ``None`` when the expected project content is no longer current.
+        """
+        document = self._session.document
+        target = tab_id
+        index = next(index for index, tab in enumerate(document.tabs) if tab.tab_id == target)
+        was_active = self.active_tab_id == target
+        candidate = document.remove_tab(target)
+        result = self.replace_document(
+            candidate,
+            expected_token=expected_token,
+        )
+        if result is None:
+            return None
+        if was_active:
+            self._active_tab_id = candidate.tabs[
+                min(index, len(candidate.tabs) - 1)
+            ].tab_id
+        return result
+
+    def tab_has_content(
+        self,
+        tab_id: str,
+        *,
+        fresh_run_defaults: SimulationExecutionSettings | None = None,
+        fresh_scientific_settings: TabScientificSettings | None = None,
+    ) -> bool:
+        tab = self._session.document.tab(tab_id)
+        return bool(
+            tab.has_canonical_content(
+                fresh_run_defaults=fresh_run_defaults,
+                fresh_scientific_settings=fresh_scientific_settings,
+            )
+            or not self.presentation(tab_id).is_default_for(tab)
+        )
+
+    def replace_tab(
+        self,
+        tab: MechanismTabDocument,
+        *,
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        candidate = self._session.document.replace_tab(tab)
+        return self.replace_document(candidate, expected_token=expected_token)
+
+    def mutate_tab(
+        self,
+        tab_id: str,
+        mutation: Callable[[MechanismTabDocument], MechanismTabDocument],
+        *,
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        target = self.tab(tab_id)
+        candidate = mutation(target)
+        return self.replace_tab(
+            candidate,
+            expected_token=expected_token,
+        )
+
+    def replace_initial_condition_set(
+        self,
+        tab_id: str,
+        initial_set: InitialConditionSet,
+        *,
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        tab = self.tab(tab_id)
+        candidate = tab.replace_initial_condition_set(initial_set)
+        return self.replace_tab(
+            candidate,
+            expected_token=expected_token,
+        )
+
+    def set_run_defaults(
+        self,
+        tab_id: str,
+        settings: SimulationExecutionSettings,
+        *,
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        tab = self.tab(tab_id)
+        return self.replace_tab(
+            tab.with_run_defaults(settings),
+            expected_token=expected_token,
+        )
+
+    def set_run_override(
+        self,
+        tab_id: str,
+        set_id: str,
+        settings: SimulationExecutionSettings | None,
+        *,
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        tab = self.tab(tab_id)
+        target = tab.initial_condition_set(set_id).set_id
+        return self.replace_tab(
+            tab.with_run_override(target, settings),
+            expected_token=expected_token,
+        )
+
+    def set_scientific_settings(
+        self,
+        tab_id: str,
+        settings: TabScientificSettings,
+        *,
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        tab = self.tab(tab_id)
+        candidate_tab = prepare_tab_scientific_settings(tab, settings)
+        candidate_document = self._session.document.replace_tab(candidate_tab)
+        return self.replace_document(
+            candidate_document,
+            expected_token=expected_token,
+        )
+
+    def remove_initial_condition_sets(
+        self,
+        tab_id: str,
+        set_ids: Iterable[str],
+        *,
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        targets = tuple(dict.fromkeys(str(set_id) for set_id in set_ids))
+        if not targets:
+            if not self._session.is_content_token_current(expected_token):
+                return None
+            return self._session.capture_content_token()
+        tab = self.tab(tab_id)
+        candidate = tab.without_initial_condition_sets(targets)
+        return self.replace_tab(
+            candidate,
+            expected_token=expected_token,
+        )
+
+    @staticmethod
+    def scientific_document_delta(
+        previous: ProjectDocument,
+        current: ProjectDocument,
+    ) -> ScientificDocumentDelta:
+        previous_tabs = {tab.tab_id: tab for tab in previous.tabs}
+        affected_by_tab: list[tuple[str, tuple[str, ...]]] = []
+        for tab in current.tabs:
+            old_tab = previous_tabs.get(tab.tab_id)
+            if old_tab is None:
+                continue
+            old_sets = {
+                initial_set.set_id: initial_set
+                for initial_set in old_tab.initial_condition_sets
+            }
+            existing_set_ids = tuple(
+                initial_set.set_id
+                for initial_set in tab.initial_condition_sets
+                if initial_set.set_id in old_sets
+            )
+            if old_tab.mechanism_source != tab.mechanism_source:
+                if existing_set_ids:
+                    affected_by_tab.append(
+                        (
+                            tab.tab_id,
+                            existing_set_ids,
+                        )
+                    )
+                continue
+            changed: list[str] = []
+            for initial_set in tab.initial_condition_sets:
+                old_set = old_sets.get(initial_set.set_id)
+                if old_set is None:
+                    continue
+                # Sparse omissions and explicit zeros are the same accepted science.
+                if canonical_initial_values(
+                    old_tab, initial_set.set_id,
+                ) != canonical_initial_values(tab, initial_set.set_id):
+                    changed.append(initial_set.set_id)
+                    continue
+                if (
+                    old_tab.resolved_execution_settings(initial_set.set_id)
+                    != tab.resolved_execution_settings(initial_set.set_id)
+                ):
+                    changed.append(initial_set.set_id)
+            if old_tab.scientific_settings != tab.scientific_settings:
+                changed = list(existing_set_ids)
+            if changed:
+                affected_by_tab.append(
+                    (
+                        tab.tab_id,
+                        tuple(dict.fromkeys(changed)),
+                    )
+                )
+        current_tab_ids = {tab.tab_id for tab in current.tabs}
+        removed_by_tab: list[tuple[str, tuple[str, ...]]] = []
+        for old_tab in previous.tabs:
+            old_set_ids = tuple(
+                initial_set.set_id
+                for initial_set in old_tab.initial_condition_sets
+            )
+            if old_tab.tab_id not in current_tab_ids:
+                if old_set_ids:
+                    removed_by_tab.append((old_tab.tab_id, old_set_ids))
+                continue
+            current_tab = next(
+                tab for tab in current.tabs if tab.tab_id == old_tab.tab_id
+            )
+            current_set_ids = {
+                initial_set.set_id
+                for initial_set in current_tab.initial_condition_sets
+            }
+            removed_set_ids = tuple(
+                set_id for set_id in old_set_ids if set_id not in current_set_ids
+            )
+            if removed_set_ids:
+                removed_by_tab.append((old_tab.tab_id, removed_set_ids))
+        return ScientificDocumentDelta(
+            affected_targets_by_tab=tuple(affected_by_tab),
+            removed_targets_by_tab=tuple(removed_by_tab),
+        )

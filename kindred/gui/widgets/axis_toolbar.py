@@ -3,91 +3,118 @@ Inline Axis Toolbar widget.
 
 Control-surface contract
 ------------------------
-- X dropdown: `t` by default. Any time-varying algebra symbol is allowed.
-- Y multi-select: all time-varying species and algebra series. Scalars disabled.
-- Add Guide from Scalar (exposed via Options menu stub entry).
-- Parametric toggle: plot X(t) vs each Y_i(t). Plotting may resample for
-  smoothness, but resampling never affects CTC (enforced in plotting layer).
-- Options: sampling choice for plotting, guide management, export scoping.
+- X dropdown: typed simulation or experimental identity, with `t` by default.
+- Y multi-select: all time-varying species and algebra series.
+- Display units and a separate row of compact manual axis limits.
 
 This widget provides a deterministic, fully functional control strip with:
 - A labeled X combobox
 - A labeled, checkable Y list
-- A Parametric toggle
-- An Options toolbutton with a QMenu exposing actions/signals
+- Unit selectors and manual range editors
 
 Signals emitted
 --------------
-xChanged(name: str)
-ySelectionChanged(selected: list[str])
-parametricToggled(enabled: bool)
-addGuideRequested(from_scalar: str | None)   # None means show chooser upstream
-optionsRequested(action: str, data: object)  # generic hook (e.g. "sampling", ...)
+xChanged(selection: SimulationSeriesAxisSelection | ExperimentalAxisSelection)
+ySelectionChanged(selected: tuple[AxisSeriesSelection, ...])
+yAllRequested()
+unitChanged(axis: str, unit: str)
 
 Public API
 ----------
-set_x_candidates(names: list[str], default: str | None = None)
-set_y_candidates(series: list[tuple[str, bool]], *, disabled: list[str] = [])
-select_y(names: list[str])
-selected_y() -> list[str]
-current_x() -> str
-set_parametric(enabled: bool) -> None
-parametric_enabled() -> bool
-is_auto_range() -> bool
-set_auto_range(enabled: bool) -> None
+set_x_candidates(candidates, *, selected)
+set_y_candidates(candidates, *, locked_checked=None)
+selected_y() -> tuple[AxisSeriesSelection, ...]
+current_x() -> AxisSeriesSelection
+set_manual_range_controls(*, auto_x: bool, auto_y: bool) -> None
 get_manual_ranges() -> tuple[float|None, float|None, float|None, float|None]
 set_manual_ranges(x_min, x_max, y_min, y_max) -> None
+
+Programmatic projection setters update widget state without emitting command
+signals; user edits and explicit actions emit the signals above.
 
 No filesystem, no network, no cwd usage.
 """
 
 from __future__ import annotations
 
-from typing import Iterable, List, Optional, Sequence, Tuple
+import math
+from typing import Mapping, Optional, Sequence
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 from PySide6.QtCore import Qt
+
+from kindred.core.project_presentation_state import (
+    AxisSeriesSelection,
+    SimulationSeriesAxisSelection,
+)
+from kindred.gui.plot_config import AxisSelectionCandidate
+from kindred.gui.ui_helpers import (
+    SCIENTIFIC_NAME_HTML_ROLE,
+    ControlRowsLayout,
+    ScientificNameComboBox,
+    configure_compact_numeric_edit,
+)
+from kindred.gui.display_name_policy import compact_text, literal_tooltip
 
 __all__ = ["AxisToolbar"]
 
 
 class AxisToolbar(QtWidgets.QWidget):
     # High-level signals
-    xChanged = QtCore.Signal(str)
-    ySelectionChanged = QtCore.Signal(list)
-    parametricToggled = QtCore.Signal(bool)
-    addGuideRequested = QtCore.Signal(object)          # scalar name or None
-    optionsRequested = QtCore.Signal(str, object)      # action, data
-    axisRangeChanged = QtCore.Signal()                 # axis range manually changed
+    xChanged = QtCore.Signal(object)
+    ySelectionChanged = QtCore.Signal(object)
+    yAllRequested = QtCore.Signal()
+    unitChanged = QtCore.Signal(str, str)
+    axisRangeChanged = QtCore.Signal(str)
 
     def __init__(
         self,
         parent: Optional[QtWidgets.QWidget] = None,
-        *,
-        orientation: str = "horizontal"
     ) -> None:
         super().__init__(parent)
-        orientation = orientation.lower()
-        if orientation not in {"horizontal", "vertical"}:
-            raise ValueError("orientation must be 'horizontal' or 'vertical'")
-        self._orientation = orientation
 
         self._x_combo = QtWidgets.QComboBox(self)
-        self._x_combo.setMinimumContentsLength(10)
-        self._x_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self._x_combo.setMinimumContentsLength(4)
+        self._x_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self._x_combo.setMaximumWidth(220)
+        self._x_combo.setToolTip(
+            'Choose time, a species, or a quantity defined with "let ... = ...". '
+            "After running a model with an initial-volume declaration, you can also select Vessel volume. "
+            "Use the adjacent Unit control to choose its display unit."
+        )
+
+        self._x_unit_combo = ScientificNameComboBox(self)
+        self._x_unit_combo.setObjectName("axisToolbarXUnit")
+        self._x_unit_combo.setMinimumWidth(64)
+        self._x_unit_combo.setMaximumWidth(84)
+
+        self._y_unit_combo = ScientificNameComboBox(self)
+        self._y_unit_combo.setObjectName("axisToolbarYUnit")
+        self._y_unit_combo.setMinimumWidth(64)
+        self._y_unit_combo.setMaximumWidth(84)
 
         self._y_list = QtWidgets.QListWidget(self)
+        self._y_list.setToolTip(
+            "Choose which model quantities and experimental data appear on the Y axis. "
+            "After running a model with an initial-volume declaration, Vessel volume is listed too. "
+            "Use the adjacent Unit control to choose its display unit."
+        )
         self._y_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
         self._y_list.setAlternatingRowColors(True)
         self._y_list.setUniformItemSizes(True)
         self._y_list.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._y_list.setMaximumHeight(160)
         self._y_list.setMinimumWidth(220)
+        self._y_list.setMaximumWidth(420)
+        self._locked_checked_y: frozenset[AxisSeriesSelection] = frozenset()
 
         self._y_selector_btn = QtWidgets.QToolButton(self)
         self._y_selector_btn.setText("Y: none")
+        self._y_selector_btn.setToolTip(self._y_list.toolTip())
+        self._y_selector_btn.setMaximumWidth(220)
+        self._y_selector_btn.setMinimumWidth(80)
+        self._y_selector_btn.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
         self._y_selector_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         self._y_selector_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
 
@@ -98,8 +125,24 @@ class AxisToolbar(QtWidgets.QWidget):
         y_popup_layout.setContentsMargins(6, 6, 6, 6)
         y_popup_layout.setSpacing(4)
 
-        self._y_popup_label = QtWidgets.QLabel("Visible series", self._y_popup_container)
+        self._y_popup_label = QtWidgets.QLabel("Visible Series", self._y_popup_container)
+        self._y_popup_label.setToolTip(self._y_list.toolTip())
+        self._invert_y_selection_btn = QtWidgets.QPushButton("Invert Selection", self._y_popup_container)
+        self._invert_y_selection_btn.setObjectName("axisToolbarInvertYSelectionButton")
+        self._invert_y_selection_btn.setToolTip(
+            "Select the unselected Y series and deselect the selected ones. "
+            "Series required by active overlays stay selected."
+        )
+        self._select_all_y_btn = QtWidgets.QPushButton("Select All", self._y_popup_container)
+        self._select_all_y_btn.setObjectName("axisToolbarSelectAllYButton")
+        self._select_all_y_btn.setToolTip(
+            "Select every Y series, including series added to the mechanism later."
+        )
+        y_buttons = QtWidgets.QHBoxLayout()
+        y_buttons.addWidget(self._select_all_y_btn)
+        y_buttons.addWidget(self._invert_y_selection_btn)
         y_popup_layout.addWidget(self._y_popup_label)
+        y_popup_layout.addLayout(y_buttons)
         y_popup_layout.addWidget(self._y_list)
 
         self._y_menu_action = QtWidgets.QWidgetAction(self._y_menu)
@@ -107,54 +150,32 @@ class AxisToolbar(QtWidgets.QWidget):
         self._y_menu.addAction(self._y_menu_action)
         self._y_selector_btn.setMenu(self._y_menu)
 
-        self._parametric = QtWidgets.QCheckBox("Parametric", self)
-        self._parametric.setToolTip("Plot selected Y variables against each other instead of against time")
-
-        self._options_btn = QtWidgets.QToolButton(self)
-        self._options_btn.setText("Options")
-        self._options_btn.setToolTip("Plot display options")
-        self._options_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
-        self._options_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self._options_btn.setIcon(QtGui.QIcon.fromTheme("preferences-other"))
-
-        self._menu = QtWidgets.QMenu(self)
-        self._action_downsampling = self._menu.addAction("Downsampling: 1k points/curve")
-        self._action_downsampling.setCheckable(True)
-        self._action_downsampling.setChecked(False)
-        self._menu.addSeparator()
-        self._action_add_guide = self._menu.addAction("Add Guide from Scalar…")
-        self._menu.addSeparator()
-        self._action_export_scope_visible = self._menu.addAction("Export Scope: Visible Series")
-        self._action_export_scope_all = self._menu.addAction("Export Scope: All Series")
-        self._options_btn.setMenu(self._menu)
-
         # Labels
         x_label = QtWidgets.QLabel("X:", self)
-        y_label = QtWidgets.QLabel("Y:", self)
+        x_label.setBuddy(self._x_combo)
+        self._x_combo.setAccessibleName("X axis")
+        self._x_unit_combo.setAccessibleName("X axis unit")
+        self._y_unit_combo.setAccessibleName("Y axis unit")
 
         # Axis range controls
-        self._auto_range = QtWidgets.QCheckBox("Auto", self)
-        self._auto_range.setChecked(True)
-        self._auto_range.setToolTip("Auto-scale axes to fit all visible data")
-
         self._x_min = QtWidgets.QLineEdit(self)
         self._x_min.setPlaceholderText("X min")
-        self._x_min.setMaximumWidth(80)
+        configure_compact_numeric_edit(self._x_min, characters=11)
         self._x_min.setEnabled(False)
 
         self._x_max = QtWidgets.QLineEdit(self)
         self._x_max.setPlaceholderText("X max")
-        self._x_max.setMaximumWidth(80)
+        configure_compact_numeric_edit(self._x_max, characters=11)
         self._x_max.setEnabled(False)
 
         self._y_min = QtWidgets.QLineEdit(self)
         self._y_min.setPlaceholderText("Y min")
-        self._y_min.setMaximumWidth(80)
+        configure_compact_numeric_edit(self._y_min, characters=11)
         self._y_min.setEnabled(False)
 
         self._y_max = QtWidgets.QLineEdit(self)
         self._y_max.setPlaceholderText("Y max")
-        self._y_max.setMaximumWidth(80)
+        configure_compact_numeric_edit(self._y_max, characters=11)
         self._y_max.setEnabled(False)
 
         self._manual_range_row = QtWidgets.QWidget(self)
@@ -162,131 +183,223 @@ class AxisToolbar(QtWidgets.QWidget):
         self._manual_range_row.setVisible(False)
 
         # Layout
-        if self._orientation == "vertical":
-            self._build_vertical_layout(x_label, y_label)
-        else:
-            self._build_horizontal_layout(x_label, y_label)
+        self._build_horizontal_layout(x_label)
 
         # Wiring
-        self._x_combo.currentTextChanged.connect(self._on_x_changed)
-        self._parametric.toggled.connect(self._on_parametric_toggled)
-        self._y_list.itemChanged.connect(self._on_y_item_changed)
-
-        self._action_downsampling.toggled.connect(
-            lambda on: self._emit_option("sampling", "coarse" if on else "dense")
+        self._x_combo.currentIndexChanged.connect(self._on_x_changed)
+        self._x_unit_combo.currentIndexChanged.connect(
+            lambda _index: self.unitChanged.emit("x", self._x_unit_combo.currentData())
         )
-        self._action_add_guide.triggered.connect(lambda: self.addGuideRequested.emit(None))
-        self._action_export_scope_visible.triggered.connect(lambda: self._emit_option("export_scope", "visible"))
-        self._action_export_scope_all.triggered.connect(lambda: self._emit_option("export_scope", "all"))
+        self._y_unit_combo.currentIndexChanged.connect(
+            lambda _index: self.unitChanged.emit("y", self._y_unit_combo.currentData())
+        )
+        self._y_list.itemChanged.connect(self._on_y_item_changed)
+        self._invert_y_selection_btn.clicked.connect(self.invert_y_selection)
+        self._select_all_y_btn.clicked.connect(self.yAllRequested.emit)
 
         # Range control wiring
-        self._auto_range.toggled.connect(self._on_auto_range_toggled)
-        # Connect both returnPressed (Enter key) and editingFinished (focus loss)
-        self._x_min.returnPressed.connect(self._on_range_changed)
-        self._x_min.editingFinished.connect(self._on_range_changed)
-        self._x_max.returnPressed.connect(self._on_range_changed)
-        self._x_max.editingFinished.connect(self._on_range_changed)
-        self._y_min.returnPressed.connect(self._on_range_changed)
-        self._y_min.editingFinished.connect(self._on_range_changed)
-        self._y_max.returnPressed.connect(self._on_range_changed)
-        self._y_max.editingFinished.connect(self._on_range_changed)
+        for axis, edits in (("x", (self._x_min, self._x_max)), ("y", (self._y_min, self._y_max))):
+            for edit in edits:
+                edit.editingFinished.connect(lambda key=axis: self._on_range_changed(key))
+
+        for edit, name in ((self._x_min, "X minimum"), (self._x_max, "X maximum"),
+                           (self._y_min, "Y minimum"), (self._y_max, "Y maximum")):
+            edit.setAccessibleName(name)
 
         # Sensible defaults
-        self.set_x_candidates(["t"], default="t")
+        time_selection = SimulationSeriesAxisSelection("t")
+        self.set_x_candidates(
+            (AxisSelectionCandidate(time_selection, "t"),),
+            selected=time_selection,
+        )
+        self.set_axis_unit_choices(
+            x_units=(("s", "s"),),
+            selected_x="s",
+            y_units=(),
+            selected_y=None,
+        )
         self.set_tab_order()
 
     # ----------------------- public API -----------------------
 
-    def set_x_candidates(self, names: Sequence[str], default: Optional[str] = None) -> None:
-        """Populate the X dropdown; if default provided and present, select it."""
-        prev = self._x_combo.currentText()
-        self._x_combo.blockSignals(True)
-        self._x_combo.clear()
-        for n in names:
-            self._x_combo.addItem(str(n))
-        # pick default or keep previous if still present
-        if default and default in names:
-            self._x_combo.setCurrentText(default)
-        elif prev in names:
-            self._x_combo.setCurrentText(prev)
-        elif names:
-            self._x_combo.setCurrentIndex(0)
-        self._x_combo.blockSignals(False)
-        # Emit if changed
-        if self._x_combo.currentText() != prev:
-            self.xChanged.emit(self._x_combo.currentText())
+    def set_x_candidates(
+        self,
+        candidates: Sequence[AxisSelectionCandidate],
+        *,
+        selected: AxisSeriesSelection,
+    ) -> None:
+        """Render one already-reconciled typed X selection exactly."""
 
-    def set_y_candidates(self, series: Sequence[Tuple[str, bool]], *, disabled: Sequence[str] = ()) -> None:
+        values = tuple(candidates)
+        identities = tuple(item.selection for item in values)
+        self._x_combo.blockSignals(True)
+        try:
+            self._x_combo.clear()
+            for candidate in values:
+                self._x_combo.addItem(
+                    candidate.label,
+                    candidate.selection,
+                )
+                self._x_combo.setItemData(self._x_combo.count() - 1, literal_tooltip(candidate.label), Qt.ToolTipRole)
+            self._x_combo.setCurrentIndex(identities.index(selected))
+        finally:
+            self._x_combo.blockSignals(False)
+
+    def set_y_candidates(
+        self,
+        candidates: Sequence[tuple[AxisSelectionCandidate, bool]],
+        *,
+        locked_checked: Mapping[AxisSeriesSelection, str] | None = None,
+    ) -> None:
         """
         Populate Y list.
 
         Parameters
         ----------
-        series : list of (name, checked)
-            Names of time-varying series and whether they should start checked.
-        disabled : list of names
-            Items that must be visible but not selectable (e.g., scalars).
+        candidates
+            Typed candidates paired with their projected checked state.
+        locked_checked
+            Derived overlay identities that remain checked and emit no
+            authored Y selection, mapped to their model-series identity.
         """
-        disabled_set = set(map(str, disabled))
-        current = set(self.selected_y())
+        values = tuple(candidates)
+        locked_checked_by_identity = dict(locked_checked or {})
+        self._locked_checked_y = frozenset(locked_checked_by_identity)
 
         self._y_list.blockSignals(True)
         self._y_list.clear()
-        for name, checked in series:
-            it = QtWidgets.QListWidgetItem(str(name))
+        for candidate, checked in values:
+            it = QtWidgets.QListWidgetItem(candidate.label)
+            it.setToolTip(literal_tooltip(candidate.label))
+            it.setData(
+                Qt.ItemDataRole.UserRole,
+                candidate.selection,
+            )
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            # Disable scalars as Y selections per spec
-            if str(name) in disabled_set:
-                it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEnabled)
-                it.setToolTip("Scalar values cannot be plotted as Y; use 'Add Guide from Scalar' in Options.")
-                it.setCheckState(Qt.CheckState.Unchecked)
+            if candidate.selection in locked_checked_by_identity:
+                it.setFlags(
+                    it.flags() & ~Qt.ItemFlag.ItemIsUserCheckable
+                )
+                it.setToolTip(literal_tooltip(
+                    candidate.label + "\nShown because an active overlay maps to "
+                    f"{locked_checked_by_identity[candidate.selection]}. "
+                    "Turn off that overlay in Plot Overlays to hide this series."
+                ))
+                it.setCheckState(Qt.CheckState.Checked)
             else:
-                # preserve existing selection if possible
-                it.setCheckState(Qt.CheckState.Checked if (str(name) in current or checked) else Qt.CheckState.Unchecked)
+                it.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
             self._y_list.addItem(it)
         self._y_list.blockSignals(False)
-        # Emit a consolidated signal after repopulation
         self._update_y_selector_text()
-        self.ySelectionChanged.emit(self.selected_y())
 
-    def select_y(self, names: Iterable[str]) -> None:
-        target = set(map(str, names))
+    def set_axis_unit_choices(
+        self,
+        *,
+        x_units: Sequence[tuple[str, str]],
+        selected_x: str | None,
+        y_units: Sequence[tuple[str, str]],
+        selected_y: str | None,
+        transformed: bool = False,
+    ) -> None:
+        """Project the available display-only units without emitting intent."""
+
+        self._set_unit_combo(self._x_unit_combo, x_units, selected_x)
+        self._set_unit_combo(self._y_unit_combo, y_units, selected_y)
+        self._x_unit_label.setText("Source X unit:" if transformed else "Unit:")
+        self._y_unit_label.setText("Source Y unit:" if transformed else "Unit:")
+        x_tooltip = (
+            "Choose the units for the original horizontal quantity. "
+            "This changes the denominator units of the displayed derivative. "
+            "For example, choosing minutes instead of seconds changes a rate per second to a rate per minute. "
+            "Manual limits and copied plot values update with the display."
+            if transformed else
+            "Choose the units for the horizontal axis. Plotted values, manual axis limits, "
+            "Copy Plotted Data, and Copy Visible Data use these units. "
+            "Switching between compatible quantities keeps your selection."
+        )
+        y_tooltip = (
+            "Choose the units for the original vertical quantities. "
+            "This changes the numerator units of the displayed derivative. "
+            "For example, choosing mM instead of M changes M/s to mM/s when the horizontal quantity is time in seconds. "
+            "In Derivative versus Y, it also changes the horizontal-axis units. "
+            "Manual limits and copied plot values update with the display."
+            if transformed else
+            "Choose the units for the vertical axis. Plotted values, manual axis limits, "
+            "Copy Plotted Data, and Copy Visible Data use these units. "
+            "Switching between compatible curves keeps your selection. "
+            "Available when the selected curves have compatible known units."
+        )
+        for widget in (self._x_unit_combo, self._x_unit_label):
+            widget.setToolTip(x_tooltip)
+        for widget in (self._y_unit_combo, self._y_unit_label):
+            widget.setToolTip(y_tooltip)
+
+    @staticmethod
+    def _set_unit_combo(
+        combo: QtWidgets.QComboBox,
+        units: Sequence[tuple[str, str]],
+        selected: str | None,
+    ) -> None:
+        blocker = QtCore.QSignalBlocker(combo)
+        try:
+            combo.clear()
+            if not units:
+                combo.addItem("—")
+                combo.setEnabled(False)
+                return
+            for identity, markup in units:
+                combo.addItem(identity, identity)
+                if markup:
+                    combo.setItemData(
+                        combo.count() - 1, markup, SCIENTIFIC_NAME_HTML_ROLE,
+                    )
+            index = combo.findData(selected)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+            combo.setEnabled(True)
+        finally:
+            del blocker
+
+    def invert_y_selection(self) -> None:
+        """Invert Y-series rows; locked overlay rows stay checked."""
         self._y_list.blockSignals(True)
         for i in range(self._y_list.count()):
             it = self._y_list.item(i)
-            if it.flags() & Qt.ItemFlag.ItemIsEnabled:
-                it.setCheckState(Qt.CheckState.Checked if it.text() in target else Qt.CheckState.Unchecked)
+            selection = it.data(Qt.ItemDataRole.UserRole)
+            if selection in self._locked_checked_y:
+                it.setCheckState(Qt.CheckState.Checked)
+                continue
+            next_state = (
+                Qt.CheckState.Unchecked
+                if it.checkState() == Qt.CheckState.Checked
+                else Qt.CheckState.Checked
+            )
+            it.setCheckState(next_state)
         self._y_list.blockSignals(False)
         self._update_y_selector_text()
         self.ySelectionChanged.emit(self.selected_y())
 
-    def selected_y(self) -> List[str]:
-        out: List[str] = []
+    def selected_y(self) -> tuple[AxisSeriesSelection, ...]:
+        out: list[AxisSeriesSelection] = []
         for i in range(self._y_list.count()):
             it = self._y_list.item(i)
             if it.checkState() == Qt.CheckState.Checked:
-                out.append(it.text())
-        return out
+                selection = it.data(Qt.ItemDataRole.UserRole)
+                if selection in self._locked_checked_y:
+                    continue
+                out.append(selection)
+        return tuple(out)
 
-    def current_x(self) -> str:
-        return self._x_combo.currentText()
+    def current_x(self) -> AxisSeriesSelection:
+        return self._x_combo.currentData()
 
-    def set_parametric(self, enabled: bool) -> None:
-        if self._parametric.isChecked() == bool(enabled):
-            return
-        self._parametric.setChecked(bool(enabled))
-
-    def parametric_enabled(self) -> bool:
-        return self._parametric.isChecked()
-
-    def is_auto_range(self) -> bool:
-        """Return True if auto range is enabled."""
-        return self._auto_range.isChecked()
-
-    def set_auto_range(self, enabled: bool) -> None:
-        """Enable or disable auto range mode."""
-        if self._auto_range.isChecked() != enabled:
-            self._auto_range.setChecked(enabled)
+    def set_manual_range_controls(self, *, auto_x: bool, auto_y: bool) -> None:
+        """Project the plot owner's range mode."""
+        self._manual_range_row.setVisible(not (auto_x and auto_y))
+        for axis, auto, edits in (("X", auto_x, (self._x_min, self._x_max)), ("Y", auto_y, (self._y_min, self._y_max))):
+            self._range_labels[axis].setText(f"{axis} ({'automatic' if auto else 'manual'}):")
+            for edit in edits:
+                edit.setEnabled(not auto)
+        self.updateGeometry()
 
     def get_manual_ranges(self) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
         """
@@ -299,9 +412,10 @@ class AxisToolbar(QtWidgets.QWidget):
         """
         def parse_float(text: str) -> Optional[float]:
             try:
-                return float(text.strip()) if text.strip() else None
+                value = float(text.strip()) if text.strip() else None
             except ValueError:
                 return None
+            return value if value is None or math.isfinite(value) else None
 
         x_min = parse_float(self._x_min.text())
         x_max = parse_float(self._x_max.text())
@@ -320,171 +434,123 @@ class AxisToolbar(QtWidgets.QWidget):
         x_min, x_max, y_min, y_max : float or None
             Axis limits. None means leave field empty.
         """
-        self._x_min.setText(f"{x_min:.6g}" if x_min is not None else "")
-        self._x_max.setText(f"{x_max:.6g}" if x_max is not None else "")
-        self._y_min.setText(f"{y_min:.6g}" if y_min is not None else "")
-        self._y_max.setText(f"{y_max:.6g}" if y_max is not None else "")
+        def _format(value: Optional[float]) -> str:
+            return format(float(value), ".6g") if value is not None else ""
+
+        self._x_min.setText(_format(x_min))
+        self._x_max.setText(_format(x_max))
+        self._y_min.setText(_format(y_min))
+        self._y_max.setText(_format(y_max))
 
     # ----------------------- layout helpers -----------------------
 
     def _build_horizontal_layout(
         self,
         x_label: QtWidgets.QLabel,
-        y_label: QtWidgets.QLabel
     ) -> None:
-        y_label.setVisible(False)
-        lay = QtWidgets.QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(8)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setSpacing(4)
+        selectors = QtWidgets.QWidget(self)
+        toolbar_rows = ControlRowsLayout(selectors)
+        layout.addWidget(selectors)
+        layout.addWidget(self._manual_range_row)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        self._x_combo.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        toolbar_groups = []
+        self._x_unit_label = QtWidgets.QLabel("Unit:", self)
+        for label, editor in ((x_label, self._x_combo),
+                              (self._x_unit_label, self._x_unit_combo)):
+            label.setToolTip(editor.toolTip())
+            group = QtWidgets.QWidget(self)
+            group_layout = QtWidgets.QHBoxLayout(group)
+            group_layout.setContentsMargins(0, 0, 0, 0)
+            group_layout.setSpacing(8)
+            group_layout.addWidget(label)
+            group_layout.addWidget(editor)
+            toolbar_groups.append(group)
+        toolbar_groups.append(self._y_selector_btn)
+        unit_group = QtWidgets.QWidget(self)
+        unit_layout = QtWidgets.QHBoxLayout(unit_group)
+        unit_layout.setContentsMargins(0, 0, 0, 0)
+        unit_layout.setSpacing(8)
+        self._y_unit_label = QtWidgets.QLabel("Unit:", self)
+        self._y_unit_label.setToolTip(self._y_unit_combo.toolTip())
+        unit_layout.addWidget(self._y_unit_label)
+        unit_layout.addWidget(self._y_unit_combo)
+        toolbar_groups.append(unit_group)
 
-        x_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        lay.addWidget(x_label, stretch=0)
-        lay.addWidget(self._x_combo, stretch=0)
-        lay.addWidget(self._y_selector_btn, stretch=0)
-        lay.addWidget(self._parametric, stretch=0)
-        lay.addWidget(self._auto_range, stretch=0)
-
-        range_layout = QtWidgets.QHBoxLayout(self._manual_range_row)
-        range_layout.setContentsMargins(0, 0, 0, 0)
+        range_layout = ControlRowsLayout(self._manual_range_row)
         range_layout.setSpacing(4)
-        range_layout.addWidget(QtWidgets.QLabel("X:", self._manual_range_row))
-        range_layout.addWidget(self._x_min)
-        range_layout.addWidget(QtWidgets.QLabel("to", self._manual_range_row))
-        range_layout.addWidget(self._x_max)
-        range_layout.addSpacing(8)
-        range_layout.addWidget(QtWidgets.QLabel("Y:", self._manual_range_row))
-        range_layout.addWidget(self._y_min)
-        range_layout.addWidget(QtWidgets.QLabel("to", self._manual_range_row))
-        range_layout.addWidget(self._y_max)
-        lay.addWidget(self._manual_range_row, stretch=0)
-
-        lay.addStretch(1)
-        lay.addWidget(self._options_btn, stretch=0)
-
-    def _build_vertical_layout(
-        self,
-        x_label: QtWidgets.QLabel,
-        y_label: QtWidgets.QLabel
-    ) -> None:
-        max_control_width = 150
-
-        self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
-        self._x_combo.setMaximumWidth(max_control_width)
-        self._y_list.setMaximumWidth(max_control_width)
-        for field in (self._x_min, self._x_max, self._y_min, self._y_max):
-            field.setMaximumWidth(70)
-
-        self._options_btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-        self._options_btn.setMaximumWidth(max_control_width)
-
-        lay = QtWidgets.QVBoxLayout(self)
-        lay.setContentsMargins(4, 6, 4, 6)
-        lay.setSpacing(6)
-
-        x_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        lay.addWidget(x_label, alignment=Qt.AlignmentFlag.AlignLeft)
-        lay.addWidget(self._x_combo, alignment=Qt.AlignmentFlag.AlignLeft)
-
-        lay.addWidget(self._parametric, alignment=Qt.AlignmentFlag.AlignLeft)
-
-        lay.addWidget(y_label, alignment=Qt.AlignmentFlag.AlignLeft)
-        lay.addWidget(self._y_list)
-
-        range_frame = QtWidgets.QFrame(self)
-        range_frame.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        range_layout = QtWidgets.QGridLayout(range_frame)
-        range_layout.setContentsMargins(0, 4, 0, 0)
-        range_layout.setHorizontalSpacing(4)
-        range_layout.setVerticalSpacing(2)
-
-        range_layout.addWidget(self._auto_range, 0, 0, 1, 2)
-
-        range_layout.addWidget(QtWidgets.QLabel("X min"), 1, 0)
-        range_layout.addWidget(self._x_min, 1, 1)
-        range_layout.addWidget(QtWidgets.QLabel("X max"), 2, 0)
-        range_layout.addWidget(self._x_max, 2, 1)
-
-        range_layout.addWidget(QtWidgets.QLabel("Y min"), 3, 0)
-        range_layout.addWidget(self._y_min, 3, 1)
-        range_layout.addWidget(QtWidgets.QLabel("Y max"), 4, 0)
-        range_layout.addWidget(self._y_max, 4, 1)
-
-        lay.addWidget(range_frame)
-        lay.addStretch()
-        lay.addWidget(self._options_btn, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom)
+        self._range_labels = {}
+        for axis, lower, upper in (("X", self._x_min, self._x_max),
+                                   ("Y", self._y_min, self._y_max)):
+            group = QtWidgets.QWidget(self._manual_range_row)
+            pair = QtWidgets.QHBoxLayout(group)
+            pair.setContentsMargins(0, 0, 0, 0)
+            pair.setSpacing(4)
+            self._range_labels[axis] = QtWidgets.QLabel(axis, group)
+            pair.addWidget(self._range_labels[axis])
+            pair.addWidget(lower)
+            pair.addWidget(QtWidgets.QLabel("to", group))
+            pair.addWidget(upper)
+            range_layout.addWidget(group)
+        for widget in toolbar_groups:
+            toolbar_rows.addWidget(widget)
 
     def _update_y_selector_text(self) -> None:
-        selected = self.selected_y()
-        if not selected:
+        selected_labels = [
+            self._y_list.item(index).text()
+            for index in range(self._y_list.count())
+            if self._y_list.item(index).checkState() == Qt.CheckState.Checked
+        ]
+        if not selected_labels:
             summary = "Y: none"
             tooltip = "No visible series selected"
-        elif len(selected) == 1:
-            summary = f"Y: {selected[0]}"
-            tooltip = selected[0]
-        elif len(selected) == 2:
-            summary = f"Y: {selected[0]}, {selected[1]}"
-            tooltip = ", ".join(selected)
+        elif len(selected_labels) == 1:
+            summary = f"Y: {selected_labels[0]}"
+            tooltip = selected_labels[0]
+        elif len(selected_labels) == 2:
+            summary = f"Y: {selected_labels[0]}, {selected_labels[1]}"
+            tooltip = ", ".join(selected_labels)
         else:
-            summary = f"Y: {selected[0]} +{len(selected) - 1}"
-            tooltip = ", ".join(selected)
-        self._y_selector_btn.setText(summary)
-        self._y_selector_btn.setToolTip(tooltip)
+            summary = (
+                f"Y: {selected_labels[0]} +{len(selected_labels) - 1}"
+            )
+            tooltip = ", ".join(selected_labels)
+        self._y_selector_btn.setText(compact_text(summary, max_chars=30).display)
+        self._y_selector_btn.setAccessibleName(summary)
+        self._y_selector_btn.setToolTip(literal_tooltip(self._y_list.toolTip() + "\n\n" + tooltip))
         self._y_selector_btn.setEnabled(self._y_list.count() > 0)
 
     # ----------------------- internal wiring -----------------------
 
-    def _emit_option(self, action: str, data: object) -> None:
-        self.optionsRequested.emit(action, data)
+    def _on_x_changed(self, _index: int) -> None:
+        if self._x_combo.count():
+            self.xChanged.emit(self.current_x())
 
-    def _on_x_changed(self, text: str) -> None:
-        self.xChanged.emit(text)
-
-    def _on_parametric_toggled(self, state: bool) -> None:
-        self.parametricToggled.emit(bool(state))
-
-    def _on_y_item_changed(self, _item: QtWidgets.QListWidgetItem) -> None:
+    def _on_y_item_changed(self, item: QtWidgets.QListWidgetItem) -> None:
+        selection = item.data(Qt.ItemDataRole.UserRole)
+        if selection in self._locked_checked_y:
+            blocker = QtCore.QSignalBlocker(self._y_list)
+            try:
+                item.setCheckState(Qt.CheckState.Checked)
+            finally:
+                del blocker
+            self._update_y_selector_text()
+            return
         self._update_y_selector_text()
         self.ySelectionChanged.emit(self.selected_y())
 
-    def _on_auto_range_toggled(self, checked: bool) -> None:
-        """Enable/disable manual range controls based on auto range checkbox."""
-        # When auto is checked, disable manual controls
-        # When auto is unchecked, enable manual controls
-        enabled = not checked
-        self._x_min.setEnabled(enabled)
-        self._x_max.setEnabled(enabled)
-        self._y_min.setEnabled(enabled)
-        self._y_max.setEnabled(enabled)
-        if self._orientation == "horizontal":
-            self._manual_range_row.setVisible(enabled)
-            self.updateGeometry()
-        # Emit signal to update plot
-        self.axisRangeChanged.emit()
-
-    def _on_range_changed(self) -> None:
-        """Called when any range text field is edited."""
-        # Only emit if auto range is disabled
-        if not self._auto_range.isChecked():
-            self.axisRangeChanged.emit()
-
-    # ----------------------- usability tweaks -----------------------
-
-    def sizeHint(self) -> QtCore.QSize:
-        if self._orientation == "horizontal":
-            return QtCore.QSize(960, 56)
-        return QtCore.QSize(800, 150)
+    def _on_range_changed(self, axis: str) -> None:
+        if self._manual_range_row.isEnabled():
+            self.axisRangeChanged.emit(axis)
 
     def set_tab_order(self) -> None:
-        if self._orientation == "horizontal":
-            QtWidgets.QWidget.setTabOrder(self._x_combo, self._y_selector_btn)
-            QtWidgets.QWidget.setTabOrder(self._y_selector_btn, self._parametric)
-            QtWidgets.QWidget.setTabOrder(self._parametric, self._auto_range)
-            QtWidgets.QWidget.setTabOrder(self._auto_range, self._x_min)
-            QtWidgets.QWidget.setTabOrder(self._x_min, self._x_max)
-            QtWidgets.QWidget.setTabOrder(self._x_max, self._y_min)
-            QtWidgets.QWidget.setTabOrder(self._y_min, self._y_max)
-            QtWidgets.QWidget.setTabOrder(self._y_max, self._options_btn)
-            return
-        QtWidgets.QWidget.setTabOrder(self._x_combo, self._parametric)
-        QtWidgets.QWidget.setTabOrder(self._parametric, self._y_list)
-        QtWidgets.QWidget.setTabOrder(self._y_list, self._options_btn)
+        QtWidgets.QWidget.setTabOrder(self._x_combo, self._x_unit_combo)
+        QtWidgets.QWidget.setTabOrder(self._x_unit_combo, self._y_selector_btn)
+        QtWidgets.QWidget.setTabOrder(self._y_selector_btn, self._y_unit_combo)
+        QtWidgets.QWidget.setTabOrder(self._y_unit_combo, self._x_min)
+        QtWidgets.QWidget.setTabOrder(self._x_min, self._x_max)
+        QtWidgets.QWidget.setTabOrder(self._x_max, self._y_min)
+        QtWidgets.QWidget.setTabOrder(self._y_min, self._y_max)

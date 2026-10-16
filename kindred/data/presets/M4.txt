@@ -1,13 +1,13 @@
-# Preset M4 — Reversible A <-> B with a spectator C (baseline variety)
+# Run from 0 to 10 s.
 
-# Mechanism
-equilibrium: A <-> B; kf=1.5; kr=0.25
-reaction: B -> C; k=0.1
+# Use * between a stoichiometric coefficient and a species name.
+# A2 is a species name. The coefficient is written separately.
+2*A <-> A2 ; kf=0.05 ; kr=0.02
 
-# Initial concentrations
-[A] = 1.0
-[B] = 0.0
-[C] = 0.0
+preset_set1 = {
+  [A] = 1.0
+  [A2] = 0.0
+}
 
-# Algebra
-let yield_C = [C] / max([A]_0, 1e-30)
+# Write coefficients explicitly in observable expressions too.
+let total = [A] + 2*[A2]

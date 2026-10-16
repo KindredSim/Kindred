@@ -1,1438 +1,1758 @@
-"""Unified species table widget for the fitting window.
+"""Presentation for the Fit target, weight and initial-condition table.
 
-Provides a single 8-column table that combines target selection, target
-weights, and initial-condition editing for all mechanism species per dataset.
+The table is deliberately a view/editor surface.  Accepted Fit setup remains
+owned by :class:`FitSessionOwner`; this widget only renders the owner supplied
+snapshot and emits complete setup replacements for user edits.
 """
 
 from __future__ import annotations
 
-import logging
 import math
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from dataclasses import replace
+from typing import Sequence
 
-import numpy as np
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFontMetrics, QPalette
+from PySide6.QtGui import QBrush, QColor, QFontMetrics, QKeySequence, QPalette
 
-from kindred.gui.ui_helpers import setup_scientific_validator
-from kindred.gui.widgets.config_panel_footer import ConfigPanelFooter
-
-logger = logging.getLogger(__name__)
+from kindred.core.validation import parse_finite_numeric_text, six_digit_text, six_digit_value
+from kindred.gui.fitting.constants import FIT_DATASET_WEIGHT_MODE_LABELS
+from kindred.gui.ui_helpers import (
+    ChoicesComboBox,
+    configure_compact_numeric_edit,
+    copy_current_cell_as_shown,
+    ignore_wheel,
+)
+from kindred.gui.fitting.contracts import FitTargetSelection, copy_target_selection
+from kindred.gui.fitting.launch import (
+    FitDatasetLocalSettings,
+    FitInitialVariable,
+    FitMappedDatasetSnapshot,
+    FitObservationSnapshot,
+    FitOriginSnapshot,
+    FitSharedInitialGroup,
+    FitSetupSnapshot,
+    shared_initial_group_labels,
+)
+from kindred.gui.fitting.ic_tolerance import ZERO_IC_PERCENT_MESSAGE, FitInitialTolerance
 
 
 class _Col:
-    """Column indices for the unified species table."""
+    """Data-and-Targets column indices."""
+
     INCLUDE = 0
     WEIGHT = 1
     SPECIES = 2
     INITIAL = 3
-    FIT_IC = 4
-    LOG10 = 5
-    MIN = 6
-    MAX = 7
+    TOLERANCE_MODE = 4
+    VARY_GLOBAL = 5
+    LOG10 = 6
+    LOWER = 7
+    UPPER = 8
+    COUNT = 9
+    HEADERS = [
+        "Include",
+        "Weight",
+        "Species",
+        "Starting IC",
+        "Vary IC",
+        "Vary Global",
+        "Log Scale",
+        "Lower",
+        "Upper",
+    ]
 
-    COUNT = 8
-    HEADERS = ["Include in Fit", "Weight", "Species", "Initial Value",
-               "Fit IC", "Log10", "Min", "Max"]
+
+_INITIAL_FIELD_HEADERS = {
+    "initial": _Col.HEADERS[_Col.INITIAL],
+    "lower": _Col.HEADERS[_Col.LOWER],
+    "upper": _Col.HEADERS[_Col.UPPER],
+}
+
+_VARY_IC_CHOICES: tuple[tuple[str, str, str], ...] = (
+    (
+        "No",
+        "disabled",
+        "Keep this initial concentration fixed during fitting.",
+    ),
+    (
+        "± X% (Symmetric)",
+        "symmetric_percent",
+        "Vary equally below and above the Starting IC. Example: 5 permits "
+        "values from 95% to 105% of the Starting IC.",
+    ),
+    (
+        "− X1% / + X2% (Separate)",
+        "asymmetric_percent",
+        "Enter separate decreases and increases relative to the Starting IC. "
+        "Example: 10 and 5 permit values from 90% to 105% of the Starting IC.",
+    ),
+    (
+        "Minimum / Maximum (in M)",
+        "absolute",
+        "Enter the actual minimum and maximum concentrations in molar units.",
+    ),
+)
+
+_TARGET_WEIGHT_MESSAGE = "Target weights must be finite and positive."
+
+_COPY_SPECIES_WEIGHTS_VARY_IC_TOOLTIP = (
+    "Copies species weights, Vary IC mode and range, and log-scale choices "
+    "from the selected dataset to compatible species in other datasets. "
+    "Starting IC values and dataset-level settings are not copied."
+)
 
 
 _INVALID_BG = QBrush(QColor(255, 200, 200))
 _INVALID_FG = QBrush(QColor(80, 0, 0))
-_DEFAULT_BG = QBrush()
-_DEFAULT_FG = QBrush()
+
+_DATASET_ROLE = Qt.ItemDataRole.UserRole
+_SET_ROLE = Qt.ItemDataRole.UserRole + 1
+_MODEL_TARGET_ROLE = Qt.ItemDataRole.UserRole + 4
+_SPECIES_ROLE = Qt.ItemDataRole.UserRole + 5
+
+
+_NUMBER_COLUMNS = (_Col.WEIGHT, _Col.INITIAL, _Col.LOWER, _Col.UPPER)
 
 
 class _ValidationCellDelegate(QtWidgets.QStyledItemDelegate):
-    """Paints cell text using ForegroundRole color, bypassing stylesheet overrides."""
+    """Paint cell text using ForegroundRole, bypassing stylesheet overrides.
 
-    def paint(self, painter, option, index):
+    Valid numbers paint at six significant digits; invalid cells show their
+    text as typed, and an open editor keeps the full text.
+    """
+
+    def initStyleOption(self, option, index) -> None:  # noqa: N802 - Qt override
+        super().initStyleOption(option, index)
+        foreground = index.data(Qt.ItemDataRole.ForegroundRole)
+        if index.column() not in _NUMBER_COLUMNS or (
+            isinstance(foreground, QBrush) and foreground.color() == _INVALID_FG.color()
+        ):
+            return
+        try:
+            option.text = six_digit_text(float(option.text))
+        except ValueError:
+            pass
+
+    def paint(self, painter, option, index):  # noqa: N802 - Qt override
         opt = QtWidgets.QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
-        fg_variant = index.data(Qt.ForegroundRole)
-        if isinstance(fg_variant, QBrush) and fg_variant.style() != Qt.BrushStyle.NoBrush:
+        fg_variant = index.data(Qt.ItemDataRole.ForegroundRole)
+        if (
+            isinstance(fg_variant, QBrush)
+            and fg_variant.style() != Qt.BrushStyle.NoBrush
+        ):
             text = opt.text
             opt.text = ""
-            style = option.widget.style() if option.widget else QtWidgets.QApplication.style()
-            style.drawControl(QtWidgets.QStyle.ControlElement.CE_ItemViewItem, opt, painter, option.widget)
+            style = (
+                option.widget.style()
+                if option.widget
+                else QtWidgets.QApplication.style()
+            )
+            style.drawControl(
+                QtWidgets.QStyle.ControlElement.CE_ItemViewItem,
+                opt,
+                painter,
+                option.widget,
+            )
             painter.save()
             if opt.state & QtWidgets.QStyle.StateFlag.State_Selected:
                 painter.setPen(opt.palette.color(QPalette.ColorRole.HighlightedText))
             else:
                 painter.setPen(fg_variant.color())
-            text_rect = style.subElementRect(QtWidgets.QStyle.SubElement.SE_ItemViewItemText, opt, option.widget)
-            alignment = opt.displayAlignment
+            text_rect = style.subElementRect(
+                QtWidgets.QStyle.SubElement.SE_ItemViewItemText,
+                opt,
+                option.widget,
+            )
             metrics = QFontMetrics(opt.font)
-            elided = metrics.elidedText(text, Qt.ElideRight, text_rect.width())
-            painter.drawText(text_rect, alignment, elided)
+            painter.drawText(
+                text_rect,
+                opt.displayAlignment,
+                metrics.elidedText(text, Qt.TextElideMode.ElideRight, text_rect.width()),
+            )
             painter.restore()
-        else:
-            super().paint(painter, option, index)
+            return
+        super().paint(painter, option, index)
+
+
+class _SpeciesTableWidget(QtWidgets.QTableWidget):
+    """Copy carries a cell exactly as it is shown."""
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if event.matches(QKeySequence.StandardKey.Copy):
+            copy_current_cell_as_shown(self)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class UnifiedSpeciesTable(QtWidgets.QWidget):
-    """Combined target-selection, weight, and IC editor for the fitting window."""
+    """Target/weight/initial presentation with complete-snapshot hooks.
 
-    # ------------------------------------------------------------------
-    # Signals
-    # ------------------------------------------------------------------
-    targetsApplied = Signal()
+    Every valid edit is submitted at once as one complete setup replacement.
+    An edit that cannot apply keeps its text, blocks Run, and stays until
+    corrected or discarded with Escape.
+    """
+
+    setupSnapshotRequested = Signal(object)
     validityChanged = Signal()
-    icApplied = Signal(str, dict, dict)
     statusMessage = Signal(str)
 
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
     def __init__(
         self,
         *,
-        dataset_entries: List[Dict[str, Any]],
-        mechanism_species: list[str],
-        dataset_entries_getter: Callable[[], List[Dict[str, Any]]],
-        included_dataset_ids_getter: Callable[[], List[str]],
-        dataset_label_getter: Callable[[str], str],
-        dataset_weight_getter: Callable[[str], float],
-        persist_dataset_weight_callback: Callable[[str, float], None],
-        dataset_manager_getter: Callable[[], Any],
-        worker_running_getter: Callable[[], bool],
-        modeled_series_getter: Optional[Callable[[], set[str]]] = None,
+        origin: FitOriginSnapshot,
+        mechanism_species: Sequence[str] = (),
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-
-        self._dataset_entries_getter = dataset_entries_getter
-        self._included_dataset_ids_getter = included_dataset_ids_getter
-        self._dataset_label_getter = dataset_label_getter
-        self._dataset_weight_getter = dataset_weight_getter
-        self._persist_dataset_weight_callback = persist_dataset_weight_callback
-        self._dataset_manager_getter = dataset_manager_getter
-        self._worker_running_getter = worker_running_getter
-
-        self._mechanism_species: list[str] = list(mechanism_species)
-        self._dataset_entries: list = list(dataset_entries)
-        self._modeled_series_getter = modeled_series_getter or (
-            lambda: {str(species) for species in self._mechanism_species if str(species).strip()}
+        self._origin = origin
+        self._mechanism_species = tuple(
+            dict.fromkeys(
+                str(species).strip()
+                for species in mechanism_species
+                if str(species).strip()
+            )
         )
-
-        self._init_fit_targets_state(dataset_entries)
-
-        # If no mechanism species provided, derive from raw data columns so the
-        # table is always populated when datasets have species_data.
         if not self._mechanism_species:
-            all_columns: set[str] = set()
-            for series_map in self._fit_targets_full_series_by_dataset.values():
-                all_columns.update(series_map.keys())
-            self._mechanism_species = sorted(all_columns)
+            self._mechanism_species = tuple(
+                dict.fromkeys(
+                    species
+                    for mapped in origin.mapped_datasets
+                    for species, _value in mapped.initial_values
+                )
+            )
 
-        self._current_row_species: list[str] = []
-        self._ic_pending: Dict[str, Dict[str, dict[str, object]]] = {}
-        self._ic_applied: Dict[str, Dict[str, dict[str, object]]] = {}
-        self._ic_error_text: Optional[str] = None
-        self._seed_all_ic_state_from_dataset_manager()
-
-        self._ic_editor_dirty = False
-        self._ic_editor_is_refreshing = False
-        self._current_dataset_id: Optional[str] = None
-        self._is_refreshing = False
-        self._dataset_weight_is_refreshing = False
-        self._cached_modeled_series: frozenset = frozenset()
-        self._fit_universe_initialized = False
+        self._projected_setup: FitSetupSnapshot | None = None
+        self._current_dataset_id: str | None = None
+        # Weight text that could not apply, keyed ("target_weight", dataset,
+        # species) or ("dataset_weight", dataset).
+        self._invalid_raw: dict[tuple[str, ...], str] = {}
+        # The complete text of each initial-condition row that could not
+        # apply, and each of its invalid cells' text and message.
+        self._invalid_initial_rows: dict[tuple[str, str], dict[str, object]] = {}
+        self._invalid_initial_raw: dict[tuple[str, str, str], tuple[str, str]] = {}
+        self._row_keys: tuple[object, ...] = ()
+        self._refreshing = False
+        self._running = False
 
         self._build_ui()
 
     # ------------------------------------------------------------------
-    # Fit-universe helpers
-    # ------------------------------------------------------------------
-    def _safe_modeled_series(self) -> set[str]:
-        """Return the modeled species set with defensive error handling."""
-        try:
-            modeled = self._modeled_series_getter()
-            result = {str(s) for s in (modeled or set()) if str(s).strip()}
-            if result:
-                return result
-        except Exception:
-            pass
-        return {str(s) for s in self._mechanism_species if str(s).strip()}
-
-    def _recompute_fit_universe(self) -> None:
-        """Recompute available_by_dataset as observed AND modeled for ALL datasets.
-
-        Also prunes pending/applied selections and weights to the new fit-universe.
-        Emits targetsApplied if any applied selection was actually pruned so that
-        FittingWindow rebuilds its run payloads.
-        """
-        modeled = self._safe_modeled_series()
-        applied_changed = False
-        for ds_id in list(self._fit_targets_full_series_by_dataset.keys()):
-            all_columns = sorted(self._fit_targets_full_series_by_dataset[ds_id].keys())
-            fit_universe = [s for s in all_columns if s in modeled]
-            fit_universe_set = set(fit_universe)
-            self._fit_targets_available_by_dataset[ds_id] = fit_universe
-
-            if ds_id in self._fit_targets_selection_pending:
-                self._fit_targets_selection_pending[ds_id] &= fit_universe_set
-            if ds_id in self._fit_targets_selection_applied:
-                old_applied = self._fit_targets_selection_applied[ds_id]
-                pruned = [s for s in old_applied if s in fit_universe_set]
-                if len(pruned) != len(old_applied):
-                    applied_changed = True
-                self._fit_targets_selection_applied[ds_id] = pruned
-            if ds_id in self._fit_target_weights_pending:
-                self._fit_target_weights_pending[ds_id] = {
-                    k: v for k, v in self._fit_target_weights_pending[ds_id].items()
-                    if k in fit_universe_set
-                }
-            if ds_id in self._fit_target_weights_applied:
-                applied_set = set(self._fit_targets_selection_applied.get(ds_id, []))
-                self._fit_target_weights_applied[ds_id] = {
-                    k: v for k, v in self._fit_target_weights_applied[ds_id].items()
-                    if k in applied_set
-                }
-            if ds_id in self._fit_target_weights_pending_invalid:
-                self._fit_target_weights_pending_invalid[ds_id] = {
-                    k: v for k, v in self._fit_target_weights_pending_invalid[ds_id].items()
-                    if k in fit_universe_set
-                }
-
-        if applied_changed:
-            self.targetsApplied.emit()
-
-    # ------------------------------------------------------------------
-    # State initialization
-    # ------------------------------------------------------------------
-    def _init_fit_targets_state(self, dataset_entries: List[Dict[str, Any]]) -> None:
-        full_series: Dict[str, Dict[str, np.ndarray]] = {}
-        full_t: Dict[str, np.ndarray] = {}
-        available_by_dataset: Dict[str, List[str]] = {}
-        applied: Dict[str, List[str]] = {}
-        applied_target_weights: Dict[str, Dict[str, float]] = {}
-
-        for entry in dataset_entries:
-            ds_id = str(entry.get("id") or "").strip()
-            if not ds_id:
-                continue
-            t_values = np.asarray(entry.get("t", []), dtype=float).reshape(-1)
-            if t_values.size == 0:
-                continue
-            raw_series = entry.get("species_data") or entry.get("species") or {}
-            series_map: Dict[str, np.ndarray] = {}
-            parse_failures: List[str] = []
-            if isinstance(raw_series, dict):
-                for name, values in raw_series.items():
-                    key = str(name).strip()
-                    if not key:
-                        continue
-                    try:
-                        arr = np.asarray(values, dtype=float).reshape(-1)
-                    except Exception as exc:
-                        parse_failures.append(key)
-                        if len(parse_failures) <= 3:
-                            logger.debug(
-                                "Skipping invalid fit-target series '%s' for dataset '%s': %s",
-                                key, ds_id, exc, exc_info=True,
-                            )
-                        continue
-                    if arr.size != t_values.size:
-                        continue
-                    series_map[key] = arr
-
-            full_series[ds_id] = series_map
-            full_t[ds_id] = t_values
-            available = sorted(series_map.keys())
-            available_by_dataset[ds_id] = available
-
-            initial_selection = [
-                str(x)
-                for x in (entry.get("selected_species") or [])
-                if str(x).strip() and str(x) in series_map
-            ]
-            applied[ds_id] = list(initial_selection)
-            applied_target_weights[ds_id] = self._normalize_fit_target_weights_for_selection(
-                ds_id, initial_selection, entry.get("target_weights"),
-            )
-
-        self._fit_targets_full_series_by_dataset = full_series
-        self._fit_targets_full_t_by_dataset = full_t
-        self._fit_targets_available_by_dataset = available_by_dataset
-        self._fit_targets_selection_applied = applied
-        self._fit_targets_selection_pending = {ds: set(names) for ds, names in applied.items()}
-        self._fit_target_weights_applied = {ds: dict(weights) for ds, weights in applied_target_weights.items()}
-        self._fit_target_weights_pending = {ds: dict(weights) for ds, weights in applied_target_weights.items()}
-        self._fit_target_weights_pending_invalid: Dict[str, Dict[str, str]] = {}
-        self._fit_targets_dirty = False
-
-    def _seed_all_ic_state_from_dataset_manager(self) -> None:
-        self._ic_pending = {}
-        self._ic_applied = {}
-        for ds_id in self._fit_targets_available_by_dataset.keys():
-            self._seed_ic_state_for_dataset(ds_id)
-
-    @staticmethod
-    def _copy_ic_dataset_state(state: Optional[Dict[str, dict[str, object]]]) -> Dict[str, dict[str, object]]:
-        copied: Dict[str, dict[str, object]] = {}
-        for species, spec in (state or {}).items():
-            copied[str(species)] = {
-                "initial": float(spec.get("initial", 0.0)),
-                "fit": bool(spec.get("fit", False)),
-                "log10": bool(spec.get("log10", False)),
-                "min": float(spec.get("min", 0.0)),
-                "max": float(spec.get("max", 10.0)),
-            }
-        return copied
-
-    @staticmethod
-    def _ic_entry_from_settings_maps(
-        species: str,
-        *,
-        initials: Dict[str, object],
-        fit_flags: Dict[str, object],
-        log10_flags: Dict[str, object],
-        bounds_map: Dict[str, object],
-    ) -> dict[str, object]:
-        init_val = float(initials.get(species, 0.0))
-        fit_flag = bool(fit_flags.get(species, False))
-        log10_flag = bool(log10_flags.get(species, False))
-        bounds = bounds_map.get(species)
-        if not bounds:
-            bounds = (0.0, max(10.0, init_val * 10 or 10.0))
-        try:
-            min_val = float(bounds[0])
-            max_val = float(bounds[1])
-        except Exception:
-            min_val, max_val = (0.0, max(10.0, init_val * 10 or 10.0))
-        return {
-            "initial": float(init_val),
-            "fit": bool(fit_flag),
-            "log10": bool(log10_flag),
-            "min": float(min_val),
-            "max": float(max_val),
-        }
-
-    def _seed_ic_state_for_dataset(self, dataset_id: str) -> None:
-        ds_id = str(dataset_id or "").strip()
-        if not ds_id:
-            return
-        settings = None
-        dataset_manager = self._dataset_manager_getter()
-        if dataset_manager is not None and hasattr(dataset_manager, "get_fit_settings"):
-            try:
-                settings = dataset_manager.get_fit_settings(ds_id)
-            except Exception:
-                settings = None
-        initials = dict(getattr(settings, "initial_conditions", {}) or {}) if settings is not None else {}
-        fit_flags = dict(getattr(settings, "fit_flags", {}) or {}) if settings is not None else {}
-        log10_flags = dict(getattr(settings, "log10_flags", {}) or {}) if settings is not None else {}
-        bounds_map = dict(getattr(settings, "bounds", {}) or {}) if settings is not None else {}
-
-        seeded = {
-            str(species): self._ic_entry_from_settings_maps(
-                str(species),
-                initials=initials,
-                fit_flags=fit_flags,
-                log10_flags=log10_flags,
-                bounds_map=bounds_map,
-            )
-            for species in self._mechanism_species
-            if str(species).strip()
-        }
-        self._ic_applied[ds_id] = self._copy_ic_dataset_state(seeded)
-        self._ic_pending[ds_id] = self._copy_ic_dataset_state(seeded)
-
-    def _pending_ic_state_for_dataset(self, dataset_id: str) -> Dict[str, dict[str, object]]:
-        ds_id = str(dataset_id or "").strip()
-        if not ds_id:
-            return {}
-        state = self._ic_pending.get(ds_id)
-        if state is None:
-            self._seed_ic_state_for_dataset(ds_id)
-            state = self._ic_pending.get(ds_id, {})
-        return state
-
-    def _displayed_row_species_for_dataset(self, dataset_id: str) -> list[str]:
-        ds_id = str(dataset_id or "").strip()
-        mechanism_species = [str(species) for species in self._mechanism_species if str(species).strip()]
-        mechanism_set = set(mechanism_species)
-        try:
-            modeled = {
-                str(species)
-                for species in (self._modeled_series_getter() or set())
-                if str(species).strip()
-            }
-        except Exception:
-            modeled = set(mechanism_species)
-        observed_only = sorted(
-            {
-                str(species)
-                for species in self._fit_targets_available_by_dataset.get(ds_id, [])
-                if str(species).strip()
-                and str(species) not in mechanism_set
-                and str(species) in modeled
-            }
-        )
-        return mechanism_species + observed_only
-
-    def _clear_ic_error(self) -> None:
-        self._ic_error_text = None
-        if hasattr(self, "_footer"):
-            self._footer.set_error(None)
-
-    def _clear_table_for_no_dataset(self) -> None:
-        self._current_row_species = []
-        if hasattr(self, "_table"):
-            self._table.setRowCount(0)
-        if hasattr(self, "_context_label"):
-            self._context_label.setText("No dataset selected")
-        if hasattr(self, "_dataset_weight_edit"):
-            self._dataset_weight_edit.clear()
-            self._dataset_weight_edit.setEnabled(False)
-        self._clear_ic_error()
-        self._ic_editor_dirty = False
-        self._refresh_dataset_weight_editor_state()
-
-    def _sync_visible_include_states(self) -> None:
-        ds_id = str(self._current_dataset_id or "").strip()
-        if not ds_id or not hasattr(self, "_table"):
-            return
-        available = set(self._fit_targets_available_by_dataset.get(ds_id, []))
-        pending_sel = self._fit_targets_selection_pending.get(ds_id, set())
-        self._is_refreshing = True
-        try:
-            for row, species in enumerate(self._current_row_species):
-                include_item = self._table.item(row, _Col.INCLUDE)
-                if include_item is None or species not in available:
-                    continue
-                include_item.setCheckState(Qt.Checked if species in pending_sel else Qt.Unchecked)
-        finally:
-            self._is_refreshing = False
-
-    # ------------------------------------------------------------------
-    # Static helpers
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _is_valid_fit_target_weight(value: object) -> bool:
-        try:
-            numeric = float(value)
-        except Exception:
-            return False
-        return bool(np.isfinite(numeric) and numeric > 0.0)
-
-    # ------------------------------------------------------------------
-    # State tier helpers
-    # ------------------------------------------------------------------
-    def _normalize_fit_target_weights_for_selection(
-        self, dataset_id: str, selection: Sequence[str], raw_weights: object,
-    ) -> Dict[str, float]:
-        weights_map = dict(raw_weights) if isinstance(raw_weights, dict) else {}
-        normalized: Dict[str, float] = {}
-        for name in [str(x) for x in (selection or []) if str(x).strip()]:
-            value = weights_map.get(name, 1.0)
-            normalized[name] = float(value) if self._is_valid_fit_target_weight(value) else 1.0
-        return normalized
-
-    def _pending_fit_target_weights_for_dataset(self, dataset_id: str) -> Dict[str, float]:
-        ds_id = str(dataset_id or "").strip()
-        if not ds_id:
-            return {}
-        weights = self._fit_target_weights_pending.setdefault(ds_id, {})
-        if not isinstance(weights, dict):
-            weights = {}
-            self._fit_target_weights_pending[ds_id] = weights
-        return weights
-
-    def _pending_fit_target_weight_invalid_text(self, dataset_id: str, target_name: str) -> Optional[str]:
-        invalid_map = self._fit_target_weights_pending_invalid.get(str(dataset_id or "").strip(), {})
-        if not isinstance(invalid_map, dict):
-            return None
-        text = invalid_map.get(str(target_name or "").strip())
-        return str(text) if text is not None else None
-
-    def _pending_fit_target_weight_value(self, dataset_id: str, target_name: str) -> float:
-        ds_id = str(dataset_id or "").strip()
-        name = str(target_name or "").strip()
-        if not ds_id or not name:
-            return 1.0
-        weights = self._pending_fit_target_weights_for_dataset(ds_id)
-        value = weights.get(name, 1.0)
-        if not self._is_valid_fit_target_weight(value):
-            value = 1.0
-        weights[name] = float(value)
-        return float(value)
-
-    def _pending_fit_target_weight_text(self, dataset_id: str, target_name: str) -> str:
-        invalid_text = self._pending_fit_target_weight_invalid_text(dataset_id, target_name)
-        if invalid_text is not None:
-            return invalid_text
-        return f"{self._pending_fit_target_weight_value(dataset_id, target_name):.6g}"
-
-    def _set_pending_fit_target_weight_text(self, dataset_id: str, target_name: str, text: str) -> None:
-        ds_id = str(dataset_id or "").strip()
-        name = str(target_name or "").strip()
-        if not ds_id or not name:
-            return
-        weights = self._pending_fit_target_weights_for_dataset(ds_id)
-        invalid_map = self._fit_target_weights_pending_invalid.setdefault(ds_id, {})
-        raw_text = str(text or "").strip()
-        if not raw_text:
-            invalid_map[name] = raw_text
-        else:
-            try:
-                value = float(raw_text)
-            except Exception:
-                invalid_map[name] = raw_text
-            else:
-                if self._is_valid_fit_target_weight(value):
-                    weights[name] = float(value)
-                    invalid_map.pop(name, None)
-                else:
-                    invalid_map[name] = raw_text
-        if not invalid_map:
-            self._fit_target_weights_pending_invalid.pop(ds_id, None)
-
-    def _fit_target_weight_is_pending_invalid(self, dataset_id: str, target_name: str) -> bool:
-        invalid_map = self._fit_target_weights_pending_invalid.get(str(dataset_id or "").strip(), {})
-        return bool(isinstance(invalid_map, dict) and str(target_name or "").strip() in invalid_map)
-
-    # ------------------------------------------------------------------
-    # UI construction
+    # Physical construction
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
-        group = QtWidgets.QGroupBox("Species Table")
+        group = QtWidgets.QGroupBox("Species Table", self)
         group.setObjectName("global_fit_unified_species_group")
+        self._group = group
         group_layout = QtWidgets.QVBoxLayout(group)
+        layout.addWidget(group, stretch=1)
 
-        self._footer = ConfigPanelFooter(
-            group,
-            show_dirty=True,
-            show_secondary_error=True,
-            show_divider=True,
-            apply_requires_no_error=False,
-            button_order=("apply", "revert"),
-            error_object_name="global_fit_species_table_error",
-            secondary_error_object_name="global_fit_species_table_run_blocked",
-            apply_object_name="global_fit_species_table_apply",
-            revert_object_name="global_fit_species_table_revert",
-        )
-        group_layout.addWidget(self._footer, stretch=1)
-        self._footer.applyRequested.connect(self._apply_changes)
-        self._footer.revertRequested.connect(self._revert_changes)
-
-        self._context_label = QtWidgets.QLabel("Selected dataset: \u2014", group)
-        self._context_label.setStyleSheet("font-weight: bold;")
-        self._footer.body_layout.addWidget(self._context_label)
-
-        # Dataset weight controls
-        weighting_form = QtWidgets.QFormLayout()
-        weighting_form.setContentsMargins(0, 0, 0, 0)
-
-        self._weight_mode_combo = QtWidgets.QComboBox(group)
+        # The composing tab places this one "Dataset weights" setting among
+        # the Fit Data settings; this table still owns its edits.  The mode
+        # and this dataset's weight always share a line.
+        weighting = QtWidgets.QWidget(self)
+        weighting_row = QtWidgets.QHBoxLayout(weighting)
+        weighting_row.setContentsMargins(0, 0, 0, 0)
+        self._weight_mode_combo = ChoicesComboBox(weighting)
         self._weight_mode_combo.setObjectName("global_fit_weight_mode_combo")
-        self._weight_mode_combo.addItems([
-            "Implicit weights (1/N per dataset)",
-            "User weights only",
-        ])
-        weighting_form.addRow("Weight mode:", self._weight_mode_combo)
-
-        self._dataset_weight_edit = QtWidgets.QLineEdit(group)
+        self._weight_mode_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self._weight_mode_combo.setMinimumContentsLength(12)
+        self._weight_mode_combo.setToolTip("Applies to all datasets.")
+        for mode, label in FIT_DATASET_WEIGHT_MODE_LABELS.items():
+            self._weight_mode_combo.addItem(label, mode)
+        self._dataset_weight_edit = QtWidgets.QLineEdit(weighting)
         self._dataset_weight_edit.setObjectName("global_fit_dataset_weight_edit")
-        setup_scientific_validator(self._dataset_weight_edit)
-        weighting_form.addRow("Dataset weight:", self._dataset_weight_edit)
-        self._footer.body_layout.addLayout(weighting_form)
+        configure_compact_numeric_edit(self._dataset_weight_edit, characters=8)
+        weighting_row.addWidget(self._weight_mode_combo)
+        weighting_row.addSpacing(12)
+        weighting_row.addWidget(QtWidgets.QLabel("This dataset", weighting))
+        weighting_row.addWidget(self._dataset_weight_edit)
+        self.weighting_settings = (("Dataset weights", weighting),)
+        self._weight_mode_combo.currentIndexChanged.connect(
+            self._on_weight_mode_changed
+        )
+        self._dataset_weight_edit.editingFinished.connect(
+            self._on_dataset_weight_edited
+        )
 
-        self._weight_mode_combo.currentIndexChanged.connect(self._on_weight_mode_changed)
-        self._dataset_weight_edit.editingFinished.connect(self._commit_selected_dataset_weight_edit)
-
-        # Bulk buttons
-        bulk_row = QtWidgets.QHBoxLayout()
-        bulk_label = QtWidgets.QLabel("Bulk:")
-        bulk_label.setStyleSheet("font-size: 11px;")
-        bulk_row.addWidget(bulk_label)
-        self._bulk_all_button = QtWidgets.QPushButton("All", group)
+        bulk_row = QtWidgets.QGridLayout()
+        self._bulk_layout = bulk_row
+        self._bulk_all_button = QtWidgets.QPushButton("All", self)
         self._bulk_all_button.setObjectName("global_fit_fit_targets_bulk_all")
-        self._bulk_all_button.clicked.connect(lambda: self._apply_bulk_action("all"))
-        self._bulk_none_button = QtWidgets.QPushButton("None", group)
+        self._bulk_all_button.clicked.connect(
+            lambda: self._apply_bulk_action("all")
+        )
+        self._bulk_none_button = QtWidgets.QPushButton("None", self)
         self._bulk_none_button.setObjectName("global_fit_fit_targets_bulk_none")
-        self._bulk_none_button.clicked.connect(lambda: self._apply_bulk_action("none"))
-        self._bulk_invert_button = QtWidgets.QPushButton("Invert", group)
+        self._bulk_none_button.clicked.connect(
+            lambda: self._apply_bulk_action("none")
+        )
+        self._bulk_invert_button = QtWidgets.QPushButton("Invert", self)
         self._bulk_invert_button.setObjectName("global_fit_fit_targets_bulk_invert")
-        self._bulk_invert_button.clicked.connect(lambda: self._apply_bulk_action("invert"))
-        bulk_row.addWidget(self._bulk_all_button)
-        bulk_row.addWidget(self._bulk_none_button)
-        bulk_row.addWidget(self._bulk_invert_button)
-        bulk_row.addStretch(1)
-        self._footer.body_layout.addLayout(bulk_row)
+        self._bulk_invert_button.clicked.connect(
+            lambda: self._apply_bulk_action("invert")
+        )
+        self._copy_targets_button = QtWidgets.QPushButton(
+            "Copy Targets to Compatible",
+            self,
+        )
+        self._copy_targets_button.setObjectName(
+            "global_fit_fit_targets_copy_compatible"
+        )
+        self._copy_targets_button.clicked.connect(
+            self._copy_targets_to_compatible_datasets
+        )
+        self._copy_species_weights_vary_ic_button = QtWidgets.QPushButton(
+            "Copy Species Weights and Vary IC to Compatible",
+            self,
+        )
+        self._copy_species_weights_vary_ic_button.setObjectName(
+            "global_fit_copy_species_weights_vary_ic_compatible"
+        )
+        self._copy_species_weights_vary_ic_button.setToolTip(
+            _COPY_SPECIES_WEIGHTS_VARY_IC_TOOLTIP
+        )
+        self._copy_species_weights_vary_ic_button.clicked.connect(
+            self._copy_species_weights_and_vary_ic_to_compatible
+        )
+        for button in (
+            self._bulk_all_button,
+            self._bulk_none_button,
+            self._bulk_invert_button,
+            self._copy_targets_button,
+            self._copy_species_weights_vary_ic_button,
+        ):
+            button.setSizePolicy(QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed)
+        self._relayout_bulk_buttons()
+        group_layout.addLayout(bulk_row)
 
-        # Table
-        self._table = QtWidgets.QTableWidget(group)
+        self._table = _SpeciesTableWidget(self)
         self._table.setObjectName("global_fit_unified_species_table")
         self._table.setItemDelegate(_ValidationCellDelegate(self._table))
         self._table.setColumnCount(_Col.COUNT)
         self._table.setHorizontalHeaderLabels(_Col.HEADERS)
-        _ih = self._table.horizontalHeader()
-        _ih.setStretchLastSection(False)
-        for col in range(_Col.COUNT):
-            _ih.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
-        _ih.setSectionResizeMode(_Col.SPECIES, QtWidgets.QHeaderView.Interactive)
-        self._table.setColumnWidth(_Col.SPECIES, 140)
+        header = self._table.horizontalHeader()
+        header.setStretchLastSection(False)
+        # Keep useful initial widths while allowing larger fonts and user resizing.
+        initial_widths = (72, 72, 140, 100, 220, 100, 82, 82, 82)
+        metrics = header.fontMetrics()
+        for column in range(_Col.COUNT):
+            header.setSectionResizeMode(
+                column,
+                QtWidgets.QHeaderView.ResizeMode.Interactive,
+            )
+            self._table.setColumnWidth(
+                column,
+                max(
+                    initial_widths[column],
+                    metrics.horizontalAdvance(_Col.HEADERS[column]) + 24,
+                ),
+            )
+        self._table.setMinimumHeight(
+            header.sizeHint().height()
+            + self._table.verticalHeader().defaultSectionSize()
+            + self._table.horizontalScrollBar().sizeHint().height() + 4
+        )
         self._table.verticalHeader().setVisible(False)
         self._table.setAlternatingRowColors(True)
-        self._table.setMinimumHeight(200)
         self._table.itemChanged.connect(self._on_table_item_changed)
-        self._footer.body_layout.addWidget(self._table, stretch=1)
+        group_layout.addWidget(self._table, stretch=1)
 
-        layout.addWidget(group, stretch=1)
+        self._error_label = QtWidgets.QLabel(self)
+        self._error_label.setObjectName("global_fit_species_table_error")
+        self._error_label.setWordWrap(True)
+        self._error_label.setVisible(False)
+        group_layout.addWidget(self._error_label)
 
-    # ------------------------------------------------------------------
-    # Dataset weight editor
-    # ------------------------------------------------------------------
-    def _refresh_dataset_weight_editor_state(self) -> None:
-        if not hasattr(self, "_dataset_weight_edit"):
-            return
-        ds_id = self._current_dataset_id
-        label = self._dataset_label_getter(ds_id or "")
-        self._dataset_weight_is_refreshing = True
-        try:
-            if hasattr(self, "_context_label"):
-                self._context_label.setText(
-                    f"Selected dataset: {label}" if ds_id else "Selected dataset: \u2014"
-                )
-            enabled = bool(ds_id)
-            if hasattr(self, "_weight_mode_combo"):
-                self._weight_mode_combo.setEnabled(enabled)
-            if ds_id:
-                self._dataset_weight_edit.setText(f"{self._dataset_weight_getter(ds_id):.6g}")
-            else:
-                self._dataset_weight_edit.clear()
-            allow_custom = (
-                enabled
-                and getattr(self, "_weight_mode_combo", None) is not None
-                and self._weight_mode_combo.currentIndex() != 0
-            )
-            self._dataset_weight_edit.setEnabled(bool(allow_custom))
-        finally:
-            self._dataset_weight_is_refreshing = False
-
-    def _flush_dataset_weight_editor_for_dataset(self, dataset_id: Optional[str]) -> None:
-        if self._dataset_weight_is_refreshing or not hasattr(self, "_dataset_weight_edit"):
-            return
-        ds_id = str(dataset_id or "").strip()
-        if not ds_id or not self._dataset_weight_edit.isEnabled():
-            return
-        text = str(self._dataset_weight_edit.text() or "").strip()
-        try:
-            weight = float(text)
-        except Exception:
-            self._refresh_dataset_weight_editor_state()
-            return
-        if not np.isfinite(weight):
-            self._refresh_dataset_weight_editor_state()
-            return
-        self._persist_dataset_weight_callback(ds_id, weight)
-
-    def _on_weight_mode_changed(self) -> None:
-        self._flush_dataset_weight_editor_for_dataset(self._current_dataset_id)
-        self._refresh_dataset_weight_editor_state()
-
-    def _commit_selected_dataset_weight_edit(self) -> None:
-        if self._dataset_weight_is_refreshing:
-            return
-        ds_id = self._current_dataset_id
-        if not ds_id:
-            return
-        text = str(self._dataset_weight_edit.text() or "").strip()
-        try:
-            weight = float(text)
-        except Exception:
-            self._refresh_dataset_weight_editor_state()
-            return
-        if not np.isfinite(weight):
-            self._refresh_dataset_weight_editor_state()
-            return
-        self._persist_dataset_weight_callback(ds_id, weight)
-        self._refresh_dataset_weight_editor_state()
-
-    # ------------------------------------------------------------------
-    # Bulk actions
-    # ------------------------------------------------------------------
-    def _apply_bulk_action(self, action: str) -> None:
-        ds_id = str(self._current_dataset_id or "").strip()
-        if not ds_id:
-            return
-        available_set = set(self._fit_targets_available_by_dataset.get(ds_id, []))
-        effective = available_set & set(self._current_row_species)
-        if not effective:
-            return
-        pending = self._fit_targets_selection_pending.setdefault(ds_id, set())
-        if action == "all":
-            updated = set(effective)
-        elif action == "none":
-            updated = set()
-        elif action == "invert":
-            updated = effective - pending
-        else:
-            return
-        self._fit_targets_selection_pending[ds_id] = updated
-        self._sync_visible_include_states()
-        self._update_combined_dirty_state()
-
-    # ------------------------------------------------------------------
-    # Table population
-    # ------------------------------------------------------------------
-    def _populate_table(self) -> None:
-        if not self._fit_universe_initialized:
-            self._fit_universe_initialized = True
-            self._recompute_fit_universe()
-        if not self._cached_modeled_series:
-            self._cached_modeled_series = frozenset(self._safe_modeled_series())
-        ds_id = str(self._current_dataset_id or "").strip()
-        self._is_refreshing = True
-        try:
-            if not ds_id:
-                self._current_row_species = []
-                self._table.setRowCount(0)
-                return
-
-            available = set(self._fit_targets_available_by_dataset.get(ds_id, []))
-            pending_sel = self._fit_targets_selection_pending.get(ds_id, set())
-            invalid_weights = self._fit_target_weights_pending_invalid.get(ds_id, {})
-            mechanism_set = {str(species) for species in self._mechanism_species if str(species).strip()}
-            pending_ic = self._pending_ic_state_for_dataset(ds_id)
-            self._current_row_species = self._displayed_row_species_for_dataset(ds_id)
-
-            self._table.setRowCount(len(self._current_row_species))
-            for row, species in enumerate(self._current_row_species):
-                has_data = species in available
-                is_mechanism_species = species in mechanism_set
-
-                # --- Col 0: Include in Fit ---
-                include_item = QtWidgets.QTableWidgetItem()
-                if has_data:
-                    include_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                    include_item.setCheckState(Qt.Checked if species in pending_sel else Qt.Unchecked)
-                else:
-                    include_item.setFlags(Qt.ItemIsSelectable)
-                    include_item.setCheckState(Qt.Unchecked)
-                self._table.setItem(row, _Col.INCLUDE, include_item)
-
-                # --- Col 1: Weight ---
-                weight_text = self._pending_fit_target_weight_text(ds_id, species) if has_data else ""
-                if has_data and species in (invalid_weights or {}):
-                    weight_text = str(invalid_weights[species])
-                weight_item = QtWidgets.QTableWidgetItem(weight_text)
-                weight_item.setTextAlignment(Qt.AlignCenter)
-                if has_data:
-                    weight_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                else:
-                    weight_item.setFlags(Qt.ItemIsSelectable)
-                if has_data and self._fit_target_weight_is_pending_invalid(ds_id, species):
-                    weight_item.setBackground(_INVALID_BG)
-                    weight_item.setForeground(_INVALID_FG)
-                self._table.setItem(row, _Col.WEIGHT, weight_item)
-
-                # --- Col 2: Species (read-only) ---
-                species_item = QtWidgets.QTableWidgetItem(str(species))
-                species_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                species_item.setTextAlignment(Qt.AlignCenter)
-                self._table.setItem(row, _Col.SPECIES, species_item)
-
-                if is_mechanism_species:
-                    spec = dict(pending_ic.get(species) or {})
-                    init_val = float(spec.get("initial", 0.0))
-                    fit_flag = bool(spec.get("fit", False))
-                    log10_flag = bool(spec.get("log10", False))
-                    min_val = float(spec.get("min", 0.0))
-                    max_val = float(spec.get("max", max(10.0, init_val * 10 or 10.0)))
-
-                    # --- Col 3: Initial Value ---
-                    init_item = QtWidgets.QTableWidgetItem(f"{init_val:.6g}")
-                    init_item.setTextAlignment(Qt.AlignCenter)
-                    self._table.setItem(row, _Col.INITIAL, init_item)
-
-                    # --- Col 4: Fit IC ---
-                    fit_item = QtWidgets.QTableWidgetItem()
-                    fit_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                    fit_item.setCheckState(Qt.Checked if fit_flag else Qt.Unchecked)
-                    self._table.setItem(row, _Col.FIT_IC, fit_item)
-
-                    # --- Col 5: Log10 ---
-                    log_item = QtWidgets.QTableWidgetItem()
-                    if fit_flag:
-                        log_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                    else:
-                        log_item.setFlags(Qt.ItemIsSelectable)
-                    log_item.setCheckState(Qt.Checked if log10_flag else Qt.Unchecked)
-                    self._table.setItem(row, _Col.LOG10, log_item)
-
-                    # --- Col 6: Min ---
-                    min_item = QtWidgets.QTableWidgetItem(f"{min_val:.6g}")
-                    min_item.setTextAlignment(Qt.AlignCenter)
-                    self._table.setItem(row, _Col.MIN, min_item)
-
-                    # --- Col 7: Max ---
-                    max_item = QtWidgets.QTableWidgetItem(f"{max_val:.6g}")
-                    max_item.setTextAlignment(Qt.AlignCenter)
-                    self._table.setItem(row, _Col.MAX, max_item)
-                else:
-                    for col in (_Col.INITIAL, _Col.FIT_IC, _Col.LOG10, _Col.MIN, _Col.MAX):
-                        disabled_item = QtWidgets.QTableWidgetItem("")
-                        disabled_item.setFlags(Qt.ItemIsSelectable)
-                        disabled_item.setTextAlignment(Qt.AlignCenter)
-                        if col in (_Col.FIT_IC, _Col.LOG10):
-                            disabled_item.setCheckState(Qt.Unchecked)
-                        self._table.setItem(row, col, disabled_item)
-        finally:
-            self._is_refreshing = False
-
-    # ------------------------------------------------------------------
-    # Table event handling
-    # ------------------------------------------------------------------
-    def _on_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
-        if self._is_refreshing:
-            return
-        col = item.column()
-        row = item.row()
-        if row < 0 or row >= len(self._current_row_species):
-            return
-        species = self._current_row_species[row]
-        ds_id = str(self._current_dataset_id or "").strip()
-        mechanism_set = {str(name) for name in self._mechanism_species if str(name).strip()}
-        available = set(self._fit_targets_available_by_dataset.get(ds_id, []))
-
-        if col == _Col.INCLUDE:
-            if not ds_id or species not in available:
-                return
-            checked = item.checkState() == Qt.Checked
-            pending = self._fit_targets_selection_pending.setdefault(ds_id, set())
-            if checked:
-                pending.add(species)
-            else:
-                pending.discard(species)
-            self._update_combined_dirty_state()
-
-        elif col == _Col.WEIGHT:
-            if not ds_id or species not in available:
-                return
-            self._set_pending_fit_target_weight_text(ds_id, species, item.text())
-            if self._fit_target_weight_is_pending_invalid(ds_id, species):
-                item.setBackground(_INVALID_BG)
-                item.setForeground(_INVALID_FG)
-            else:
-                item.setBackground(_DEFAULT_BG)
-                item.setForeground(_DEFAULT_FG)
-            self._update_combined_dirty_state()
-
-        elif col in (_Col.INITIAL, _Col.MIN, _Col.MAX):
-            if not ds_id or species not in mechanism_set:
-                return
-            self._clear_ic_error()
-            self._ic_editor_dirty = True
-            field = {
-                _Col.INITIAL: "initial",
-                _Col.MIN: "min",
-                _Col.MAX: "max",
-            }[col]
-            try:
-                value = float(item.text())
-            except Exception:
-                value = None
-            if value is not None:
-                pending_ic = self._pending_ic_state_for_dataset(ds_id)
-                if species in pending_ic:
-                    pending_ic[species][field] = float(value)
-            self._update_combined_dirty_state()
-
-        elif col == _Col.FIT_IC:
-            if not ds_id or species not in mechanism_set:
-                return
-            self._clear_ic_error()
-            self._ic_editor_dirty = True
-            fit_checked = item.checkState() == Qt.Checked
-            pending_ic = self._pending_ic_state_for_dataset(ds_id)
-            if species in pending_ic:
-                pending_ic[species]["fit"] = bool(fit_checked)
-            log_item = self._table.item(row, _Col.LOG10)
-            if log_item is not None:
-                self._is_refreshing = True
-                try:
-                    if fit_checked:
-                        log_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                    else:
-                        log_item.setFlags(Qt.ItemIsSelectable)
-                        log_item.setCheckState(Qt.Unchecked)
-                        if species in pending_ic:
-                            pending_ic[species]["log10"] = False
-                finally:
-                    self._is_refreshing = False
-            self._update_combined_dirty_state()
-
-        elif col == _Col.LOG10:
-            if not ds_id or species not in mechanism_set:
-                return
-            self._clear_ic_error()
-            self._ic_editor_dirty = True
-            pending_ic = self._pending_ic_state_for_dataset(ds_id)
-            if species in pending_ic:
-                pending_ic[species]["log10"] = bool(item.checkState() == Qt.Checked)
-            self._update_combined_dirty_state()
-
-    # ------------------------------------------------------------------
-    # Dataset loading
-    # ------------------------------------------------------------------
-    def load_for_dataset(self, ds_id: str) -> None:
-        ds_id = str(ds_id or "").strip()
-        if not ds_id:
-            return
-        # Reject unknown dataset IDs
-        known_ids = set(self._fit_targets_available_by_dataset.keys())
-        entry_ids = {str(e.get("id") or "").strip() for e in self._dataset_entries}
-        if ds_id not in known_ids and ds_id not in entry_ids:
-            return
-        # Flush current state before switching
-        old_id = self._current_dataset_id
-        if old_id and old_id != ds_id:
-            self._flush_visible_weight_edits_internal()
-            self._flush_dataset_weight_editor_for_dataset(old_id)
-            self._ic_pending[old_id] = self._copy_ic_dataset_state(self._ic_applied.get(old_id, {}))
-
-        self._seed_ic_state_for_dataset(ds_id)
-        self._current_dataset_id = ds_id
-        self._ic_editor_dirty = False
-        self._clear_ic_error()
-        self._populate_table()
-        self._refresh_dataset_weight_editor_state()
-        self._update_combined_dirty_state()
-
-    # ------------------------------------------------------------------
-    # Dirty state
-    # ------------------------------------------------------------------
-    def _update_combined_dirty_state(self) -> None:
-        self._update_fit_targets_dirty_state()
-        combined = self._fit_targets_dirty or self._ic_editor_dirty
-        if hasattr(self, "_footer"):
-            self._footer.set_dirty(combined)
-        self._refresh_internal_validity_ui()
-
-    def _update_fit_targets_dirty_state(self) -> None:
-        all_ids = (
-            set(self._fit_targets_selection_applied.keys())
-            | set(self._fit_targets_selection_pending.keys())
-            | set(self._fit_target_weights_applied.keys())
-            | set(self._fit_target_weights_pending.keys())
-            | set(self._fit_target_weights_pending_invalid.keys())
+        self._discard_shortcuts = tuple(
+            QtGui.QShortcut(QKeySequence(Qt.Key.Key_Escape), parent)
+            for parent in (self, self._dataset_weight_edit)
         )
-        dirty = False
-        for ds_id in all_ids:
-            if set(self._fit_targets_selection_applied.get(ds_id, []) or []) != set(
-                self._fit_targets_selection_pending.get(ds_id, set()) or set()
-            ):
-                dirty = True
-                break
-            names = (
-                set(self._fit_targets_available_by_dataset.get(ds_id, []) or [])
-                | set((self._fit_target_weights_applied.get(ds_id, {}) or {}).keys())
-                | set((self._fit_target_weights_pending.get(ds_id, {}) or {}).keys())
-                | set((self._fit_target_weights_pending_invalid.get(ds_id, {}) or {}).keys())
-            )
-            for name in names:
-                applied_weight = float((self._fit_target_weights_applied.get(ds_id, {}) or {}).get(name, 1.0))
-                pending_weight = float((self._fit_target_weights_pending.get(ds_id, {}) or {}).get(name, 1.0))
-                if self._fit_target_weight_is_pending_invalid(ds_id, name) or not math.isclose(
-                    applied_weight, pending_weight, rel_tol=1e-12, abs_tol=1e-12,
-                ):
-                    dirty = True
-                    break
-            if dirty:
-                break
-        self._fit_targets_dirty = bool(dirty)
+        for shortcut in self._discard_shortcuts:
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.setEnabled(False)
+            shortcut.activated.connect(self._discard_current_invalid_entries)
 
-    # ------------------------------------------------------------------
-    # Validity checks
-    # ------------------------------------------------------------------
-    def _invalid_pending_used_dataset_ids(self) -> List[str]:
-        used = set(self._included_dataset_ids_getter())
-        invalid = []
-        for ds_id in sorted(used):
-            pending = self._fit_targets_selection_pending.get(ds_id, set()) if isinstance(self._fit_targets_selection_pending, dict) else set()
-            if not pending:
-                invalid.append(ds_id)
-        return invalid
-
-    def _invalid_pending_target_weight_dataset_ids(self) -> List[str]:
-        invalid: List[str] = []
-        used = set(self._included_dataset_ids_getter())
-        all_ids = set(self._fit_targets_selection_pending.keys()) | set(self._fit_target_weights_pending_invalid.keys())
-        for ds_id in sorted(all_ids & used):
-            pending_selection = set(self._fit_targets_selection_pending.get(ds_id, set()) or set())
-            invalid_map = self._fit_target_weights_pending_invalid.get(ds_id, {})
-            if not isinstance(invalid_map, dict):
-                continue
-            if any(str(name).strip() in pending_selection for name in invalid_map.keys()):
-                invalid.append(ds_id)
-        return invalid
-
-    def _invalid_applied_used_dataset_ids(self) -> List[str]:
-        used = set(self._included_dataset_ids_getter())
-        invalid = []
-        for ds_id in sorted(used):
-            applied = self._fit_targets_selection_applied.get(ds_id, []) if isinstance(self._fit_targets_selection_applied, dict) else []
-            if not (applied or []):
-                invalid.append(ds_id)
-        return invalid
-
-    def _refresh_internal_validity_ui(self) -> None:
-        if not hasattr(self, "_footer"):
-            return
-        invalid_pending = set(self._invalid_pending_used_dataset_ids())
-        invalid_pending_weights = set(self._invalid_pending_target_weight_dataset_ids())
-        invalid_applied = set(self._invalid_applied_used_dataset_ids())
-
-        current = str(getattr(self, "_current_dataset_id", "") or "").strip()
-        target_error: Optional[str] = None
-        if current and current in invalid_pending:
-            label = self._dataset_label_getter(current)
-            target_error = f"Dataset {label} has no fit targets. Select at least one series or uncheck Use."
-        elif current and current in invalid_pending_weights:
-            label = self._dataset_label_getter(current)
-            target_error = f"Dataset {label} has invalid target weights. Use finite values > 0."
-
-        if target_error:
-            self._footer.set_error(target_error)
-        elif self._ic_error_text:
-            self._footer.set_error(self._ic_error_text)
-        else:
-            self._footer.set_error(None)
-
-        if invalid_applied:
-            labels = [self._dataset_label_getter(ds_id) for ds_id in sorted(invalid_applied)]
-            joined = ", ".join(labels)
-            message = (
-                f"Run Fit disabled: {joined} has no applied fit targets. Select targets and Apply, or uncheck Use."
-            )
-            self._footer.set_secondary_error(message)
-        else:
-            self._footer.set_secondary_error(None)
-
-        self.validityChanged.emit()
-
-    # ------------------------------------------------------------------
-    # Apply / Revert
-    # ------------------------------------------------------------------
-    def _apply_changes(self) -> None:
-        targets_applied = self._apply_targets()
-        ic_status = self._apply_ic()
-
-        if targets_applied:
-            self.targetsApplied.emit()
-        if ic_status != "failed" and (targets_applied or ic_status == "applied"):
-            self._populate_table()
-        self._update_combined_dirty_state()
-
-        messages = []
-        if targets_applied:
-            messages.append("Fit targets applied")
-        if ic_status == "applied":
-            messages.append("Initial conditions applied")
-        if not targets_applied and ic_status != "applied":
-            messages.append("No changes applied")
-        self.statusMessage.emit("; ".join(messages))
-
-    def _apply_targets(self) -> bool:
-        self._flush_visible_weight_edits_internal()
-        if not self._fit_targets_dirty:
-            return False
-        used_ids = set(self._included_dataset_ids_getter())
-        new_applied = dict(self._fit_targets_selection_applied or {})
-        new_applied_target_weights = dict(self._fit_target_weights_applied or {})
-        invalid_pending_weights: set[str] = set()
-        deferred_excluded_pending_weights: set[str] = set()
-
-        for ds_id in sorted(set(self._fit_targets_selection_pending.keys()) | set(new_applied.keys())):
-            available = list(self._fit_targets_available_by_dataset.get(ds_id, []))
-            pending_set = self._fit_targets_selection_pending.get(ds_id, set()) or set()
-            pending_list = [name for name in available if name in pending_set]
-            invalid_map = self._fit_target_weights_pending_invalid.get(ds_id, {})
-            has_invalid_pending_weights = isinstance(invalid_map, dict) and any(name in invalid_map for name in pending_list)
-            if ds_id in used_ids and has_invalid_pending_weights:
-                invalid_pending_weights.add(ds_id)
-                continue
-            if ds_id not in used_ids and has_invalid_pending_weights:
-                deferred_excluded_pending_weights.add(ds_id)
-                continue
-            new_applied[str(ds_id)] = list(pending_list)
-            pending_weights = self._fit_target_weights_pending.get(ds_id, {}) if isinstance(self._fit_target_weights_pending, dict) else {}
-            new_applied_target_weights[str(ds_id)] = {
-                str(name): float(pending_weights.get(name, 1.0))
-                for name in pending_list
-            }
-
-        self._fit_targets_selection_applied = {ds: list(v) for ds, v in new_applied.items()}
-        self._fit_target_weights_applied = {ds: dict(v) for ds, v in new_applied_target_weights.items()}
-        for ds_id in list(self._fit_targets_selection_pending.keys()):
-            if (
-                ds_id in invalid_pending_weights
-                or ds_id in deferred_excluded_pending_weights
-            ):
-                continue
-            self._fit_targets_selection_pending[ds_id] = set(self._fit_targets_selection_applied.get(ds_id, []) or [])
-            self._fit_target_weights_pending[ds_id] = dict(self._fit_target_weights_applied.get(ds_id, {}) or {})
-            self._fit_target_weights_pending_invalid.pop(ds_id, None)
-        return True
-
-    def _apply_ic(self) -> str:
-        if not self._ic_editor_dirty:
-            return "skipped"
-        error = self._validate_ic_cells()
-        if error:
-            self._ic_error_text = str(error)
-            if hasattr(self, "_footer"):
-                self._footer.set_error(str(error))
-            return "failed"
-        ds_id = str(self._current_dataset_id or "").strip()
-        if not ds_id:
-            self._ic_error_text = "No dataset selected."
-            if hasattr(self, "_footer"):
-                self._footer.set_error(self._ic_error_text)
-            return "failed"
-        dataset_manager = self._dataset_manager_getter()
-        if dataset_manager is None or not hasattr(dataset_manager, "get_fit_settings") or not hasattr(dataset_manager, "update_fit_settings"):
-            self._ic_error_text = "Dataset manager unavailable; cannot persist Initial Conditions."
-            if hasattr(self, "_footer"):
-                self._footer.set_error(self._ic_error_text)
-            return "failed"
-        try:
-            settings = dataset_manager.get_fit_settings(ds_id)
-        except Exception:
-            self._ic_error_text = f"Failed to load fit settings for dataset {ds_id}."
-            if hasattr(self, "_footer"):
-                self._footer.set_error(self._ic_error_text)
-            return "failed"
-
-        initials = dict(getattr(settings, "initial_conditions", {}) or {})
-        fit_flags = dict(getattr(settings, "fit_flags", {}) or {})
-        log10_flags = dict(getattr(settings, "log10_flags", {}) or {})
-        bounds_map = dict(getattr(settings, "bounds", {}) or {})
-        promoted = self._copy_ic_dataset_state(self._pending_ic_state_for_dataset(ds_id))
-        updates: Dict[str, Dict[str, object]] = {}
-        fit_flags_updates: Dict[str, bool] = {}
-        for species, spec in promoted.items():
-            species_key = str(species)
-            initials[species_key] = float(spec["initial"])
-            fit_flags[species_key] = bool(spec["fit"])
-            log10_flags[species_key] = bool(spec["log10"])
-            bounds_map[species_key] = (float(spec["min"]), float(spec["max"]))
-            updates[species_key] = {
-                "initial": float(spec["initial"]),
-                "log10": bool(spec["log10"]),
-                "min": float(spec["min"]),
-                "max": float(spec["max"]),
-            }
-            fit_flags_updates[species_key] = bool(spec["fit"])
-
-        settings.initial_conditions = initials
-        settings.fit_flags = fit_flags
-        settings.log10_flags = log10_flags
-        settings.bounds = bounds_map
-        try:
-            dataset_manager.update_fit_settings(ds_id, settings)
-        except Exception:
-            self._ic_error_text = f"Failed to persist fit settings for dataset {ds_id}."
-            if hasattr(self, "_footer"):
-                self._footer.set_error(self._ic_error_text)
-            return "failed"
-
-        self._ic_applied[ds_id] = self._copy_ic_dataset_state(promoted)
-        self._ic_pending[ds_id] = self._copy_ic_dataset_state(promoted)
-        self._clear_ic_error()
-        self.icApplied.emit(ds_id, updates, fit_flags_updates)
-        self._ic_editor_dirty = False
-        return "applied"
-
-    def _validate_ic_cells(self) -> Optional[str]:
-        ds_id = str(self._current_dataset_id or "").strip()
-        if not ds_id:
-            return "No dataset selected."
-        mechanism_set = {str(species) for species in self._mechanism_species if str(species).strip()}
-        if not mechanism_set:
-            return "No mechanism species available."
-        for row, species in enumerate(self._current_row_species):
-            if species not in mechanism_set:
-                continue
-            init_item = self._table.item(row, _Col.INITIAL)
-            fit_item = self._table.item(row, _Col.FIT_IC)
-            log_item = self._table.item(row, _Col.LOG10)
-            min_item = self._table.item(row, _Col.MIN)
-            max_item = self._table.item(row, _Col.MAX)
-            try:
-                init_val = float(init_item.text())
-            except Exception:
-                return f"Species '{species}' requires a numeric initial concentration."
-            fit_flag = bool(fit_item and fit_item.checkState() == Qt.Checked)
-            log10_flag = bool(log_item and log_item.checkState() == Qt.Checked)
-            try:
-                min_val = float(min_item.text())
-                max_val = float(max_item.text())
-            except Exception:
-                return f"Species '{species}' requires numeric bounds."
-            if fit_flag and not (min_val < max_val):
-                return f"Species '{species}' bounds must satisfy min < max."
-            if fit_flag and log10_flag:
-                if not (init_val > 0.0 and min_val > 0.0 and max_val > 0.0):
-                    return f"Species '{species}' requires initial/min/max > 0 when Log10 is enabled."
-        return None
-
-    def _revert_changes(self) -> None:
-        # Revert targets
-        if self._fit_targets_dirty:
-            self._fit_targets_selection_pending = {
-                ds: set(v) for ds, v in (self._fit_targets_selection_applied or {}).items()
-            }
-            self._fit_target_weights_pending = {
-                ds: dict(v) for ds, v in (self._fit_target_weights_applied or {}).items()
-            }
-            self._fit_target_weights_pending_invalid = {}
-
-        self._seed_all_ic_state_from_dataset_manager()
-        self._ic_editor_dirty = False
-        self._clear_ic_error()
-        self._populate_table()
-        self._update_combined_dirty_state()
-
-    # ------------------------------------------------------------------
-    # Flush helpers
-    # ------------------------------------------------------------------
-    def _flush_visible_weight_edits_internal(self) -> None:
-        ds_id = str(self._current_dataset_id or "").strip()
-        if not ds_id or not hasattr(self, "_table"):
-            return
-        available = set(self._fit_targets_available_by_dataset.get(ds_id, []))
-        for row in range(self._table.rowCount()):
-            if row >= len(self._current_row_species):
-                break
-            species = self._current_row_species[row]
-            if species not in available:
-                continue
-            weight_item = self._table.item(row, _Col.WEIGHT)
-            if weight_item is None:
-                continue
-            self._set_pending_fit_target_weight_text(ds_id, species, weight_item.text())
-
-    # ------------------------------------------------------------------
-    # IC helpers
-    # ------------------------------------------------------------------
-    def _initial_parameter_defaults_for_species(self, dataset_id: str, species: str):
-        ds_id = str(dataset_id or "").strip()
-        settings = None
-        dataset_manager = self._dataset_manager_getter()
-        if dataset_manager is not None and hasattr(dataset_manager, "get_fit_settings"):
-            try:
-                settings = dataset_manager.get_fit_settings(ds_id)
-            except Exception:
-                settings = None
-        initials = dict(getattr(settings, "initial_conditions", {}) or {}) if settings is not None else {}
-        fit_flags = dict(getattr(settings, "fit_flags", {}) or {}) if settings is not None else {}
-        log10_flags = dict(getattr(settings, "log10_flags", {}) or {}) if settings is not None else {}
-        bounds_map = dict(getattr(settings, "bounds", {}) or {}) if settings is not None else {}
-
-        state = self._ic_entry_from_settings_maps(
-            str(species),
-            initials=initials,
-            fit_flags=fit_flags,
-            log10_flags=log10_flags,
-            bounds_map=bounds_map,
+    def _relayout_bulk_buttons(self) -> None:
+        buttons = (
+            self._bulk_all_button,
+            self._bulk_none_button,
+            self._bulk_invert_button,
+            self._copy_targets_button,
+            self._copy_species_weights_vary_ic_button,
         )
-        return bool(state.get("fit", False)), {
-            "initial": float(state.get("initial", 0.0)),
-            "min": float(state.get("min", 0.0)),
-            "max": float(state.get("max", 10.0)),
-            "log10": bool(state.get("log10", False)),
-        }
+        for button in buttons:
+            self._bulk_layout.removeWidget(button)
+        for index in range(6):
+            self._bulk_layout.setColumnStretch(index, 0)
+        metrics = self.fontMetrics()
+        wide = self.width() >= (
+            sum(metrics.horizontalAdvance(text) + 24 for text in (
+                "All", "None", "Invert", "Copy Targets to Compatible",
+                "Copy Species Weights and Vary IC to Compatible",
+            )) + 80
+        )
+        self._copy_targets_button.setText(
+            "Copy Targets to Compatible" if wide else "Copy Targets\nto Compatible"
+        )
+        self._copy_species_weights_vary_ic_button.setText(
+            "Copy Species Weights and Vary IC to Compatible" if wide
+            else "Copy Species Weights and Vary IC\nto Compatible"
+        )
+        if wide:
+            for column, button in enumerate(buttons):
+                self._bulk_layout.addWidget(button, 0, column)
+            self._bulk_layout.setColumnStretch(5, 1)
+        else:
+            for column, button in enumerate(buttons[:4]):
+                self._bulk_layout.addWidget(button, 0, column)
+            self._bulk_layout.addWidget(buttons[4], 1, 0, 1, 4)
+            self._bulk_layout.setColumnStretch(4, 1)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        self._relayout_bulk_buttons()
 
     # ------------------------------------------------------------------
-    # Public API -- Properties
+    # Typed snapshot projection
     # ------------------------------------------------------------------
-    @property
-    def fit_targets_selection_applied(self) -> Dict[str, List[str]]:
-        return {ds: list(v) for ds, v in self._fit_targets_selection_applied.items()}
-
-    def applied_target_weights_for_dataset(self, dataset_id: str) -> Dict[str, float]:
-        ds_id = str(dataset_id or "").strip()
-        selection = [str(x) for x in (self._fit_targets_selection_applied.get(ds_id, []) or []) if str(x).strip()]
-        weights = self._fit_target_weights_applied.get(ds_id, {}) if isinstance(self._fit_target_weights_applied, dict) else {}
-        return {
-            name: float(weights.get(name, 1.0)) if self._is_valid_fit_target_weight(weights.get(name, 1.0)) else 1.0
-            for name in selection
-        }
-
-    @property
-    def full_series_by_dataset(self) -> dict:
-        return self._fit_targets_full_series_by_dataset
-
-    @property
-    def full_t_by_dataset(self) -> dict:
-        return self._fit_targets_full_t_by_dataset
-
-    @property
-    def available_by_dataset(self) -> dict:
-        return self._fit_targets_available_by_dataset
-
-    @property
-    def _ic_editor_current_dataset_id(self) -> Optional[str]:
-        return self._current_dataset_id
-
-    @_ic_editor_current_dataset_id.setter
-    def _ic_editor_current_dataset_id(self, value):
-        self._current_dataset_id = value
-
-    # ------------------------------------------------------------------
-    # Public API -- Flush
-    # ------------------------------------------------------------------
-    def flush_visible_weight_edits(self) -> None:
-        self._flush_visible_weight_edits_internal()
-
-    def flush_dataset_weight_editor(self) -> None:
-        self._flush_dataset_weight_editor_for_dataset(self._current_dataset_id)
-
-    # ------------------------------------------------------------------
-    # Public API -- Weight mode
-    # ------------------------------------------------------------------
-    def weight_mode_is_implicit(self) -> bool:
-        return bool(getattr(self, "_weight_mode_combo", None) is not None and self._weight_mode_combo.currentIndex() == 0)
-
-    # ------------------------------------------------------------------
-    # Public API -- Validity queries
-    # ------------------------------------------------------------------
-    def invalid_applied_used_dataset_ids(self) -> List[str]:
-        return self._invalid_applied_used_dataset_ids()
-
-    def invalid_pending_used_dataset_ids(self) -> List[str]:
-        return self._invalid_pending_used_dataset_ids()
-
-    def invalid_pending_target_weight_dataset_ids(self) -> List[str]:
-        return self._invalid_pending_target_weight_dataset_ids()
-
-    # ------------------------------------------------------------------
-    # Public API -- Dataset mutation
-    # ------------------------------------------------------------------
-    def add_dataset_state(
+    def project_setup_snapshot(
         self,
-        dataset_id: str,
+        snapshot: FitSetupSnapshot,
         *,
-        full_series: Dict[str, np.ndarray],
-        full_t: np.ndarray,
-        available: List[str],
+        dataset_id: str | None = None,
     ) -> None:
-        self._fit_targets_full_series_by_dataset[dataset_id] = dict(full_series)
-        self._fit_targets_full_t_by_dataset[dataset_id] = full_t
-        self._fit_targets_selection_applied[dataset_id] = []
-        self._fit_targets_selection_pending[dataset_id] = set()
-        self._fit_target_weights_applied[dataset_id] = {}
-        self._fit_target_weights_pending[dataset_id] = {}
-        self._fit_target_weights_pending_invalid.pop(dataset_id, None)
-        self._seed_ic_state_for_dataset(dataset_id)
-        self._recompute_fit_universe()
+        """Render an owner snapshot without reconstructing Fit state."""
 
-    def remove_dataset_state(self, dataset_ids: set[str]) -> None:
-        for ds_id in list(dataset_ids):
-            self._fit_targets_selection_applied.pop(ds_id, None)
-            self._fit_targets_selection_pending.pop(ds_id, None)
-            self._fit_target_weights_applied.pop(ds_id, None)
-            self._fit_target_weights_pending.pop(ds_id, None)
-            self._fit_target_weights_pending_invalid.pop(ds_id, None)
-            self._fit_targets_available_by_dataset.pop(ds_id, None)
-            self._fit_targets_full_series_by_dataset.pop(ds_id, None)
-            self._fit_targets_full_t_by_dataset.pop(ds_id, None)
-            self._ic_pending.pop(ds_id, None)
-            self._ic_applied.pop(ds_id, None)
-        if self._current_dataset_id in dataset_ids:
-            self._current_dataset_id = None
-            self._clear_table_for_no_dataset()
-        self._update_combined_dirty_state()
+        self._origin = snapshot.origin
+        available_ids = tuple(item.dataset_id for item in snapshot.datasets)
+        requested_id = dataset_id or self._current_dataset_id
+        self._projected_setup = snapshot
+        self._current_dataset_id = requested_id or (
+            available_ids[0] if available_ids else None
+        )
+        self._refresh_visible_presentation()
 
-    def refresh_dataset_list(self) -> None:
-        if self._current_dataset_id and self._current_dataset_id not in self._fit_targets_available_by_dataset:
-            self._current_dataset_id = None
-        if self._current_dataset_id is None:
-            self._clear_table_for_no_dataset()
-            self._update_combined_dirty_state()
+    def load_for_dataset(self, dataset_id: str) -> None:
+        """Select one projected dataset and repaint the table."""
+
+        if self._projected_setup is None:
             return
-        self._refresh_dataset_weight_editor_state()
-        self._refresh_internal_validity_ui()
+        self._current_dataset_id = dataset_id
+        self._refresh_visible_presentation()
 
-    # ------------------------------------------------------------------
-    # Public API -- Tab activation
-    # ------------------------------------------------------------------
-    def on_tab_activated(self, seed_dataset_id: Optional[str] = None) -> None:
-        if self._current_dataset_id is None and seed_dataset_id:
-            self.load_for_dataset(seed_dataset_id)
-        else:
-            if self._current_dataset_id:
-                if not self._ic_editor_dirty:
-                    self._seed_ic_state_for_dataset(self._current_dataset_id)
-                self._populate_table()
-            self._refresh_dataset_weight_editor_state()
-            self._refresh_internal_validity_ui()
-
-    # ------------------------------------------------------------------
-    # Public API -- Refresh
-    # ------------------------------------------------------------------
     def refresh_validity_ui(self) -> None:
-        self._refresh_internal_validity_ui()
+        """Refresh presentation validation without becoming a Fit validator."""
 
-    # ------------------------------------------------------------------
-    # Public API -- IC interface
-    # ------------------------------------------------------------------
-    def set_mechanism_species(self, species: list[str]) -> None:
-        try:
-            current_modeled = frozenset(
-                str(s) for s in (self._modeled_series_getter() or set()) if str(s).strip()
-            )
-        except Exception:
-            current_modeled = frozenset()
+        self._refresh_error()
 
-        mechanism_changed = (species != self._mechanism_species)
-        modeled_changed = (current_modeled != self._cached_modeled_series)
+    def clear_pending_edits(self) -> None:
+        """Discard every held invalid weight and initial-condition entry."""
 
-        if not mechanism_changed and not modeled_changed:
-            return
-
-        self._cached_modeled_series = current_modeled
-
-        if mechanism_changed:
-            self._mechanism_species = list(species)
-            self._seed_all_ic_state_from_dataset_manager()
-            self._ic_editor_dirty = False
-            self._clear_ic_error()
-
-        self._recompute_fit_universe()
-        self._current_row_species = []
-        if self._current_dataset_id:
-            self._populate_table()
-        self._update_combined_dirty_state()
-
-    def refresh_dataset_combo(self, dataset_entries: list) -> None:
-        self._dataset_entries = list(dataset_entries)
-
-    def initial_parameter_defaults_for_species(self, dataset_id: str, species: str) -> tuple[bool, dict[str, float]]:
-        return self._initial_parameter_defaults_for_species(dataset_id, species)
+        self._invalid_raw.clear()
+        self._invalid_initial_rows.clear()
+        self._invalid_initial_raw.clear()
+        self._refresh_visible_presentation()
 
     def set_running_state(self, running: bool) -> None:
-        if hasattr(self, "_table"):
-            self._table.setEnabled(not running)
-        if hasattr(self, "_weight_mode_combo"):
-            self._weight_mode_combo.setEnabled(not running)
-        if hasattr(self, "_dataset_weight_edit"):
-            if running:
-                self._dataset_weight_edit.setEnabled(False)
+        """Lock every editor while a Fit runs."""
+
+        self._running = bool(running)
+        self._table.setEnabled(not self._running)
+        self._weight_mode_combo.setEnabled(not self._running)
+        if self._running:
+            self._dataset_weight_edit.setEnabled(False)
+        else:
+            self._refresh_dataset_weight_editor()
+        for button in (
+            self._bulk_all_button,
+            self._bulk_none_button,
+            self._bulk_invert_button,
+            self._copy_targets_button,
+            self._copy_species_weights_vary_ic_button,
+        ):
+            button.setEnabled(not self._running)
+
+    def set_status(self, text: str) -> None:
+        self.statusMessage.emit(str(text))
+
+    def _submit(self, replacement: FitSetupSnapshot) -> None:
+        """Submit one complete setup; the owner projects the accepted one back."""
+
+        self.setupSnapshotRequested.emit(replacement)
+        # A refused replacement leaves the previous projection to restore.
+        self._refresh_visible_presentation()
+
+    # ------------------------------------------------------------------
+    # Snapshot lookup and presentation helpers
+    # ------------------------------------------------------------------
+    def _current_setup(self) -> FitSetupSnapshot | None:
+        return self._projected_setup
+
+    def _projected_dataset(self, dataset_id: str) -> FitDatasetLocalSettings | None:
+        setup = self._current_setup()
+        if setup is None:
+            return None
+        return next(
+            (
+                item
+                for item in setup.datasets
+                if item.dataset_id == dataset_id
+            ),
+            None,
+        )
+
+    def _current_dataset(self) -> FitDatasetLocalSettings | None:
+        if self._projected_setup is None or not self._current_dataset_id:
+            return None
+        return self._projected_dataset(self._current_dataset_id)
+
+    def _mapped_dataset(self, dataset_id: str) -> FitMappedDatasetSnapshot | None:
+        return next(
+            (
+                item
+                for item in self._origin.mapped_datasets
+                if item.dataset_id == dataset_id
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _float_text(value: float) -> str:
+        # Cells keep the exact accepted binary64 value as their item text;
+        # tolerance edits re-parse it.  The delegate paints six digits.
+        return repr(float(value))
+
+    @staticmethod
+    def _set_editable(item: QtWidgets.QTableWidgetItem, enabled: bool) -> None:
+        flags = Qt.ItemFlag.ItemIsSelectable
+        if enabled:
+            flags |= Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            flags |= Qt.ItemFlag.ItemIsEditable
+        item.setFlags(flags)
+
+    @staticmethod
+    def _set_checkable(
+        item: QtWidgets.QTableWidgetItem,
+        checked: bool,
+        enabled: bool,
+    ) -> None:
+        flags = Qt.ItemFlag.ItemIsSelectable
+        if enabled:
+            flags |= Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+        item.setFlags(flags)
+        item.setCheckState(
+            Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        )
+
+    @staticmethod
+    def _observation_target(
+        dataset: FitDatasetLocalSettings,
+        observation: FitObservationSnapshot,
+    ) -> str:
+        mapping = dict(dataset.observation_targets)
+        return str(mapping.get(observation.raw_observation_id, observation.model_target))
+
+    def _row_species(self, dataset: FitDatasetLocalSettings) -> list[str]:
+        mapped = self._mapped_dataset(dataset.dataset_id)
+        observed = (
+            [self._observation_target(dataset, observation) for observation in mapped.observations]
+            if mapped is not None
+            else []
+        )
+        projected_initials = (
+            [
+                item.species
+                for item in (self._current_setup().initials if self._current_setup() else ())
+                if mapped is not None and item.set_id == mapped.set_id
+            ]
+        )
+        return list(
+            dict.fromkeys(
+                [
+                    *self._mechanism_species,
+                    *projected_initials,
+                    *(name for name in observed if name),
+                ]
+            )
+        )
+
+    def _local_initial(
+        self,
+        dataset: FitDatasetLocalSettings,
+        species: str,
+    ) -> FitInitialVariable | None:
+        setup = self._current_setup()
+        if setup is None:
+            return None
+        mapped = self._mapped_dataset(dataset.dataset_id)
+        if mapped is None:
+            return None
+        return next(
+            (
+                item
+                for item in setup.initials
+                if item.set_id == mapped.set_id and item.species == species
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _initial_raw(
+        initial: FitInitialVariable | FitSharedInitialGroup,
+    ) -> dict[str, object]:
+        return {
+            "initial": UnifiedSpeciesTable._float_text(initial.initial),
+            "mode": initial.tolerance.mode,
+            "lower": (
+                ""
+                if initial.tolerance.lower is None
+                else UnifiedSpeciesTable._float_text(initial.tolerance.lower)
+            ),
+            "upper": (
+                ""
+                if initial.tolerance.upper is None
+                else UnifiedSpeciesTable._float_text(initial.tolerance.upper)
+            ),
+            "log10": bool(initial.log10),
+        }
+
+    def _shared_initial_group(
+        self,
+        dataset_id: str,
+        species: str,
+    ) -> FitSharedInitialGroup | None:
+        setup = self._current_setup()
+        return next(
+            (
+                item
+                for item in (setup.shared_initial_groups if setup is not None else ())
+                if item.species == species and dataset_id in item.member_dataset_ids
+            ),
+            None,
+        )
+
+    def _dataset_name(self, dataset_id: str) -> str:
+        mapped = self._mapped_dataset(dataset_id)
+        return mapped.display_name if mapped is not None else dataset_id
+
+    def _refresh_vary_global_availability(self, row: int) -> None:
+        """Refresh one Vary Global cell without rebuilding the table."""
+
+        global_item = self._table.item(row, _Col.VARY_GLOBAL)
+        initial_item = self._table.item(row, _Col.INITIAL)
+        if global_item is None or initial_item is None:
+            return
+        dataset_id = str(initial_item.data(_DATASET_ROLE) or "").strip()
+        set_id = str(initial_item.data(_SET_ROLE) or "").strip()
+        species = str(initial_item.data(_SPECIES_ROLE) or "").strip()
+        if not dataset_id or not set_id or not species:
+            return
+        group = self._shared_initial_group(dataset_id, species)
+        if group is not None:
+            checked = True
+            enabled = True
+        else:
+            local = self._local_initial(
+                self._projected_dataset(dataset_id),
+                species,
+            )
+            # Only an applied varied row can start or join a group.
+            enabled = (
+                (set_id, species) not in self._invalid_initial_rows
+                and local is not None
+                and local.fit
+            )
+            checked = False
+        blocker = QtCore.QSignalBlocker(self._table)
+        self._set_checkable(global_item, checked, enabled)
+        del blocker
+
+    def _group_edit_dialog(
+        self,
+        species: str,
+        dataset_id: str,
+    ) -> tuple[str | None, tuple[str, ...]] | None:
+        """Ask which shared IC group the dataset joins, or which datasets form a new one.
+
+        Returns the joined group's origin (None for a new group) and the other
+        datasets added, or None on Cancel.  The dialog only adds: existing
+        members stay, and datasets in other groups of the species are greyed.
+        Groups are numbered by the table position of their origin dataset, and
+        datasets excluded from the fit are marked.  Each dataset shows its own
+        Starting IC.
+        """
+
+        setup = self._current_setup()
+        if setup is None:
+            return None
+        included = {item.dataset_id for item in setup.datasets if item.included}
+        groups = tuple(
+            group for group in setup.shared_initial_groups if group.species == species
+        )
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"Vary Global — {species}")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.addWidget(QtWidgets.QLabel("Datasets sharing this initial concentration:"))
+        target = QtWidgets.QComboBox(dialog)
+        target.addItem("New Group", None)
+        for origin_dataset_id, (_number, label) in shared_initial_group_labels(
+            groups, species, setup.datasets, self._origin,
+        ).items():
+            target.addItem(label, origin_dataset_id)
+        layout.addWidget(target)
+        checks: dict[str, QtWidgets.QCheckBox] = {}
+        for dataset in setup.datasets:
+            local = self._local_initial(dataset, species)
+            if dataset.dataset_id != dataset_id and local is None:
+                continue
+            name = self._dataset_name(dataset.dataset_id)
+            if local is not None:
+                name = f"{name} ({six_digit_text(local.initial)} M)"
+            check = QtWidgets.QCheckBox(
+                name if dataset.dataset_id in included else f"{name} (not in fit)", dialog,
+            )
+            layout.addWidget(check)
+            checks[dataset.dataset_id] = check
+
+        def project() -> None:
+            """Tick and lock the clicked dataset and the chosen group's members."""
+
+            joined = target.currentData()
+            members = next(
+                (group.member_dataset_ids for group in groups if group.origin_dataset_id == joined), (),
+            )
+            occupied = {member for group in groups for member in group.member_dataset_ids}
+            for item, check in checks.items():
+                locked = item == dataset_id or item in members
+                free = not locked and item not in occupied
+                check.setChecked(locked or (free and check.isChecked()))
+                check.setEnabled(free)
+
+        target.currentIndexChanged.connect(project)
+        project()
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return None
+        return target.currentData(), tuple(
+            item for item, check in checks.items() if check.isChecked() and check.isEnabled()
+        )
+
+    def _submit_groups(
+        self,
+        groups: Sequence[FitSharedInitialGroup],
+        *,
+        initials: Sequence[FitInitialVariable] | None = None,
+    ) -> None:
+        setup = self._current_setup()
+        self._submit(replace(
+            setup,
+            shared_initial_groups=tuple(groups),
+            initials=setup.initials if initials is None else tuple(initials),
+        ))
+
+    def _leave_shared_initial_group(self, group: FitSharedInitialGroup, dataset_id: str) -> None:
+        """One dataset leaves; a group left with one member dissolves.
+
+        When the origin leaves, the first remaining member in table order
+        becomes the origin.  Departing datasets keep their own Starting IC
+        and Vary IC, which membership never changed.
+        """
+
+        setup = self._current_setup()
+        order = tuple(item.dataset_id for item in setup.datasets)
+        remaining = tuple(sorted(
+            (item for item in group.member_dataset_ids if item != dataset_id), key=order.index,
+        ))
+        others = [item for item in setup.shared_initial_groups if item != group]
+        if len(remaining) >= 2:
+            origin = group.origin_dataset_id if group.origin_dataset_id in remaining else remaining[0]
+            others.append(replace(group, origin_dataset_id=origin, member_dataset_ids=remaining))
+        self._submit_groups(others)
+
+    def _on_vary_global_changed(self, row: int, item: QtWidgets.QTableWidgetItem) -> None:
+        """Untick leaves the dataset's group; tick opens the membership dialog."""
+
+        if self._refreshing or self._running:
+            return
+        dataset_id = str(item.data(_DATASET_ROLE) or "").strip()
+        species = str(item.data(_SPECIES_ROLE) or "").strip()
+        if not dataset_id or not species:
+            return
+        group = self._shared_initial_group(dataset_id, species)
+        if group is not None:
+            if item.checkState() != Qt.CheckState.Checked:
+                self._leave_shared_initial_group(group, dataset_id)
+            return
+        if item.checkState() != Qt.CheckState.Checked:
+            return
+        current_dataset = self._current_dataset()
+        local = self._local_initial(current_dataset, species) if current_dataset else None
+        mapped = self._mapped_dataset(dataset_id)
+        if (
+            mapped is None
+            or local is None
+            or not local.fit
+            or (mapped.set_id, species) in self._invalid_initial_rows
+        ):
+            self._refresh_visible_presentation()
+            return
+        choice = self._group_edit_dialog(species, dataset_id)
+        if choice is None:
+            self._refresh_visible_presentation()
+            return
+        joined, added = choice
+        if joined is None and not added:
+            self.set_status("Vary Global needs an additional compatible dataset.")
+            self._refresh_visible_presentation()
+            return
+        # Every joiner takes the group's configuration over its invalid text.
+        for member in (dataset_id, *added):
+            self._drop_invalid_initial_row(self._mapped_dataset(member).set_id, species)
+        setup = self._current_setup()
+        if joined is None:
+            self._submit_groups((
+                *setup.shared_initial_groups,
+                FitSharedInitialGroup(
+                    species=species,
+                    origin_dataset_id=dataset_id,
+                    member_dataset_ids=(dataset_id, *added),
+                    initial=local.initial,
+                    tolerance=local.tolerance,
+                    log10=local.log10,
+                ),
+            ))
+            return
+        self._submit_groups(tuple(
+            replace(group, member_dataset_ids=(*group.member_dataset_ids, dataset_id, *added))
+            if group.species == species and group.origin_dataset_id == joined
+            else group
+            for group in setup.shared_initial_groups
+        ))
+
+    def _observations_for_target(
+        self,
+        dataset: FitDatasetLocalSettings,
+        target: str,
+    ) -> tuple[FitObservationSnapshot, ...]:
+        mapped = self._mapped_dataset(dataset.dataset_id)
+        if mapped is None:
+            return ()
+        return tuple(
+            observation
+            for observation in mapped.observations
+            if self._observation_target(dataset, observation) == target
+        )
+
+    def _observation_tooltip(
+        self,
+        dataset: FitDatasetLocalSettings,
+        target: str,
+    ) -> str:
+        return "\n".join(
+            f"Data column {item.raw_column} → {self._observation_target(dataset, item)}"
+            for item in self._observations_for_target(dataset, target)
+        )
+
+    def _populate_table(self) -> None:
+        dataset = self._current_dataset()
+        if dataset is None:
+            self._table.setRowCount(0)
+            self._row_keys = ()
+            self._group.setTitle("Species Table")
+            return
+
+        mapped = self._mapped_dataset(dataset.dataset_id)
+        if mapped is None:
+            return
+        self._group.setTitle(f"Species Table — {mapped.display_name}")
+        x_name = dataset.parametric.x_name if dataset.parametric is not None else None
+        selected = set(dataset.target_species)
+        selected.discard(x_name)
+        weights = dict(dataset.target_weights)
+        row_species = self._row_species(dataset)
+        current = self._table.currentIndex()
+        current_cell = (current.row(), current.column()) if current.isValid() else None
+        keys = (dataset.dataset_id, tuple(row_species))
+        if keys != self._row_keys:
+            # Only another dataset or roster replaces rows; ordinary edits
+            # update cells in place and keep the current cell.
+            self._table.setRowCount(0)
+            self._table.setRowCount(len(row_species))
+            self._row_keys = keys
+            current_cell = None
+        for row, species in enumerate(row_species):
+            observations = self._observations_for_target(dataset, species)
+            has_data = bool(observations)
+            local = self._local_initial(dataset, species)
+            group_config = self._shared_initial_group(dataset.dataset_id, species)
+            group_origin = (
+                group_config is not None
+                and group_config.origin_dataset_id == dataset.dataset_id
+            )
+            group_member = group_config is not None and not group_origin
+            local_key = (mapped.set_id, species)
+            if local_key in self._invalid_initial_rows:
+                raw_initial = self._invalid_initial_rows[local_key]
+            elif group_config is not None:
+                raw_initial = self._initial_raw(group_config)
             else:
-                self._refresh_dataset_weight_editor_state()
-        if hasattr(self, "_footer"):
-            self._footer.setEnabled(not running)
-        for btn in (getattr(self, "_bulk_all_button", None),
-                    getattr(self, "_bulk_none_button", None),
-                    getattr(self, "_bulk_invert_button", None)):
-            if btn is not None:
-                btn.setEnabled(not running)
+                raw_initial = self._initial_raw(local) if local is not None else {}
+            member_tooltip = (
+                f"Shared with {self._dataset_name(group_config.origin_dataset_id)}. Edit it there."
+                if group_member else ""
+            )
+            target_item = QtWidgets.QTableWidgetItem()
+            eligible = has_data and species != x_name
+            self._set_checkable(target_item, species in selected, eligible)
+            target_item.setData(_DATASET_ROLE, dataset.dataset_id)
+            target_item.setData(_MODEL_TARGET_ROLE, species)
+            target_item.setData(_SPECIES_ROLE, species)
+            self._table.setItem(row, _Col.INCLUDE, target_item)
+
+            weight_invalid_key = (
+                "target_weight",
+                dataset.dataset_id,
+                species,
+            )
+            weight_text = (
+                self._invalid_raw[weight_invalid_key]
+                if weight_invalid_key in self._invalid_raw
+                else self._float_text(weights.get(species, 1.0))
+            )
+            weight_item = QtWidgets.QTableWidgetItem(
+                weight_text if has_data else ""
+            )
+            weight_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._set_editable(weight_item, has_data)
+            weight_item.setData(_DATASET_ROLE, dataset.dataset_id)
+            weight_item.setData(_MODEL_TARGET_ROLE, species)
+            weight_item.setData(_SPECIES_ROLE, species)
+            if weight_invalid_key in self._invalid_raw:
+                weight_item.setBackground(_INVALID_BG)
+                weight_item.setForeground(_INVALID_FG)
+                weight_item.setToolTip(_TARGET_WEIGHT_MESSAGE)
+            self._table.setItem(row, _Col.WEIGHT, weight_item)
+
+            species_item = QtWidgets.QTableWidgetItem(species)
+            species_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            )
+            species_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            species_item.setData(_DATASET_ROLE, dataset.dataset_id)
+            species_item.setData(_MODEL_TARGET_ROLE, species)
+            species_item.setData(_SPECIES_ROLE, species)
+            tooltip = self._observation_tooltip(dataset, species)
+            if tooltip:
+                species_item.setToolTip(tooltip)
+            self._table.setItem(row, _Col.SPECIES, species_item)
+
+            tolerance_mode = str(raw_initial.get("mode", "disabled"))
+            for column, field in (
+                (_Col.INITIAL, "initial"),
+                (_Col.LOWER, "lower"),
+                (_Col.UPPER, "upper"),
+            ):
+                invalid_key = (mapped.set_id, species, field)
+                initial_item = QtWidgets.QTableWidgetItem(
+                    self._invalid_initial_raw[invalid_key][0]
+                    if invalid_key in self._invalid_initial_raw
+                    else str(raw_initial.get(field, ""))
+                )
+                self._set_editable(
+                    initial_item,
+                    local is not None and not group_member
+                    and (
+                        field == "initial"
+                        or (field == "lower" and tolerance_mode != "disabled")
+                        or (
+                            field == "upper"
+                            and tolerance_mode in {"asymmetric_percent", "absolute"}
+                        )
+                    ),
+                )
+                initial_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                initial_item.setData(_DATASET_ROLE, dataset.dataset_id)
+                initial_item.setData(_SET_ROLE, mapped.set_id)
+                initial_item.setData(_SPECIES_ROLE, species)
+                if invalid_key in self._invalid_initial_raw:
+                    initial_item.setBackground(_INVALID_BG)
+                    initial_item.setForeground(_INVALID_FG)
+                    initial_item.setToolTip(self._invalid_initial_raw[invalid_key][1])
+                elif member_tooltip:
+                    initial_item.setToolTip(member_tooltip)
+                self._table.setItem(row, column, initial_item)
+
+            mode = QtWidgets.QComboBox(self._table)
+            ignore_wheel(mode)
+            mode.setObjectName("global_fit_vary_ic_combo")
+            for label, value, tooltip in _VARY_IC_CHOICES:
+                mode.addItem(label, value)
+                item_index = mode.model().index(mode.count() - 1, 0)
+                mode.model().setData(
+                    item_index,
+                    tooltip,
+                    Qt.ItemDataRole.ToolTipRole,
+                )
+            if self._shows_zero_initial(raw_initial):
+                # A percentage of zero is no range; only Minimum / Maximum applies.
+                for value in ("symmetric_percent", "asymmetric_percent"):
+                    choice = mode.model().item(mode.findData(value))
+                    choice.setEnabled(False)
+                    choice.setToolTip(ZERO_IC_PERCENT_MESSAGE)
+            mode.setEnabled(local is not None and not group_member)
+            mode.setCurrentIndex(
+                max(0, mode.findData(tolerance_mode))
+            )
+            self._set_vary_ic_combo_tooltip(mode)
+            if member_tooltip:
+                mode.setToolTip(member_tooltip)
+            mode.currentIndexChanged.connect(
+                lambda _index, table_row=row, combo=mode:
+                self._on_vary_ic_mode_changed(table_row, combo)
+            )
+            self._table.setCellWidget(row, _Col.TOLERANCE_MODE, mode)
+
+            global_item = QtWidgets.QTableWidgetItem()
+            self._set_checkable(global_item, False, False)
+            global_item.setData(_DATASET_ROLE, dataset.dataset_id)
+            global_item.setData(_SET_ROLE, mapped.set_id)
+            global_item.setData(_SPECIES_ROLE, species)
+            self._table.setItem(row, _Col.VARY_GLOBAL, global_item)
+
+            check_item = QtWidgets.QTableWidgetItem()
+            self._set_checkable(
+                check_item,
+                bool(raw_initial.get("log10", False)),
+                local is not None
+                and tolerance_mode != "disabled"
+                and not group_member,
+            )
+            check_item.setData(_DATASET_ROLE, dataset.dataset_id)
+            check_item.setData(_SET_ROLE, mapped.set_id)
+            check_item.setData(_SPECIES_ROLE, species)
+            if member_tooltip:
+                check_item.setToolTip(member_tooltip)
+            self._table.setItem(row, _Col.LOG10, check_item)
+            self._refresh_vary_global_availability(row)
+        if current_cell is not None and current_cell[0] < self._table.rowCount():
+            self._table.setCurrentCell(*current_cell)
+
+    @staticmethod
+    def _shows_zero_initial(raw_initial: dict[str, object]) -> bool:
+        try:
+            return float(str(raw_initial.get("initial", ""))) == 0.0
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _set_vary_ic_combo_tooltip(combo: QtWidgets.QComboBox) -> None:
+        """Keep the closed combo tooltip equal to its selected popup item."""
+
+        index = combo.currentIndex()
+        tooltip = "" if index < 0 else str(
+            combo.itemData(index, Qt.ItemDataRole.ToolTipRole) or ""
+        )
+        combo.setToolTip(tooltip)
+
+    def _on_vary_ic_mode_changed(
+        self,
+        row: int,
+        combo: QtWidgets.QComboBox,
+    ) -> None:
+        """Author one complete fresh range for a Vary IC mode transition."""
+
+        self._set_vary_ic_combo_tooltip(combo)
+        if self._refreshing or self._running:
+            return
+        mode = combo.currentData()
+        initial_item = self._table.item(row, _Col.INITIAL)
+        if initial_item is None:
+            return
+        try:
+            initial = float(initial_item.text())
+            if not math.isfinite(initial) or initial < 0.0:
+                raise ValueError
+        except ValueError:
+            # A mode transition still authors a fresh range when Starting IC
+            # is incomplete.  The row validator retains the invalid Starting
+            # IC and Run remains blocked until the user repairs it.
+            initial = None
+
+        lower_item = self._table.item(row, _Col.LOWER)
+        upper_item = self._table.item(row, _Col.UPPER)
+        if lower_item is None or upper_item is None:
+            return
+        if mode == "disabled":
+            lower, upper, disable_log = "", "", True
+        elif mode == "symmetric_percent":
+            lower, upper, disable_log = "5", "", False
+        elif mode == "asymmetric_percent":
+            lower, upper, disable_log = "5", "5", False
+        else:
+            lower = "0"
+            upper = (
+                self._float_text(six_digit_value(10.0 * initial))
+                if initial is not None and initial > 0.0
+                else ""
+            )
+            disable_log = True
+
+        # Signals from the two cleared cells must not stage half-written
+        # rows. The single explicit stage below sees the complete row.
+        table_blocker = QtCore.QSignalBlocker(self._table)
+        lower_item.setText(lower)
+        upper_item.setText(upper)
+        if disable_log:
+            log_item = self._table.item(row, _Col.LOG10)
+            if log_item is not None:
+                self._set_checkable(log_item, False, mode != "disabled")
+        del table_blocker
+        self._stage_initial_row_at(row)
+
+    def _accepted_initial(
+        self,
+        set_id: str,
+        species: str,
+    ) -> FitInitialVariable | None:
+        setup = self._current_setup()
+        return next(
+            (
+                item
+                for item in (setup.initials if setup is not None else ())
+                if item.set_id == set_id and item.species == species
+            ),
+            None,
+        )
+
+    def _refresh_visible_presentation(self) -> None:
+        self._refreshing = True
+        self.setUpdatesEnabled(False)
+        self._table.blockSignals(True)
+        self._weight_mode_combo.blockSignals(True)
+        self._dataset_weight_edit.blockSignals(True)
+        try:
+            setup = self._current_setup()
+            if setup is not None:
+                mode_index = self._weight_mode_combo.findData(setup.dataset_weight_mode)
+                self._weight_mode_combo.setCurrentIndex(max(0, mode_index))
+            self._populate_table()
+            self._refresh_dataset_weight_editor()
+        finally:
+            self._dataset_weight_edit.blockSignals(False)
+            self._weight_mode_combo.blockSignals(False)
+            self._table.blockSignals(False)
+            self._refreshing = False
+            self.setUpdatesEnabled(True)
+        self._refresh_error()
+
+    # ------------------------------------------------------------------
+    # Edits
+    # ------------------------------------------------------------------
+    def _on_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._refreshing or self._running:
+            return
+        dataset_id = str(item.data(_DATASET_ROLE) or "")
+        species = str(item.data(_SPECIES_ROLE) or item.data(_MODEL_TARGET_ROLE) or "")
+        if not dataset_id or not species:
+            return
+        if item.column() in {
+            _Col.INITIAL,
+            _Col.LOG10,
+            _Col.LOWER,
+            _Col.UPPER,
+        }:
+            self._stage_initial_row_at(item.row())
+            return
+        if item.column() == _Col.VARY_GLOBAL:
+            self._on_vary_global_changed(item.row(), item)
+            return
+        if item.column() == _Col.WEIGHT:
+            self._on_target_weight_edited(item, dataset_id, species)
+            return
+        if item.column() == _Col.INCLUDE:
+            self._stage_visible_target_selection(dataset_id)
+            return
+
+    def _on_target_weight_edited(
+        self,
+        item: QtWidgets.QTableWidgetItem,
+        dataset_id: str,
+        species: str,
+    ) -> None:
+        key = ("target_weight", dataset_id, species)
+        try:
+            value = float(item.text())
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError
+        except ValueError:
+            self._invalid_raw[key] = item.text()
+            self._mark_invalid(item, _TARGET_WEIGHT_MESSAGE)
+            return
+        self._invalid_raw.pop(key, None)
+        dataset = self._projected_dataset(dataset_id)
+        weights = dict(dataset.target_weights)
+        if weights.get(species, 1.0) == value:
+            self._refresh_visible_presentation()
+            return
+        weights[species] = value
+        self._submit_dataset(replace(dataset, target_weights=tuple(weights.items())))
+
+    def _submit_dataset(self, dataset: FitDatasetLocalSettings) -> None:
+        setup = self._current_setup()
+        self._submit(replace(
+            setup,
+            datasets=tuple(
+                dataset if item.dataset_id == dataset.dataset_id else item
+                for item in setup.datasets
+            ),
+        ))
+
+    def _stage_initial_row_at(self, row: int) -> None:
+        """Apply one complete initial-condition row, or hold its text."""
+
+        identity_item = self._table.item(row, _Col.INITIAL)
+        if identity_item is None:
+            return
+        set_id = str(identity_item.data(_SET_ROLE) or "").strip()
+        species = str(identity_item.data(_SPECIES_ROLE) or "").strip()
+        dataset_id = str(identity_item.data(_DATASET_ROLE) or "").strip()
+        if not set_id or not species:
+            return
+        items = {
+            "initial": self._table.item(row, _Col.INITIAL),
+            "lower": self._table.item(row, _Col.LOWER),
+            "upper": self._table.item(row, _Col.UPPER),
+        }
+        mode_widget = self._table.cellWidget(row, _Col.TOLERANCE_MODE)
+        log_item = self._table.item(row, _Col.LOG10)
+        if (
+            any(value is None for value in items.values())
+            or not isinstance(mode_widget, QtWidgets.QComboBox)
+            or log_item is None
+        ):
+            return
+        accepted = self._accepted_initial(set_id, species)
+        if accepted is None:
+            return
+        key = (set_id, species)
+        group = self._shared_initial_group(dataset_id, species)
+        if group is not None and group.origin_dataset_id != dataset_id:
+            return
+        mode = str(mode_widget.currentData() or "disabled")
+        log10 = mode != "disabled" and log_item.checkState() == Qt.CheckState.Checked
+        raw: dict[str, object] = {
+            field: str(value.text()) for field, value in items.items()
+        }
+        raw.update({"mode": mode, "log10": log10})
+
+        typed: dict[str, float] = {}
+        parse_errors: dict[str, str] = {}
+        required_fields = {"initial"}
+        if mode == "symmetric_percent":
+            required_fields.add("lower")
+        elif mode in {"asymmetric_percent", "absolute"}:
+            required_fields.update({"lower", "upper"})
+        for field in required_fields:
+            try:
+                typed[field] = parse_finite_numeric_text(
+                    str(raw[field]), field=_INITIAL_FIELD_HEADERS[field]
+                )
+            except ValueError as exc:
+                parse_errors[field] = str(exc)
+        if not parse_errors:
+            # A tolerance error lies in Lower/Upper alone; a row error may
+            # involve the Starting IC too.
+            try:
+                if mode == "disabled":
+                    tolerance = FitInitialTolerance()
+                elif mode == "symmetric_percent":
+                    tolerance = FitInitialTolerance.symmetric_percent(typed["lower"])
+                elif mode == "asymmetric_percent":
+                    tolerance = FitInitialTolerance.asymmetric_percent(
+                        typed["lower"], typed["upper"]
+                    )
+                else:
+                    tolerance = FitInitialTolerance.absolute(
+                        typed["lower"], typed["upper"]
+                    )
+            except ValueError as caught_error:
+                parse_errors = dict.fromkeys(required_fields - {"initial"}, str(caught_error))
+        if not parse_errors:
+            try:
+                initial = FitInitialVariable(
+                    set_id=set_id,
+                    species=species,
+                    initial=float(typed["initial"]),
+                    tolerance=tolerance,
+                    log10=log10,
+                )
+            except ValueError as caught_error:
+                parse_errors = dict.fromkeys(required_fields, str(caught_error))
+        if parse_errors:
+            self._drop_invalid_initial_row(set_id, species)
+            self._invalid_initial_rows[key] = raw
+            for field, message in parse_errors.items():
+                self._invalid_initial_raw[(set_id, species, field)] = (str(raw[field]), message)
+            self._refresh_visible_presentation()
+            return
+        self._drop_invalid_initial_row(set_id, species)
+        setup = self._current_setup()
+        if group is not None:
+            if initial.tolerance.mode == "disabled":
+                # Turning off Vary IC on the origin dissolves its group; every
+                # member keeps its own Starting IC, and the origin's Vary IC is
+                # off.  The row shows the group's value unless the user typed
+                # another Starting IC, which the origin then keeps.
+                fixed = replace(
+                    accepted,
+                    initial=accepted.initial if initial.initial == group.initial else initial.initial,
+                    tolerance=initial.tolerance,
+                    log10=False,
+                )
+                self._submit_groups(
+                    tuple(item for item in setup.shared_initial_groups if item != group),
+                    initials=tuple(
+                        fixed if item.set_id == set_id and item.species == species else item
+                        for item in setup.initials
+                    ),
+                )
+                return
+            self._submit_groups(tuple(
+                replace(item, initial=initial.initial, tolerance=initial.tolerance, log10=initial.log10)
+                if item == group else item
+                for item in setup.shared_initial_groups
+            ))
+            return
+        if initial == accepted:
+            self._refresh_visible_presentation()
+            return
+        self._submit(replace(
+            setup,
+            initials=tuple(
+                initial if item.set_id == set_id and item.species == species else item
+                for item in setup.initials
+            ),
+        ))
+
+    def _drop_invalid_initial_row(self, set_id: str, species: str) -> None:
+        self._invalid_initial_rows.pop((set_id, species), None)
+        for field in ("initial", "lower", "upper"):
+            self._invalid_initial_raw.pop((set_id, species, field), None)
+
+    @staticmethod
+    def _with_targets(
+        dataset: FitDatasetLocalSettings,
+        selected: tuple[str, ...],
+    ) -> FitDatasetLocalSettings:
+        """Select targets; every species keeps its weight, a new target weighs 1."""
+
+        weights = dict(dataset.target_weights)
+        for target in selected:
+            weights.setdefault(target, 1.0)
+        return replace(dataset, target_species=selected, target_weights=tuple(weights.items()))
+
+    def _stage_visible_target_selection(self, dataset_id: str) -> None:
+        projected = self._projected_dataset(dataset_id)
+        if projected is None:
+            return
+        checked = {
+            str(item.data(_MODEL_TARGET_ROLE) or "").strip()
+            for row in range(self._table.rowCount())
+            for item in (self._table.item(row, _Col.INCLUDE),)
+            if item is not None
+            and str(item.data(_DATASET_ROLE) or "") == dataset_id
+            and item.checkState() == Qt.CheckState.Checked
+        }
+        # Targets keep the dataset's column order, as on open and Copy
+        # Targets, so the same ticks are always the same setup.
+        selected = tuple(target for target in self._eligible_targets(dataset_id) if target in checked)
+        if selected == projected.target_species:
+            self._refresh_visible_presentation()
+            return
+        self._submit_dataset(self._with_targets(projected, selected))
+
+    def _on_dataset_weight_edited(self) -> None:
+        if self._refreshing or self._running:
+            return
+        raw = self._dataset_weight_edit.text()
+        dataset_id = str(self._current_dataset_id or "").strip()
+        projected = self._projected_dataset(dataset_id)
+        if not dataset_id or projected is None:
+            return
+        key = ("dataset_weight", dataset_id)
+        try:
+            value = float(raw)
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError
+        except ValueError:
+            self._invalid_raw[key] = raw
+            self._mark_invalid_line_edit(
+                self._dataset_weight_edit,
+                "Dataset weight must be finite and positive.",
+            )
+            return
+        self._invalid_raw.pop(key, None)
+        if value == projected.weight:
+            self._refresh_visible_presentation()
+            return
+        self._submit_dataset(replace(projected, weight=value))
+
+    def _selected_targets(self, dataset: FitDatasetLocalSettings) -> tuple[str, ...]:
+        if dataset.parametric is None:
+            return dataset.target_species
+        return tuple(
+            target
+            for target in dataset.target_species
+            if target != dataset.parametric.x_name
+        )
+
+    def _weighted_species(self, dataset: FitDatasetLocalSettings) -> set[str]:
+        """The targets whose weights enter the Fit: ticked species or
+        observables, and measured X."""
+        weighted = set(self._selected_targets(dataset))
+        if dataset.parametric is not None:
+            weighted.add(dataset.parametric.x_name)
+        return weighted
+
+    def _eligible_targets(self, dataset_id: str) -> tuple[str, ...]:
+        dataset = self._projected_dataset(dataset_id)
+        mapped = self._mapped_dataset(dataset_id)
+        if dataset is None or mapped is None:
+            return ()
+        x_name = dataset.parametric.x_name if dataset.parametric is not None else None
+        return tuple(
+            dict.fromkeys(
+                target
+                for observation in mapped.observations
+                for target in (self._observation_target(dataset, observation),)
+                if target and target != x_name
+            )
+        )
+
+    def _discard_current_invalid_entries(self) -> None:
+        """Escape: discard the shown dataset's invalid weights and rows."""
+
+        dataset_id = self._current_dataset_id
+        mapped = self._mapped_dataset(dataset_id) if dataset_id else None
+        if mapped is None:
+            return
+        for key in tuple(self._invalid_raw):
+            if key[1] == dataset_id:
+                self._invalid_raw.pop(key)
+        for set_id, species in tuple(self._invalid_initial_rows):
+            if set_id == mapped.set_id:
+                self._drop_invalid_initial_row(set_id, species)
+        self._refresh_visible_presentation()
+        self.set_status(f"Invalid values for {mapped.display_name} discarded.")
+
+    def _apply_bulk_action(self, action: str) -> None:
+        if self._current_dataset() is None:
+            return
+        self._table.blockSignals(True)
+        try:
+            for row in range(self._table.rowCount()):
+                item = self._table.item(row, _Col.INCLUDE)
+                if item is None or not item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                    continue
+                if action == "all":
+                    state = Qt.CheckState.Checked
+                elif action == "none":
+                    state = Qt.CheckState.Unchecked
+                elif action == "invert":
+                    state = (
+                        Qt.CheckState.Unchecked
+                        if item.checkState() == Qt.CheckState.Checked
+                        else Qt.CheckState.Checked
+                    )
+                else:
+                    return
+                item.setCheckState(state)
+        finally:
+            self._table.blockSignals(False)
+        self._stage_visible_target_selection(self._current_dataset_id or "")
+
+    def _copy_targets_to_compatible_datasets(self) -> None:
+        setup = self._current_setup()
+        source = self._current_dataset()
+        if source is None:
+            return
+        source_selection = FitTargetSelection(
+            dataset_id=source.dataset_id,
+            eligible_targets=self._eligible_targets(source.dataset_id),
+            selected_targets=self._selected_targets(source),
+        )
+        if not source_selection.selected_targets:
+            self.set_status("No targets selected to copy")
+            return
+        destinations = tuple(
+            FitTargetSelection(
+                dataset_id=destination.dataset_id,
+                eligible_targets=self._eligible_targets(destination.dataset_id),
+                selected_targets=self._selected_targets(destination),
+            )
+            for destination in setup.datasets
+            if destination.dataset_id != source.dataset_id
+        )
+        copied_selections, copied, skipped = copy_target_selection(
+            source_selection,
+            destinations,
+        )
+        selections = {item.dataset_id: item.selected_targets for item in copied_selections}
+        self._submit(replace(
+            setup,
+            datasets=tuple(
+                self._with_targets(item, selections[item.dataset_id])
+                if item.dataset_id in selections
+                and selections[item.dataset_id] != item.target_species
+                else item
+                for item in setup.datasets
+            ),
+        ))
+        self.set_status(f"Copy Targets: {copied} copied, {skipped} skipped.")
+
+    def _copy_species_weights_and_vary_ic_to_compatible(self) -> None:
+        """Copy row-local Vary IC ranges and target weights across datasets.
+
+        Destination target selection, Starting IC values and dataset
+        settings remain untouched.  A weight is copied for every target
+        weighted in both datasets (a ticked species or observable, or
+        measured X, in either role).
+        """
+
+        setup = self._current_setup()
+        source = self._current_dataset()
+        if setup is None or source is None:
+            return
+
+        source_mapped = self._mapped_dataset(source.dataset_id)
+        if source_mapped is None:
+            return
+        source_weights = dict(source.target_weights)
+        source_weighted = self._weighted_species(source)
+        copied_ranges = 0
+        copied_weights = 0
+        skipped = 0
+        not_copied: dict[str, list[str]] = {}
+        source_initials = {
+            item.species: item
+            for item in setup.initials
+            if item.set_id == source_mapped.set_id
+        }
+        initials = {(item.set_id, item.species): item for item in setup.initials}
+        datasets = {item.dataset_id: item for item in setup.datasets}
+        for destination in setup.datasets:
+            if destination.dataset_id == source.dataset_id:
+                continue
+            destination_mapped = self._mapped_dataset(destination.dataset_id)
+            if destination_mapped is None:
+                continue
+            destination_weighted = self._weighted_species(destination)
+            for species, source_initial in source_initials.items():
+                destination_key = (destination_mapped.set_id, species)
+                destination_initial = initials.get(destination_key)
+                if destination_initial is None:
+                    skipped += 1
+                    continue
+                if self._shared_initial_group(destination.dataset_id, species) is not None:
+                    # Group membership owns the effective IC configuration;
+                    # leave the dataset's own row untouched.
+                    skipped += 1
+                    continue
+                source_group = self._shared_initial_group(source.dataset_id, species)
+                source_config = source_group if source_group is not None else source_initial
+                held = self._invalid_initial_rows.get(destination_key)
+                try:
+                    copied_initial = replace(
+                        destination_initial,
+                        # A typed Starting IC that could not apply yet is kept.
+                        initial=(
+                            destination_initial.initial if held is None
+                            else parse_finite_numeric_text(
+                                str(held["initial"]), field=_INITIAL_FIELD_HEADERS["initial"]
+                            )
+                        ),
+                        tolerance=source_config.tolerance,
+                        log10=source_config.log10,
+                    )
+                except ValueError:
+                    # The copied range cannot contain this destination's
+                    # Starting IC (e.g. a percentage around zero), so this
+                    # row is not compatible and stays as is, typed text included.
+                    not_copied.setdefault(
+                        destination_mapped.display_name, []
+                    ).append(species)
+                    skipped += 1
+                    continue
+                self._drop_invalid_initial_row(*destination_key)
+                initials[destination_key] = copied_initial
+                copied_ranges += 1
+
+            # Weights are copied independently of Vary IC, for every target
+            # weighted in both datasets, observables included.
+            destination_weights = dict(destination.target_weights)
+            for species in source_weighted & destination_weighted:
+                self._invalid_raw.pop(("target_weight", destination.dataset_id, species), None)
+                destination_weights[species] = source_weights.get(species, 1.0)
+                copied_weights += 1
+            datasets[destination.dataset_id] = replace(
+                destination, target_weights=tuple(destination_weights.items()),
+            )
+
+        self._submit(replace(
+            setup,
+            datasets=tuple(datasets[item.dataset_id] for item in setup.datasets),
+            initials=tuple(initials[(item.set_id, item.species)] for item in setup.initials),
+        ))
+        detail = " ".join(
+            f"Not copied to {name}: {', '.join(names)}; its Starting IC must be a number inside the copied range."
+            for name, names in not_copied.items()
+        )
+        self.set_status(
+            "Copy Species Weights and Vary IC: "
+            f"{copied_ranges} ranges, {copied_weights} weights copied, "
+            f"{skipped} skipped."
+            + (f" {detail}" if detail else "")
+        )
+
+    # ------------------------------------------------------------------
+    # Weight-mode and validation presentation
+    # ------------------------------------------------------------------
+    def _on_weight_mode_changed(self) -> None:
+        if self._refreshing or self._running or self._current_setup() is None:
+            return
+        mode = str(self._weight_mode_combo.currentData() or "implicit")
+        if mode == self._current_setup().dataset_weight_mode:
+            self._refresh_dataset_weight_editor()
+            return
+        self._submit(
+            replace(
+                self._current_setup(),
+                dataset_weight_mode=mode,
+            )
+        )
+
+    def _refresh_dataset_weight_editor(self) -> None:
+        dataset = self._current_dataset()
+        if dataset is None:
+            self._dataset_weight_edit.clear()
+            self._weight_mode_combo.setEnabled(False)
+            self._dataset_weight_edit.setEnabled(False)
+            return
+        self._weight_mode_combo.setEnabled(not self._running)
+        invalid_key = ("dataset_weight", dataset.dataset_id)
+        if invalid_key in self._invalid_raw:
+            self._dataset_weight_edit.setText(self._invalid_raw[invalid_key])
+            self._mark_invalid_line_edit(
+                self._dataset_weight_edit,
+                "Dataset weight must be finite and positive.",
+            )
+        else:
+            self._dataset_weight_edit.setText(self._float_text(dataset.weight))
+            self._clear_invalid_line_edit(self._dataset_weight_edit)
+            if self._weight_mode_combo.currentData() != "user":
+                self._dataset_weight_edit.setToolTip("Used only with Custom.")
+        self._dataset_weight_edit.setEnabled(
+            not self._running
+            and self._weight_mode_combo.currentData() == "user"
+        )
+
+    def _mark_invalid(self, item: QtWidgets.QTableWidgetItem, message: str) -> None:
+        previous_blocked = self._table.blockSignals(True)
+        try:
+            item.setBackground(_INVALID_BG)
+            item.setForeground(_INVALID_FG)
+            item.setToolTip(message)
+        finally:
+            self._table.blockSignals(previous_blocked)
+        self._refresh_error()
+
+    def _mark_invalid_line_edit(self, edit: QtWidgets.QLineEdit, message: str) -> None:
+        edit.setStyleSheet("background: rgb(255, 200, 200); color: rgb(80, 0, 0);")
+        edit.setToolTip(message)
+        self._refresh_error()
+
+    def _clear_invalid_line_edit(self, edit: QtWidgets.QLineEdit) -> None:
+        edit.setStyleSheet("")
+        edit.setToolTip("")
+
+    def _blocking_invalid_keys(self) -> tuple[tuple[str, ...], ...]:
+        """Held weight text; a dataset weight counts only while Custom uses it."""
+
+        setup = self._current_setup()
+        custom = setup is not None and setup.dataset_weight_mode == "user"
+        return tuple(key for key in self._invalid_raw if custom or key[0] != "dataset_weight")
+
+    def _current_has_invalid_entries(self) -> bool:
+        dataset_id = self._current_dataset_id
+        mapped = self._mapped_dataset(dataset_id) if dataset_id else None
+        return mapped is not None and (
+            any(key[1] == dataset_id for key in self._blocking_invalid_keys())
+            or any(set_id == mapped.set_id for set_id, _species in self._invalid_initial_rows)
+        )
+
+    def _refresh_error(self) -> None:
+        locations = self.invalid_editor_locations
+        current = self._current_has_invalid_entries()
+        text = ""
+        if locations:
+            more = f" (+{len(locations) - 1} more)" if len(locations) > 1 else ""
+            text = f"Invalid value in {locations[0]}{more}."
+            if current:
+                text += "\nPress Esc to discard this dataset's invalid values."
+        self._error_label.setText(text)
+        self._error_label.setToolTip("\n".join(locations))
+        self._error_label.setVisible(bool(text))
+        for shortcut in self._discard_shortcuts:
+            shortcut.setEnabled(current)
+        self.validityChanged.emit()
+
+    @property
+    def invalid_editor_locations(self) -> tuple[str, ...]:
+        """Name each invalid entry by dataset, species, and column in table order."""
+
+        datasets = self._projected_setup.datasets if self._projected_setup else ()
+        order = {item.dataset_id: index for index, item in enumerate(datasets)}
+        rows = {item.dataset_id: self._row_species(item) for item in datasets}
+        by_set = {item.set_id: item.dataset_id for item in self._origin.mapped_datasets}
+        columns = {"initial": _Col.INITIAL, "lower": _Col.LOWER, "upper": _Col.UPPER}
+
+        def row(dataset_id: str, species: str) -> int:
+            species_rows = rows.get(dataset_id, [])
+            return species_rows.index(species) if species in species_rows else len(species_rows)
+
+        located = [
+            (key[1], -1, 0, "Dataset weight") if key[0] == "dataset_weight"
+            else (key[1], row(key[1], key[2]), _Col.WEIGHT, f"{key[2]} Weight")
+            for key in self._blocking_invalid_keys()
+        ]
+        located += [
+            (
+                by_set[set_id], row(by_set[set_id], species), columns[field],
+                f"{species} {_INITIAL_FIELD_HEADERS[field]}",
+            )
+            for set_id, species, field in self._invalid_initial_raw
+        ]
+        located.sort(key=lambda item: (order.get(item[0], len(order)), item[1], item[2]))
+        return tuple(
+            f"{self._dataset_name(dataset_id)}: {label}"
+            for dataset_id, _row, _column, label in located
+        )
+
+
+__all__ = ["UnifiedSpeciesTable"]

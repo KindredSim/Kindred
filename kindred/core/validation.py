@@ -5,15 +5,58 @@ Small core validation helpers shared across multiple core modules.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
+from decimal import Decimal, InvalidOperation
 
 
-def validate_name(name: str) -> str:
-    if not isinstance(name, str):
-        raise TypeError("species name must be a string")
-    s = name.strip()
-    if not s:
-        raise ValueError("species name cannot be empty or whitespace")
-    return s
+def parse_finite_numeric_text(text: str, *, field: str = "Value") -> float:
+    """Admit numeric text without silently replacing a nonzero input by zero."""
+    try:
+        value = float(text)
+    except (ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be a number.") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"{field} must be finite.")
+    if value == 0.0:
+        try:
+            nonzero = not Decimal(text).is_zero()
+        except InvalidOperation as exc:
+            raise ValueError(f"{field} cannot be represented as a number.") from exc
+        if nonzero:
+            raise ValueError(f"{field} is nonzero but too small to represent.")
+    return value
+
+
+def and_join(items: Sequence[str]) -> str:
+    """Names in a sentence: "a", "a and b", or "a, b, and c"."""
+    if len(items) < 3:
+        return " and ".join(items)
+    return f"{', '.join(items[:-1])}, and {items[-1]}"
+
+
+def six_digit_value(value: float) -> float:
+    """The value rounded to six significant digits."""
+    return float(format(float(value), ".6g"))
+
+
+def six_digit_text(value: float) -> str:
+    """Display text for one value at six significant digits.
+
+    Plain notation for 0.01 <= |v| < 10000 and scientific notation otherwise,
+    chosen from the rounded value; exact zero stays 0 and a nonzero value never
+    becomes 0.
+    """
+    rounded = six_digit_value(value)
+    if rounded == 0.0 or 0.01 <= abs(rounded) < 10000.0:
+        return format(rounded, ".6g")
+    mantissa, exponent = format(rounded, ".5e").split("e")
+    return f"{mantissa.rstrip('0').rstrip('.')}e{exponent}"
+
+
+def six_digit_source_text(value: float) -> str:
+    """Writer spelling: the six-digit text when it parses back exactly, else repr."""
+    text = six_digit_text(value)
+    return text if float(text) == float(value) else repr(float(value))
 
 
 def try_parse_finite_float(value: object) -> tuple[float, bool]:
@@ -32,22 +75,6 @@ def try_parse_finite_float(value: object) -> tuple[float, bool]:
     return float(v), True
 
 
-def try_parse_callable_finite_float(value: object) -> tuple[float, bool]:
-    """
-    Best-effort float parsing that accepts either a scalar or a 0-arg callable.
-
-    This is used at boundaries where values may be wrapped in lightweight bindings
-    (e.g., `RateBinding`) but callers still want a single canonical "finite float"
-    parsing policy.
-    """
-    if callable(value):
-        try:
-            value = value()
-        except Exception:
-            return 0.0, False
-    return try_parse_finite_float(value)
-
-
 def try_parse_nonneg_finite_float(value: object) -> tuple[float, bool]:
     """
     Best-effort float parsing for non-negative finite values.
@@ -60,16 +87,3 @@ def try_parse_nonneg_finite_float(value: object) -> tuple[float, bool]:
     return float(v), True
 
 
-def try_parse_int(value: object) -> tuple[int, bool]:
-    """
-    Best-effort int parsing with an explicit validity flag.
-
-    Returns (parsed_value, ok). When ok is False, parsed_value is 0.
-    """
-    if isinstance(value, bool):
-        return 0, False
-    try:
-        v = int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError):
-        return 0, False
-    return int(v), True

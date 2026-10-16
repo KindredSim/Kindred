@@ -1,540 +1,830 @@
+"""Application configuration, defaults, and recent-project persistence."""
+
 from __future__ import annotations
 
-from contextlib import suppress
-from dataclasses import dataclass
 import logging
+import math
 import os
-from typing import Callable, List, Optional, Tuple
+from collections.abc import Mapping, Sequence
+from types import MappingProxyType
 
 from PySide6 import QtCore, QtGui, QtWidgets
-from shiboken6 import isValid
+
+from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
+from kindred.core.project_document import (
+    FitDefaults,
+    SIMULATION_POINT_RANGE,
+    ProjectDocument,
+    SimulationExecutionSettings,
+    TabScientificSettings,
+    default_fit_defaults,
+    default_project_document,
+    default_simulation_execution_settings,
+    default_tab_scientific_settings,
+    validate_fit_defaults,
+    validate_simulation_execution_settings,
+    validate_tab_scientific_settings,
+)
+from kindred.core.simulator.solvers import normalize_solver_name
+from kindred.gui.theme_manager import readable_plot_color
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ConfigController"]
+__all__ = [
+    "ConfigController",
+]
 
+_RECENT_PROJECTS_KEY = "recent_files"
+_RECENT_PROJECT_LIMIT = 10
+_THEME_KEY = "ui/dark_mode"
 
-@dataclass(frozen=True, slots=True)
-class ConfigControllerPort:
-    """Explicit injected wiring surface for ConfigController."""
+_RUN_SETTINGS_KEYS = {
+    "solver": "simulation/solver",
+    "t_start": "simulation/t_start",
+    "t_end": "simulation/time",
+    "integration_points": "simulation/points",
+}
+_SCIENTIFIC_SETTINGS_KEYS = {
+    "temperature": "simulation/temperature",
+    "standard_conc_M": "simulation/standard_conc_M",
+    "energy_unit": "simulation/energy_unit",
+    "rtol": "simulation/rtol",
+    "atol": "simulation/atol",
+    "analytic_jacobian_policy": "simulation/use_analytic_jacobian",
+    "use_authored_stops": "simulation/use_authored_stops",
+}
+_FIT_SETTINGS_KEYS = {
+    "method": "fitting/method",
+    "max_nfev": "fitting/max_nfev",
+    "ftol": "fitting/ftol",
+    "xtol": "fitting/xtol",
+    "use_seed": "fitting/use_seed",
+    "seed": "fitting/seed",
+}
+_RUN_USER_MAXIMUM_KEY = "simulation/run_user_maximum"
+_RESULT_CACHE_CAPACITY_KEY = "results/cache_capacity"
+_PREVIEW_POINTS_KEY = "sliders/preview_points"
+_PREVIEW_DELAY_KEY = "sliders/preview_delay_ms"
+_DEFAULT_RESULT_CACHE_CAPACITY = 32
+_QT_POSITIVE_INT_MAX = (1 << 31) - 1
+_DEFAULT_PREVIEW_POINTS = 50
+_DEFAULT_PREVIEW_DELAY_MS = 150
 
-    parent: QtCore.QObject
-    settings: Callable[[], object]
-    is_maximized: Callable[[], bool]
-    restore_maximized_state: Callable[[], None]
-    restore_geometry: Callable[[object], None]
-    save_geometry: Callable[[], object]
-    restore_window_state: Callable[[object], None]
-    save_window_state: Callable[[], object]
-    schedule_restored_floating_dock_recovery: Callable[[], None]
-    splitter: Callable[[], object | None]
-    set_temperature: Callable[[float], None]
-    temperature: Callable[[], float]
-    set_simulation_time_text: Callable[[str], None]
-    simulation_time_text: Callable[[], str]
-    set_num_points: Callable[[int], None]
-    num_points: Callable[[], int]
-    set_slider_preview_points: Callable[[int], None]
-    slider_preview_points: Callable[[], int]
-    set_slider_preview_solver: Callable[[str], None]
-    slider_preview_solver: Callable[[], str]
-    apply_solver_runtime_state: Callable[..., None]
-    has_explicit_startup_solver_override: Callable[[], bool]
-    has_explicit_startup_rtol_override: Callable[[], bool]
-    has_explicit_startup_atol_override: Callable[[], bool]
-    initial_solver_name: Callable[[], Optional[str]]
-    explicit_startup_solver_name: Callable[[], Optional[str]]
-    initial_rtol: Callable[[], Optional[float]]
-    explicit_startup_rtol: Callable[[], Optional[float]]
-    initial_atol: Callable[[], Optional[float]]
-    explicit_startup_atol: Callable[[], Optional[float]]
-    set_use_sparse_jacobian: Callable[[bool], None]
-    use_sparse_jacobian: Callable[[], bool]
-    set_wegscheider_cyclicity_enabled: Callable[[bool], None]
-    wegscheider_cyclicity_enabled: Callable[[], bool]
-    max_parallel_batch_workers: Callable[[], int]
-    set_max_parallel_batch_workers: Callable[[int], None]
-    limit_blas_threads_per_worker: Callable[[], bool]
-    set_limit_blas_threads_per_worker: Callable[[bool], None]
-    result_cache_cap: Callable[[], int]
-    preview_cache_cap: Callable[[], int]
-    set_cache_caps: Callable[..., None]
-    set_ribbon_collapsed: Callable[[bool], None]
-    ribbon_collapsed: Callable[[], bool]
-    set_dark_mode: Callable[[bool], None]
-    dark_mode: Callable[[], bool]
-    dark_mode_action: Callable[[], object | None]
-    apply_theme: Callable[[bool], None]
-    profile_manager: Callable[[], object]
-    apply_profile: Callable[[object], None]
-    set_profile_indicator_text: Callable[[str], None]
-    set_status_text: Callable[[str], None]
-    update_profiles_menu: Callable[[], None]
-    profiles_menu_available: Callable[[], bool]
-    load_custom_shortcuts: Callable[[dict], None]
-    recent_menu: Callable[[], object | None]
-    set_recent_menu: Callable[[object | None], None]
-    menu_bar: Callable[[], object]
-    load_recent_project: Callable[[str], None]
+_SPECIES_COLORS_KEY = "plot/species_colors"
+_EXPERIMENTAL_POINT_SHAPE_KEY = "plot/experimental_point_shape"
+_EXPERIMENTAL_POINT_SIZE_KEY = "plot/experimental_point_size"
+_EXPERIMENTAL_POINT_OPACITY_KEY = "plot/experimental_point_opacity"
+_WINDOW_LAYOUT_KEYS = {
+    "is_maximized": "window/is_maximized",
+    "geometry": "window/geometry",
+    "dock_state": "window/dock_state",
+}
+_DEFAULT_EXPERIMENTAL_POINT_SIZE = 6
+_DEFAULT_EXPERIMENTAL_POINT_OPACITY = 180.0 / 255.0
+_SPECIES_SUFFIXES = ("_conc", "_concentration")
+_BASE_SPECIES_RGB: tuple[tuple[int, int, int], ...] = (
+    (230, 159, 0),
+    (86, 180, 233),
+    (0, 158, 115),
+    (240, 228, 66),
+    (0, 114, 178),
+    (213, 94, 0),
+    (204, 121, 167),
+    (0, 134, 149),
+)
 
 
 class ConfigController(QtCore.QObject):
-    """
-    Global configuration / settings controller.
+    """The sole QSettings-backed owner of admitted application settings."""
 
-    Consolidates QSettings persistence and settings-driven UI application behind
-    an explicit injected UI port instead of a raw MainWindow back-reference.
-    """
+    EXPERIMENTAL_POINT_SHAPES = (
+        ("Circle", "o"), ("Square", "s"), ("Triangle", "t"),
+        ("Diamond", "d"), ("Cross", "x"), ("Plus", "+"),
+    )
 
-    def __init__(self, ui: ConfigControllerPort):
-        super().__init__(ui.parent)
-        self._ui = ui
-        # User preference snapshot — not overwritten by document loads.
-        self._user_preferences: dict[str, object] = {}
+    applicationPlotPreferencesChanged = QtCore.Signal()
+    recentProjectsChanged = QtCore.Signal()
+    resultCacheCapacityChanged = QtCore.Signal(int)
+    previewSettingsChanged = QtCore.Signal()
 
-    def update_user_preference(self, key: str, value: object) -> None:
-        """Record a user-chosen value for a dual-persisted settings key."""
-        from kindred.gui.project_schema import QSETTINGS_KEY_MAP
-        if key not in QSETTINGS_KEY_MAP:
-            raise ValueError(f"Unknown user preference key: {key!r}")
-        self._user_preferences[key] = value
-
-    def get_user_preference(self, key: str) -> object:
-        """Return the stored user preference, falling back to factory default."""
-        from kindred.gui.project_schema import PROJECT_DEFAULTS
-        return self._user_preferences.get(key, PROJECT_DEFAULTS.get(key))
-
-    @staticmethod
-    def _read_int_setting(settings: QtCore.QSettings, key: str, default: int) -> int:
-        raw_value = settings.value(key, default)
-        try:
-            return int(raw_value)
-        except (TypeError, ValueError):
-            logger.warning("Invalid integer setting %s=%r; using %s", key, raw_value, int(default))
-            return int(default)
-
-    @staticmethod
-    def _discard_invalid_gui_state(settings: QtCore.QSettings, key: str) -> None:
-        with suppress(RuntimeError, TypeError):
-            settings.remove(key)
-            settings.sync()
-
-    def _read_gui_state_setting(self, settings: QtCore.QSettings, key: str) -> object | None:
-        try:
-            return settings.value(key)
-        except (EOFError, TypeError, ValueError) as exc:
-            logger.warning("Ignoring unreadable persisted GUI state %s: %s", key, exc)
-            self._discard_invalid_gui_state(settings, key)
-            return None
-
-    def _restore_gui_state_setting(
-        self,
-        settings: QtCore.QSettings,
-        key: str,
-        restore_state: Callable[[object], object],
-        *,
-        state_name: str,
-    ) -> bool:
-        state = self._read_gui_state_setting(settings, key)
-        if not state:
-            return False
-        try:
-            restored = restore_state(state)
-        except (EOFError, RuntimeError, TypeError, ValueError) as exc:
-            logger.warning("Ignoring invalid persisted %s %s: %s", state_name, key, exc)
-            self._discard_invalid_gui_state(settings, key)
-            return False
-        if restored is False:
-            logger.warning("Ignoring invalid persisted %s %s: restore rejected stored state", state_name, key)
-            self._discard_invalid_gui_state(settings, key)
-            return False
-        return True
-
-    def load_settings(self) -> None:
-        settings = self._settings()
-        from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
-
-        restore_maximized = settings.value("window/is_maximized", False, type=bool)
-        self._restore_gui_state_setting(
-            settings,
-            "window/geometry",
-            self._ui.restore_geometry,
-            state_name="window geometry",
-        )
-
-        splitter = self._ui.splitter()
-        if splitter:
-            self._restore_gui_state_setting(
-                settings,
-                "window/splitter_state",
-                splitter.restoreState,
-                state_name="workspace splitter state",
-            )
-
-        temperature = settings.value("simulation/temperature", 298.15, type=float)
-        self._ui.set_temperature(temperature)
-
-        sim_time_raw = settings.value("simulation/time", "10.0")
-        if isinstance(sim_time_raw, (int, float)):
-            sim_time_text = f"{float(sim_time_raw):g}"
-        else:
-            sim_time_text = str(sim_time_raw)
-        self._ui.set_simulation_time_text(sim_time_text)
-
-        num_points = settings.value("simulation/points", 100, type=int)
-        self._ui.set_num_points(num_points)
-        slider_preview_points = self._read_int_setting(settings, "simulation/slider_preview_points", 100)
-        self._ui.set_slider_preview_points(max(50, min(20000, slider_preview_points)))
-        slider_preview_solver = str(settings.value("simulation/slider_preview_solver", "LSODA") or "LSODA").strip() or "LSODA"
-        self._ui.set_slider_preview_solver(slider_preview_solver)
-        explicit_solver_value = self._ui.explicit_startup_solver_name()
-        explicit_rtol_value = self._ui.explicit_startup_rtol()
-        explicit_atol_value = self._ui.explicit_startup_atol()
-        if self._ui.has_explicit_startup_solver_override():
-            solver_value = explicit_solver_value or str(DEFAULT_SOLVER_NAME)
-        else:
-            solver_value = settings.value(
-                "simulation/solver",
-                self._ui.initial_solver_name() or str(DEFAULT_SOLVER_NAME),
-            )
-        if self._ui.has_explicit_startup_rtol_override():
-            rtol_value = explicit_rtol_value
-        else:
-            rtol_value = settings.value("simulation/rtol", self._ui.initial_rtol() or 1e-6)
-        if self._ui.has_explicit_startup_atol_override():
-            atol_value = explicit_atol_value
-        else:
-            atol_value = settings.value("simulation/atol", self._ui.initial_atol() or 1e-12)
-        self._ui.apply_solver_runtime_state(
-            solver=str(solver_value or DEFAULT_SOLVER_NAME),
-            rtol=rtol_value,
-            atol=atol_value,
-        )
-
-        legacy_use_advanced = settings.value("simulation/use_advanced_dsl", None)
-        if legacy_use_advanced is not None:
-            logger.info("Ignoring legacy setting simulation/use_advanced_dsl (advanced DSL always enabled)")
-            settings.remove("simulation/use_advanced_dsl")
-
-        self._ui.set_use_sparse_jacobian(
-            settings.value(
-                "simulation/use_sparse_jacobian",
-                False,
-                type=bool,
-            )
-        )
-        self._ui.set_wegscheider_cyclicity_enabled(
-            settings.value(
-                "simulation/wegscheider_cyclicity_enabled",
-                False,
-                type=bool,
-            )
-        )
-        self._ui.set_max_parallel_batch_workers(
-            max(
-                1,
-                self._read_int_setting(settings, "simulation/max_parallel_batch_workers", 12),
-            )
-        )
-
-        self._ui.set_limit_blas_threads_per_worker(
-            settings.value(
-                "simulation/limit_blas_threads_per_worker",
-                True,
-                type=bool,
-            )
-        )
-
-        default_result_cap = self._ui.result_cache_cap()
-        default_preview_cap = self._ui.preview_cache_cap()
-        result_cap = self._read_int_setting(settings, "simulation/result_cache_cap", default_result_cap)
-        preview_cap = self._read_int_setting(settings, "simulation/preview_cache_cap", default_preview_cap)
-        self._ui.set_cache_caps(result_cap=result_cap, preview_cap=preview_cap, persist=False)
-
-        if self._restore_gui_state_setting(
-            settings,
-            "window/dock_state",
-            self._ui.restore_window_state,
-            state_name="window dock state",
-        ):
-            self._ui.schedule_restored_floating_dock_recovery()
-
-        if restore_maximized:
-            self._ui.restore_maximized_state()
-
-        ribbon_collapsed = settings.value("ui/ribbon_collapsed", False, type=bool)
-        self._ui.set_ribbon_collapsed(ribbon_collapsed)
-
-        profiles_available = self._ui.profiles_menu_available()
-        if not profiles_available:
-            # Profiles menu is hidden — clear any stranded key so the hidden
-            # feature does not silently override user settings each launch.
-            stored = settings.value("profiles/active", "", type=str)
-            if stored:
-                logger.info(
-                    "Clearing stranded profiles/active='%s' — "
-                    "profiles menu is not available",
-                    stored,
-                )
-                settings.remove("profiles/active")
-                settings.sync()
-
-        profile_to_apply = None
-        active_profile = None
-        stored_profile = ""
-        if profiles_available:
-            profile_manager = self._ui.profile_manager()
-            active_profile = profile_manager.get_active_profile()
-            if active_profile is None:
-                stored_profile = settings.value("profiles/active", "", type=str)
-                if stored_profile:
-                    profile = profile_manager.get_profile(stored_profile)
-                    if profile:
-                        profile_manager.set_active_profile(stored_profile)
-                        profile_to_apply = profile
-
-        dark_mode = settings.value("ui/dark_mode", True, type=bool)
-        if active_profile is None and profile_to_apply is None:
-            self._ui.set_dark_mode(dark_mode)
-            dark_mode_action = self._ui.dark_mode_action()
-            if dark_mode_action is not None:
-                dark_mode_action.setChecked(dark_mode)
-            self._ui.apply_theme(dark_mode)
-
-        if profile_to_apply is not None:
-            self._ui.apply_profile(profile_to_apply)
-            if (
-                self._ui.has_explicit_startup_solver_override()
-                or self._ui.has_explicit_startup_rtol_override()
-                or self._ui.has_explicit_startup_atol_override()
-            ):
-                self._ui.apply_solver_runtime_state(
-                    solver=(
-                        explicit_solver_value
-                        if self._ui.has_explicit_startup_solver_override()
-                        else (self._ui.initial_solver_name() or str(DEFAULT_SOLVER_NAME))
-                    ),
-                    rtol=(
-                        explicit_rtol_value
-                        if self._ui.has_explicit_startup_rtol_override()
-                        else (self._ui.initial_rtol() or 1e-6)
-                    ),
-                    atol=(
-                        explicit_atol_value
-                        if self._ui.has_explicit_startup_atol_override()
-                        else (self._ui.initial_atol() or 1e-12)
-                    ),
-                )
-            self._ui.set_profile_indicator_text(f"Profile: {stored_profile}")
-            self._ui.set_status_text(f"Applied profile: {stored_profile}")
-            self._ui.update_profiles_menu()
-
-        saved_shortcuts = settings.value("keyboard/shortcuts", {})
-        if saved_shortcuts:
-            self._ui.load_custom_shortcuts(saved_shortcuts)
-
-        # Snapshot resolved startup values as the user preference baseline.
-        # Reads from QSettings, then patches in any CLI/profile overrides that
-        # were applied to live state above but not written to QSettings.
-        from kindred.gui.project_schema import get_user_preference_payload
-        self._user_preferences = get_user_preference_payload(settings)
-        if self._ui.has_explicit_startup_solver_override():
-            self._user_preferences["solver"] = str(solver_value or DEFAULT_SOLVER_NAME)
-        if self._ui.has_explicit_startup_rtol_override():
-            self._user_preferences["rtol"] = rtol_value
-        if self._ui.has_explicit_startup_atol_override():
-            self._user_preferences["atol"] = atol_value
-
-        logger.debug("User settings loaded from QSettings (dark_mode=%s)", self._ui.dark_mode())
-
-    def save_settings(self) -> None:
-        from kindred.gui.project_schema import PROJECT_DEFAULTS, QSETTINGS_KEY_MAP
-
-        settings = self._settings()
-
-        settings.setValue("window/is_maximized", self._ui.is_maximized())
-        settings.setValue("window/geometry", self._ui.save_geometry())
-        settings.setValue("window/dock_state", self._ui.save_window_state())
-
-        splitter = self._ui.splitter()
-        if splitter:
-            settings.setValue("window/splitter_state", splitter.saveState())
-
-        # Dual-persisted keys — write user preferences, not live document state.
-        for key, qs_key in QSETTINGS_KEY_MAP.items():
-            value = self._user_preferences.get(key, PROJECT_DEFAULTS.get(key))
-            if value is not None:
-                settings.setValue(qs_key, value)
-
-        # Application-level keys — always read from live UI state.
-        settings.setValue("simulation/slider_preview_points", self._ui.slider_preview_points())
-        settings.setValue("simulation/slider_preview_solver", self._ui.slider_preview_solver())
-        settings.setValue(
-            "simulation/result_cache_cap",
-            self._ui.result_cache_cap(),
-        )
-        settings.setValue(
-            "simulation/preview_cache_cap",
-            self._ui.preview_cache_cap(),
-        )
-
-        settings.setValue("ui/ribbon_collapsed", self._ui.ribbon_collapsed())
-
-        active_profile = self._ui.profile_manager().get_active_profile()
-        if active_profile:
-            settings.setValue("profiles/active", active_profile.name)
-        else:
-            settings.remove("profiles/active")
-
-        settings.sync()
-        logger.debug("User settings saved to QSettings")
-
-    def persist_keyboard_shortcuts(self, shortcuts_dict: dict) -> None:
-        self._settings().setValue("keyboard/shortcuts", shortcuts_dict)
-
-    def toggle_theme(self) -> None:
-        action = self._ui.dark_mode_action()
-        if action is None:
-            return
-        dark_mode = bool(action.isChecked())
-        self._ui.set_dark_mode(dark_mode)
-        self._ui.apply_theme(dark_mode)
-        self._settings().setValue("ui/dark_mode", dark_mode)
+    def __init__(self, settings: QtCore.QSettings):
+        super().__init__()
+        self._settings_store = settings
+        self._species_palette = self._build_species_palette()
 
     def _settings(self) -> QtCore.QSettings:
-        settings = self._ui.settings()
-        if not isinstance(settings, QtCore.QSettings):
-            raise TypeError(f"ConfigControllerPort.settings() must return QSettings, got {type(settings).__name__}")
-        return settings
+        return self._settings_store
 
-    def get_recent_menu(self, *, force_recreate: bool = False) -> Optional[QtWidgets.QMenu]:
-        """
-        Return a live Recent Projects submenu, recreating it when Qt deleted it.
-
-        Qt can invalidate Python wrappers for menu objects during lifecycle churn
-        (platform integration, deferred deletes, or menu rebuilds). This method
-        always returns a currently valid menu or ``None`` when File menu lookup
-        fails.
-        """
-        recent_menu = self._ui.recent_menu()
-        if not force_recreate and recent_menu is not None and isValid(recent_menu):
-            return recent_menu
-
-        for _ in range(2):
-            menubar = self._ui.menu_bar()
-            file_menu = None
-            for candidate in menubar.findChildren(QtWidgets.QMenu):
-                if candidate is None or not isValid(candidate):
-                    continue
-                if candidate.title().replace("&", "") == "File":
-                    file_menu = candidate
-                    break
-            if file_menu is None:
-                for action in menubar.actions():
-                    candidate = action.menu()
-                    if candidate is None or not isValid(candidate):
-                        continue
-                    if candidate.title().replace("&", "") == "File":
-                        file_menu = candidate
-                        break
-
-            if file_menu is None:
-                logger.warning("Recent Projects menu unavailable: File menu is missing or invalid")
-                return None
-
-            try:
-                recent_actions = [action for action in list(file_menu.actions()) if action.text() == "Recent Projects"]
-                if not force_recreate:
-                    valid_recent_actions: List[Tuple[QtGui.QAction, QtWidgets.QMenu]] = []
-                    for action in recent_actions:
-                        action_menu = action.menu()
-                        if action_menu is not None and isValid(action_menu):
-                            valid_recent_actions.append((action, action_menu))
-
-                    if valid_recent_actions:
-                        keep_action, keep_menu = valid_recent_actions[0]
-                        for action in recent_actions:
-                            if action is keep_action:
-                                continue
-                            file_menu.removeAction(action)
-                        self._ui.set_recent_menu(keep_menu)
-                        return keep_menu
-
-                for stale_action in recent_actions:
-                    file_menu.removeAction(stale_action)
-
-                recent_menu = QtWidgets.QMenu("Recent Projects", file_menu)
-                insert_before = next((action for action in file_menu.actions() if action.isSeparator()), None)
-                if insert_before is not None:
-                    file_menu.insertMenu(insert_before, recent_menu)
-                else:
-                    file_menu.addMenu(recent_menu)
-                self._ui.set_recent_menu(recent_menu)
-                if isValid(recent_menu):
-                    return recent_menu
-            except RuntimeError:
-                continue
-
-        logger.warning("Recent Projects menu unavailable: failed to acquire a live File menu")
+    @staticmethod
+    def _parsed_int(value: object) -> int | None:
+        if type(value) is int:
+            return int(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if text and text.lstrip("+-").isdigit():
+                return int(text)
         return None
 
-    def update_recent_files_menu(self) -> None:
-        def _populate(menu: QtWidgets.QMenu) -> None:
-            menu.clear()
+    def run_user_maximum_preference(self) -> int | None:
+        """Return a clamped explicit Run maximum, or ``None`` for Run fallback."""
 
-            recent_files = self._settings().value("recent_files", [])
-            if not isinstance(recent_files, list):
-                recent_files = []
+        settings = self._settings()
+        if not settings.contains(_RUN_USER_MAXIMUM_KEY):
+            return None
+        parsed = self._parsed_int(settings.value(_RUN_USER_MAXIMUM_KEY))
+        if parsed is None:
+            return None
+        return min(MAX_PARALLEL_WORKERS_CEILING, max(1, parsed))
 
-            if not recent_files:
-                no_files_action = menu.addAction("No recent projects")
-                no_files_action.setEnabled(False)
-                no_files_action.setToolTip(
-                    "No projects have been opened recently. Load a project to populate this list."
+    def set_run_user_maximum(self, value: int | None) -> int | None:
+        if value is None:
+            settings = self._settings()
+            snapshot = self._snapshot_settings(settings, (_RUN_USER_MAXIMUM_KEY,))
+            settings.remove(_RUN_USER_MAXIMUM_KEY)
+            self._sync_or_report(
+                settings,
+                "Run user maximum",
+                snapshot=snapshot,
+                success_message="Run parallel maximum reset to Automatic.",
+            )
+            return None
+        # The dialog's spin box admits 1 to the ceiling.
+        accepted = value
+        settings = self._settings()
+        snapshot = self._snapshot_settings(settings, (_RUN_USER_MAXIMUM_KEY,))
+        settings.setValue(_RUN_USER_MAXIMUM_KEY, accepted)
+        self._sync_or_report(
+            settings,
+            "Run user maximum",
+            snapshot=snapshot,
+            success_message=f"Run parallel maximum set to {accepted}.",
+        )
+        return accepted
+
+    def result_cache_capacity(self) -> int:
+        """Return the validated per-tab explicit-result cache capacity."""
+
+        parsed = self._parsed_int(
+            self._settings().value(
+                _RESULT_CACHE_CAPACITY_KEY,
+                _DEFAULT_RESULT_CACHE_CAPACITY,
+            )
+        )
+        if parsed is None or not 1 <= parsed <= _QT_POSITIVE_INT_MAX:
+            logger.warning(
+                "Ignoring invalid persisted result cache capacity."
+            )
+            return _DEFAULT_RESULT_CACHE_CAPACITY
+        return parsed
+
+    def set_result_cache_capacity(self, value: int) -> int:
+        """Persist and synchronously publish one positive Qt integer."""
+
+        previous = self.result_cache_capacity()
+        settings = self._settings()
+        snapshot = self._snapshot_settings(settings, (_RESULT_CACHE_CAPACITY_KEY,))
+        settings.setValue(_RESULT_CACHE_CAPACITY_KEY, value)
+        self._sync_or_report(
+            settings,
+            "result cache capacity",
+            snapshot=snapshot,
+            success_message=(
+                f"Result cache capacity set to {value} per mechanism tab."
+            ),
+        )
+        if previous != value:
+            self.resultCacheCapacityChanged.emit(value)
+        return value
+
+    def preview_points(self) -> int:
+        return self._preview_setting(
+            _PREVIEW_POINTS_KEY, _DEFAULT_PREVIEW_POINTS, SIMULATION_POINT_RANGE,
+        )
+
+    def set_preview_points(self, value: int) -> int:
+        return self._set_preview_setting(
+            _PREVIEW_POINTS_KEY, value, self.preview_points(), label="Preview points",
+        )
+
+    def preview_delay_ms(self) -> int:
+        return self._preview_setting(
+            _PREVIEW_DELAY_KEY, _DEFAULT_PREVIEW_DELAY_MS, (0, 1000),
+        )
+
+    def set_preview_delay_ms(self, value: int) -> int:
+        return self._set_preview_setting(
+            _PREVIEW_DELAY_KEY, value, self.preview_delay_ms(), label="Preview delay (ms)",
+        )
+
+    def _preview_setting(
+        self, key: str, default: int, bounds: tuple[int, int],
+    ) -> int:
+        parsed = self._parsed_int(self._settings().value(key, default))
+        return default if parsed is None else min(bounds[1], max(bounds[0], parsed))
+
+    def _set_preview_setting(
+        self, key: str, value: int, previous: int, *, label: str,
+    ) -> int:
+        # The Simulation Settings editors admit the range.
+        accepted = value
+        settings = self._settings()
+        snapshot = self._snapshot_settings(settings, (key,))
+        settings.setValue(key, accepted)
+        self._sync_or_report(
+            settings, label, snapshot=snapshot,
+            success_message=f"{label} set to {accepted}.",
+        )
+        if previous != accepted:
+            self.previewSettingsChanged.emit()
+        return accepted
+
+    @staticmethod
+    def _setting(
+        settings: QtCore.QSettings,
+        key: str,
+        default: object,
+        expected_type: type,
+    ) -> object:
+        try:
+            if expected_type is float:
+                # PySide6 coerces typed float reads of stored text via float32.
+                return float(settings.value(key, default))
+            return settings.value(key, default, type=expected_type)
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("Ignoring invalid persisted setting %s.", key)
+            return default
+
+    def application_run_defaults(self) -> SimulationExecutionSettings:
+        """Return the complete Run default for a newly created tab."""
+        settings = self._settings()
+        factory = default_simulation_execution_settings()
+        try:
+            candidate = SimulationExecutionSettings(
+                solver=normalize_solver_name(
+                    self._setting(
+                        settings,
+                        _RUN_SETTINGS_KEYS["solver"],
+                        factory.solver,
+                        str,
+                    )
+                ),
+                t_start=float(
+                    self._setting(
+                        settings,
+                        _RUN_SETTINGS_KEYS["t_start"],
+                        factory.t_start,
+                        float,
+                    )
+                ),
+                t_end=float(
+                    self._setting(
+                        settings,
+                        _RUN_SETTINGS_KEYS["t_end"],
+                        factory.t_end,
+                        float,
+                    )
+                ),
+                integration_points=int(
+                    self._setting(
+                        settings,
+                        _RUN_SETTINGS_KEYS["integration_points"],
+                        factory.integration_points,
+                        int,
+                    )
+                ),
+            )
+            return validate_simulation_execution_settings(
+                candidate,
+                "application Run defaults",
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            logger.warning(
+                "Ignoring invalid persisted application Run defaults: %s", exc
+            )
+            return factory
+
+    def application_scientific_defaults(self) -> TabScientificSettings:
+        """Return the separate scientific default for a newly created tab."""
+        settings = self._settings()
+        factory = default_tab_scientific_settings()
+        try:
+            candidate = TabScientificSettings(
+                standard_conc_M=float(self._setting(
+                    settings, _SCIENTIFIC_SETTINGS_KEYS["standard_conc_M"],
+                    factory.standard_conc_M, float,
+                )),
+                energy_unit=str(self._setting(
+                    settings, _SCIENTIFIC_SETTINGS_KEYS["energy_unit"],
+                    factory.energy_unit, str,
+                )),
+                temperature=float(
+                    self._setting(
+                        settings,
+                        _SCIENTIFIC_SETTINGS_KEYS["temperature"],
+                        factory.temperature,
+                        float,
+                    )
+                ),
+                rtol=float(
+                    self._setting(
+                        settings,
+                        _SCIENTIFIC_SETTINGS_KEYS["rtol"],
+                        factory.rtol,
+                        float,
+                    )
+                ),
+                atol=float(
+                    self._setting(
+                        settings,
+                        _SCIENTIFIC_SETTINGS_KEYS["atol"],
+                        factory.atol,
+                        float,
+                    )
+                ),
+                analytic_jacobian_policy=bool(
+                    self._setting(
+                        settings,
+                        _SCIENTIFIC_SETTINGS_KEYS["analytic_jacobian_policy"],
+                        factory.analytic_jacobian_policy,
+                        bool,
+                    )
+                ),
+                use_authored_stops=bool(self._setting(
+                    settings, _SCIENTIFIC_SETTINGS_KEYS["use_authored_stops"],
+                    factory.use_authored_stops, bool,
+                )),
+            )
+            return validate_tab_scientific_settings(
+                candidate,
+                "application tab-scientific defaults",
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            logger.warning(
+                "Ignoring invalid persisted tab-scientific defaults: %s", exc
+            )
+            return factory
+
+    def application_fit_defaults(self) -> FitDefaults:
+        """Return only optimizer defaults; obsolete Fit simulation keys are ignored."""
+        settings = self._settings()
+        factory = default_fit_defaults()
+        try:
+            candidate = FitDefaults(
+                method=str(
+                    self._setting(
+                        settings,
+                        _FIT_SETTINGS_KEYS["method"],
+                        factory.method,
+                        str,
+                    )
                 )
-                return
+                .strip()
+                .lower(),
+                max_nfev=int(
+                    self._setting(
+                        settings,
+                        _FIT_SETTINGS_KEYS["max_nfev"],
+                        factory.max_nfev,
+                        int,
+                    )
+                ),
+                ftol=float(
+                    self._setting(
+                        settings,
+                        _FIT_SETTINGS_KEYS["ftol"],
+                        factory.ftol,
+                        float,
+                    )
+                ),
+                xtol=float(
+                    self._setting(
+                        settings,
+                        _FIT_SETTINGS_KEYS["xtol"],
+                        factory.xtol,
+                        float,
+                    )
+                ),
+                use_seed=bool(
+                    self._setting(
+                        settings,
+                        _FIT_SETTINGS_KEYS["use_seed"],
+                        factory.use_seed,
+                        bool,
+                    )
+                ),
+                seed=int(
+                    self._setting(
+                        settings,
+                        _FIT_SETTINGS_KEYS["seed"],
+                        factory.seed,
+                        int,
+                    )
+                ),
+            )
+            return validate_fit_defaults(candidate)
+        except (TypeError, ValueError, OverflowError) as exc:
+            logger.warning(
+                "Ignoring invalid persisted application Fit defaults: %s", exc
+            )
+            return factory
 
-            for filepath in recent_files[:10]:
-                action = menu.addAction(
-                    os.path.basename(filepath),
-                    lambda p=filepath: self._ui.load_recent_project(p),
+    def default_project_document(self) -> ProjectDocument:
+        """Seed a new project from current application defaults."""
+        return default_project_document(
+            run_defaults=self.application_run_defaults(),
+            scientific_settings=self.application_scientific_defaults(),
+            fit_defaults=self.application_fit_defaults(),
+        )
+
+    def persist_run_defaults(
+        self, candidate: SimulationExecutionSettings,
+    ) -> SimulationExecutionSettings:
+        # The Simulation Settings dialog admitted the candidate.
+        settings = self._settings()
+        snapshot = self._snapshot_settings(settings, tuple(_RUN_SETTINGS_KEYS.values()))
+        for field_name, key in _RUN_SETTINGS_KEYS.items():
+            settings.setValue(key, getattr(candidate, field_name))
+        self._sync_or_report(settings, "Run defaults", snapshot=snapshot)
+        return candidate
+
+    def persist_scientific_defaults(
+        self,
+        candidate: TabScientificSettings,
+    ) -> TabScientificSettings:
+        # The Simulation Settings dialog admitted the candidate.
+        settings = self._settings()
+        snapshot = self._snapshot_settings(
+            settings,
+            tuple(_SCIENTIFIC_SETTINGS_KEYS.values()),
+        )
+        for field_name, key in _SCIENTIFIC_SETTINGS_KEYS.items():
+            settings.setValue(key, getattr(candidate, field_name))
+        self._sync_or_report(
+            settings,
+            "default scientific settings",
+            snapshot=snapshot,
+        )
+        return candidate
+
+    def persist_fit_defaults(self, candidate: FitDefaults) -> FitDefaults:
+        # The Fit defaults dialog admitted the candidate.
+        settings = self._settings()
+        snapshot = self._snapshot_settings(
+            settings,
+            tuple(_FIT_SETTINGS_KEYS.values()),
+        )
+        for field_name, key in _FIT_SETTINGS_KEYS.items():
+            settings.setValue(key, getattr(candidate, field_name))
+        self._sync_or_report(
+            settings,
+            "Fit defaults",
+            snapshot=snapshot,
+            success_message=(
+                "Application Fit defaults updated for newly created projects."
+            ),
+        )
+        return candidate
+
+    def persist_theme(self, dark_mode: bool) -> None:
+        settings = self._settings()
+        snapshot = self._snapshot_settings(settings, (_THEME_KEY,))
+        settings.setValue(_THEME_KEY, bool(dark_mode))
+        self._sync_or_report(settings, "theme", snapshot=snapshot)
+
+    def theme_preference(self) -> bool:
+        """Return the persisted application theme preference."""
+
+        return bool(
+            self._setting(
+                self._settings(),
+                _THEME_KEY,
+                True,
+                bool,
+            )
+        )
+
+    def window_layout_preference(
+        self,
+    ) -> tuple[bool, object | None, object | None]:
+        """Return persisted physical window state and optional Qt payloads."""
+
+        settings = self._settings()
+        return (
+            bool(
+                self._setting(
+                    settings,
+                    _WINDOW_LAYOUT_KEYS["is_maximized"],
+                    False,
+                    bool,
                 )
-                action.setToolTip(filepath)
+            ),
+            settings.value(_WINDOW_LAYOUT_KEYS["geometry"]),
+            settings.value(_WINDOW_LAYOUT_KEYS["dock_state"]),
+        )
 
-            menu.addSeparator()
-            clear_action = menu.addAction("Clear Recent Projects")
-            clear_action.triggered.connect(self.clear_recent_files)
+    def persist_window_layout(
+        self,
+        is_maximized: bool,
+        geometry: object,
+        dock_state: object,
+    ) -> None:
+        """Persist the complete MainWindow layout as one settings write."""
 
-        last_error: Optional[BaseException] = None
-        for attempt in range(2):
-            recent_menu = self.get_recent_menu(force_recreate=bool(attempt))
-            if recent_menu is None or not isValid(recent_menu):
-                continue
+        settings = self._settings()
+        keys = tuple(_WINDOW_LAYOUT_KEYS.values())
+        snapshot = self._snapshot_settings(settings, keys)
+        settings.setValue(_WINDOW_LAYOUT_KEYS["is_maximized"], is_maximized)
+        settings.setValue(_WINDOW_LAYOUT_KEYS["geometry"], geometry)
+        settings.setValue(_WINDOW_LAYOUT_KEYS["dock_state"], dock_state)
+        self._sync_or_report(
+            settings,
+            "window layout",
+            snapshot=snapshot,
+        )
 
-            try:
-                _populate(recent_menu)
-                return
-            except RuntimeError as exc:
-                last_error = exc
+    @staticmethod
+    def _snapshot_settings(
+        settings: QtCore.QSettings,
+        keys: Sequence[str],
+    ) -> tuple[tuple[str, bool, object], ...]:
+        snapshot: list[tuple[str, bool, object]] = []
+        for key in keys:
+            existed = settings.contains(key)
+            snapshot.append((key, existed, settings.value(key) if existed else None))
+        return tuple(snapshot)
 
-        if last_error is not None:
-            logger.warning("Recent Projects menu update skipped: %s", last_error)
+    @staticmethod
+    def _restore_settings(
+        settings: QtCore.QSettings,
+        snapshot: Sequence[tuple[str, bool, object]],
+    ) -> None:
+        for key, existed, raw_value in snapshot:
+            if existed:
+                settings.setValue(key, raw_value)
+            else:
+                settings.remove(key)
+
+    def _sync_or_report(
+        self,
+        settings: QtCore.QSettings,
+        label: str,
+        *,
+        snapshot: Sequence[tuple[str, bool, object]],
+        success_message: str | None = None,
+    ) -> None:
+        message = f"{label[:1].upper()}{label[1:]} could not be saved."
+        settings.sync()
+        if settings.status() != QtCore.QSettings.Status.NoError:
+            logger.warning("%s (QSettings status %s)", message, settings.status())
+            self._restore_settings(settings, snapshot)
+            # QSettings may write new values while retaining a prior
+            # FormatError status. Persist the restored accepted values.
+            settings.sync()
+            raise OSError(message)
+        if success_message is not None:
+            logger.info(success_message)
+
+    def recent_projects(self) -> tuple[str, ...]:
+        raw = self._settings().value(_RECENT_PROJECTS_KEY, [])
+        if isinstance(raw, str):
+            candidates = [raw]
+        elif isinstance(raw, (list, tuple)):
+            candidates = list(raw)
         else:
-            logger.warning("Recent Projects menu update skipped: unable to acquire a valid menu")
+            candidates = []
+        result: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            path = str(candidate).strip()
+            identity = os.path.normcase(os.path.abspath(path))
+            if not path or identity in seen:
+                continue
+            seen.add(identity)
+            result.append(path)
+            if len(result) == _RECENT_PROJECT_LIMIT:
+                break
+        return tuple(result)
 
-    def add_to_recent_files(self, filepath: str) -> None:
-        recent_files = self._settings().value("recent_files", [])
-        if not isinstance(recent_files, list):
-            recent_files = []
+    def record_recent_project(self, path: str) -> tuple[str, ...]:
+        identity = os.path.normcase(path)
+        current = [
+            item
+            for item in self.recent_projects()
+            if os.path.normcase(os.path.abspath(item)) != identity
+        ]
+        result = tuple([path, *current][:_RECENT_PROJECT_LIMIT])
+        self._persist_recent_projects(result)
+        return result
 
-        if filepath in recent_files:
-            recent_files.remove(filepath)
-
-        recent_files.insert(0, filepath)
-        recent_files = recent_files[:10]
-        self._settings().setValue("recent_files", recent_files)
-        self.update_recent_files_menu()
+    def _persist_recent_projects(self, projects: Sequence[str]) -> None:
+        settings = self._settings()
+        snapshot = self._snapshot_settings(settings, (_RECENT_PROJECTS_KEY,))
+        settings.setValue(_RECENT_PROJECTS_KEY, list(projects))
+        self._sync_or_report(
+            settings,
+            "recent projects",
+            snapshot=snapshot,
+        )
+        self.recentProjectsChanged.emit()
 
     def clear_recent_files(self) -> None:
-        self._settings().setValue("recent_files", [])
-        self.update_recent_files_menu()
+        self._persist_recent_projects(())
+
+    def species_color(
+        self,
+        species: str,
+        known_species: Sequence[str] = (),
+    ) -> QtGui.QColor:
+        """Return one application preference color as an independent QColor."""
+        canonical = self._resolve_species_name(species, known_species)
+        override = self._species_color_overrides().get(canonical)
+        if override is not None:
+            return QtGui.QColor(override)
+        slot = self._default_species_slot(canonical, known_species)
+        # qdarktheme supplies application Text while styling Base per widget.
+        dark_mode = (
+            QtWidgets.QApplication.palette().color(QtGui.QPalette.Text).lightness() > 128
+        )
+        return readable_plot_color(self._species_palette[slot], dark_mode)
+
+    def set_species_color(
+        self,
+        species: str,
+        color: QtGui.QColor,
+        known_species: Sequence[str] = (),
+    ) -> None:
+        canonical = self._resolve_species_name(species, known_species)
+        overrides = dict(self._species_color_overrides())
+        overrides[canonical] = QtGui.QColor(color).name(QtGui.QColor.NameFormat.HexRgb)
+        settings = self._settings()
+        snapshot = self._snapshot_settings(settings, (_SPECIES_COLORS_KEY,))
+        settings.setValue(_SPECIES_COLORS_KEY, overrides)
+        self._sync_or_report(
+            settings,
+            "species colors",
+            snapshot=snapshot,
+        )
+        self.applicationPlotPreferencesChanged.emit()
+
+    def experimental_point_shape(self) -> str:
+        value = self._settings().value(_EXPERIMENTAL_POINT_SHAPE_KEY, "o")
+        return (
+            value
+            if value in tuple(code for _label, code in self.EXPERIMENTAL_POINT_SHAPES)
+            else "o"
+        )
+
+    def set_experimental_point_shape(self, shape: str) -> str:
+        settings = self._settings()
+        snapshot = self._snapshot_settings(settings, (_EXPERIMENTAL_POINT_SHAPE_KEY,))
+        settings.setValue(_EXPERIMENTAL_POINT_SHAPE_KEY, shape)
+        self._sync_or_report(settings, "experimental point shape", snapshot=snapshot)
+        self.applicationPlotPreferencesChanged.emit()
+        return shape
+
+    def experimental_point_size(self) -> int:
+        value = self._setting(
+            self._settings(),
+            _EXPERIMENTAL_POINT_SIZE_KEY,
+            _DEFAULT_EXPERIMENTAL_POINT_SIZE,
+            int,
+        )
+        try:
+            return self._validate_experimental_point_size(value)
+        except ValueError:
+            return _DEFAULT_EXPERIMENTAL_POINT_SIZE
+
+    def set_experimental_point_size(self, size: int) -> int:
+        accepted = size
+        settings = self._settings()
+        snapshot = self._snapshot_settings(settings, (_EXPERIMENTAL_POINT_SIZE_KEY,))
+        settings.setValue(_EXPERIMENTAL_POINT_SIZE_KEY, accepted)
+        self._sync_or_report(
+            settings,
+            "experimental point size",
+            snapshot=snapshot,
+        )
+        self.applicationPlotPreferencesChanged.emit()
+        return accepted
+
+    def experimental_point_opacity(self) -> float:
+        value = self._setting(
+            self._settings(),
+            _EXPERIMENTAL_POINT_OPACITY_KEY,
+            _DEFAULT_EXPERIMENTAL_POINT_OPACITY,
+            float,
+        )
+        try:
+            return self._validate_experimental_point_opacity(value)
+        except ValueError:
+            return _DEFAULT_EXPERIMENTAL_POINT_OPACITY
+
+    def set_experimental_point_opacity(self, opacity: float) -> float:
+        accepted = opacity
+        settings = self._settings()
+        snapshot = self._snapshot_settings(settings, (_EXPERIMENTAL_POINT_OPACITY_KEY,))
+        settings.setValue(_EXPERIMENTAL_POINT_OPACITY_KEY, accepted)
+        self._sync_or_report(
+            settings,
+            "experimental point opacity",
+            snapshot=snapshot,
+        )
+        self.applicationPlotPreferencesChanged.emit()
+        return accepted
+
+    @staticmethod
+    def _validate_experimental_point_size(value: int) -> int:
+        if not 1 <= value <= 20:
+            raise ValueError("Experimental point size must be between 1 and 20.")
+        return value
+
+    @staticmethod
+    def _validate_experimental_point_opacity(value: float) -> float:
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError("Experimental point opacity must be between zero and one.")
+        return value
+
+    def _species_color_overrides(self) -> Mapping[str, str]:
+        raw = self._settings().value(_SPECIES_COLORS_KEY, {})
+        if not isinstance(raw, Mapping):
+            return MappingProxyType({})
+        accepted: dict[str, str] = {}
+        for name, value in raw.items():
+            key = str(name).strip()
+            color = QtGui.QColor(str(value))
+            if key and color.isValid():
+                accepted[key] = color.name(QtGui.QColor.NameFormat.HexRgb)
+        return MappingProxyType(accepted)
+
+    @classmethod
+    def _resolve_species_name(
+        cls,
+        species: str,
+        known_species: Sequence[str],
+    ) -> str:
+        raw = species
+        roster = tuple(known_species)
+        if not roster:
+            return raw
+        exact = {name: name for name in roster}
+        if raw in exact:
+            return exact[raw]
+        folded = {name.casefold(): name for name in roster}
+        if raw.casefold() in folded:
+            return folded[raw.casefold()]
+        lowered = raw.casefold()
+        for suffix in _SPECIES_SUFFIXES:
+            if lowered.endswith(suffix) and len(raw) > len(suffix):
+                base = raw[: -len(suffix)].casefold()
+                if base in folded:
+                    return folded[base]
+        return raw
+
+    def _default_species_slot(
+        self,
+        canonical: str,
+        known_species: Sequence[str],
+    ) -> int:
+        roster = sorted(
+            known_species,
+            key=str.casefold,
+        )
+        if canonical in roster:
+            return roster.index(canonical) % len(self._species_palette)
+        return sum(ord(character) for character in canonical) % len(
+            self._species_palette
+        )
+
+    @classmethod
+    def _build_species_palette(cls) -> tuple[QtGui.QColor, ...]:
+        base = [QtGui.QColor(*rgb) for rgb in _BASE_SPECIES_RGB]
+        darker = [
+            cls._mix_color(color, factor=0.22, toward_white=False) for color in base
+        ]
+        lighter = [
+            cls._mix_color(color, factor=0.18, toward_white=True) for color in base
+        ]
+        return tuple(base + darker + lighter)
+
+    @staticmethod
+    def _mix_color(
+        color: QtGui.QColor,
+        *,
+        factor: float,
+        toward_white: bool,
+    ) -> QtGui.QColor:
+        target = 255 if toward_white else 0
+
+        def channel(value: int) -> int:
+            mixed = (
+                value + (target - value) * factor
+                if toward_white
+                else value * (1.0 - factor)
+            )
+            return max(0, min(int(round(mixed)), 255))
+
+        return QtGui.QColor(
+            channel(color.red()),
+            channel(color.green()),
+            channel(color.blue()),
+        )

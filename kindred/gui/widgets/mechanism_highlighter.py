@@ -6,7 +6,11 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from PySide6 import QtCore, QtGui
+from PySide6 import QtCore, QtGui, QtWidgets
+
+from kindred.gui.theme_manager import semantic_color
+
+from kindred.core.simulator.algebra_section import is_algebra_line
 
 __all__ = ["MechanismHighlighter"]
 
@@ -16,20 +20,18 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
     Syntax highlighter for Kindred mechanism DSL.
 
     Highlights:
-    - Keywords (reaction, equilibrium, time, etc.) - bold purple
+    - Keywords (init, param, intervention, etc.) - bold purple
     - Species names (A, B, ATP, etc.) - blue
-    - Operators (->, =>, <->, <=>, <-, +) - red bold
-    - Rate constants (k=, kf=, kr=, K=, kappa=) - green
+    - Operators (->, =>, <->, <=>, +) - muted in light mode, red in dark mode
+    - Rate constants (k=, kf=, kr=, Keq=, local kappa=) - green
     - Numbers (1.0, 1e-5, etc.) - orange
-    - Comments (#...) - gray italic
+    - Comments (#...) - gray
     - Energy terms (Ea=, dG_act=, etc.) - cyan
     - Initial conditions ([A]=) - magenta
 
     Example:
         highlighter = MechanismHighlighter(text_edit.document())
     """
-
-    _ALGEBRA_BLOCK_STATE = 1
 
     def __init__(self, parent: Optional[QtCore.QObject] = None):
         """
@@ -42,54 +44,12 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         """
         super().__init__(parent)
 
-        # Define text formats
         self.formats = {}
-
-        # Keywords (reaction, equilibrium, etc.)
-        keyword_format = QtGui.QTextCharFormat()
-        keyword_format.setForeground(QtGui.QColor(147, 112, 219))  # Medium purple
-        keyword_format.setFontWeight(QtGui.QFont.Bold)
-        self.formats['keyword'] = keyword_format
-
-        # Species names (A, B, ATP, etc.)
-        species_format = QtGui.QTextCharFormat()
-        species_format.setForeground(QtGui.QColor(70, 130, 180))  # Steel blue
-        self.formats['species'] = species_format
-
-        # Operators (->, <->, <-, =)
-        operator_format = QtGui.QTextCharFormat()
-        operator_format.setForeground(QtGui.QColor(220, 20, 60))  # Crimson red
-        operator_format.setFontWeight(QtGui.QFont.Bold)
-        self.formats['operator'] = operator_format
-
-        # Rate constants (k=, kf=, kr=, K=)
-        rate_format = QtGui.QTextCharFormat()
-        rate_format.setForeground(QtGui.QColor(34, 139, 34))  # Forest green
-        rate_format.setFontWeight(QtGui.QFont.Bold)
-        self.formats['rate'] = rate_format
-
-        # Numbers (1.0, 1e-5, etc.)
-        number_format = QtGui.QTextCharFormat()
-        number_format.setForeground(QtGui.QColor(255, 140, 0))  # Dark orange
-        self.formats['number'] = number_format
-
-        # Comments (#...)
-        comment_format = QtGui.QTextCharFormat()
-        comment_format.setForeground(QtGui.QColor(128, 128, 128))  # Gray
-        comment_format.setFontItalic(True)
-        self.formats['comment'] = comment_format
-
-        # Energy terms (Ea=, dG_act=, dG_eq=, A=)
-        energy_format = QtGui.QTextCharFormat()
-        energy_format.setForeground(QtGui.QColor(0, 206, 209))  # Dark turquoise
-        energy_format.setFontWeight(QtGui.QFont.Bold)
-        self.formats['energy'] = energy_format
-
-        # Initial conditions ([A]=)
-        initial_format = QtGui.QTextCharFormat()
-        initial_format.setForeground(QtGui.QColor(199, 21, 133))  # Medium violet red
-        initial_format.setFontWeight(QtGui.QFont.Bold)
-        self.formats['initial'] = initial_format
+        for role in ("keyword", "species", "operator", "rate", "number", "comment", "energy", "initial"):
+            text_format = QtGui.QTextCharFormat()
+            if role in {"keyword", "operator", "rate", "energy", "initial"}:
+                text_format.setFontWeight(QtGui.QFont.Bold)
+            self.formats[role] = text_format
 
         # Define highlighting rules (order matters — setFormat is last-wins,
         # so broad catch-alls go first and specific patterns override them).
@@ -103,12 +63,12 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         number_pattern = r'\b\d+\.?\d*(?:[eE][+-]?\d+)?\b|\.\d+(?:[eE][+-]?\d+)?\b'
         self.rules.append((re.compile(number_pattern), 'number', True))
 
-        # 3. Rate constants (k=, kf=, kr=, K=, kappa=, κ=)
+        # 3. Rate constants (k=, kf=, kr=, Keq=, local kappa=)
         rate_patterns = [
-            (r'\bk[fr]?\s*=', re.IGNORECASE),          # k=, kf=, kr=
-            (r'\bK(?:eq|_eq)?\s*=', re.IGNORECASE),    # K=, Keq=, K_eq=
+            (r'\bk\s*=', 0),                           # k=
+            (r'\bk[fr]\s*=', re.IGNORECASE),           # kf=, kr=
+            (r'\bKeq\s*=', re.IGNORECASE),             # Keq=
             (r'\bkappa\s*=', re.IGNORECASE),           # kappa=
-            (r'\bκ\s*=', 0),                           # κ= (Unicode kappa)
         ]
         for pattern, flags in rate_patterns:
             self.rules.append((re.compile(pattern, flags), 'rate', False))
@@ -116,47 +76,65 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         # 4. Energy/thermodynamic terms (Ea=, dG_act=, dG_eq=, A=, T=, etc.)
         energy_terms = [
             r'\bEa\s*=', r'\bdG_act\s*=', r'\bdG_eq\s*=', r'\bA\s*=',
-            r'\bT\s*=', r'\benergy\s*=', r'\bΔG‡\s*=', r'\bΔG°\s*=',
-            r'\bC0\s*=', r'\bC°\s*=', r'\bdegeneracy\s*=',
+            r'\bT\s*=', r'\benergy\s*=',
+            r'\bC0\s*=', r'\bdegeneracy\s*=',
         ]
         for term in energy_terms:
             self.rules.append((re.compile(term, re.IGNORECASE), 'energy', True))
 
-        # 5. Keywords (reaction, equilibrium, init, etc.)
+        # 5. Declaration and intervention keywords
         keywords = [
-            'reaction', 'equilibrium',
             'init', 'initial', 'time',
-            'temp_const', 'temp_step', 'temp_response', 'state', 'edge',
+            'temp_step', 'temp_response', 'intervention',
+            'trigger', 'watch_species', 'watch_observable', 'threshold',
+            'threshold_param', 'direction', 'rising', 'falling', 'either',
+            'then', 'stop',
         ]
         keyword_pattern = r'\b(' + '|'.join(keywords) + r')\b'
         self.rules.append((re.compile(keyword_pattern, re.IGNORECASE), 'keyword', False))
 
-        # 6. Operators (->, =>, <->, <=>, <-, +)
+        # 6. Algebra keywords (param, let)
+        algebra_keywords = ['param', 'let']
+        algebra_keyword_pattern = r'\b(' + '|'.join(algebra_keywords) + r')\b'
+        self.rules.append((re.compile(algebra_keyword_pattern, re.IGNORECASE), 'keyword', True))
+
+        # 7. Operators (->, =>, <->, <=>, +)
         # Applied after rate/energy so arrow `=` is not consumed by `A=` patterns.
         operators = [
             r'<=>',  # Reversible (alternate)
             r'<->',  # Reversible
             r'=>',   # Forward (alternate)
             r'->',   # Forward
-            r'<-',   # Backward (rare)
             r'\+',   # Addition (in reactions)
         ]
         for op in operators:
             self.rules.append((re.compile(op), 'operator', True))
 
-        # 7. Initial conditions ([Species] = value)
+        # 8. Initial conditions ([Species] = value)
         self.rules.append((re.compile(r'\[[A-Za-z_][A-Za-z0-9_]*\]\s*='), 'initial', True))
 
-        # 8. Comments (applied last — highest effective priority)
+        # 9. Comments (applied last — highest effective priority)
         self.rules.append((re.compile(r'#[^\n]*'), 'comment', True))
+        self.set_theme(dark_mode=QtWidgets.QApplication.palette().color(QtGui.QPalette.Text).lightness() > 128)
 
-    @staticmethod
-    def _is_algebra_header(stripped: str) -> bool:
-        return stripped.lower().startswith("# algebra")
-
-    @classmethod
-    def _is_section_boundary(cls, stripped: str) -> bool:
-        return stripped.lower().startswith("# ") and not cls._is_algebra_header(stripped)
+    def set_theme(self, *, dark_mode: bool) -> None:
+        colors = {
+            "keyword": ("#7040a0", "#c5a0ef"),
+            "species": ("#246398", "#8bc5f2"),
+            "number": ("#925000", "#ffc078"),
+            "energy": ("#006a70", "#7ddde2"),
+            "initial": ("#983172", "#ef9ed2"),
+        }
+        semantic_roles = {"comment": "muted", "rate": "success", "operator": "error" if dark_mode else "muted"}
+        self.formats["operator"].setFontWeight(QtGui.QFont.Bold if dark_mode else QtGui.QFont.Normal)
+        for role, text_format in self.formats.items():
+            color = (
+                semantic_color(semantic_roles[role], dark_mode)
+                if role in semantic_roles
+                else QtGui.QColor(colors[role][int(dark_mode)])
+            )
+            text_format.setForeground(color)
+        self.rehighlight()
 
     def highlightBlock(self, text: str):
         """
@@ -169,17 +147,12 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         text : str
             Text to highlight
         """
-        stripped = text.strip()
-        previous_state = self.previousBlockState()
-        starts_algebra = self._is_algebra_header(stripped)
-        ends_algebra = previous_state == self._ALGEBRA_BLOCK_STATE and self._is_section_boundary(stripped)
-        in_algebra_body = previous_state == self._ALGEBRA_BLOCK_STATE and not starts_algebra and not ends_algebra
-        next_state = self._ALGEBRA_BLOCK_STATE if (starts_algebra or in_algebra_body) else 0
-        self.setCurrentBlockState(next_state)
+        algebra_line = is_algebra_line(text)
+        self.setCurrentBlockState(0)
 
         # Apply all rules in order
         for pattern, format_name, applies_in_algebra in self.rules:
-            if in_algebra_body and not applies_in_algebra:
+            if algebra_line and not applies_in_algebra:
                 continue
             format_obj = self.formats[format_name]
 

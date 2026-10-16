@@ -1,6 +1,30 @@
-"""Shared constants for the fitting UI subsystem."""
+"""Small Fit-local UI constants; simulation science comes from each mapped set."""
+
+from kindred.core.validation import parse_finite_numeric_text
 
 INITIAL_PREFIX = "init:"
-FITTING_DEFAULT_SOLVER = "LSODA"
-DEFAULT_PARALLEL_STARTS = 4
-_SAMPLING_ALL_POINTS_SENTINEL = 0
+DIFFERENTIAL_EVOLUTION_METHOD = "differential_evolution"
+# Tolerance labels shared by the Fit window and the Fitting Defaults dialog.
+FUNCTION_TOLERANCE_LABEL = "Objective-improvement tolerance"
+STEP_TOLERANCE_LABEL = "Parameter-step tolerance"
+FIT_DATASET_WEIGHT_MODE_LABELS = {
+    "implicit": "Equal (1/N)",
+    "user": "Custom",
+}
+FIT_METHOD_LABELS = {
+    "trf": "Trust Region Reflective",
+    "dogbox": "Dogbox",
+    "differential_evolution": "Differential Evolution",
+}
+
+
+def fit_method_label(value: str) -> str:
+    return FIT_METHOD_LABELS[value]
+
+
+def admit_fit_tolerance(text: str, label: str) -> float:
+    """Admit one optimizer tolerance box, named by its visible label."""
+    value = parse_finite_numeric_text(text, field=label)
+    if value <= 0.0:
+        raise ValueError(f"{label} must be positive.")
+    return value

@@ -1,2622 +1,1907 @@
-# kindred/gui/widgets/pyqtgraph_plot_panel_impl.py
-"""High-performance plot panel using PyQtGraph (GPU-accelerated)."""
+"""PyQtGraph workspace surface for one immutable result input."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import partial
-import logging
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, NamedTuple
+import html
+
+from kindred.core.quantity_units import (
+    CUBIC_METRE,
+    MOLAR,
+    SECOND,
+    Unit,
+    conversion_scale,
+    format_unit_for_display,
+    presentation_unit,
+    reconcile_unit_choices,
+    scientific_unit,
+)
+
+import io
+import math
+from dataclasses import dataclass, replace
+from collections.abc import Mapping, Sequence
+from typing import Any, Iterator
 
 import numpy as np
-from PySide6 import QtCore, QtWidgets
-from PySide6.QtCore import Qt
+from PySide6 import QtCore, QtGui, QtWidgets
 
-from kindred.gui.color_manager import ColorManager
+from kindred.core.project_presentation_state import (
+    ProjectPresentationState,
+    SimulationSeriesAxisSelection,
+)
+from kindred.gui.curve_copy_headers import copy_column_header, copy_series_label
+from kindred.gui.display_name_policy import literal_tooltip
+from kindred.gui.theme_manager import plot_background_color, plot_foreground_color
+from kindred.gui.ui_helpers import (
+    SCIENTIFIC_NAME_HTML_ROLE,
+    ScientificNameComboBox,
+    clamp_initial_size,
+)
+import pyqtgraph as pg
 
-# Direct imports required to avoid circular dependency with widgets/__init__.py
+from kindred.gui.plot_config import TIME_DISPLAY_UNITS
 from kindred.gui.widgets.axis_toolbar import AxisToolbar
-from kindred.gui.widgets.dataset_overlay_panel import DatasetOverlayPanel
-from kindred.gui.widgets.species_statistics_table import SpeciesStatisticsTable
 from kindred.gui.widgets.parameter_statistics_table import ParameterStatisticsTable
-from ..ui_helpers import make_pyqtgraph_fallback_widget
+from kindred.gui.widgets.plot_data_item import PlotDataItem
+from kindred.gui.widgets.species_statistics_table import SpeciesStatisticsTable
+from kindred.gui.workspace_result_presenter import (
+    ResultDataBlock,
+    ResultRenderInput,
+    ResultLayerKind,
+    encode_clipboard_text,
+    encode_tsv_row,
+    intervention_label,
+)
 
-logger = logging.getLogger(__name__)
 
-__all__ = [
-    "CopyAllExportPlan",
-    "CopyAllMissingItem",
-    "CopyAllShownBlock",
-    "PyQtGraphPlotPanel",
-    "PYQTGRAPH_AVAILABLE",
-]
+__all__ = ["PyQtGraphPlotPanel"]
+
+
+class _PlotViewBox(pg.ViewBox):
+    """Keep native gestures, with effective axis masks for axis drags and rectangles."""
+
+    def childrenBounds(self, frac=None, orthoRange=(None, None), items=None):
+        items = self.addedItems if items is None else items
+        # 0.13.7 ScatterPlotItem caches restricted bounds as unrestricted
+        # bounds. Clear that cache before asking native code for the bounds.
+        for item in items:
+            if isinstance(item, pg.PlotDataItem):
+                item.scatter.bounds = [None, None]
+        return super().childrenBounds(frac=frac, orthoRange=orthoRange, items=items)
+
+    def mouseDragEvent(self, event: object, axis: int | None = None) -> None:
+        enabled = self.state["mouseEnabled"]
+        # 0.13.7 emits mouseEnabled instead of its axis-local drag mask.
+        # Narrow the native gesture itself so right drags also leave the other
+        # axis automatic; restore the user's locks when this event returns.
+        self.state["mouseEnabled"] = [
+            value and (axis is None or index == axis)
+            for index, value in enumerate(enabled)
+        ]
+        try:
+            super().mouseDragEvent(event, axis=axis)
+        finally:
+            self.state["mouseEnabled"] = enabled
+
+    def showAxRect(self, rect: QtCore.QRectF, **kwargs: object) -> None:
+        rect = rect.normalized()
+        ranges = {}
+        if self.state["mouseEnabled"][0]:
+            ranges["xRange"] = (rect.left(), rect.right())
+        if self.state["mouseEnabled"][1]:
+            ranges["yRange"] = (rect.top(), rect.bottom())
+        if ranges:
+            self.setRange(**ranges, **kwargs)
+            self.sigRangeChangedManually.emit(self.state["mouseEnabled"])
 
 
 @dataclass(frozen=True, slots=True)
-class CopyAllShownBlock:
-    set_id: str
+class _AxisRangeSession:
+    auto_x: bool = True
+    auto_y: bool = True
+    mouse_x: bool = True
+    mouse_y: bool = True
+    fraction_x: float = 1.0
+    fraction_y: float = 1.0
+    pan_x: bool = False
+    pan_y: bool = False
+    visible_x: bool = False
+    x_min: float | None = None
+    x_max: float | None = None
+    y_min: float | None = None
+    y_max: float | None = None
+
+
+@dataclass(slots=True)
+class _AnnotationLabel:
+    item: Any
+    anchor: QtCore.QPointF
+    event_x: float
+    lane: int
+
+
+_EPSILON = 1e-9
+_DisplayAnnotation = tuple[str, str, Mapping[str, object], float]
+_AnnotationKey = tuple[str, str, tuple[tuple[str, str], ...]]
+_ANNOTATION_ACCENTS = ("#4E79A7", "#F28E2B", "#59A14F", "#E15759", "#B07AA1", "#76B7B2")
+
+
+def _undefined_edges(*arrays: np.ndarray) -> np.ndarray:
+    """Rows on both sides of every change between defined and undefined values
+    in each array, kept through sampling so no curve's undefined stretch is drawn
+    across, even inside another curve's longer one."""
+    changes = np.concatenate([
+        np.flatnonzero(known[1:] != known[:-1])
+        for known in (np.isfinite(values) for values in arrays)
+    ])
+    return np.concatenate((changes, changes + 1))
+
+
+def _transform_samples(x: np.ndarray, y: np.ndarray, transform: str) -> tuple[np.ndarray, np.ndarray]:
+    """Native adjacent-difference mapping, with undefined pairs kept as breaks."""
+    if transform == "original":
+        return x, y
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        dx, dy = np.diff(x), np.diff(y)
+        valid = np.isfinite(x[:-1]) & np.isfinite(x[1:]) & np.isfinite(y[:-1]) & np.isfinite(y[1:]) & np.isfinite(dx) & np.isfinite(dy) & (dx != 0)
+        derivative = np.full(dx.shape, np.nan, dtype=float)
+        np.divide(dy, dx, out=derivative, where=valid)
+        derivative[~np.isfinite(derivative)] = np.nan
+    return (y[:-1] if transform == "phase" else x[:-1]), derivative
+
+
+@dataclass(frozen=True, slots=True)
+class _RenderedPointChunk:
+    """One exact point chunk handed to a plot item."""
+
+    x: np.ndarray
+    series: tuple[tuple[str, np.ndarray], ...]
+    sample_time: np.ndarray | None
+    instantaneous: bool = False
+
+    def __post_init__(self) -> None:
+        x = np.asarray(self.x)
+        x.setflags(write=False)
+        series = tuple(
+            (str(name), np.asarray(values)) for name, values in self.series
+        )
+        for _name, values in series:
+            values.setflags(write=False)
+        if self.sample_time is not None:
+            sample_time = np.asarray(self.sample_time)
+            sample_time.setflags(write=False)
+            object.__setattr__(self, "sample_time", sample_time)
+        object.__setattr__(self, "x", x)
+        object.__setattr__(self, "series", series)
+
+
+@dataclass(frozen=True, slots=True)
+class _RenderedPointBlock:
+    """Private sampled roster entry; it is not result or export authority."""
+
+    block_id: str
+    group_id: str
     label: str
-    t: np.ndarray
-    series: Dict[str, np.ndarray]
+    kind: str
+    x_name: str
+    x_is_time: bool
+    x_unit: str | None
+    time_column_name: str | None
+    y_names: tuple[tuple[str, str], ...]
+    y_units: tuple[tuple[str, str | None], ...]
+    chunks: tuple[_RenderedPointChunk, ...]
+    left_endpoint: bool = False
 
-
-@dataclass(frozen=True, slots=True)
-class CopyAllMissingItem:
-    set_id: str
-    label: str
-    popup_label: str
-    reason: str
-
-
-@dataclass(frozen=True, slots=True)
-class CopyAllExportPlan:
-    shown_blocks: List[CopyAllShownBlock]
-    missing_items: List[CopyAllMissingItem]
-
-
-def _try_float(value: object) -> Optional[float]:
-    try:
-        out = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if not np.isfinite(out):
-        return None
-    return float(out)
-
-
-def _try_1d_float_array(value: object) -> np.ndarray:
-    try:
-        return np.asarray(value, dtype=float).reshape(-1)
-    except Exception:
-        return np.asarray([], dtype=float)
-
-
-# Try to import pyqtgraph
-try:
-    import pyqtgraph as pg
-    PYQTGRAPH_AVAILABLE = True
-except ImportError:
-    PYQTGRAPH_AVAILABLE = False
-    pg = None
-
-
-if PYQTGRAPH_AVAILABLE:
-    class _OverlaySeries(NamedTuple):
-        dataset: str
-        species: str
-        x: np.ndarray
-        y: np.ndarray
-        logical_x_axis_name: str
-        resolved_x_column: Optional[str]
-        resolved_y_column: str
-
-    class _DetailInspectorDock(QtWidgets.QFrame):
-        """Compact secondary inspector wrapper with a small default height hint."""
-
-        def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
-            super().__init__(parent)
-            self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-            self.setSizePolicy(
-                QtWidgets.QSizePolicy.Policy.Expanding,
-                QtWidgets.QSizePolicy.Policy.Minimum,
-            )
-
-        def sizeHint(self) -> QtCore.QSize:
-            hint = super().sizeHint()
-            return QtCore.QSize(max(hint.width(), 320), 136)
-
-        def minimumSizeHint(self) -> QtCore.QSize:
-            hint = super().minimumSizeHint()
-            return QtCore.QSize(max(hint.width(), 260), 120)
-
-    def _resolve_dataset_species(
-        species_name: str,
-        species_dict: Dict[str, np.ndarray]
-    ) -> Tuple[Optional[str], Optional[np.ndarray]]:
-        """
-        Resolve a mechanism species name to a dataset column name and values.
-
-        This function implements flexible matching to handle common naming patterns
-        in experimental datasets (e.g., "A" matching "A_conc").
-
-        Matching rules (applied in order, first match wins):
-        1. Exact match: species_name is directly in species_dict
-        2. Case-insensitive exact match
-        3. Suffix-based match: species_name + common suffixes ("_conc", "_concentration")
-
-        Parameters
-        ----------
-        species_name : str
-            Mechanism species name (e.g., "A", "PBMP")
-        species_dict : dict
-            Dataset species columns mapping names to concentration arrays
-
-        Returns
-        -------
-        tuple
-            (resolved_key, values) if match found, (None, None) otherwise
-        """
-        if not species_name or not species_dict:
-            return None, None
-
-        # Rule 1: Exact match
-        if species_name in species_dict:
-            return species_name, species_dict[species_name]
-
-        # Build lookup for case-insensitive matching
-        lower_to_key = {key.lower(): key for key in species_dict.keys()}
-        species_lower = species_name.lower()
-
-        # Rule 2: Case-insensitive exact match
-        if species_lower in lower_to_key:
-            matched_key = lower_to_key[species_lower]
-            return matched_key, species_dict[matched_key]
-
-        # Rule 3: Suffix-based matching (common concentration column patterns)
-        suffixes = ["_conc", "_concentration"]
-        for suffix in suffixes:
-            candidate_lower = species_lower + suffix
-            if candidate_lower in lower_to_key:
-                matched_key = lower_to_key[candidate_lower]
-                return matched_key, species_dict[matched_key]
-
-        # No match found
-        return None, None
-
-    class PyQtGraphPlotPanel(QtWidgets.QWidget):
-        """
-        High-performance plot panel using PyQtGraph.
-
-        Features:
-        - GPU-accelerated rendering (OpenGL)
-        - Handles millions of points smoothly
-        - Real-time updates (60+ FPS)
-        - Interactive zoom, pan, mouse tracking
-        - AxisToolbar integration (X-axis selection, Y-axis selection, parametric mode)
-        - Custom X-axis selection (plot any species vs any species)
-        - Parametric mode support
-        - Legend with show/hide toggle
-        - Dark theme support
-
-        Performance:
-        - Handles 1M+ points smoothly with GPU acceleration
-        """
-
-        # Signal emitted when series visibility changes
-        seriesVisibilityChanged = QtCore.Signal(str, bool)
-
-        def __init__(
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "block_id", str(self.block_id))
+        object.__setattr__(self, "label", str(self.label))
+        object.__setattr__(self, "kind", str(self.kind))
+        object.__setattr__(self, "x_name", str(self.x_name))
+        object.__setattr__(
             self,
-            parent: Optional[QtWidgets.QWidget] = None,
-            *,
-            embed_analysis_tabs: bool = True,
-            workspace_splitter_object_name: Optional[str] = None,
-            enable_axis_inversion_actions: bool = False,
-            enable_canonical_ghost_toggle_action: bool = False,
-            enable_copy_visible_data_action: bool = False,
-        ):
-            """
-            Initialize PyQtGraph plot panel.
+            "x_unit",
+            None if self.x_unit is None else str(self.x_unit),
+        )
+        object.__setattr__(self, "chunks", tuple(self.chunks))
 
-            Parameters
-            ----------
-            parent : QWidget, optional
-                Parent widget
-            """
-            super().__init__(parent)
 
-            # Data storage
-            self._t: Optional[np.ndarray] = None
-            self._series: Dict[str, np.ndarray] = {}
-            self._visible: Dict[str, bool] = {}
-            self._colors: Dict[str, tuple] = {}
-            self._owned_species_keys: Set[str] = set()
-            self._plot_items: Dict[str, pg.PlotDataItem] = {}
-            self._dataset_scatter_items: Dict[str, pg.ScatterPlotItem] = {}
-            self._dataset_model_items: Dict[str, pg.PlotDataItem] = {}
-            self._overlay_items: Dict[Tuple[str, str], pg.ScatterPlotItem] = {}
-            self._overlay_datasets: Dict[str, Dict[str, np.ndarray]] = {}
-            self._overlay_symbols: Dict[str, str] = {}
-            self._active_overlay_series: List[_OverlaySeries] = []
-            self._export_all_overlay_series: List[_OverlaySeries] = []
-            self._active_overlay_warnings: List[str] = []
-            self._export_all_overlay_warnings: List[str] = []
-            self._export_all_overlay_cache_dirty: bool = True
-            self._dark_mode = False
-            self._scalar_values: Dict[str, float] = {}
+class PyQtGraphPlotPanel(QtWidgets.QWidget):
+    """Physical plot/analysis widget; semantic visibility stays in presentation."""
 
-            # Batch simulation overlays (multiple initial-condition sets overlaid as lines)
-            self._simulation_set_label: Optional[str] = None
-            self._simulation_set_popup_label: Optional[str] = None
-            self._simulation_overlays: List[Dict[str, object]] = []
+    referenceLayerVisibilityRequested = QtCore.Signal(bool)
+    interventionAnnotationsVisibilityRequested = QtCore.Signal(bool)
+    interventionLabelsVisibilityRequested = QtCore.Signal(bool)
+    copyAllRequested = QtCore.Signal()
+    xSeriesRequested = QtCore.Signal(object)
+    ySeriesRequested = QtCore.Signal(object)
+    yAllSeriesRequested = QtCore.Signal()
+    plotPresentationIntentRequested = QtCore.Signal(str, object)
+    resultDiagnostic = QtCore.Signal(str)
 
-            # Axis control (for parametric mode and custom X-axis)
-            self._x_axis_name: str = "t"  # Current X-axis variable
-            self._parametric_mode: bool = False  # Parametric plotting mode
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._sampling_limit: int | None = None
+        self._plot_items_by_key: dict[tuple[object, ...], object] = {}
+        self._annotation_items: dict[_AnnotationKey, object] = {}
+        self._annotation_labels: dict[tuple[object, ...], _AnnotationLabel] = {}
+        self._zoom_enabled = False
+        self._presentation = ProjectPresentationState()
+        self._axis_range = _AxisRangeSession()
+        self._refit_axes = (False, False)
+        self._axis_display_units: dict[tuple[str, tuple], Unit] = {}
+        self._volume_display_unit: Unit | None = None
+        self._render_input: ResultRenderInput | None = None
+        self._copy_all_available = False
+        self._rendered_point_roster: tuple[_RenderedPointBlock, ...] = ()
 
-            # Plot enhancements (v0.2.0)
-            self._log_x: bool = False
-            self._log_y: bool = False
-            self._invert_x_axis: bool = False
-            self._invert_y_axis: bool = False
-            self._enable_axis_inversion_actions = bool(enable_axis_inversion_actions)
-            self._show_canonical_ghost_lines: bool = True
-            self._enable_canonical_ghost_toggle_action = bool(enable_canonical_ghost_toggle_action)
-            self._enable_copy_visible_data_action = bool(enable_copy_visible_data_action)
-            self._copy_all_export_plan_provider: Optional[Callable[[], Optional[CopyAllExportPlan]]] = None
-            self._annotations: List[pg.TextItem] = []
-            self._sampling_mode: str = "dense"
-            self._sampling_target: int = 1000
-            self._export_scope_preference: str = "axis"
-            self._guide_items: List[pg.InfiniteLine] = []
-            self._analysis_tabs_detached = False
+        self._plot_widget = pg.PlotWidget(self, viewBox=_PlotViewBox())
+        self._plot_widget.setObjectName("plotViewport")
+        self._plot_widget.plotItem.setContentsMargins(0, 0, 0, 10)
+        self._plot_widget.setBackground(plot_background_color(False))
+        self._plot_widget.showGrid(x=True, y=True, alpha=0.25)
+        self._legend = self._plot_widget.addLegend(
+            offset=(-10, 10),
+            labelTextColor=plot_foreground_color(self._plot_widget.backgroundBrush().color().lightness() < 128),
+        )
+        self._plot_widget.getPlotItem().setMenuEnabled(False)
+        self._plot_widget.getPlotItem().hideButtons()
+        self._plot_widget.scene().installEventFilter(self)
+        self._plot_widget.scene().sigMouseClicked.connect(self._on_plot_click)
+        self._axis_toolbar = AxisToolbar(self)
+        self._axis_toolbar.xChanged.connect(self.xSeriesRequested.emit)
+        self._axis_toolbar.ySelectionChanged.connect(self.ySeriesRequested.emit)
+        self._axis_toolbar.yAllRequested.connect(self.yAllSeriesRequested.emit)
+        self._axis_toolbar.axisRangeChanged.connect(self._apply_axis_range)
+        self._axis_toolbar.unitChanged.connect(self._apply_display_unit_change)
+        self._plot_widget.getViewBox().sigRangeChangedManually.connect(
+            self._on_manual_navigation
+        )
+        self._plot_widget.getViewBox().sigRangeChanged.connect(
+            self._position_annotation_labels
+        )
 
-            # Setup UI
-            layout = QtWidgets.QVBoxLayout(self)
-            layout.setContentsMargins(0, 0, 0, 0)
-            layout.setSpacing(0)
-
-            # Create PyQtGraph PlotWidget
-            self._plot_widget = pg.PlotWidget()
-            self._plot_widget.setObjectName("plotViewport")
-            self._plot_item = self._plot_widget.getPlotItem()
-            self._plot_widget.plotItem.setContentsMargins(0, 0, 0, 10)
-
-            # Set white background (user requested light background)
-            self._plot_widget.setBackground('w')
-
-            # Configure plot appearance
-            self._plot_item.setLabel('bottom', 'Time', units='s')
-            self._plot_item.setLabel('left', 'Concentration', units='M')
-            self._plot_item.showGrid(x=True, y=True, alpha=0.3)
-            self._legend = self._plot_item.addLegend()
-            self._legend_visible = True
-
-            # Enable antialiasing for smoother lines
-            self._plot_widget.setAntialiasing(True)
-
-            # Setup context menu
-            self._plot_widget.setContextMenuPolicy(Qt.CustomContextMenu)
-            self._plot_widget.customContextMenuRequested.connect(self._show_context_menu)
-
-            # Disable PyQtGraph's native context menus (prevents double-popups in some builds)
-            self._plot_item.setMenuEnabled(False)
-            vb = self._plot_item.getViewBox()
-            vb.setMenuEnabled(False)
-            self._apply_axis_inversion_state()
-
-            self._toolbar = AxisToolbar(self, orientation="horizontal")
-            self._toolbar.setSizePolicy(
-                QtWidgets.QSizePolicy.Policy.Expanding,
-                QtWidgets.QSizePolicy.Policy.Fixed,
-            )
-
-            self._legend_toggle_btn = QtWidgets.QCheckBox("Legend", self._toolbar)
-            self._legend_toggle_btn.setChecked(True)
-            self._legend_toggle_btn.setSizePolicy(
-                QtWidgets.QSizePolicy.Policy.Fixed,
-                QtWidgets.QSizePolicy.Policy.Fixed,
-            )
-            self._legend_toggle_btn.toggled.connect(self._toggle_legend)
-            toolbar_layout = self._toolbar.layout()
-            toolbar_layout.insertWidget(toolbar_layout.count() - 1, self._legend_toggle_btn, 0, Qt.AlignVCenter)
-
-            self._control_strip = QtWidgets.QWidget(self)
-            control_layout = QtWidgets.QHBoxLayout(self._control_strip)
-            control_layout.setContentsMargins(8, 6, 8, 2)
-            control_layout.setSpacing(6)
-            control_layout.addWidget(self._toolbar, stretch=1)
-            layout.addWidget(self._control_strip, stretch=0)
-
-            self._plot_surface = QtWidgets.QFrame(self)
-            self._plot_surface.setObjectName("mainPlotSurface")
-            self._plot_surface.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-            plot_surface_layout = QtWidgets.QVBoxLayout(self._plot_surface)
-            plot_surface_layout.setContentsMargins(8, 0, 8, 0)
-            plot_surface_layout.setSpacing(0)
-            self._plot_widget.setSizePolicy(
-                QtWidgets.QSizePolicy.Policy.Expanding,
-                QtWidgets.QSizePolicy.Policy.Expanding,
-            )
-            plot_surface_layout.addWidget(self._plot_widget, stretch=1)
-
-            # Vertical splitter: plot area (top) | compact detail dock (bottom)
-            self._main_splitter = QtWidgets.QSplitter(Qt.Vertical, self)
-            if workspace_splitter_object_name:
-                self._main_splitter.setObjectName(str(workspace_splitter_object_name))
-            self._main_splitter.setChildrenCollapsible(False)
-            self._main_splitter.setHandleWidth(8)
-            self._main_splitter.addWidget(self._plot_surface)
-            self._main_splitter.setCollapsible(0, False)
-
-            self._details_dock = _DetailInspectorDock(self._main_splitter)
-            details_dock_layout = QtWidgets.QVBoxLayout(self._details_dock)
-            details_dock_layout.setContentsMargins(0, 0, 0, 0)
-            details_dock_layout.setSpacing(0)
-
-            self._details_tabs = QtWidgets.QTabWidget(self._details_dock)
-            self._details_tabs.setObjectName("mainPlotDetailTabs")
-            self._details_tabs.setDocumentMode(True)
-            self._details_tabs.setTabPosition(QtWidgets.QTabWidget.TabPosition.North)
-            details_dock_layout.addWidget(self._details_tabs, stretch=1)
-
-            stats_container = QtWidgets.QWidget(self._details_tabs)
-            stats_layout = QtWidgets.QVBoxLayout(stats_container)
-            stats_layout.setContentsMargins(8, 8, 8, 8)
-            stats_layout.setSpacing(4)
-
-            stats_selector_row = QtWidgets.QHBoxLayout()
-            stats_selector_row.setContentsMargins(0, 0, 0, 0)
-            stats_selector_row.setSpacing(6)
-
-            stats_selector_label = QtWidgets.QLabel("Select Result Set:", stats_container)
-            stats_selector_row.addWidget(stats_selector_label, stretch=0)
-
-            self._stats_result_selector = QtWidgets.QComboBox(stats_container)
-            self._stats_result_selector.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
-            stats_selector_row.addWidget(self._stats_result_selector, stretch=1)
-            stats_selector_row.addStretch(1)
-
-            stats_layout.addLayout(stats_selector_row, stretch=0)
-
-            self._stats_table = SpeciesStatisticsTable(stats_container)
-            stats_layout.addWidget(self._stats_table, stretch=1)
-
-            self._stats_results_map: Dict[str, Dict[str, object]] = {}
-            self._stats_result_selector.currentTextChanged.connect(self._on_stats_result_selector_changed)
-
-            self._param_table = ParameterStatisticsTable(self._details_tabs)
-            self._param_table.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
-
-            self._overlay_panel = DatasetOverlayPanel(self._details_tabs)
-            self._overlay_panel.selectionChanged.connect(self._on_overlay_selection_changed)
-            self._overlay_panel.styleChanged.connect(self._on_overlay_style_changed)
-
-            self._details_tabs.addTab(stats_container, "Statistics")
-            self._details_tabs.addTab(self._param_table, "Parameters")
-            self._details_tabs.setCurrentWidget(stats_container)
-
-            self._main_splitter.addWidget(self._details_dock)
-            self._main_splitter.setCollapsible(1, True)
-            self._main_splitter.setStretchFactor(0, 5)
-            self._main_splitter.setStretchFactor(1, 1)
-            layout.addWidget(self._main_splitter, stretch=1)
-            QtCore.QTimer.singleShot(0, self._apply_default_workspace_splitter_sizes)
-
-            if not bool(embed_analysis_tabs):
-                self.detach_analysis_tabs_for_dock()
-
-            # Connect toolbar signals
-            self._toolbar.xChanged.connect(self._on_x_axis_changed)
-            self._toolbar.ySelectionChanged.connect(self._on_y_selection_changed)
-            self._toolbar.parametricToggled.connect(self._on_parametric_toggled)
-            self._toolbar.axisRangeChanged.connect(self._on_axis_range_changed)
-            self._toolbar.optionsRequested.connect(self._on_toolbar_option_requested)
-            self._toolbar.addGuideRequested.connect(self._on_add_guide_requested)
-            logger.debug("Connected axis range changed signal")
-
-            logger.debug("PyQtGraphPlotPanel initialized")
-
-        def _apply_default_workspace_splitter_sizes(self) -> None:
-            splitter = getattr(self, "_main_splitter", None)
-            if splitter is None:
-                return
-            total = sum(int(size) for size in splitter.sizes())
-            if total <= 0:
-                total = max(int(self.height()), 720)
-            if bool(getattr(self, "_analysis_tabs_detached", False)):
-                splitter.setSizes([max(1, total), 0])
-                return
-            detail = max(120, int(round(total * 0.16)))
-            detail = min(detail, max(140, int(total * 0.18)))
-            # Ensure the plot surface keeps at least 200px
-            if total - detail < 200:
-                detail = max(0, total - 200)
-            plot = max(1, total - detail)
-            splitter.setSizes([plot, detail])
-
-        def analysis_tabs_widget(self) -> Optional[QtWidgets.QWidget]:
-            return getattr(self, "_details_tabs", None)
-
-        def workspace_splitter(self) -> Optional[QtWidgets.QSplitter]:
-            return getattr(self, "_main_splitter", None)
-
-        def detach_analysis_tabs_for_dock(self) -> Optional[QtWidgets.QWidget]:
-            tabs = getattr(self, "_details_tabs", None)
-            if tabs is None:
-                return None
-            if bool(getattr(self, "_analysis_tabs_detached", False)):
-                return tabs
-
-            details_dock = getattr(self, "_details_dock", None)
-            if details_dock is not None:
-                layout = details_dock.layout()
-                if layout is not None:
-                    layout.removeWidget(tabs)
-                tabs.setParent(None)
-                details_dock.hide()
-                details_dock.setMinimumHeight(0)
-                details_dock.setMaximumHeight(0)
-
-            splitter = getattr(self, "_main_splitter", None)
-            if splitter is not None:
-                splitter.setSizes([max(1, sum(int(size) for size in splitter.sizes())), 0])
-
-            self._analysis_tabs_detached = True
-            return tabs
-
-        def set_data(
+        self._completion_warning_badge = QtWidgets.QLabel(
+            "Completed with warnings",
             self,
-            t: np.ndarray,
-            series: Dict[str, np.ndarray],
-            *,
-            label: Optional[str] = None,
-            overlays: Optional[Sequence[Dict[str, object]]] = None,
-            owned_species: Optional[Sequence[str]] = None,
-        ) -> None:
-            """
-            Set time and concentration data.
-
-            Parameters
-            ----------
-            t : np.ndarray
-                Time points
-            series : dict
-                Dictionary of {species_name: concentrations}
-
-            Notes
-            -----
-            No downsampling needed! PyQtGraph handles large datasets efficiently.
-            """
-            self._t = np.asarray(t, dtype=float).reshape(-1)
-            self._series = {str(k): np.asarray(v, dtype=float).reshape(-1)
-                           for k, v in series.items()}
-            self._visible = {k: True for k in self._series.keys()}
-            color_manager = ColorManager.instance()
-            provided_owned = {str(name).strip() for name in (owned_species or []) if str(name).strip()}
-            series_keys = {str(name).strip() for name in self._series.keys() if str(name).strip()}
-            if provided_owned:
-                self._owned_species_keys = set(provided_owned)
-                color_manager.set_species_roster(sorted(self._owned_species_keys))
-            elif self._owned_species_keys and self._owned_species_keys.issubset(series_keys):
-                self._owned_species_keys = {name for name in self._owned_species_keys if name in series_keys}
-            else:
-                self._owned_species_keys = set(series_keys)
-                if self._owned_species_keys:
-                    color_manager.seed_species(sorted(self._owned_species_keys))
-
-            self._simulation_set_label = str(label) if label else None
-            self._simulation_set_popup_label = None
-            self._workspace_preview_display_provenance_by_set_id = {}
-            normalized_overlays: List[Dict[str, object]] = []
-            for entry in (overlays or []):
-                if not isinstance(entry, dict):
-                    continue
-                entry_label = str(entry.get("label") or "")
-                entry_t = entry.get("t")
-                entry_series = entry.get("series") or entry.get("species") or {}
-                if not entry_label or entry_t is None or not isinstance(entry_series, dict):
-                    continue
-                t_arr = _try_1d_float_array(entry_t)
-                if t_arr.size == 0:
-                    continue
-                series_map: Dict[str, np.ndarray] = {}
-                for k, v in entry_series.items():
-                    arr = _try_1d_float_array(v)
-                    if arr.size == 0:
-                        continue
-                    series_map[str(k)] = arr
-                normalized_entry: Dict[str, object] = {"label": entry_label, "t": t_arr, "series": series_map}
-                set_id = str(entry.get("set_id") or "").strip()
-                if set_id:
-                    normalized_entry["set_id"] = set_id
-                popup_label = str(entry.get("popup_label") or "").strip()
-                if popup_label:
-                    normalized_entry["popup_label"] = popup_label
-                curve_role = str(entry.get("curve_role") or "").strip()
-                if curve_role:
-                    normalized_entry["curve_role"] = curve_role
-                normalized_overlays.append(normalized_entry)
-            self._simulation_overlays = normalized_overlays
-            # Assign colors
-            self._assign_colors()
-            self._overlay_panel.refresh_color_swatches()
-
-            # Update AxisToolbar with available data
-            self._update_toolbar()
-
-            # Update plot
-            self._update_plot()
-
-            logger.debug(f"Data set: {len(self._t)} points, {len(self._series)} series")
-
-        def render_dataset_layers(
-            self,
-            *,
-            data_t: np.ndarray,
-            dataset_series: Dict[str, np.ndarray],
-            model_t: Optional[np.ndarray] = None,
-            model_series: Optional[Dict[str, np.ndarray]] = None,
-            visible_species: Sequence[str],
-            xlabel: str,
-            ylabel: str,
-        ) -> None:
-            """Render dataset-tab scatter/model layers without clearing unrelated backend state."""
-            t_arr = _try_1d_float_array(data_t)
-            series_map = {
-                str(name): _try_1d_float_array(values)
-                for name, values in (dataset_series or {}).items()
-                if str(name)
-            }
-            active_dataset = {name: values for name, values in series_map.items() if values.size}
-            visible = {str(name) for name in (visible_species or []) if str(name)}
-
-            model_t_arr = _try_1d_float_array(model_t) if model_t is not None else np.asarray([], dtype=float)
-            model_map = {
-                str(name): _try_1d_float_array(values)
-                for name, values in (model_series or {}).items()
-                if str(name)
-            }
-
-            self._set_dataset_axis_labels(xlabel=xlabel, ylabel=ylabel)
-
-            if t_arr.size == 0 or not active_dataset:
-                self._prune_dataset_scatter_items(set())
-                self._prune_dataset_model_items(set())
-                return
-
-            color_manager = ColorManager.instance()
-            color_manager.seed_species(active_dataset.keys())
-
-            active_scatter_keys: Set[str] = set()
-            active_model_keys: Set[str] = set()
-            for species_name, y_data in active_dataset.items():
-                if y_data.shape[0] != t_arr.shape[0]:
-                    logger.warning(
-                        "Dataset layer length mismatch for %s: %s vs %s",
-                        species_name,
-                        int(y_data.shape[0]),
-                        int(t_arr.shape[0]),
-                    )
-                    continue
-
-                scatter_color = color_manager.get_species_rgb(species_name, known_species=tuple(active_dataset.keys()))
-                brush = pg.mkBrush(*scatter_color, 150)
-                active_scatter_keys.add(species_name)
-                self._upsert_dataset_scatter_item(
-                    key=species_name,
-                    x_data=t_arr,
-                    y_data=y_data,
-                    brush=brush,
-                    size=8,
-                    name=f"{species_name} (data)",
-                )
-                self._dataset_scatter_items[species_name].setVisible(species_name in visible)
-
-                model_values = model_map.get(species_name)
-                if model_t_arr.size == 0 or model_values is None:
-                    continue
-                if model_values.shape[0] != model_t_arr.shape[0]:
-                    logger.warning(
-                        "Dataset model length mismatch for %s: %s vs %s",
-                        species_name,
-                        int(model_values.shape[0]),
-                        int(model_t_arr.shape[0]),
-                    )
-                    continue
-
-                pen = pg.mkPen(color=scatter_color, width=2)
-                active_model_keys.add(species_name)
-                self._upsert_dataset_model_item(
-                    key=species_name,
-                    x_data=model_t_arr,
-                    y_data=model_values,
-                    pen=pen,
-                    name=f"{species_name} (model)",
-                )
-                self._dataset_model_items[species_name].setVisible(species_name in visible)
-
-            self._prune_dataset_scatter_items(active_scatter_keys)
-            self._prune_dataset_model_items(active_model_keys)
-
-        def stats_table(self) -> SpeciesStatisticsTable:
-            """Return the species statistics table widget."""
-            return self._stats_table
-
-        def parameter_table(self) -> ParameterStatisticsTable:
-            """Return the solver-parameter table widget."""
-            return self._param_table
-
-        def overlay_panel(self) -> DatasetOverlayPanel:
-            """Return the dataset overlay panel widget."""
-            return self._overlay_panel
-
-        def set_scalar_values(self, scalars: Dict[str, float]) -> None:
-            """Store algebra scalar outputs for guide selection."""
-            cleaned: Dict[str, float] = {}
-            for name, value in (scalars or {}).items():
-                val = _try_float(value)
-                if val is None:
-                    continue
-                cleaned[str(name)] = float(val)
-            self._scalar_values = cleaned
-            if self._t is not None and self._series:
-                self._update_toolbar()
-
-        def selected_series(self) -> List[str]:
-            """Return the currently selected Y-series names."""
-            return list(self._toolbar.selected_y())
-
-        def get_export_scope_preference(self) -> str:
-            """Return the preferred export scope for CSV dialogs."""
-            return self._export_scope_preference
-
-        def _get_clipboard(self):
-            """Clipboard accessor seam (monkeypatchable in tests)."""
-            try:
-                app = QtWidgets.QApplication.instance()
-                return app.clipboard() if app is not None else None
-            except Exception:
-                return None
-
-        def export_payload(self) -> Optional[Dict[str, object]]:
-            """
-            Return a standardized export payload for CSV export code.
-
-            Returns
-            -------
-            dict or None
-                {'t': np.ndarray, 'series': Dict[str, np.ndarray]}
-            """
-            if self._t is None or not self._series:
-                return None
-            return {
-                "t": np.asarray(self._t, dtype=float).reshape(-1),
-                "series": dict(self._series),
-            }
-
-        def set_selected_series(self, names: Sequence[str]) -> None:
-            """Apply a specific selection of Y-series."""
-            valid = [n for n in names if n in self._series]
-            self._toolbar.select_y(valid)
-            self._on_y_selection_changed(valid)
-
-        def _series_names_compatible_with_x(
-            self,
-            names: Sequence[str],
-            series_map: Dict[str, object],
-            x_array: np.ndarray,
-            *,
-            require_visible: bool,
-        ) -> List[str]:
-            compatible: List[str] = []
-            seen: Set[str] = set()
-            for raw_name in names:
-                name = str(raw_name)
-                if name in seen:
-                    continue
-                seen.add(name)
-                if name not in series_map:
-                    continue
-                if require_visible and not self._visible.get(name, True):
-                    continue
-                y_array = _try_1d_float_array(series_map.get(name))
-                if y_array.size == 0 or y_array.shape[0] != x_array.shape[0]:
-                    continue
-                compatible.append(name)
-            return compatible
-
-        def _visible_selected_series_names(self) -> List[str]:
-            toolbar = getattr(self, "_toolbar", None)
-            if toolbar is None:
-                return []
-            names: List[str] = []
-            seen: Set[str] = set()
-            for raw_name in toolbar.selected_y():
-                name = str(raw_name)
-                if name in seen:
-                    continue
-                seen.add(name)
-                if name not in self._series:
-                    continue
-                if not self._visible.get(name, True):
-                    continue
-                names.append(name)
-            return names
-
-        def _current_primary_renderable_series_names(
-            self,
-            names: Sequence[str],
-            *,
-            require_visible: bool,
-        ) -> List[str]:
-            primary_basis = self._current_primary_plot_basis()
-            if primary_basis is None:
-                return []
-            return self._series_names_compatible_with_x(
-                names,
-                self._series,
-                primary_basis[2],
-                require_visible=require_visible,
-            )
-
-        def _axis_scope_series_names(self) -> List[str]:
-            return list(self._visible_selected_series_names())
-
-        def _series_header_text(self, series_name: str) -> str:
-            return str(series_name)
-
-        def _visible_overlay_copy_series_names(self) -> List[str]:
-            return self._axis_scope_series_names()
-
-        def _visible_primary_copy_series_names(self) -> List[str]:
-            return list(
-                self._current_primary_renderable_series_names(
-                    self._axis_scope_series_names(),
-                    require_visible=False,
-                )
-            )
-
-        @staticmethod
-        def _apply_sample_indices(array: np.ndarray, sample_idx: object) -> np.ndarray:
-            values = _try_1d_float_array(array)
-            if values.size == 0:
-                return values
-            if isinstance(sample_idx, slice):
-                return values
-            return values[sample_idx]
-
-        def _current_primary_plot_basis(
-            self,
-        ) -> Optional[Tuple[str, str, np.ndarray, np.ndarray, Optional[np.ndarray], object]]:
-            x_name = str(self._x_axis_name or "t")
-            x_data, x_label = self._get_x_data()
-            x_array = _try_1d_float_array(x_data)
-            if x_array.size == 0:
-                return None
-            sample_idx = self._get_sampling_indices(x_array.shape[0])
-            x_plot = self._apply_sample_indices(x_array, sample_idx)
-            t_array = _try_1d_float_array(self._t)
-            t_plot: Optional[np.ndarray] = None
-            if t_array.size != 0 and t_array.shape[0] == x_array.shape[0]:
-                t_plot = self._apply_sample_indices(t_array, sample_idx)
-            return x_name, x_label, x_array, x_plot, t_plot, sample_idx
-
-        @staticmethod
-        def _qualified_copy_header(block_label: Optional[str], column_label: str) -> str:
-            label = str(block_label or "").strip()
-            column = str(column_label or "").strip()
-            if not label:
-                return column
-            return f"{label}::{column}"
-
-        def _copy_series_header(self, block_label: Optional[str], series_name: str) -> str:
-            return self._qualified_copy_header(block_label, self._series_header_text(series_name))
-
-        def _primary_copy_block_label(self) -> str:
-            return str(self._simulation_set_popup_label or self._simulation_set_label or "").strip()
-
-        @staticmethod
-        def _overlay_copy_block_label(entry: object) -> str:
-            if not isinstance(entry, dict):
-                return ""
-            return str(entry.get("popup_label") or entry.get("label") or "").strip()
-
-        def _append_copy_column(
-            self,
-            columns: List[Tuple[str, np.ndarray]],
-            *,
-            header: str,
-            values: object,
-        ) -> None:
-            array = _try_1d_float_array(values)
-            if array.size == 0:
-                return
-            columns.append((str(header), array))
-
-        def set_copy_all_export_plan_provider(
-            self,
-            provider: Optional[Callable[[], Optional[CopyAllExportPlan]]],
-        ) -> None:
-            self._copy_all_export_plan_provider = provider if callable(provider) else None
-
-        def _current_copy_axis_spec(self) -> Tuple[str, str]:
-            x_name = str(self._x_axis_name or "t")
-            _, x_label = self._get_x_data()
-            if x_name != "t" and x_name not in self._series:
-                return "t", "Time (s)"
-            return x_name, str(x_label or "Time (s)")
-
-        def _build_visible_overlay_copy_blocks(
-            self,
-            *,
-            x_name: str,
-            x_label: str,
-            visible_y_names: Sequence[str],
-            excluded_set_ids: Optional[Set[str]] = None,
-        ) -> List[List[Tuple[str, np.ndarray]]]:
-            blocks: List[List[Tuple[str, np.ndarray]]] = []
-            excluded = {str(set_id) for set_id in (excluded_set_ids or set()) if str(set_id)}
-            for entry in list(self._simulation_overlays or []):
-                if not isinstance(entry, dict):
-                    continue
-                if str(entry.get("curve_role") or "") == "canonical_ghost":
-                    continue
-                entry_set_id = str(entry.get("set_id") or "").strip()
-                if entry_set_id and entry_set_id in excluded:
-                    continue
-                block_label = self._overlay_copy_block_label(entry)
-                overlay_series = entry.get("series") or {}
-                if not isinstance(overlay_series, dict):
-                    continue
-                if x_name == "t":
-                    x_overlay = entry.get("t")
-                else:
-                    x_overlay = overlay_series.get(x_name)
-                x_overlay_array = _try_1d_float_array(x_overlay)
-                if x_overlay_array.size == 0:
-                    continue
-                overlay_sample_idx = self._get_sampling_indices(x_overlay_array.shape[0])
-                x_overlay_plot = self._apply_sample_indices(x_overlay_array, overlay_sample_idx)
-
-                overlay_columns: List[Tuple[str, np.ndarray]] = []
-                self._append_copy_column(
-                    overlay_columns,
-                    header=self._qualified_copy_header(block_label, x_label),
-                    values=x_overlay_plot,
-                )
-
-                overlay_y_added = 0
-                for name in visible_y_names:
-                    y_array = _try_1d_float_array(overlay_series.get(name))
-                    if y_array.size == 0 or y_array.shape[0] != x_overlay_array.shape[0]:
-                        continue
-                    y_plot = self._apply_sample_indices(y_array, overlay_sample_idx)
-                    self._append_copy_column(
-                        overlay_columns,
-                        header=self._copy_series_header(block_label, name),
-                        values=y_plot,
-                    )
-                    overlay_y_added += 1
-                if overlay_y_added:
-                    blocks.append(overlay_columns)
-            return blocks
-
-        def _build_dataset_overlay_copy_blocks(
-            self,
-            *,
-            x_label: str,
-        ) -> List[List[Tuple[str, np.ndarray]]]:
-            blocks: List[List[Tuple[str, np.ndarray]]] = []
-            for overlay in list(self._active_overlay_series or []):
-                x_overlay_array = _try_1d_float_array(overlay.x)
-                y_overlay_array = _try_1d_float_array(overlay.y)
-                if x_overlay_array.size == 0 or y_overlay_array.size == 0:
-                    continue
-                x_overlay_plot, y_overlay_plot = self._sample_xy(x_overlay_array, y_overlay_array)
-                block_label = str(overlay.dataset or "").strip()
-                dataset_columns: List[Tuple[str, np.ndarray]] = []
-                self._append_copy_column(
-                    dataset_columns,
-                    header=self._qualified_copy_header(block_label, x_label),
-                    values=x_overlay_plot,
-                )
-                self._append_copy_column(
-                    dataset_columns,
-                    header=self._copy_series_header(block_label, str(overlay.species)),
-                    values=y_overlay_plot,
-                )
-                if dataset_columns:
-                    blocks.append(dataset_columns)
-            return blocks
-
-        def _shown_block_current_x_values(
-            self,
-            *,
-            t_values: np.ndarray,
-            series_values: Dict[str, np.ndarray],
-            x_name: str,
-        ) -> np.ndarray:
-            if x_name == "t":
-                return t_values
-            x_values = _try_1d_float_array(series_values.get(x_name))
-            if x_values.size == 0 or x_values.shape[0] != t_values.shape[0]:
-                return np.asarray([], dtype=float)
-            return x_values
-
-        def _build_shown_simulation_copy_block(
-            self,
-            shown_block: CopyAllShownBlock,
-            *,
-            x_name: str,
-            x_label: str,
-            visible_y_names: Sequence[str],
-        ) -> Tuple[Optional[List[Tuple[str, np.ndarray]]], Optional[str]]:
-            t_values = _try_1d_float_array(shown_block.t)
-            if t_values.size == 0:
-                return None, "no_simulation_data"
-            x_values = self._shown_block_current_x_values(t_values=t_values, series_values=shown_block.series, x_name=x_name)
-            if x_values.size == 0:
-                return None, "current_x_unavailable"
-
-            block_label = str(shown_block.label or "").strip()
-            shown_columns: List[Tuple[str, np.ndarray]] = []
-            self._append_copy_column(
-                shown_columns,
-                header=self._qualified_copy_header(block_label, "Time (s)"),
-                values=t_values,
-            )
-            if x_name != "t":
-                self._append_copy_column(
-                    shown_columns,
-                    header=self._qualified_copy_header(block_label, x_label),
-                    values=x_values,
-                )
-
-            y_added = 0
-            for name in visible_y_names:
-                y_values = _try_1d_float_array(shown_block.series.get(name))
-                if y_values.size == 0 or y_values.shape[0] != x_values.shape[0]:
-                    continue
-                self._append_copy_column(
-                    shown_columns,
-                    header=self._copy_series_header(block_label, name),
-                    values=y_values,
-                )
-                y_added += 1
-            if y_added <= 0:
-                return None, "no_visible_series"
-            return shown_columns, None
-
-        def _build_copy_all_blocks(
-            self,
-            plan: CopyAllExportPlan,
-        ) -> Tuple[List[List[Tuple[str, np.ndarray]]], List[CopyAllMissingItem]]:
-            if self._t is None or not self._series:
-                raise ValueError("No simulation data is available to copy.")
-
-            visible_overlay_y_names = self._visible_overlay_copy_series_names()
-            x_name, x_label = self._current_copy_axis_spec()
-
-            blocks: List[List[Tuple[str, np.ndarray]]] = []
-            missing_items: List[CopyAllMissingItem] = list(plan.missing_items or [])
-            # Provider-owned shown-set IDs are the only truthful source for shown simulations.
-            shown_set_ids: Set[str] = {
-                str(item.set_id or "").strip()
-                for item in list(plan.missing_items or [])
-                if str(item.set_id or "").strip()
-            }
-
-            for shown_block in list(plan.shown_blocks or []):
-                set_id = str(shown_block.set_id or "").strip()
-                if set_id:
-                    shown_set_ids.add(set_id)
-                block_columns, missing_reason = self._build_shown_simulation_copy_block(
-                    shown_block,
-                    x_name=x_name,
-                    x_label=x_label,
-                    visible_y_names=self._axis_scope_series_names(),
-                )
-                if block_columns is not None:
-                    blocks.append(block_columns)
-                    continue
-                missing_items.append(
-                    CopyAllMissingItem(
-                        set_id=set_id,
-                        label=str(shown_block.label or ""),
-                        popup_label=str(shown_block.label or set_id or "Shown simulation"),
-                        reason=str(missing_reason or "no_simulation_data"),
-                    )
-                )
-
-            blocks.extend(
-                self._build_visible_overlay_copy_blocks(
-                    x_name=x_name,
-                    x_label=x_label,
-                    visible_y_names=visible_overlay_y_names,
-                    excluded_set_ids=shown_set_ids,
-                )
-            )
-            blocks.extend(self._build_dataset_overlay_copy_blocks(x_label=x_label))
-            if not blocks:
-                raise ValueError("No visible simulation series are available to copy.")
-            return blocks, missing_items
-
-        @staticmethod
-        def _copy_all_reason_text(reason: str) -> str:
-            reason_key = str(reason or "").strip()
-            return {
-                "preview_pending": "Preview pending",
-                "no_cached_results": "Result not cached (evicted)",
-                "invalid_cache_entry": "Invalid cached result",
-                "current_x_unavailable": "Current X-axis data unavailable",
-                "no_visible_series": "No visible series available",
-                "no_simulation_data": "No simulation data available",
-            }.get(reason_key, "Unavailable")
-
-        def _confirm_copy_all_missing_items(self, missing_items: Sequence[CopyAllMissingItem]) -> bool:
-            entries = [item for item in missing_items if isinstance(item, CopyAllMissingItem)]
-            if not entries:
-                return True
-            box = QtWidgets.QMessageBox(self)
-            box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
-            box.setWindowTitle("Copy All")
-            box.setText("Some shown simulations are unavailable for truthful export.")
-            lines = [
-                f"{str(item.popup_label or item.label or item.set_id or 'Shown simulation')}: "
-                f"{self._copy_all_reason_text(item.reason)}"
-                for item in entries
-            ]
-            box.setInformativeText("\n".join(lines) + "\n\nCopy available data anyway?")
-            yes_button = box.addButton("Yes", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-            no_button = box.addButton("No", QtWidgets.QMessageBox.ButtonRole.RejectRole)
-            box.setDefaultButton(no_button)
-            box.setEscapeButton(no_button)
-            box.exec()
-            return box.clickedButton() is yes_button
-
-        def _build_visible_copy_blocks(self) -> List[List[Tuple[str, np.ndarray]]]:
-            if self._t is None or not self._series:
-                raise ValueError("No simulation data is available to copy.")
-
-            primary_visible_y_names = self._visible_primary_copy_series_names()
-            overlay_visible_y_names = self._visible_overlay_copy_series_names()
-
-            primary_basis = self._current_primary_plot_basis()
-            if primary_basis is None:
-                raise ValueError("The current X-axis has no visible data to copy.")
-            x_name, x_label, x_array, x_plot, t_plot, sample_idx = primary_basis
-
-            blocks: List[List[Tuple[str, np.ndarray]]] = []
-            primary_label = self._primary_copy_block_label()
-            primary_columns: List[Tuple[str, np.ndarray]] = []
-
-            if t_plot is not None:
-                self._append_copy_column(
-                    primary_columns,
-                    header=self._qualified_copy_header(primary_label, "Time (s)"),
-                    values=t_plot,
-                )
-            if x_name != "t":
-                self._append_copy_column(
-                    primary_columns,
-                    header=self._qualified_copy_header(primary_label, x_label),
-                    values=x_plot,
-                )
-
-            primary_y_added = 0
-            for name in primary_visible_y_names:
-                y_array = _try_1d_float_array(self._series.get(name))
-                if y_array.size == 0 or y_array.shape[0] != x_array.shape[0]:
-                    continue
-                y_array = self._apply_sample_indices(y_array, sample_idx)
-                if y_array.size == 0 or y_array.shape[0] != x_plot.shape[0]:
-                    continue
-                self._append_copy_column(
-                    primary_columns,
-                    header=self._copy_series_header(primary_label, name),
-                    values=y_array,
-                )
-                primary_y_added += 1
-            if primary_y_added:
-                blocks.append(primary_columns)
-
-            blocks.extend(
-                self._build_visible_overlay_copy_blocks(
-                    x_name=x_name,
-                    x_label=x_label,
-                    visible_y_names=overlay_visible_y_names,
-                )
-            )
-            blocks.extend(self._build_dataset_overlay_copy_blocks(x_label=x_label))
-
-            return blocks
-
-        @staticmethod
-        def _flatten_copy_blocks(blocks: Sequence[Sequence[Tuple[str, np.ndarray]]]) -> List[Tuple[str, np.ndarray]]:
-            columns: List[Tuple[str, np.ndarray]] = []
-            non_empty_blocks = [list(block) for block in blocks if list(block)]
-            for idx, block in enumerate(non_empty_blocks):
-                if idx > 0:
-                    columns.append(("", np.asarray([], dtype=float)))
-                columns.extend(block)
-            return columns
-
-        @staticmethod
-        def _copy_columns_to_rows(columns: Sequence[Tuple[str, np.ndarray]]) -> Tuple[List[str], List[List[object]]]:
-            if not columns:
-                raise ValueError("No visible plot data is available to copy.")
-            max_len = max(values.shape[0] for _, values in columns)
-            header = [label for label, _ in columns]
-            rows: List[List[object]] = []
-            for idx in range(max_len):
-                row: List[object] = []
-                for _, values in columns:
-                    row.append(values[idx] if idx < values.shape[0] else "")
-                rows.append(row)
-            return header, rows
-
-        @staticmethod
-        def _rows_to_tsv(header: Sequence[object], rows: Sequence[Sequence[object]]) -> str:
-            def _cell(value: object) -> str:
-                if value == "":
-                    return ""
-                return str(value)
-
-            lines = ["\t".join(_cell(cell) for cell in header)]
-            for row in rows:
-                lines.append("\t".join(_cell(cell) for cell in row))
-            return "\n".join(lines)
-
-        def _copy_visible_data(self) -> None:
-            try:
-                columns = self._flatten_copy_blocks(self._build_visible_copy_blocks())
-                header, rows = self._copy_columns_to_rows(columns)
-                clipboard = self._get_clipboard()
-                if clipboard is None:
-                    raise ValueError("Clipboard is unavailable.")
-                clipboard.setText(self._rows_to_tsv(header, rows))
-            except ValueError as exc:
-                QtWidgets.QMessageBox.warning(self, "Copy Visible Data", str(exc))
-            except Exception as exc:
-                logger.exception("Failed to copy visible plot data: %s", exc)
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "Copy Visible Data",
-                    f"Failed to copy visible plot data: {exc}",
-                )
-
-        def _copy_all(self) -> None:
-            try:
-                provider = self._copy_all_export_plan_provider
-                if provider is None:
-                    raise ValueError("Copy All is unavailable.")
-                plan = provider()
-                if plan is None:
-                    raise ValueError("Copy All is unavailable.")
-                blocks, missing_items = self._build_copy_all_blocks(plan)
-                if missing_items and not self._confirm_copy_all_missing_items(missing_items):
-                    return
-                columns = self._flatten_copy_blocks(blocks)
-                header, rows = self._copy_columns_to_rows(columns)
-                clipboard = self._get_clipboard()
-                if clipboard is None:
-                    raise ValueError("Clipboard is unavailable.")
-                clipboard.setText(self._rows_to_tsv(header, rows))
-            except ValueError as exc:
-                QtWidgets.QMessageBox.warning(self, "Copy All", str(exc))
-            except Exception as exc:
-                logger.exception("Failed to copy all plot data: %s", exc)
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "Copy All",
-                    f"Failed to copy all plot data: {exc}",
-                )
-
-        def update_statistics(
-            self,
-            t: np.ndarray,
-            series: Dict[str, np.ndarray],
-            chi_squared: Optional[float] = None,
-        ) -> None:
-            """Update the species statistics table with latest results."""
-            label = str(getattr(self, "_simulation_set_label", "") or "").strip() or "Results"
-            self.set_statistics_results(
-                {label: {"t": t, "series": series, "chi_squared": chi_squared}},
-                prefer=label,
-            )
-
-        def set_statistics_results(
-            self,
-            results_map: Dict[str, Dict[str, object]],
-            *,
-            prefer: Optional[str] = None,
-        ) -> None:
-            """
-            Provide the full set of results available for the statistics table.
-
-            Parameters
-            ----------
-            results_map : dict
-                Mapping of result-set label -> {'t': array, 'series': {species: array}, 'chi_squared': optional}
-            prefer : str, optional
-                Preferred selection label (used after refresh).
-            """
-            cleaned: Dict[str, Dict[str, object]] = {}
-            for raw_label, payload in (results_map or {}).items():
-                label = str(raw_label or "").strip()
-                if not label:
-                    continue
-                if not isinstance(payload, dict):
-                    continue
-                t_payload = payload.get("t")
-                series_payload = payload.get("series")
-                if t_payload is None or not isinstance(series_payload, dict) or not series_payload:
-                    continue
-                cleaned[label] = dict(payload)
-
-            self._stats_results_map = cleaned
-
-            previous = str(self._stats_result_selector.currentText() or "").strip()
-            preferred = str(prefer or "").strip()
-            next_selection = (
-                preferred
-                if preferred and preferred in cleaned
-                else (previous if previous and previous in cleaned else next(iter(cleaned.keys()), ""))
-            )
-
-            self._stats_result_selector.blockSignals(True)
-            try:
-                self._stats_result_selector.clear()
-                for label in cleaned.keys():
-                    self._stats_result_selector.addItem(label)
-                if next_selection:
-                    self._stats_result_selector.setCurrentText(next_selection)
-            finally:
-                self._stats_result_selector.blockSignals(False)
-
-            self._stats_result_selector.setEnabled(self._stats_result_selector.count() > 1)
-            if next_selection:
-                self._render_statistics_for_label(next_selection)
-            else:
-                self._stats_table.setRowCount(0)
-
-        def _on_stats_result_selector_changed(self, label: str) -> None:
-            label = str(label or "").strip()
-            if not label:
-                self._stats_table.setRowCount(0)
-                return
-            self._render_statistics_for_label(label)
-
-        def _render_statistics_for_label(self, label: str) -> None:
-            payload = self._stats_results_map.get(str(label))
-            if not isinstance(payload, dict):
-                self._stats_table.setRowCount(0)
-                return
-            t_payload = payload.get("t")
-            series_payload = payload.get("series")
-            if t_payload is None or not isinstance(series_payload, dict):
-                self._stats_table.setRowCount(0)
-                return
-            chi_squared_value: Optional[float] = None
-            raw_chi_squared = payload.get("chi_squared")
-            if raw_chi_squared is not None:
-                try:
-                    chi_squared_value = float(raw_chi_squared)
-                except Exception:
-                    chi_squared_value = None
-
-            t_arr = _try_1d_float_array(t_payload)
-            if t_arr.size == 0:
-                self._stats_table.setRowCount(0)
-                return
-
-            normalized_series: Dict[str, np.ndarray] = {}
-            for name, values in series_payload.items():
-                arr = _try_1d_float_array(values)
-                if arr.size == 0:
-                    continue
-                normalized_series[str(name)] = arr
-
-            if not normalized_series:
-                self._stats_table.setRowCount(0)
-                return
-
-            self._stats_table.update_results(t_arr, normalized_series, chi_squared=chi_squared_value)
-
-        def update_parameters(self, parameters: Dict[str, Tuple[float, str]]) -> None:
-            """Update the solver parameter table."""
-            try:
-                self._param_table.update_parameters(parameters)
-            except Exception as exc:
-                logger.debug("Failed to update parameter table: %s", exc)
-
-        def set_overlay_catalog(self, datasets: Dict[str, Dict[str, np.ndarray]]) -> None:
-            """
-            Provide the currently loaded experimental datasets for overlays.
-
-            Parameters
-            ----------
-            datasets : dict
-                Mapping of dataset name -> {'t': array, 'species': {name: array}}
-            """
-            normalized: Dict[str, Dict[str, np.ndarray]] = {}
-            for name, payload in (datasets or {}).items():
-                try:
-                    t_raw = np.asarray(payload.get("t", []), dtype=float).reshape(-1)
-                    species_raw = payload.get("species") or {}
-                    if t_raw.size == 0 or not species_raw:
-                        continue
-                    species_norm: Dict[str, np.ndarray] = {}
-                    for sp_name, values in species_raw.items():
-                        arr = np.asarray(values, dtype=float).reshape(-1)
-                        if arr.size:
-                            species_norm[str(sp_name)] = arr
-                    if species_norm:
-                        normalized[name] = {"t": t_raw, "species": species_norm}
-                except Exception as exc:
-                    logger.warning("Failed to normalize dataset '%s' for overlay: %s", name, exc)
-
-            self._overlay_datasets = normalized
-            self._assign_overlay_styles()
-            self._overlay_panel.set_datasets(normalized)
-            self._update_plot()
-
-        def active_overlays(self) -> List[str]:
-            """Return dataset names currently active as overlays."""
-            return self._overlay_panel.selected_datasets()
-
-        def overlay_snapshot(self) -> Dict[str, object]:
-            """Return metadata about overlay state for provenance."""
-            return {
-                "selected": list(self._overlay_panel.selected_datasets()),
-                "available": sorted(self._overlay_datasets.keys()),
-                "x_axis": self._x_axis_name,
-                "parametric": self._parametric_mode,
-            }
-
-        def _assign_colors(self):
-            """Assign globally owned colors to species and neutral colors to derived series."""
-            color_manager = ColorManager.instance()
-            self._colors.clear()
-            owned_keys = set(self._owned_species_keys or set())
-            if owned_keys:
-                color_manager.seed_species(sorted(owned_keys))
-            for name in self._series.keys():
-                canonical = color_manager.resolve_species_key(name, known_species=tuple(owned_keys) if owned_keys else None)
-                if not owned_keys or canonical in owned_keys:
-                    self._colors[name] = color_manager.get_species_rgb(name, known_species=tuple(owned_keys) if owned_keys else None)
-                else:
-                    non_species = color_manager.get_non_species_color(name)
-                    self._colors[name] = (non_species.red(), non_species.green(), non_species.blue())
-
-        def _assign_overlay_styles(self):
-            """Assign deterministic marker styles to overlay datasets."""
-            color_manager = ColorManager.instance()
-            self._overlay_symbols.clear()
-            for idx, name in enumerate(sorted(self._overlay_datasets.keys())):
-                self._overlay_symbols[name] = color_manager.get_dataset_symbol(idx)
-
-        def _overlay_display_color(self, species_key: str) -> tuple[int, int, int]:
-            """Return the current display color for a resolved overlay dataset column."""
-            color_manager = ColorManager.instance()
-            color_key = str(species_key or "").strip()
-            current_species_color = color_manager.get_current_species_color(color_key)
-            color = (
-                current_species_color
-                if current_species_color is not None
-                else color_manager.get_non_species_color(color_key)
-            )
-            return (int(color.red()), int(color.green()), int(color.blue()))
-
-        def refresh_overlay_presentation_for_current_roster(self) -> None:
-            """Keep visible overlay markers aligned with current-roster swatch semantics."""
-            self._overlay_panel.refresh_color_swatches()
-            self._draw_overlay_series(list(self._active_overlay_series))
-
-        def _clear_overlay_series_caches(self) -> None:
-            self._active_overlay_series = []
-            self._export_all_overlay_series = []
-            self._active_overlay_warnings = []
-            self._export_all_overlay_warnings = []
-            self._export_all_overlay_cache_dirty = True
-
-        def _resolve_overlay_x_source(
-            self,
-            x_name: str,
-            payload: Dict[str, Dict[str, np.ndarray]],
-        ) -> Tuple[Optional[str], Optional[np.ndarray]]:
-            """Resolve overlay X values once while preserving current exact-match semantics."""
-            if x_name == "t":
-                return None, _try_1d_float_array(payload.get("t"))
-            species_payload = payload.get("species") or {}
-            if not isinstance(species_payload, dict):
-                return None, None
-            x_source = species_payload.get(x_name)
-            if x_source is None:
-                return None, None
-            return x_name, _try_1d_float_array(x_source)
-
-        def _rebuild_overlay_series_caches(self, axis_scope_series: Sequence[str]) -> None:
-            """
-            Rebuild all overlay-record caches before any downstream consumer uses them.
-
-            Built overlay records are fully resolved snapshots. Draw, refresh,
-            copy, and export paths must use only these records and must
-            not call _resolve_dataset_species() again.
-            """
-            axis_candidate_names = list(axis_scope_series or [])
-            self._active_overlay_series, self._active_overlay_warnings = self._build_overlay_series(axis_candidate_names)
-
-        def _ensure_export_all_overlay_cache(self) -> None:
-            if not self._export_all_overlay_cache_dirty:
-                return
-            overlay_series, raw_warnings = self._build_overlay_series(
-                list(self._series.keys())
-            )
-            self._export_all_overlay_series = overlay_series
-            self._export_all_overlay_warnings = [
-                msg for msg in raw_warnings
-                if ": no column matching species " not in msg
-            ]
-            self._export_all_overlay_cache_dirty = False
-
-        def _get_sampling_indices(self, length: int):
-            """Return slice or index array for downsampling plots."""
-            if self._sampling_mode == "dense" or length <= self._sampling_target:
-                return slice(None)
-            if length <= 0:
-                return np.array([], dtype=int)
-            target = max(2, min(int(self._sampling_target), int(length)))
-            return np.unique(np.linspace(0, length - 1, num=target, dtype=int))
-
-        def _sample_xy(self, x_data: np.ndarray, y_data: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-            """Apply sampling to X/Y arrays for plotting."""
-            indices = self._get_sampling_indices(x_data.shape[0])
-            if isinstance(indices, slice):
-                return x_data, y_data
-            return x_data[indices], y_data[indices]
-
-        _SUBSCRIPT_CHAR_MAP = {
-            "0": "₀",
-            "1": "₁",
-            "2": "₂",
-            "3": "₃",
-            "4": "₄",
-            "5": "₅",
-            "6": "₆",
-            "7": "₇",
-            "8": "₈",
-            "9": "₉",
-            "+": "₊",
-            "-": "₋",
-            "(": "₍",
-            ")": "₎",
-            "a": "ₐ",
-            "e": "ₑ",
-            "h": "ₕ",
-            "i": "ᵢ",
-            "j": "ⱼ",
-            "k": "ₖ",
-            "l": "ₗ",
-            "m": "ₘ",
-            "n": "ₙ",
-            "o": "ₒ",
-            "p": "ₚ",
-            "r": "ᵣ",
-            "s": "ₛ",
-            "t": "ₜ",
-            "u": "ᵤ",
-            "v": "ᵥ",
-            "x": "ₓ",
+        )
+        self._completion_warning_badge.setObjectName("completedWithWarningsBadge")
+        self._completion_warning_badge.setStyleSheet(
+            "QLabel { border: 1px solid #b7791f; border-radius: 6px; "
+            "padding: 2px 7px; color: #8a5a12; background: #fff7df; }"
+        )
+        self._create_plot_context_menu()
+        self._apply_zoom_mode()
+        self._clear_completion_warning()
+
+        plot_host = QtWidgets.QWidget(self)
+        plot_layout = QtWidgets.QVBoxLayout(plot_host)
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+        plot_layout.setSpacing(4)
+        plot_header = QtWidgets.QWidget(plot_host)
+        plot_header_layout = QtWidgets.QHBoxLayout(plot_header)
+        plot_header_layout.setContentsMargins(0, 0, 0, 0)
+        plot_header_layout.setSpacing(6)
+        plot_header_layout.addWidget(self._axis_toolbar, 1)
+        plot_header_layout.addWidget(
+            self._completion_warning_badge,
+            0,
+            QtCore.Qt.AlignmentFlag.AlignTop,
+        )
+        plot_layout.addWidget(plot_header)
+        plot_layout.addWidget(self._plot_widget, 1)
+
+        self._parameter_table = ParameterStatisticsTable(self)
+        self._species_table = SpeciesStatisticsTable(self)
+        self._analysis_tabs = QtWidgets.QTabWidget(self)
+        self._analysis_tabs.addTab(self._parameter_table, "Parameters")
+        self._analysis_tabs.addTab(self._species_table, "Statistics")
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(plot_host)
+
+    def analysis_tabs(self) -> QtWidgets.QTabWidget:
+        """Return the panel's analysis surface for the owning workspace stack."""
+
+        return self._analysis_tabs
+
+    def _add_plot_data(self, x, y, **options) -> PlotDataItem:
+        item = PlotDataItem(x, y, **options)
+        self._plot_widget.addItem(item)
+        return item
+
+    def apply_result_input(self, render_input: ResultRenderInput) -> None:
+        """Retain and draw one immutable result input."""
+
+        self._render_input = render_input
+        self._render_result_scene(render_input)
+        if any(self._refit_axes):
+            self._fit_axes_once(self._refit_axes)
+            self._refit_axes = (False, False)
+            self._apply_axis_range_state(self._axis_range, self._presentation)
+        if render_input.unavailable_x_diagnostic is not None:
+            self.resultDiagnostic.emit(render_input.unavailable_x_diagnostic)
+
+    def set_copy_all_available(self, available: bool) -> None:
+        """Project semantic Copy All eligibility into the physical menu."""
+
+        self._copy_all_available = bool(available)
+        self._sync_plot_controls()
+
+    def _create_plot_context_menu(self) -> None:
+        self._plot_menu = QtWidgets.QMenu(self)
+        self._plot_menu.setToolTipsVisible(True)
+        self._plot_actions: dict[str, QtGui.QAction] = {}
+        self._plot_percentages: dict[str, QtWidgets.QDoubleSpinBox] = {}
+        appearance = self._plot_menu.addMenu("Appearance")
+        appearance.menuAction().setToolTip(
+            "Control grid lines, curve visibility, legends, and intervention annotations."
+        )
+        transforms = self._plot_menu.addMenu("Transform")
+        transforms.menuAction().setToolTip(
+            "Show original values, derivatives, or derivatives plotted against Y."
+        )
+        axes = self._plot_menu.addMenu("Axes")
+        axes.menuAction().setToolTip(
+            "Adjust axis scaling, navigation, and automatic range settings."
+        )
+        axis_menus = {axis: axes.addMenu(f"{axis.upper()} Axis") for axis in ("x", "y")}
+        axis_menus["x"].menuAction().setToolTip(
+            "Control horizontal scaling, direction, and mouse navigation."
+        )
+        axis_menus["y"].menuAction().setToolTip(
+            "Control vertical scaling, direction, and mouse navigation."
+        )
+        # PySide transfers menu ownership to wrappers returned by menuAction;
+        # retain both so inspecting actions cannot destroy a nested menu.
+        self._plot_submenus = {
+            menu.menuAction(): menu for menu in (appearance, transforms, axes, *axis_menus.values())
         }
-
-        def _format_species_set_label(self, species: str, set_label: Optional[str]) -> str:
-            """Format legend labels like A(set1), preferring a subscript set label when feasible."""
-            species = str(species)
-            set_label = str(set_label or "").strip()
-            if not set_label:
-                return species
-            sub_chars: List[str] = []
-            for ch in set_label:
-                mapped = self._SUBSCRIPT_CHAR_MAP.get(ch)
-                if mapped is None:
-                    mapped = self._SUBSCRIPT_CHAR_MAP.get(ch.lower())
-                if mapped is None:
-                    return f"{species}({set_label})"
-                sub_chars.append(mapped)
-            return f"{species}₍{''.join(sub_chars)}₎"
-
-        def _upsert_curve_item(
-            self,
-            *,
-            key: str,
-            x_data: np.ndarray,
-            y_data: np.ndarray,
-            pen: object,
-            name: Optional[str] = None,
-        ) -> None:
-            item = self._plot_items.get(key)
-            if item is None:
-                item = self._plot_item.plot(x_data, y_data, name=str(name or key), pen=pen)
-                self._plot_items[key] = item
-                return
-            item.setData(x_data, y_data)
-            item.setPen(pen)
-
-        def _prune_curve_items(self, active_keys: Set[str]) -> None:
-            for key in list(self._plot_items.keys()):
-                if key in active_keys:
-                    continue
-                item = self._plot_items.pop(key, None)
-                if item is None:
-                    continue
-                self._plot_item.removeItem(item)
-
-        def _upsert_dataset_scatter_item(
-            self,
-            *,
-            key: str,
-            x_data: np.ndarray,
-            y_data: np.ndarray,
-            brush: object,
-            size: float,
-            name: str,
-        ) -> None:
-            item = self._dataset_scatter_items.get(key)
-            if item is None:
-                item = pg.ScatterPlotItem(
-                    x=x_data,
-                    y=y_data,
-                    pen=None,
-                    brush=brush,
-                    size=size,
-                    name=name,
-                )
-                self._plot_item.addItem(item)
-                self._dataset_scatter_items[key] = item
-                return
-            item.setData(x=x_data, y=y_data, pen=None, brush=brush, size=size)
-
-        def _prune_dataset_scatter_items(self, active_keys: Set[str]) -> None:
-            for key in list(self._dataset_scatter_items.keys()):
-                if key in active_keys:
-                    continue
-                item = self._dataset_scatter_items.pop(key, None)
-                if item is None:
-                    continue
-                self._plot_item.removeItem(item)
-
-        def _upsert_dataset_model_item(
-            self,
-            *,
-            key: str,
-            x_data: np.ndarray,
-            y_data: np.ndarray,
-            pen: object,
-            name: str,
-        ) -> None:
-            item = self._dataset_model_items.get(key)
-            if item is None:
-                item = self._plot_item.plot(x_data, y_data, name=name, pen=pen)
-                self._dataset_model_items[key] = item
-                return
-            item.setData(x_data, y_data)
-            item.setPen(pen)
-
-        def _prune_dataset_model_items(self, active_keys: Set[str]) -> None:
-            for key in list(self._dataset_model_items.keys()):
-                if key in active_keys:
-                    continue
-                item = self._dataset_model_items.pop(key, None)
-                if item is None:
-                    continue
-                self._plot_item.removeItem(item)
-
-        def _upsert_dataset_overlay_item(
-            self,
-            *,
-            key: Tuple[str, str],
-            x_data: np.ndarray,
-            y_data: np.ndarray,
-            pen: object,
-            brush: object,
-            size: float,
-            symbol: str,
-            name: str,
-        ) -> None:
-            scatter = self._overlay_items.get(key)
-            if scatter is None:
-                scatter = pg.ScatterPlotItem(
-                    x_data,
-                    y_data,
-                    pen=pen,
-                    brush=brush,
-                    size=size,
-                    symbol=symbol,
-                    name=name,
-                )
-                scatter.setZValue(5)
-                self._plot_item.addItem(scatter)
-                self._overlay_items[key] = scatter
-                return
-            scatter.setData(x=x_data, y=y_data, pen=pen, brush=brush, size=size, symbol=symbol)
-            scatter.setZValue(5)
-
-        def _prune_dataset_overlay_items(self, active_keys: Set[Tuple[str, str]]) -> None:
-            for key in list(self._overlay_items.keys()):
-                if key in active_keys:
-                    continue
-                item = self._overlay_items.pop(key, None)
-                if item is None:
-                    continue
-                self._plot_item.removeItem(item)
-
-        def _update_plot(self):
-            """Update plot with current data, visibility settings, and axis configuration."""
-            self._clear_overlay_series_caches()
-            self._overlay_panel.set_status_messages([])
-            if self._t is None:
-                return
-
-            primary_basis = self._current_primary_plot_basis()
-            if primary_basis is None:
-                return
-            _x_name, x_label, x_array, x_plot, _t_plot, sample_idx = primary_basis
-            selected_visible_series = self._visible_selected_series_names()
-            axis_scope_series = self._axis_scope_series_names()
-            selected_primary_series = self._current_primary_renderable_series_names(
-                selected_visible_series,
-                require_visible=False,
+        for menu in self._plot_submenus.values():
+            menu.setToolTipsVisible(True)
+        groups = (
+            (self._plot_menu, (("copy_all", "Copy All"), ("copy_plotted", "Copy Plotted Data"),
+                              ("copy_visible", "Copy Visible Data"),
+                              ("fit_once", "Fit Once"), ("zoom", "Zoom"), ("auto_range", "Auto Range"))),
+            (appearance, (("show_grid", "Show Grid"), ("grid_x", "X Grid"), ("grid_y", "Y Grid"),
+                          ("simulation_markers", "Simulation Sample Markers"),
+                          ("legend_visible", "Show Legend"), ("reference_lines_visible", "Show Reference"),
+                          ("intervention_annotations_visible", "Show Intervention Indicators"),
+                          ("intervention_labels_visible", "Show Intervention Labels"))),
+            (transforms, (("original", "Original"), ("derivative", "Derivative (dy/dx)"),
+                          ("phase", "Derivative versus Y"))),
+            (axes, (("visible_x", "Fit Y to Visible X"),)),
+            (self._plot_menu, (("sampling", "Downsampling: 1k Points/Curve"), ("warnings", "Warning Details…"))),
+        )
+        for menu, group in groups:
+            for key, text in group:
+                action = menu.addAction(text)
+                action.setCheckable(key not in {"copy_all", "copy_plotted", "copy_visible", "fit_once", "warnings"})
+                self._plot_actions[key] = action
+        volume_host = QtWidgets.QWidget(appearance)
+        volume_layout = QtWidgets.QHBoxLayout(volume_host)
+        volume_layout.addWidget(QtWidgets.QLabel("Volume Unit", volume_host))
+        self._volume_unit_combo = ScientificNameComboBox(volume_host)
+        self._volume_unit_combo.setAccessibleName("Volume Unit")
+        self._volume_unit_combo.setToolTip(
+            "Use one volume unit for plot axes and intervention labels. Authored uses the unit of the "
+            "initial-volume declaration, or L when no compatible unit is declared. "
+            "Inflow labels use this volume unit divided by the selected time unit."
+        )
+        volume_layout.addWidget(self._volume_unit_combo)
+        self._volume_unit_action = QtWidgets.QWidgetAction(appearance)
+        self._volume_unit_action.setDefaultWidget(volume_host)
+        appearance.addAction(self._volume_unit_action)
+        self._volume_unit_combo.currentIndexChanged.connect(
+            lambda _index: self._apply_volume_unit_change(
+                self._volume_unit_combo.currentData()
             )
-
-            # Update axis labels dynamically
-            self._plot_item.setLabel('bottom', x_label)
-            if not self._parametric_mode:
-                self._plot_item.setLabel('left', 'Concentration', units='M')
-            else:
-                # In parametric mode, Y label depends on selected series
-                if selected_primary_series:
-                    self._plot_item.setLabel('left', f'{selected_primary_series[0]}', units='M')
-
-            # Add visible series (only those selected in toolbar)
-            active_curve_keys: Set[str] = set()
-            for name in selected_primary_series:
-                y_data = np.asarray(self._series[name], dtype=float).reshape(-1)
-                color = self._colors.get(name, (100, 100, 100))
-                pen = pg.mkPen(color=color, width=2)
-
-                y_plot = self._apply_sample_indices(y_data, sample_idx)
-                label = self._format_species_set_label(name, self._simulation_set_label)
-                active_curve_keys.add(label)
-                self._upsert_curve_item(
-                    key=label,
-                    x_data=x_plot,
-                    y_data=y_plot,
-                    pen=pen,
-                )
-
-            # Batch simulation overlays (additional initial-condition sets as lines)
-            sim_overlays = list(self._simulation_overlays or [])
-            if sim_overlays:
-                color_manager = ColorManager.instance()
-                x_name = self._x_axis_name or "t"
-                for idx, entry in enumerate(sim_overlays):
-                    if not isinstance(entry, dict):
-                        continue
-                    set_label = str(entry.get("label") or "")
-                    curve_role = str(entry.get("curve_role") or "")
-                    if curve_role == "canonical_ghost" and not self._show_canonical_ghost_lines:
-                        continue
-                    if not set_label:
-                        continue
-                    t_overlay = entry.get("t")
-                    series_overlay = entry.get("series") or {}
-                    if t_overlay is None or not isinstance(series_overlay, dict):
-                        continue
-                    t_arr = _try_1d_float_array(t_overlay)
-                    if t_arr.size == 0:
-                        continue
-                    if x_name == "t":
-                        x_overlay = t_arr
-                    else:
-                        x_source = series_overlay.get(x_name)
-                        if x_source is None:
-                            continue
-                        x_overlay = np.asarray(x_source, dtype=float).reshape(-1)
-                        if x_overlay.size == 0:
-                            continue
-
-                    idx_overlay = self._get_sampling_indices(x_overlay.shape[0])
-                    x_plot_overlay = x_overlay if isinstance(idx_overlay, slice) else x_overlay[idx_overlay]
-                    style = color_manager.get_dataset_line_style(idx)
-                    overlay_species = self._series_names_compatible_with_x(
-                        axis_scope_series,
-                        series_overlay,
-                        x_overlay,
-                        require_visible=False,
-                    )
-                    for species in overlay_species:
-                        y_source = series_overlay.get(species)
-                        if y_source is None:
-                            continue
-                        y_arr = np.asarray(y_source, dtype=float).reshape(-1)
-                        if y_arr.shape[0] != x_overlay.shape[0]:
-                            continue
-                        y_plot_overlay = y_arr if isinstance(idx_overlay, slice) else y_arr[idx_overlay]
-
-                        base_color = self._colors.get(species, (100, 100, 100))
-                        try:
-                            r, g, b = base_color
-                        except Exception:
-                            r, g, b = (100, 100, 100)
-
-                        overlay_label = self._format_species_set_label(species, set_label)
-                        overlay_key = overlay_label
-                        overlay_name = overlay_label
-                        if curve_role == "canonical_ghost":
-                            overlay_key = f"{overlay_label} [canonical]"
-                            overlay_name = f"{overlay_label} [ref]"
-                            pen = pg.mkPen(color=(r, g, b, 90), width=1.2, style=Qt.PenStyle.DashLine)
-                        else:
-                            pen = pg.mkPen(color=(r, g, b, 180), width=1.6, style=style)
-                        active_curve_keys.add(overlay_key)
-                        self._upsert_curve_item(
-                            key=overlay_key,
-                            x_data=x_plot_overlay,
-                            y_data=y_plot_overlay,
-                            pen=pen,
-                            name=overlay_name,
-                        )
-
-            self._prune_curve_items(active_curve_keys)
-
-            self._rebuild_overlay_series_caches(axis_scope_series)
-            self._overlay_panel.set_status_messages(self._active_overlay_warnings)
-            self._draw_overlay_series(list(self._active_overlay_series))
-            self._refresh_view_after_plot_update()
-
-        def _refresh_view_after_plot_update(self) -> None:
-            """Keep auto-range truthful across live result updates without overriding manual ranges."""
-            toolbar = getattr(self, "_toolbar", None)
-            if toolbar is None or not bool(toolbar.is_auto_range()):
-                return
-            try:
-                self._plot_item.enableAutoRange(x=True, y=True)
-                self._plot_item.autoRange()
-            except Exception as exc:
-                logger.debug("Failed to auto-range plot after data update: %s", exc, exc_info=True)
-
-        def _build_overlay_series(self, selected_series: List[str]) -> Tuple[List[_OverlaySeries], List[str]]:
-            """Compute fully resolved overlay records for the current axis and dataset subset."""
-            overlays: List[_OverlaySeries] = []
-            warnings: List[str] = []
-            x_name = self._x_axis_name or "t"
-            active = self._overlay_panel.selected_datasets()
-
-            # Get per-dataset enabled species/columns from overlay panel
-            enabled_by_dataset = self._overlay_panel.selected_dataset_species()
-
-            for dataset_name in active:
-                payload = self._overlay_datasets.get(dataset_name)
-                if not payload:
-                    continue
-                species_payload = payload["species"]
-                enabled_for_dataset = enabled_by_dataset.get(dataset_name)
-                enabled_species = None
-                if enabled_for_dataset is not None:
-                    enabled_species = {
-                        key: species_payload[key]
-                        for key in enabled_for_dataset
-                        if key in species_payload
-                    }
-                resolved_x_column, x_array = self._resolve_overlay_x_source(x_name, payload)
-                if x_array is None:
-                    warnings.append(f"{dataset_name}: missing '{x_name}' values")
-                    continue
-                if x_array.size == 0:
-                    warnings.append(f"{dataset_name}: '{resolved_x_column or x_name}' has no data")
-                    continue
-
-                for species in selected_series:
-                    # Enabled dataset columns are authoritative for what can render/export.
-                    # Species-X views skip silently when the enabled subset does not expose
-                    # a given simulation species. Time-axis views still warn on true dataset
-                    # mismatches, so probe the full payload only to classify misses.
-                    resolved_key = None
-                    y_source = None
-                    if enabled_species is not None:
-                        resolved_key, y_source = _resolve_dataset_species(species, enabled_species)
-                    else:
-                        resolved_key, y_source = _resolve_dataset_species(species, species_payload)
-                    if y_source is None:
-                        if enabled_species is not None:
-                            if x_name != "t":
-                                continue
-                            full_resolved_key, _ = _resolve_dataset_species(species, species_payload)
-                            if full_resolved_key is not None:
-                                continue
-                        available = sorted(species_payload.keys())
-                        warnings.append(
-                            f"{dataset_name}: no column matching species '{species}'. "
-                            f"Available: {', '.join(available[:5])}" +
-                            (f" (and {len(available) - 5} more)" if len(available) > 5 else "")
-                        )
-                        continue
-                    if enabled_species is not None and resolved_key not in enabled_species:
-                        # Guard against future resolver changes selecting a disabled column.
-                        continue
-
-                    y_array = np.asarray(y_source, dtype=float).reshape(-1)
-                    if y_array.size == 0:
-                        warnings.append(f"{dataset_name}: '{resolved_key}' has no data")
-                        continue
-                    if y_array.shape[0] != x_array.shape[0]:
-                        warnings.append(
-                            f"{dataset_name}: '{resolved_key}' length ({y_array.shape[0]}) != '{x_name}' ({x_array.shape[0]})"
-                        )
-                        continue
-                    overlays.append(
-                        _OverlaySeries(
-                            dataset_name,
-                            species,
-                            x_array,
-                            y_array,
-                            x_name,
-                            resolved_x_column,
-                            str(resolved_key),
-                        )
-                    )
-
-            return overlays, warnings
-
-        def _draw_overlay_series(self, overlays: List[_OverlaySeries]) -> None:
-            """Render overlay scatter markers using species-owned colors and dataset markers."""
-            # Get current dataset styling from overlay panel (size and opacity)
-            style = self._overlay_panel.dataset_style()
-            active_overlay_keys: Set[Tuple[str, str]] = set()
-
-            for entry in overlays:
-                color = self._overlay_display_color(entry.resolved_y_column)
-                symbol = self._overlay_symbols.get(entry.dataset, 'o')
-
-                # Apply user-configured opacity to alpha channel
-                alpha = style.opacity
-                brush = pg.mkBrush(color[0], color[1], color[2], alpha)
-                pen = pg.mkPen(color=color, width=1.4)
-
-                name = f"{entry.dataset}: {entry.species}"
-                x_plot, y_plot = self._sample_xy(
-                    np.asarray(entry.x, dtype=float).reshape(-1),
-                    np.asarray(entry.y, dtype=float).reshape(-1),
-                )
-                overlay_key = (entry.dataset, entry.species)
-                active_overlay_keys.add(overlay_key)
-                self._upsert_dataset_overlay_item(
-                    key=overlay_key,
-                    x_data=x_plot,
-                    y_data=y_plot,
-                    pen=pen,
-                    brush=brush,
-                    size=style.size,
-                    symbol=symbol,
-                    name=name,
-                )
-            self._prune_dataset_overlay_items(active_overlay_keys)
-
-        def build_visible_export(self, scope: str) -> Tuple[List[str], List[List[object]]]:
-            """
-            Build header + rows for CSV export including overlays.
-
-            Parameters
-            ----------
-            scope : str
-                "axis" to use current toolbar selections, "all" for all series.
-            """
-            toolbar = self._toolbar
-            if toolbar is None:
-                raise ValueError("Axis toolbar unavailable for export.")
-
-            series = self._series
-            if not series:
-                raise ValueError("No simulation data available to export.")
-
-            if scope == "axis":
-                candidate_names = self._axis_scope_series_names()
-                if not candidate_names:
-                    raise ValueError("Select at least one Y-series before exporting.")
-                overlay_series = list(self._active_overlay_series)
-                warnings = list(self._active_overlay_warnings)
-            else:
-                self._ensure_export_all_overlay_cache()
-                candidate_names = list(series.keys())
-                overlay_series = list(self._export_all_overlay_series)
-                warnings = list(self._export_all_overlay_warnings)
-
-            x_name = toolbar.current_x() or "t"
-            x_data, derived_label = self._get_x_data()
-            if x_data is None:
-                raise ValueError(f"The selected X-axis '{x_name}' has no data to export.")
-
-            x_array = np.asarray(x_data, dtype=float).reshape(-1)
-            if x_array.size == 0:
-                raise ValueError("X-axis has no points to export.")
-
-            x_header = derived_label or x_name
-            blocks: List[List[Tuple[str, np.ndarray]]] = []
-            primary_y_names = self._series_names_compatible_with_x(
-                candidate_names,
-                series,
-                x_array,
-                require_visible=False,
+        )
+        for axis, menu in axis_menus.items():
+            for key, label in ((f"auto_{axis}", "Auto Range"), (f"mouse_{axis}", "Mouse Navigation"),
+                               (f"pan_{axis}", "Auto Pan"), (f"log_{axis}", "Log Scale"),
+                               (f"{axis}_inverted", "Invert Axis")):
+                action = menu.addAction(label)
+                action.setCheckable(True)
+                self._plot_actions[key] = action
+            self._add_plot_percentage(
+                menu, f"fraction_{axis}", "Auto-Range Coverage", minimum=1,
+                tooltip="Choose the central percentage of each curve used to adjust the axis automatically. "
+                "Lower percentages can leave extreme values outside the view. "
+                "Copy Plotted Data keeps those points, and Copy Visible Data uses the current view.",
             )
-            if primary_y_names:
-                primary_columns: List[Tuple[str, np.ndarray]] = [(x_header, x_array)]
-                for name in primary_y_names:
-                    arr = np.asarray(series[name], dtype=float).reshape(-1)
-                    if arr.shape[0] != x_array.shape[0]:
-                        continue
-                    primary_columns.append((self._series_header_text(name), arr))
-                if len(primary_columns) > 1:
-                    blocks.append(primary_columns)
+        self._add_plot_percentage(
+            appearance, "grid_opacity", "Grid Opacity",
+            tooltip="Adjust how clearly the grid lines appear. At 0%, the grid is invisible.",
+        )
+        self._add_plot_percentage(
+            appearance, "simulation_opacity", "Simulation Opacity",
+            tooltip="Adjust the visibility of simulation curves and their points. At 100%, references and previews "
+            "keep their usual transparency. At 0%, the curves and points are invisible.",
+        )
+        transform_group = QtGui.QActionGroup(self)
+        transform_group.setExclusive(True)
+        for transform in ("original", "derivative", "phase"):
+            action = self._plot_actions[transform]
+            transform_group.addAction(action)
+            action.triggered.connect(lambda _checked, value=transform: self._request_plot_presentation("plot_transform", value))
+        actions = self._plot_actions
+        actions["copy_all"].setToolTip(
+            "Copy all available results, references, and linked experimental data for this mechanism tab, "
+            "including hidden sets and quantities. Use original values, standard units, and every recorded point."
+        )
+        actions["copy_plotted"].setToolTip(
+            "Copy the selected curves using the current transform, units, and sampling. "
+            "Include points outside the visible area."
+        )
+        actions["copy_visible"].setToolTip(
+            "Copy existing plotted samples inside both current axis limits, using the current "
+            "transform, units, and sampling. Do not interpolate points at the view boundaries."
+        )
+        actions["copy_visible"].setEnabled(False)
+        actions["zoom"].setToolTip("Drag with the left mouse button to select a zoom area. Turn this off to drag the view instead.")
+        actions["auto_range"].setToolTip(
+            "Automatically adjust both axes using their coverage and Auto Pan settings. "
+            "Turn this off to keep the current limits for manual adjustment."
+        )
+        actions["show_grid"].setToolTip("Show or hide both grid directions. This is checked when both directions are enabled.")
+        actions["grid_x"].setToolTip("Show vertical grid lines at the X axis ticks.")
+        actions["grid_y"].setToolTip("Show horizontal grid lines at the Y axis ticks.")
+        actions["simulation_markers"].setToolTip(
+            "Show points along simulation and reference curves. Downsampling changes which points are shown. "
+            "Experimental markers have separate settings."
+        )
+        actions["original"].setToolTip("Show the selected quantities without calculating derivatives. Log scale settings still apply.")
+        actions["derivative"].setToolTip(
+            "Show the change in Y divided by the change in X between neighboring plotted points. "
+            "Downsampling affects this calculation."
+        )
+        actions["phase"].setToolTip(
+            "Show the numerical derivative against the original Y values for each curve. "
+            "Intervention lines, shaded regions, and labels are hidden in this view."
+        )
+        for axis in ("x", "y"):
+            actions[f"auto_{axis}"].setToolTip(
+                "Automatically adjust this axis using its coverage and Auto Pan settings. "
+                "Turn this off to keep its current limits for manual adjustment."
+            )
+            actions[f"mouse_{axis}"].setToolTip(
+                "Allow mouse dragging and scrolling to move or scale this axis. Turn this off to lock mouse movement "
+                "on this axis. Automatic adjustments can still move it."
+            )
+            actions[f"pan_{axis}"].setToolTip(
+                "Keep the current range width and move its center to follow the data. Requires Auto Range. "
+                "Coverage controls how much of the data determines the center."
+            )
+            actions[f"log_{axis}"].setToolTip(
+                "Use a logarithmic scale. Only positive values can appear, and manual limits must be positive. "
+                "Invalid manual limits are fitted again where data is available. The axis stays manual."
+            )
+        actions["legend_visible"].setToolTip("Show curve names and colors.")
+        actions["reference_lines_visible"].setToolTip(
+            "Show curves from the accepted model alongside Slider previews."
+        )
+        actions["intervention_annotations_visible"].setToolTip(
+            "Show intervention lines and shaded regions. Changing this setting also turns intervention labels on or off."
+        )
+        actions["intervention_labels_visible"].setToolTip(
+            "Show intervention labels that you can drag to a new position. "
+            "Turning this on also shows the intervention lines and shaded regions."
+        )
+        actions["x_inverted"].setToolTip("Reverse the direction of this axis.")
+        actions["y_inverted"].setToolTip("Reverse the direction of this axis.")
+        actions["sampling"].setToolTip(
+            "Display about 1,000 points per curve while preserving intervention boundaries. "
+            "This affects displayed derivatives, Copy Plotted Data, and Copy Visible Data. Copy All keeps every point."
+        )
+        actions["warnings"].setToolTip("Read the warnings for the current plot.")
+        actions["copy_all"].triggered.connect(self.copyAllRequested.emit)
+        actions["copy_plotted"].triggered.connect(self._copy_rendered_points_to_clipboard)
+        actions["copy_visible"].triggered.connect(self._copy_visible_points_to_clipboard)
+        actions["zoom"].triggered.connect(self._set_zoom_enabled)
+        actions["auto_range"].triggered.connect(self._set_auto_range)
+        actions["fit_once"].triggered.connect(self._fit_once)
+        for key in ("auto_x", "auto_y", "mouse_x", "mouse_y", "pan_x", "pan_y", "visible_x"):
+            actions[key].triggered.connect(lambda enabled, option=key: self._set_navigation(option, enabled))
+        actions["visible_x"].setToolTip(
+            "Automatically adjust Y to the data within the visible X range. X stays manual and Y Auto Pan turns off. "
+            "Moving Y manually, enabling X Auto Range, or enabling Y Auto Pan ends this mode."
+        )
+        actions["fit_once"].setToolTip("Fit all displayed data once, then leave both axes under manual control.")
+        actions["reference_lines_visible"].triggered.connect(self.referenceLayerVisibilityRequested)
+        actions["intervention_annotations_visible"].triggered.connect(self.interventionAnnotationsVisibilityRequested)
+        actions["intervention_labels_visible"].triggered.connect(self.interventionLabelsVisibilityRequested)
+        for option in ("legend_visible", "log_x", "log_y", "x_inverted", "y_inverted", "show_grid", "grid_x", "grid_y", "simulation_markers"):
+            actions[option].triggered.connect(
+                lambda enabled, key=option: self._request_plot_presentation(key, enabled)
+            )
+        actions["sampling"].triggered.connect(self._set_coarse_sampling)
+        actions["warnings"].triggered.connect(self._show_completion_warning_details)
+        self._plot_menu.aboutToShow.connect(self._sync_plot_controls)
+        self._plot_menu.aboutToShow.connect(self._refresh_visible_copy_availability)
 
-            for entry in list(self._simulation_overlays or []):
-                if not isinstance(entry, dict):
+    def _add_plot_percentage(self, menu: QtWidgets.QMenu, key: str, label: str, *, tooltip: str, minimum: int = 0) -> None:
+        host = QtWidgets.QWidget(menu)
+        layout = QtWidgets.QHBoxLayout(host)
+        caption = QtWidgets.QLabel(label, host)
+        layout.addWidget(caption)
+        spin = QtWidgets.QDoubleSpinBox(host)
+        spin.setRange(minimum, 100)
+        spin.setDecimals(0)
+        spin.setSuffix(" %")
+        spin.setKeyboardTracking(False)
+        spin.setAccessibleName(label)
+        layout.addWidget(spin)
+        action = QtWidgets.QWidgetAction(menu)
+        action.setDefaultWidget(host)
+        for target in (action, host, caption, spin):
+            target.setToolTip(tooltip)
+        menu.addAction(action)
+        self._plot_percentages[key] = spin
+        if key.startswith("fraction_"):
+            spin.valueChanged.connect(lambda value: self._set_navigation(key, value / 100))
+        else:
+            spin.valueChanged.connect(lambda value: self._request_plot_presentation(key, value / 100))
+
+    def _sync_plot_controls(self) -> None:
+        """Project accepted presentation and plot-session navigation."""
+        state = self._axis_range
+        values = {
+            "zoom": self._zoom_enabled,
+            "auto_range": state.auto_x and state.auto_y,
+            "sampling": self._sampling_limit is not None,
+            "show_grid": self._presentation.grid_x and self._presentation.grid_y,
+        }
+        for key in ("legend_visible", "log_x", "log_y", "x_inverted", "y_inverted", "grid_x", "grid_y", "simulation_markers"):
+            values[key] = getattr(self._presentation, key)
+        for key in ("auto_x", "auto_y", "mouse_x", "mouse_y", "pan_x", "pan_y", "visible_x"):
+            values[key] = getattr(state, key)
+        for key in ("original", "derivative", "phase"):
+            values[key] = self._presentation.plot_transform == key
+        for key in ("reference_lines_visible", "intervention_annotations_visible", "intervention_labels_visible"):
+            values[key] = bool(self._render_input and getattr(self._render_input, key))
+        for key, checked in values.items():
+            self._plot_actions[key].setChecked(checked)
+        for key, spin in self._plot_percentages.items():
+            with QtCore.QSignalBlocker(spin):
+                spin.setValue(100 * getattr(state if key.startswith("fraction_") else self._presentation, key))
+        self._plot_actions["copy_all"].setEnabled(self._copy_all_available)
+        self._plot_actions["copy_plotted"].setEnabled(
+            any(chunk.x.size for block in self._rendered_point_roster for chunk in block.chunks)
+        )
+        self._plot_actions["warnings"].setEnabled(bool(self._completion_warning_badge.text()))
+        self._axis_toolbar.set_manual_range_controls(auto_x=state.auto_x, auto_y=state.auto_y)
+        units = self._volume_unit_choices()
+        with QtCore.QSignalBlocker(self._volume_unit_combo):
+            self._volume_unit_combo.clear()
+            self._volume_unit_combo.addItem("Authored", "Authored")
+            for unit in units:
+                self._volume_unit_combo.addItem(unit.symbol, unit.symbol)
+                self._volume_unit_combo.setItemData(
+                    self._volume_unit_combo.count() - 1,
+                    format_unit_for_display(unit),
+                    SCIENTIFIC_NAME_HTML_ROLE,
+                )
+            self._volume_unit_combo.setCurrentIndex(
+                self._volume_unit_combo.findData(
+                    self._volume_display_unit.symbol if self._volume_display_unit is not None else "Authored"
+                )
+            )
+        available = self._render_input is not None and self._render_input.authored_volume_unit is not None
+        self._volume_unit_action.setEnabled(available)
+
+    def _on_plot_click(self, event: object) -> None:
+        if event.button() == QtCore.Qt.MouseButton.RightButton:
+            event.accept()
+            self._plot_menu.popup(event.screenPos().toPoint())
+
+    def eventFilter(self, watched: object, event: QtCore.QEvent) -> bool:
+        if watched is self._plot_widget.scene() and event.type() == QtCore.QEvent.Type.GraphicsSceneContextMenu:
+            # Mouse menus belong to the scene's click/drag recognizer.
+            if event.reason() != QtWidgets.QGraphicsSceneContextMenuEvent.Reason.Mouse:
+                self._plot_menu.popup(event.screenPos())
+            event.accept()
+            return True
+        return super().eventFilter(watched, event)
+
+    @QtCore.Slot()
+    def _refresh_visible_copy_availability(self) -> None:
+        self._plot_actions["copy_visible"].setEnabled(_has_visible_samples(
+            self._rendered_point_roster,
+            self._plot_widget.getViewBox().viewRange(),
+            log_x=self._presentation.log_x, log_y=self._presentation.log_y,
+        ))
+
+    @QtCore.Slot()
+    def _copy_visible_points_to_clipboard(self) -> None:
+        roster = self._rendered_point_roster
+        view_range = self._plot_widget.getViewBox().viewRange()
+        log_x, log_y = self._presentation.log_x, self._presentation.log_y
+        try:
+            visible = _visible_point_roster(roster, view_range, log_x=log_x, log_y=log_y)
+            if not visible:
+                self.resultDiagnostic.emit("No plotted samples are inside the current view.")
+                return
+            output = io.StringIO()
+            output.writelines(_iter_rendered_point_tsv_chunks(visible, action_name="Copy Visible Data"))
+            rendered_text = output.getvalue()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.critical(self, "Copy Visible Data", str(exc))
+            return
+        QtWidgets.QApplication.clipboard().setText(rendered_text)
+
+    @QtCore.Slot()
+    def _copy_rendered_points_to_clipboard(self) -> None:
+        roster = self._rendered_point_roster
+        try:
+            output = io.StringIO()
+            output.writelines(_iter_rendered_point_tsv_chunks(roster))
+            rendered_text = output.getvalue()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.critical(self, "Copy Plotted Data", str(exc))
+            return
+        QtWidgets.QApplication.clipboard().setText(rendered_text)
+
+    def set_persisted_plot_state(self, state: ProjectPresentationState) -> None:
+        """Project the registry's accepted choices; the next render refits changed coordinates."""
+        old = self._presentation.plot_transform
+        new = state.plot_transform
+        if old != new:
+            self._refit_axes = (
+                self._refit_axes[0] or "phase" in (old, new),
+                self._refit_axes[1] or "original" in (old, new),
+            )
+        for index, axis in enumerate(("x", "y")):
+            if (
+                getattr(state, f"log_{axis}")
+                and not getattr(self._presentation, f"log_{axis}")
+                and not getattr(self._axis_range, f"auto_{axis}")
+            ):
+                low = getattr(self._axis_range, f"{axis}_min")
+                high = getattr(self._axis_range, f"{axis}_max")
+                if low is None or high is None or not 0 < low < high:
+                    self._refit_axes = tuple(
+                        pending or current == index
+                        for current, pending in enumerate(self._refit_axes)
+                    )
+        self._presentation = state
+        self._apply_plot_presentation(state)
+
+    def reset_plot_session_state(self) -> None:
+        """Project replacement/reopen resets non-archived Plot session truth."""
+
+        self._render_input = None
+        self._copy_all_available = False
+        self._rendered_point_roster = ()
+        self._clear_annotation_items()
+        self._zoom_enabled = False
+        self._presentation = ProjectPresentationState()
+        self._sampling_limit = None
+        self._axis_range = _AxisRangeSession()
+        self._refit_axes = (False, False)
+        self._apply_axis_range_state(self._axis_range, self._presentation)
+        self._axis_display_units: dict[tuple[str, tuple], Unit] = {}
+        self._volume_display_unit = None
+        self._axis_toolbar.set_axis_unit_choices(
+            x_units=tuple(
+                (unit, format_unit_for_display(unit))
+                for unit in TIME_DISPLAY_UNITS
+            ),
+            selected_x="s",
+            y_units=(),
+            selected_y=None,
+        )
+        self._axis_toolbar.set_manual_ranges(None, None, None, None)
+        self._sync_plot_controls()
+        self._apply_zoom_mode()
+
+    @staticmethod
+    def _annotation_signature(
+        annotation: _DisplayAnnotation,
+    ) -> _AnnotationKey:
+        role, set_id, payload, _opacity = annotation
+        return (
+            role,
+            set_id,
+            tuple(sorted((str(name), repr(value)) for name, value in payload.items())),
+        )
+
+    @staticmethod
+    def _annotation_accent(annotation: Mapping[str, object]) -> QtGui.QColor:
+        authored = annotation.get("authored_ordinal")
+        index = int(annotation["declaration_ordinal"]) + (
+            0 if authored is None else int(authored)
+        )
+        return QtGui.QColor(_ANNOTATION_ACCENTS[index % len(_ANNOTATION_ACCENTS)])
+
+    def _show_completion_warning_details(self) -> None:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Completion Warning Details")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        details = QtWidgets.QPlainTextEdit(dialog)
+        details.setReadOnly(True)
+        details.setAccessibleName("Completion warning details")
+        details.setPlainText(self._completion_warning_badge.accessibleDescription())
+        layout.addWidget(details)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        clamp_initial_size(dialog, 560, 420)
+        dialog.exec()
+
+    def _clear_completion_warning(self) -> None:
+        self._completion_warning_badge.setText("")
+        self._completion_warning_badge.setToolTip("")
+        self._completion_warning_badge.setAccessibleName("")
+        self._completion_warning_badge.setAccessibleDescription("")
+        self._completion_warning_badge.setVisible(False)
+        self._sync_plot_controls()
+
+    @staticmethod
+    def _has_time_x(render_input: ResultRenderInput) -> bool:
+        selection = render_input.selected_x_series
+        return (
+            isinstance(selection, SimulationSeriesAxisSelection)
+            and selection.series_name == "t"
+        )
+
+    def _selected_display_unit(self, axis: str, source: Unit | None) -> Unit | None:
+        if source is None:
+            return None
+        if source.compatible(CUBIC_METRE) and self._render_input is not None and self._render_input.authored_volume_unit is not None:
+            return self._selected_volume_unit()
+        return self._axis_display_units.get(
+            (axis, source.dimensions), presentation_unit(scientific_unit(source.dimensions)),
+        )
+
+    def _selected_volume_unit(self) -> Unit:
+        authored = self._render_input.authored_volume_unit if self._render_input is not None else None
+        return self._volume_display_unit or authored or presentation_unit(CUBIC_METRE)
+
+    def _volume_unit_choices(self) -> tuple[Unit, ...]:
+        units = self._render_input.volume_unit_options if self._render_input is not None else ()
+        return reconcile_unit_choices(units, self._volume_display_unit)
+
+    def _display_unit_choices(self, render_input: ResultRenderInput, axis: str) -> tuple[Unit, ...]:
+        source = render_input.x_unit if axis == "x" else render_input.y_unit
+        selected = self._selected_display_unit(axis, source)
+        if selected is None:
+            return ()
+        if source.compatible(CUBIC_METRE) and render_input.authored_volume_unit is not None:
+            return self._volume_unit_choices() or (selected,)
+        options = render_input.x_unit_options if axis == "x" else render_input.y_unit_options
+        return reconcile_unit_choices(options, selected)
+
+    def _display_unit_state(
+        self,
+        render_input: ResultRenderInput,
+    ) -> tuple[str | None, str | None, float, float]:
+        def selected(axis, unit):
+            shown = self._selected_display_unit(axis, unit)
+            if shown is None:
+                return None, 1.0
+            return shown.symbol, conversion_scale(unit, shown).number()
+        x_unit, x_scale = selected("x", render_input.x_unit)
+        y_unit, y_scale = selected("y", render_input.y_unit)
+        return x_unit, y_unit, x_scale, y_scale
+
+    def _curve_unit_state(self, axis: str, source: Unit | None) -> tuple[str | None, float]:
+        """Keep mixed quantities scientific except for the shared volume choice."""
+        if source is None:
+            return None, 1.0
+        render_input = self._render_input
+        common = None if render_input is None else render_input.x_unit if axis == "x" else render_input.y_unit
+        if common is not None:
+            shown = self._selected_display_unit(axis, common)
+        elif source.compatible(CUBIC_METRE) and render_input is not None and render_input.authored_volume_unit is not None:
+            shown = self._selected_volume_unit()
+        else:
+            shown = source
+        return shown.symbol, conversion_scale(source, shown).number()
+
+    def _configure_axis_unit_controls(self, render_input: ResultRenderInput) -> None:
+        x_unit, y_unit, _x_scale, _y_scale = self._display_unit_state(render_input)
+        def options(axis, source, selected):
+            units = tuple(
+                (unit.symbol, format_unit_for_display(unit))
+                for unit in self._display_unit_choices(render_input, axis)
+            )
+            if source is not None and source.compatible(CUBIC_METRE) and render_input.authored_volume_unit is not None:
+                return (("Authored", ""), *units), selected if self._volume_display_unit is not None else "Authored"
+            return units, selected
+        x_units, x_unit = options("x", render_input.x_unit, x_unit)
+        y_units, y_unit = options("y", render_input.y_unit, y_unit)
+        self._axis_toolbar.set_axis_unit_choices(
+            x_units=x_units,
+            selected_x=x_unit,
+            y_units=y_units,
+            selected_y=y_unit,
+            transformed=self._presentation.plot_transform != "original",
+        )
+
+    def _display_axis_labels(
+        self,
+        render_input: ResultRenderInput,
+    ) -> tuple[str, str]:
+        x_unit, y_unit, _x_scale, _y_scale = self._display_unit_state(
+            render_input
+        )
+        if self._has_time_x(render_input):
+            x_label = f"Time ({format_unit_for_display(x_unit)})"
+        elif x_unit is not None:
+            x_label = f"{html.escape(render_input.x_label)} ({format_unit_for_display(x_unit)})"
+        else:
+            x_label = html.escape(render_input.x_label)
+        y_label = (
+            f"{html.escape(render_input.y_label)} ({format_unit_for_display(y_unit)})"
+            if y_unit is not None
+            else html.escape(render_input.y_label)
+        )
+        if self._presentation.plot_transform != "original":
+            derivative_label = f"d({y_label}) / d({x_label})"
+            if self._presentation.plot_transform == "phase":
+                x_label = y_label
+            y_label = derivative_label
+        return x_label, y_label
+
+    @staticmethod
+    def _derivative_unit(x_unit: str | None, y_unit: str | None) -> str | None:
+        if x_unit is None or y_unit is None:
+            return None
+        numerator = f"({y_unit})" if "*" in y_unit or "/" in y_unit else y_unit
+        denominator = f"({x_unit})" if "*" in x_unit or "/" in x_unit else x_unit
+        return f"{numerator}/{denominator}"
+
+    def _coordinate_scales(self, render_input: ResultRenderInput) -> tuple[float, float]:
+        _x_unit, _y_unit, x_scale, y_scale = self._display_unit_state(render_input)
+        transform = self._presentation.plot_transform
+        return (
+            y_scale if transform == "phase" else x_scale,
+            y_scale if transform == "original" else y_scale / x_scale,
+        )
+
+    @staticmethod
+    def _scaled_display_values(values: np.ndarray, scale: float) -> np.ndarray:
+        array = np.asarray(values)
+        if scale == 1.0:
+            return array
+        return np.asarray(array * scale)
+
+    def _render_result_scene(
+        self,
+        render_input: ResultRenderInput,
+    ) -> None:
+        self._rendered_point_roster = ()
+        # Every added or removed item re-ranges over the whole plot; the axis
+        # state applied with the presentation below restores auto-range once.
+        self._plot_widget.getViewBox().disableAutoRange()
+        existing_items = dict(self._plot_items_by_key)
+        self._configure_axis_unit_controls(render_input)
+        x_label, y_label = self._display_axis_labels(render_input)
+        self._plot_widget.setLabel("bottom", x_label)
+        self._plot_widget.setLabel("left", y_label)
+        rendered_items: dict[tuple[object, ...], object] = {}
+        rendered_points: list[_RenderedPointBlock] = []
+        for block in render_input.blocks:
+            if not block.visible:
+                continue
+            self._render_layer(
+                block,
+                sampling_limit=self._sampling_limit,
+                existing_items=existing_items,
+                rendered_items=rendered_items,
+                rendered_points=rendered_points,
+            )
+        for item_key, item in existing_items.items():
+            if item_key not in rendered_items:
+                self._remove_plot_item(item)
+        self._plot_items_by_key = rendered_items
+        self._axis_toolbar.set_x_candidates(
+            render_input.axis_candidates,
+            selected=render_input.selected_x_series,
+        )
+        y_candidates = tuple(
+            candidate for candidate in render_input.axis_candidates
+            if not (
+                isinstance(candidate.selection, SimulationSeriesAxisSelection)
+                and candidate.selection.series_name == "t"
+            )
+        )
+        locked_checked = dict(render_input.mapped_overlay_locks)
+        self._axis_toolbar.set_y_candidates(
+            [
+                (
+                    candidate,
+                    render_input.selected_y_uses_default_all
+                    or candidate.selection in render_input.selected_y_series
+                    or candidate.selection in locked_checked,
+                )
+                for candidate in y_candidates
+            ],
+            locked_checked=locked_checked,
+        )
+        self._apply_zoom_mode()
+        presentation = self._presentation
+        self._render_analysis(render_input)
+        axis_range = self._axis_range
+        self._axis_toolbar.set_manual_ranges(axis_range.x_min, axis_range.x_max, axis_range.y_min, axis_range.y_max)
+        self._apply_plot_presentation(presentation, axis_range=axis_range)
+        self._render_annotations(render_input, presentation)
+        self._project_completion_warning(render_input)
+        self._rendered_point_roster = tuple(rendered_points)
+        self._sync_plot_controls()
+
+    def _update_plot_item_legend(self, item: object, name: str | None) -> None:
+        # PyQtGraph 0.13.7 exposes PlotDataItem.name() as an opts-backed
+        # getter without a corresponding name mutator.
+        item.opts["name"] = name
+        if self._legend is None:
+            return
+        if name is None:
+            # A reused item may have been the first chunk in an earlier
+            # topology. Remove that stale row when it becomes a later chunk,
+            # a connector, or a ghost curve.
+            if self._legend.getLabel(item) is not None:
+                self._legend.removeItem(item)
+            return
+        label = self._legend.getLabel(item)
+        if label is None:
+            self._legend.addItem(item, name=name)
+        else:
+            label.setText(name)
+
+    def _remove_plot_item(self, item: object) -> None:
+        if self._legend is not None:
+            self._legend.removeItem(item)
+        self._plot_widget.getPlotItem().removeItem(item)
+
+    def _rendered_block_for_static(
+        self,
+        block: ResultDataBlock,
+        sampling_limit: int | None,
+    ) -> tuple[_RenderedPointBlock, tuple[_RenderedPointChunk, ...]]:
+        sample = self._sample_static_block(block, sampling_limit)
+        definitions = dict(block.copy_definitions)
+        x_is_time = (
+            isinstance(block.x_axis, SimulationSeriesAxisSelection)
+            and block.x_axis.series_name == "t"
+        )
+        x_name = (
+            block.time_column_name
+            if block.kind is ResultLayerKind.EXPERIMENTAL and x_is_time
+            else block.x_name
+        )
+        x_unit, x_scale = self._curve_unit_state("x", block.unit_for(block.x_name, x=True))
+        y_units = {name: self._curve_unit_state("y", block.unit_for(name)) for name, _ in block.series}
+        if block.result is not None:
+            from kindred.core.result_curve_projection import physical_curve_chunks
+            projected = physical_curve_chunks(block.result, block.x_axis, block.series_axes, sample + block.first_index)
+            rendered_chunks = tuple(_RenderedPointChunk(
+                x=self._scaled_display_values(chunk.x, x_scale),
+                series=tuple((name, self._scaled_display_values(values, y_units[name][1])) for name, values in chunk.series),
+                sample_time=chunk.time, instantaneous=chunk.instantaneous,
+            ) for chunk in projected)
+        else:
+            rendered_chunks = (_RenderedPointChunk(
+                x=self._scaled_display_values(block.t[sample], x_scale),
+                series=tuple((name, self._scaled_display_values(values[sample], y_units[name][1])) for name, values in block.series),
+                sample_time=None if block.sample_time is None else block.sample_time[sample],
+            ),)
+        rendered_block = _RenderedPointBlock(
+            block_id=block.block_id,
+            group_id=(
+                block.block_id.dataset_id
+                if block.kind is ResultLayerKind.EXPERIMENTAL else block.block_id
+            ),
+            label=block.label,
+            kind=block.kind.value,
+            x_name=copy_series_label(
+                x_name,
+                definition=definitions.get(block.x_name),
+            ),
+            x_is_time=x_is_time,
+            x_unit=x_unit,
+            time_column_name=block.time_column_name,
+            y_names=tuple(
+                (name, copy_series_label(name, definition=definitions.get(name)))
+                for name, _ in block.series
+            ),
+            y_units=tuple(
+                (name, y_units[name][0])
+                for name, _ in block.series
+            ),
+            chunks=rendered_chunks,
+        )
+        return rendered_block, rendered_chunks
+
+    def _transformed_blocks(self, block: _RenderedPointBlock) -> tuple[_RenderedPointBlock, ...]:
+        transform = self._presentation.plot_transform
+        if transform == "original":
+            return (block,)
+        names = tuple(name for name, _ in block.chunks[0].series) if block.chunks else ()
+        groups = tuple((name,) for name in names) if transform == "phase" else (names,)
+        denominator = copy_series_label(block.x_name, block.x_unit)
+        y_names, y_units = dict(block.y_names), dict(block.y_units)
+        result = []
+        for group in groups:
+            chunks = []
+            for chunk in block.chunks:
+                if chunk.instantaneous:
                     continue
-                if str(entry.get("curve_role") or "") == "canonical_ghost":
+                series = dict(chunk.series)
+                mapped = tuple((name, _transform_samples(chunk.x, series[name], transform)) for name in group)
+                if not mapped:
                     continue
-                block_label = self._overlay_copy_block_label(entry)
-                overlay_series_map = entry.get("series") or {}
-                if not isinstance(overlay_series_map, dict):
-                    continue
-                if x_name == "t":
-                    x_overlay = entry.get("t")
+                chunks.append(_RenderedPointChunk(
+                    x=mapped[0][1][0],
+                    series=tuple((name, coordinates[1]) for name, coordinates in mapped),
+                    sample_time=None if chunk.sample_time is None else chunk.sample_time[:-1],
+                ))
+            result.append(replace(
+                block, chunks=tuple(chunks), left_endpoint=True,
+                x_name=f"{y_names[group[0]]} [phase, left endpoint]" if transform == "phase" else f"{block.x_name} [left endpoint]",
+                x_is_time=block.x_is_time and transform != "phase",
+                x_unit=y_units[group[0]] if transform == "phase" else block.x_unit,
+                y_names=tuple(
+                    (name, f"d({copy_series_label(y_names[name], y_units[name])})/d({denominator}) [adjacent samples]")
+                    for name in group
+                ),
+                y_units=tuple((name, self._derivative_unit(block.x_unit, y_units[name])) for name in group),
+            ))
+        return tuple(result)
+
+    def _render_layer(
+        self,
+        block: ResultDataBlock,
+        *,
+        sampling_limit: int | None,
+        existing_items: Mapping[tuple[object, ...], object] | None = None,
+        rendered_items: dict[tuple[object, ...], object] | None = None,
+        rendered_points: list[_RenderedPointBlock] | None = None,
+    ) -> None:
+        rendered_block, rendered_chunks = self._rendered_block_for_static(
+            block,
+            sampling_limit,
+        )
+        transformed_blocks = self._transformed_blocks(rendered_block)
+        transform = self._presentation.plot_transform
+        colors = dict(block.color_by_series)
+        item_store = rendered_items if rendered_items is not None else {}
+        existing_store = existing_items if existing_items is not None else {}
+        # Items are keyed by lane, so a set's Run, drag and exact Preview reuse
+        # its foreground items and only the Reference has its own.
+        lane = (
+            block.kind.value
+            if block.kind in {ResultLayerKind.REFERENCE, ResultLayerKind.EXPERIMENTAL}
+            else "foreground"
+        )
+        role = (lane, block.block_id)
+        for series_name, _values in block.series:
+            color = colors[series_name]
+            transformed = next((item for item in transformed_blocks if item.chunks and series_name in dict(item.chunks[0].series)), None)
+            rendered_chunks = () if transformed is None else transformed.chunks
+            physical_chunks: list[tuple[np.ndarray, np.ndarray, bool]] = []
+            for chunk_index, chunk in enumerate(rendered_chunks):
+                x = chunk.x
+                y = dict(chunk.series)[series_name]
+                if transform == "original" and chunk_index and block.result is None:
+                    prior_x, prior_y, _instantaneous = physical_chunks[-1]
+                    physical_chunks[-1] = (
+                        np.concatenate((prior_x, x)),
+                        np.concatenate((prior_y, y)),
+                        False,
+                    )
                 else:
-                    x_overlay = overlay_series_map.get(x_name)
-                x_overlay_array = _try_1d_float_array(x_overlay)
-                if x_overlay_array.size == 0:
+                    physical_chunks.append((x, y, chunk.instantaneous))
+            legend_pending = True
+            for chunk_index, (x, y, instantaneous) in enumerate(physical_chunks):
+                if not np.any(np.isfinite(x) & np.isfinite(y)):
                     continue
-                overlay_y_names = self._series_names_compatible_with_x(
-                    candidate_names,
-                    overlay_series_map,
-                    x_overlay_array,
-                    require_visible=False,
-                )
-                if not overlay_y_names:
-                    continue
-                overlay_columns: List[Tuple[str, np.ndarray]] = [
-                    (f"{block_label}::{x_header}", x_overlay_array)
-                ]
-                for name in overlay_y_names:
-                    arr = np.asarray(overlay_series_map[name], dtype=float).reshape(-1)
-                    if arr.shape[0] != x_overlay_array.shape[0]:
-                        continue
-                    overlay_columns.append((f"{block_label}::{self._series_header_text(name)}", arr))
-                if len(overlay_columns) > 1:
-                    blocks.append(overlay_columns)
-
-            active_overlays = self._overlay_panel.selected_datasets()
-            if warnings and active_overlays:
-                warning_msg = "\n".join(f" - {msg}" for msg in warnings)
-                raise ValueError(
-                    "Cannot export overlay datasets until issues are resolved:\n" + warning_msg
-                )
-
-            for entry in overlay_series:
-                x_header_ds = f"{entry.dataset}::{x_header}"
-                y_header_ds = f"{entry.dataset}::{self._series_header_text(entry.species)}"
-                blocks.append([(x_header_ds, entry.x), (y_header_ds, entry.y)])
-
-            columns: List[Tuple[str, np.ndarray]] = [col for block in blocks for col in block]
-            if not columns:
-                raise ValueError("No valid Y-series found to export.")
-
-            max_len = max(col[1].shape[0] for col in columns)
-            header = [col[0] for col in columns]
-            rows: List[List[object]] = []
-            for idx in range(max_len):
-                row: List[object] = []
-                for _, values in columns:
-                    if idx < values.shape[0]:
-                        row.append(values[idx])
+                marker = block.markers
+                item_key = (role, dict(block.series_axes)[series_name], chunk_index, "marker" if marker else "line")
+                item = existing_store.get(item_key)
+                name = f"{block.label}: {series_name}"
+                unit = block.unit_for(series_name)
+                if self._render_input.y_unit is None and unit is not None:
+                    name += f" [{format_unit_for_display(dict(transformed.y_units)[series_name])}]"
+                legend_name = name if legend_pending else None
+                legend_pending = False
+                if item is None:
+                    if marker:
+                        item = self._add_plot_data(
+                            x, y, pen=None, symbol=block.point_shape,
+                            symbolSize=block.point_size,
+                            symbolBrush=pg.mkBrush(color), symbolPen=pg.mkPen(color),
+                            name=legend_name, connect="finite",
+                        )
                     else:
-                        row.append("")
-                rows.append(row)
+                        item = self._add_plot_data(
+                            x, y,
+                            pen=pg.mkPen(color=color, width=2, style=(QtCore.Qt.PenStyle.DashLine if block.dashed else QtCore.Qt.PenStyle.SolidLine)),
+                            name=legend_name, connect="finite", connectors=instantaneous,
+                        )
+                else:
+                    item.setData(x, y, connect="finite", connectors=instantaneous)
+                    if marker:
+                        item.setSymbolBrush(pg.mkBrush(color))
+                        item.setSymbolPen(pg.mkPen(color))
+                        item.setSymbol(block.point_shape)
+                        item.setSymbolSize(block.point_size)
+                    else:
+                        item.setPen(pg.mkPen(color=color, width=2, style=(QtCore.Qt.PenStyle.DashLine if block.dashed else QtCore.Qt.PenStyle.SolidLine)))
+                self._update_plot_item_legend(item, legend_name)
+                item.setVisible(True)
+                self._style_simulation_item(item, block.kind is not ResultLayerKind.EXPERIMENTAL, color, block.opacity)
+                item_store[item_key] = item
+        if rendered_points is not None and any(
+            chunk.x.size for chunk in rendered_block.chunks
+        ):
+            rendered_points.extend(transformed_blocks)
+    def _style_simulation_item(self, item: object, simulation: bool, color: object, opacity: float) -> None:
+        if simulation:
+            item.setSymbol("o" if self._presentation.simulation_markers else None)
+            if self._presentation.simulation_markers:
+                item.setSymbolSize(5)
+                item.setSymbolBrush(pg.mkBrush(color))
+                item.setSymbolPen(pg.mkPen(color))
+            opacity *= self._presentation.simulation_opacity
+        item.setOpacity(opacity)
 
-            return header, rows
+    def _sample_static_block(
+        self,
+        block: ResultDataBlock,
+        sampling_limit: int | None,
+    ) -> np.ndarray:
+        sample = self._sample_indices(block.t.size, sampling_limit)
+        if block.kind is not ResultLayerKind.EXPERIMENTAL:
+            region_endpoints = self._execution_region_endpoints(block)
+            undefined_edges = _undefined_edges(block.t, *(values for _name, values in block.series))
+            sample = np.unique(np.concatenate((sample, region_endpoints, undefined_edges)))
+        return sample
 
-        def _set_dataset_axis_labels(self, *, xlabel: str, ylabel: str) -> None:
-            x_text = str(xlabel or "Time")
-            y_text = str(ylabel or "Concentration")
-            x_units = "s" if x_text == "Time" else None
-            y_units = "M" if y_text == "Concentration" else None
-            self._plot_item.setLabel("bottom", x_text, units=x_units)
-            self._plot_item.setLabel("left", y_text, units=y_units)
-
-        def _update_toolbar(self):
-            """Update AxisToolbar with available variables."""
-            if self._t is None:
-                return
-
-            # X-axis candidates: time + all species
-            x_candidates = ["t"] + list(self._series.keys())
-            self._toolbar.set_x_candidates(x_candidates)
-
-            # Y-axis candidates: all species (checked by default if visible)
-            y_candidates = [(name, self._visible.get(name, True)) for name in self._series.keys()]
-            scalar_names = [
-                name for name in sorted(self._scalar_values.keys())
-                if name not in self._series
-            ]
-            for name in scalar_names:
-                y_candidates.append((name, False))
-            self._toolbar.set_y_candidates(y_candidates, disabled=scalar_names)
-
-        def visible_series(self):
-            """Get list of visible series names."""
-            return [name for name, vis in self._visible.items() if vis]
-
-        def set_series_visible(self, name: str, visible: bool) -> None:
-            """
-            Set visibility of a series.
-
-            Parameters
-            ----------
-            name : str
-                Series name
-            visible : bool
-                Whether the series should be visible
-            """
-            if name not in self._series:
-                return
-            prev = self._visible.get(name, True)
-            self._visible[name] = bool(visible)
-            if prev != self._visible[name]:
-                self.seriesVisibilityChanged.emit(name, self._visible[name])
-                self._update_plot()
-
-        def visible(self, name: str) -> bool:
-            """
-            Check if a series is visible.
-
-            Parameters
-            ----------
-            name : str
-                Series name
-
-            Returns
-            -------
-            bool
-                True if visible, False otherwise
-            """
-            return self._visible.get(name, False)
-
-        def _get_x_data(self) -> Tuple[Optional[np.ndarray], str]:
-            """
-            Get X-axis data and label based on current selection.
-
-            Returns
-            -------
-            tuple
-                (x_data array, x_label string)
-            """
-            if self._x_axis_name == "t":
-                return self._t, "Time (s)"
-            elif self._x_axis_name in self._series:
-                # X-axis is one of the species
-                return self._series[self._x_axis_name], f"[{self._x_axis_name}] (M)"
-            else:
-                # Unknown X-axis, fall back to time
-                return self._t, "Time (s)"
-
-        def _on_x_axis_changed(self, name: str) -> None:
-            """Handle X-axis selection change from toolbar."""
-            self._x_axis_name = name
-            self._update_plot()
-
-        def _on_y_selection_changed(self, selected: List[str]) -> None:
-            """Handle Y-axis selection change from toolbar."""
-            # Update visibility based on toolbar selection
-            for series_name in self._series.keys():
-                self._visible[series_name] = series_name in selected
-            self._update_plot()
-
-        def _on_parametric_toggled(self, enabled: bool) -> None:
-            """Handle parametric mode toggle from toolbar."""
-            self._parametric_mode = enabled
-            self._update_plot()
-
-        def _on_toolbar_option_requested(self, action: str, data: object) -> None:
-            """Handle option menu selections from the axis toolbar."""
-            action_key = str(action).strip().lower()
-            if action_key == "sampling":
-                mode = str(data).strip().lower()
-                if mode in {"dense", "coarse"}:
-                    self._sampling_mode = mode
-                    self._update_plot()
-                return
-            if action_key == "export_scope":
-                scope = str(data).strip().lower()
-                if scope in {"axis", "visible"}:
-                    self._export_scope_preference = "axis"
-                elif scope == "all":
-                    self._export_scope_preference = "all"
-                return
-            logger.debug("Unhandled toolbar option: %s (%s)", action, data)
-
-        def _add_guide_line(self, value: float) -> None:
-            guide = pg.InfiniteLine(
-                angle=0,
-                pos=value,
-                movable=True,
-                pen=pg.mkPen(color=(150, 0, 150), width=1, style=Qt.DashLine),
+    def _render_analysis(self, render_input: ResultRenderInput) -> None:
+        concentration_unit = (
+            self._selected_display_unit("y", render_input.y_unit)
+            if render_input.y_unit is not None and render_input.y_unit.compatible(MOLAR)
+            else MOLAR
+        )
+        time_unit = (
+            self._selected_display_unit("x", SECOND)
+            if self._has_time_x(render_input)
+            else SECOND
+        )
+        volume_unit = (
+            self._selected_volume_unit()
+            if render_input.authored_volume_unit is not None
+            else CUBIC_METRE
+        )
+        self._parameter_table.update_parameters(
+            render_input.parameters_for_display(
+                concentration_unit=concentration_unit, time_unit=time_unit, volume_unit=volume_unit,
             )
-            guide.setZValue(10)
-            self._plot_item.addItem(guide, ignoreBounds=True)
-            self._guide_items.append(guide)
+        )
+        result = render_input.statistics_result
+        if result is None or not render_input.statistics_series_names:
+            self._species_table.setRowCount(0)
+            return
+        self._species_table.update_results(
+            canonical_time=result.t,
+            species_data={name: result.series[name] for name in render_input.statistics_series_names},
+            intervention_execution=result.intervention_execution,
+            presentation_boundaries=result.presentation_boundaries,
+            concentration_display_unit=concentration_unit,
+            time_display_unit=time_unit,
+        )
+    def _project_completion_warning(
+        self,
+        render_input: ResultRenderInput,
+    ) -> None:
+        diagnostic = render_input.unavailable_x_diagnostic
+        has_warnings = bool(diagnostic or render_input.completion_warning_details)
+        warning_details = render_input.completion_warning_tooltip
+        details = "\n\n".join(
+            detail
+            for detail in (diagnostic, warning_details)
+            if detail
+        )
+        if not has_warnings:
+            self._clear_completion_warning()
+            return
+        caption = "Selected X unavailable" if diagnostic is not None else "Completed with warnings"
+        self._completion_warning_badge.setText(caption)
+        self._completion_warning_badge.setAccessibleName(caption)
+        self._completion_warning_badge.setToolTip(literal_tooltip(details))
+        self._completion_warning_badge.setAccessibleDescription(details)
+        self._completion_warning_badge.setVisible(True)
+        self._sync_plot_controls()
 
-        def _on_add_guide_requested(self, from_scalar: object) -> None:
-            """Add a horizontal guide line at a user-provided value."""
-            scalars = self._scalar_values or {}
-            scalar_name: Optional[str] = None
+    @staticmethod
+    def _raw_to_view_coordinate(
+        value: object,
+        *,
+        log_enabled: bool,
+    ) -> float | None:
+        """Map one raw semantic coordinate into the active plot view."""
 
-            if isinstance(from_scalar, str) and from_scalar:
-                scalar_name = from_scalar
-            elif scalars:
-                options = []
-                option_map: Dict[str, str] = {}
-                for name, value in sorted(scalars.items(), key=lambda item: item[0]):
-                    label = f"{name} = {value:.6g}"
-                    options.append(label)
-                    option_map[label] = name
-                selection, ok = QtWidgets.QInputDialog.getItem(
-                    self,
-                    "Add Guide",
-                    "Select scalar for guide:",
-                    options,
-                    0,
-                    False,
+        raw = float(value)
+        if not np.isfinite(raw):
+            return None
+        if not log_enabled:
+            return raw
+        if raw <= 0.0:
+            return None
+        mapped = float(np.log10(raw))
+        return mapped if np.isfinite(mapped) else None
+
+    @staticmethod
+    def _view_to_raw_coordinate(
+        value: object,
+        *,
+        log_enabled: bool,
+    ) -> float | None:
+        """Map an axis view coordinate back to its raw range value."""
+
+        view = float(value)
+        if not np.isfinite(view):
+            return None
+        if not log_enabled:
+            return view
+        raw = float(np.power(10.0, view))
+        return raw if np.isfinite(raw) and raw > 0.0 else None
+
+    def _render_annotations(
+        self,
+        render_input: ResultRenderInput,
+        presentation: ProjectPresentationState,
+    ) -> None:
+        annotations = self._merge_annotation_values(render_input.intervention_annotations)
+        self._render_owned_annotations(render_input, annotations, presentation)
+
+    @staticmethod
+    def _merge_annotation_values(
+        annotations: Sequence[_DisplayAnnotation],
+    ) -> tuple[_DisplayAnnotation, ...]:
+        merged: dict[_AnnotationKey, _DisplayAnnotation] = {}
+        for annotation in annotations:
+            signature = PyQtGraphPlotPanel._annotation_signature(annotation)
+            prior = merged.get(signature)
+            opacity = annotation[3] + (0.0 if prior is None else prior[3])
+            merged[signature] = (*annotation[:3], min(1.0, opacity))
+        return tuple(merged.values())
+
+    def _render_owned_annotations(
+        self,
+        render_input: ResultRenderInput,
+        annotations: Sequence[_DisplayAnnotation],
+        presentation: ProjectPresentationState,
+    ) -> None:
+        if (
+            not render_input.intervention_annotations_visible
+            or self._presentation.plot_transform == "phase"
+            or not self._has_time_x(render_input)
+        ):
+            self._clear_annotation_items()
+            return
+        _x_unit, _y_unit, x_scale, _y_scale = self._display_unit_state(
+            render_input
+        )
+        entries: list[
+            tuple[_AnnotationKey, _DisplayAnnotation, float, float | None]
+        ] = []
+        for owned in annotations:
+            role, set_id, annotation, opacity = owned
+            if role == "ghost" and not render_input.reference_lines_visible:
+                continue
+            if "start" in annotation and "end" in annotation:
+                start = self._raw_to_view_coordinate(
+                    float(annotation["start"]) * x_scale,
+                    log_enabled=presentation.log_x,
                 )
-                if not ok or not selection:
-                    return
-                scalar_name = option_map.get(selection)
-
-            if scalar_name and scalar_name in scalars:
-                self._add_guide_line(float(scalars[scalar_name]))
-                return
-
-            label = "Guide value"
-            if isinstance(from_scalar, str) and from_scalar:
-                label = f"Value for {from_scalar}"
-
-            value, ok = QtWidgets.QInputDialog.getDouble(
-                self,
-                "Add Guide",
-                label,
-                0.0,
-                -1e12,
-                1e12,
-                6,
-            )
-            if not ok:
-                return
-            self._add_guide_line(value)
-
-        def _toggle_legend(self, visible: bool) -> None:
-            """Toggle legend visibility."""
-            self._legend_visible = visible
-            if self._legend is not None:
-                self._legend.setVisible(visible)
-            logger.debug(f"Legend visibility: {visible}")
-
-        def _on_overlay_selection_changed(self, _names: List[str]) -> None:
-            """Redraw when overlay checklist changes."""
-            self._update_plot()
-
-        def _on_overlay_style_changed(self) -> None:
-            """Redraw when dataset point styling changes."""
-            self._update_plot()
-
-        def _on_axis_range_changed(self) -> None:
-            """Handle axis range change from toolbar (auto/manual toggle or manual values changed)."""
-            logger.debug(f"Axis range changed: auto={self._toolbar.is_auto_range()}, ranges={self._toolbar.get_manual_ranges()}")
-            self._apply_axis_ranges()
-
-        def _apply_axis_ranges(self) -> None:
-            """Apply manual axis ranges from toolbar, or use auto range."""
-            if self._toolbar.is_auto_range():
-                # Auto range mode: let PyQtGraph auto-scale
-                self._plot_item.enableAutoRange()
-                logger.debug("Applied auto range")
-            else:
-                # Manual range mode: use values from toolbar
-                x_min, x_max, y_min, y_max = self._toolbar.get_manual_ranges()
-
-                # Apply X range if both values are provided
-                if x_min is not None and x_max is not None:
-                    self._plot_item.setXRange(x_min, x_max, padding=0)
-                    logger.debug(f"Applied manual X range: [{x_min}, {x_max}]")
-
-                # Apply Y range if both values are provided
-                if y_min is not None and y_max is not None:
-                    self._plot_item.setYRange(y_min, y_max, padding=0)
-                    logger.debug(f"Applied manual Y range: [{y_min}, {y_max}]")
-
-        def clear(self):
-            """Clear all plot data."""
-            self._plot_item.clear()
-            self._t = None
-            self._series = {}
-            self._visible = {}
-            self._colors = {}
-            self._plot_items = {}
-            self._dataset_scatter_items = {}
-            self._dataset_model_items = {}
-            self._overlay_items = {}
-            self._active_overlay_series = []
-            self._export_all_overlay_series = []
-            self._active_overlay_warnings = []
-            self._export_all_overlay_warnings = []
-            self._export_all_overlay_cache_dirty = True
-            self._annotations = []
-            self._guide_items = []
-            self._scalar_values = {}
-            self._simulation_set_label = None
-            self._simulation_set_popup_label = None
-            self._simulation_overlays = []
-
-        # ==================== Plot Enhancements (v0.2.0) ====================
-
-        def _show_context_menu(self, position):
-            """Show context menu for plot enhancements."""
-            menu = QtWidgets.QMenu(self)
-
-            # Log scale actions
-            log_menu = menu.addMenu("Log Scale")
-
-            log_x_action = log_menu.addAction("Log X-Axis")
-            log_x_action.setCheckable(True)
-            log_x_action.setChecked(self._log_x)
-            log_x_action.triggered.connect(self._toggle_log_x)
-
-            log_y_action = log_menu.addAction("Log Y-Axis")
-            log_y_action.setCheckable(True)
-            log_y_action.setChecked(self._log_y)
-            log_y_action.triggered.connect(self._toggle_log_y)
-
-            if self._enable_axis_inversion_actions:
-                direction_menu = menu.addMenu("Axis Direction")
-
-                invert_x_action = direction_menu.addAction("Invert X-Axis")
-                invert_x_action.setCheckable(True)
-                invert_x_action.setChecked(self._invert_x_axis)
-                invert_x_action.triggered.connect(self._toggle_invert_x)
-
-                invert_y_action = direction_menu.addAction("Invert Y-Axis")
-                invert_y_action.setCheckable(True)
-                invert_y_action.setChecked(self._invert_y_axis)
-                invert_y_action.triggered.connect(self._toggle_invert_y)
-
-            menu.addSeparator()
-
-            if self._enable_canonical_ghost_toggle_action:
-                ghost_action = menu.addAction("Show Canonical Reference Lines")
-                ghost_action.setCheckable(True)
-                ghost_action.setChecked(self._show_canonical_ghost_lines)
-                ghost_action.setEnabled(self._has_canonical_ghost_overlays())
-                ghost_action.toggled.connect(self._set_canonical_ghost_lines_visible)
-                menu.addSeparator()
-
-            # Axis range actions
-            axis_range_action = menu.addAction("Custom Axis Ranges...")
-            axis_range_action.triggered.connect(self._show_axis_range_dialog)
-
-            menu.addSeparator()
-
-            # Annotation actions
-            annotation_menu = menu.addMenu("Annotations")
-            add_annotation_action = annotation_menu.addAction("Add Text Annotation...")
-            add_annotation_action.triggered.connect(self._add_annotation)
-
-            if self._annotations:
-                clear_annotations_action = annotation_menu.addAction("Clear All Annotations")
-                clear_annotations_action.triggered.connect(self._clear_annotations)
-
-            menu.addSeparator()
-
-            if self._copy_all_export_plan_provider is not None:
-                copy_all_action = menu.addAction("Copy All")
-                copy_all_action.triggered.connect(self._copy_all)
-
-            if self._enable_copy_visible_data_action:
-                copy_visible_action = menu.addAction("Copy Visible Data")
-                copy_visible_action.triggered.connect(self._copy_visible_data)
-
-            export_action = menu.addAction("Export Plot...")
-            export_action.triggered.connect(self._export_plot)
-            mouse_menu = menu.addMenu("Mouse Mode")
-            vb = self._plot_item.getViewBox()
-
-            pan_action = mouse_menu.addAction("Pan (3-Button)")
-            pan_action.triggered.connect(
-                partial(vb.setMouseMode, pg.ViewBox.PanMode)
-            )
-
-            rect_action = mouse_menu.addAction("Rect Zoom (1-Button)")
-            rect_action.triggered.connect(
-                partial(vb.setMouseMode, pg.ViewBox.RectMode)
-            )
-
-            menu.addSeparator()
-
-            # Reset view action
-            reset_action = menu.addAction("Reset View")
-            reset_action.triggered.connect(self._reset_view)
-
-            # Show menu at cursor position
-            menu.exec_(self._plot_widget.mapToGlobal(position))
-
-        def _has_canonical_ghost_overlays(self) -> bool:
-            for entry in (self._simulation_overlays or []):
-                if not isinstance(entry, dict):
+                end = self._raw_to_view_coordinate(
+                    float(annotation["end"]) * x_scale,
+                    log_enabled=presentation.log_x,
+                )
+                if start is None or end is None:
                     continue
-                if str(entry.get("curve_role") or "").strip() == "canonical_ghost":
-                    return True
-            return False
-
-        def _set_canonical_ghost_lines_visible(self, visible: bool) -> None:
-            show = bool(visible)
-            if self._show_canonical_ghost_lines == show:
-                return
-            self._show_canonical_ghost_lines = show
-            self._update_plot()
-
-        def _apply_axis_inversion_state(self) -> None:
-            viewbox = self._plot_item.getViewBox()
-            viewbox.invertX(self._invert_x_axis)
-            viewbox.invertY(self._invert_y_axis)
-
-        def _toggle_invert_x(self):
-            """Toggle X-axis inversion."""
-            self._invert_x_axis = not self._invert_x_axis
-            self._apply_axis_inversion_state()
-            logger.info(f"X-axis inverted: {self._invert_x_axis}")
-
-        def _toggle_invert_y(self):
-            """Toggle Y-axis inversion."""
-            self._invert_y_axis = not self._invert_y_axis
-            self._apply_axis_inversion_state()
-            logger.info(f"Y-axis inverted: {self._invert_y_axis}")
-
-        def _toggle_log_x(self):
-            """Toggle X-axis log scale."""
-            self._log_x = not self._log_x
-            self._plot_item.setLogMode(x=self._log_x, y=self._log_y)
-            logger.info(f"X-axis log scale: {self._log_x}")
-
-        def _toggle_log_y(self):
-            """Toggle Y-axis log scale."""
-            self._log_y = not self._log_y
-            self._plot_item.setLogMode(x=self._log_x, y=self._log_y)
-            logger.info(f"Y-axis log scale: {self._log_y}")
-
-        def _show_axis_range_dialog(self):
-            """Show dialog for custom axis ranges."""
-            dialog = QtWidgets.QDialog(self)
-            dialog.setWindowTitle("Custom Axis Ranges")
-            dialog.setModal(True)
-
-            layout = QtWidgets.QFormLayout(dialog)
-
-            # Get current ranges
-            x_range = self._plot_item.viewRange()[0]
-            y_range = self._plot_item.viewRange()[1]
-
-            # X-axis range
-            x_min_spin = QtWidgets.QDoubleSpinBox()
-            x_min_spin.setDecimals(6)
-            x_min_spin.setRange(-1e10, 1e10)
-            x_min_spin.setValue(x_range[0])
-
-            x_max_spin = QtWidgets.QDoubleSpinBox()
-            x_max_spin.setDecimals(6)
-            x_max_spin.setRange(-1e10, 1e10)
-            x_max_spin.setValue(x_range[1])
-
-            # Y-axis range
-            y_min_spin = QtWidgets.QDoubleSpinBox()
-            y_min_spin.setDecimals(6)
-            y_min_spin.setRange(-1e10, 1e10)
-            y_min_spin.setValue(y_range[0])
-
-            y_max_spin = QtWidgets.QDoubleSpinBox()
-            y_max_spin.setDecimals(6)
-            y_max_spin.setRange(-1e10, 1e10)
-            y_max_spin.setValue(y_range[1])
-
-            layout.addRow("X Min:", x_min_spin)
-            layout.addRow("X Max:", x_max_spin)
-            layout.addRow("Y Min:", y_min_spin)
-            layout.addRow("Y Max:", y_max_spin)
-
-            # Buttons
-            button_box = QtWidgets.QDialogButtonBox(
-                QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+                entries.append((self._annotation_signature(owned), owned, start, end))
+                continue
+            if "time" not in annotation:
+                continue
+            time = self._raw_to_view_coordinate(
+                float(annotation["time"]) * x_scale,
+                log_enabled=presentation.log_x,
             )
-            button_box.accepted.connect(dialog.accept)
-            button_box.rejected.connect(dialog.reject)
-            layout.addRow(button_box)
+            if time is None:
+                continue
+            entries.append((self._annotation_signature(owned), owned, time, None))
 
-            if dialog.exec_() == QtWidgets.QDialog.Accepted:
-                # Apply ranges
-                self._plot_item.setRange(
-                    xRange=(x_min_spin.value(), x_max_spin.value()),
-                    yRange=(y_min_spin.value(), y_max_spin.value())
+        foreground_opacity: dict[tuple[object, ...], float] = {}
+        for _key, (role, set_id, _payload, opacity), start, end in entries:
+            if role == "foreground":
+                geometry = (set_id, start, end)
+                foreground_opacity[geometry] = min(1.0, foreground_opacity.get(geometry, 0.0) + opacity)
+        existing = self._annotation_items
+        rendered: dict[_AnnotationKey, object] = {}
+        label_candidates: dict[
+            tuple[object, ...], tuple[Mapping[str, object], float, float]
+        ] = {}
+        for key, owned, start, end in entries:
+            role, set_id, annotation, opacity = owned
+            if role == "ghost":
+                opacity *= 1.0 - foreground_opacity.get((set_id, start, end), 0.0)
+                if opacity <= _EPSILON:
+                    continue
+            if role == "foreground" and render_input.intervention_labels_visible:
+                occurrence = (
+                    set_id, annotation["kind"],
+                    annotation["declaration_ordinal"],
+                    annotation.get("authored_ordinal"), annotation.get("window_ordinal"),
+                    annotation.get("firing_ordinal"),
                 )
-                logger.info(
-                    f"Custom axis ranges applied: X=[{x_min_spin.value()}, {x_max_spin.value()}], "
-                    f"Y=[{y_min_spin.value()}, {y_max_spin.value()}]"
+                prior = label_candidates.get(occurrence)
+                label_candidates[occurrence] = (
+                    annotation,
+                    start * opacity + (0.0 if prior is None else prior[1]),
+                    opacity + (0.0 if prior is None else prior[2]),
                 )
-
-        def _add_annotation(self):
-            """Add text annotation to plot."""
-            # Get annotation text
-            text, ok = QtWidgets.QInputDialog.getText(
-                self,
-                "Add Annotation",
-                "Enter annotation text:"
-            )
-
-            if not ok or not text:
-                return
-
-            # Get position (center of current view)
-            view_range = self._plot_item.viewRange()
-            x_pos = (view_range[0][0] + view_range[0][1]) / 2
-            y_pos = (view_range[1][0] + view_range[1][1]) / 2
-
-            # Create text item
-            annotation = pg.TextItem(
-                text=text,
-                color='k' if not self._dark_mode else 'w',
-                anchor=(0.5, 0.5),
-                border=pg.mkPen('k' if not self._dark_mode else 'w'),
-                fill=pg.mkBrush(255, 255, 255, 200) if not self._dark_mode else pg.mkBrush(30, 30, 30, 200)
-            )
-            annotation.setPos(x_pos, y_pos)
-
-            # Make it draggable (by setting movable flag)
-            # Note: TextItem doesn't have built-in drag support, but we can add it
-            self._plot_item.addItem(annotation)
-            self._annotations.append(annotation)
-
-            logger.info(f"Added annotation: {text} at ({x_pos}, {y_pos})")
-
-        def _clear_annotations(self):
-            """Clear all annotations from plot."""
-            for annotation in self._annotations:
-                self._plot_item.removeItem(annotation)
-            self._annotations.clear()
-            logger.info("Cleared all annotations")
-
-        def _export_plot(self):
-            """Open pyqtgraph's export dialog for the plot scene."""
-            scene = self._plot_item.scene()
-            scene.contextMenuItem = self._plot_item
-            scene.showExportDialog()
-
-        def _reset_view(self):
-            """Reset plot view to auto range."""
-            self._plot_item.autoRange()
-            self._apply_axis_inversion_state()
-            logger.info("Reset plot view to auto range")
-
-        def set_theme(self, dark_mode: bool = False):
-            """
-            Apply color theme to plot.
-
-            Parameters
-            ----------
-            dark_mode : bool
-                If True, use dark theme colors
-            """
-            self._dark_mode = bool(dark_mode)
-
-            if dark_mode:
-                # Dark theme
-                self._plot_widget.setBackground('#1e1e1e')
-                self._plot_item.getAxis('bottom').setPen('#e0e0e0')
-                self._plot_item.getAxis('left').setPen('#e0e0e0')
-                self._plot_item.getAxis('bottom').setTextPen('#e0e0e0')
-                self._plot_item.getAxis('left').setTextPen('#e0e0e0')
-
-                # Grid color
-                self._plot_item.showGrid(x=True, y=True, alpha=0.2)
+            primary = rendered.get(key) or existing.get(key)
+            if primary is None:
+                accent = self._annotation_accent(annotation)
+                if end is None:
+                    primary = pg.InfiniteLine(
+                        pos=start,
+                        angle=90,
+                        movable=False,
+                        pen=pg.mkPen(accent, width=1, style=QtCore.Qt.PenStyle.DashLine),
+                    )
+                else:
+                    fill = QtGui.QColor(accent)
+                    fill.setAlpha(35)
+                    primary = pg.LinearRegionItem(
+                        values=(start, end),
+                        movable=False,
+                        brush=pg.mkBrush(fill),
+                        pen=pg.mkPen(accent),
+                    )
+                primary.setZValue(10)
+                self._plot_widget.addItem(primary)
+            elif end is None:
+                primary.setValue(start)
             else:
-                # Light theme
-                self._plot_widget.setBackground('w')
-                self._plot_item.getAxis('bottom').setPen('k')
-                self._plot_item.getAxis('left').setPen('k')
-                self._plot_item.getAxis('bottom').setTextPen('k')
-                self._plot_item.getAxis('left').setTextPen('k')
+                primary.setRegion((start, end))
+            primary.setOpacity(opacity)
+            rendered[key] = primary
+        for key, item in existing.items():
+            if key not in rendered:
+                self._remove_annotation_item(item)
+        self._annotation_items = rendered
 
-                # Grid color
-                self._plot_item.showGrid(x=True, y=True, alpha=0.3)
+        if not render_input.intervention_labels_visible:
+            self._clear_annotation_labels()
+            return
 
-            # Refresh plot
-            self._update_plot()
+        existing_labels = self._annotation_labels
+        rendered_labels: dict[tuple[object, ...], _AnnotationLabel] = {}
+        for lane, (occurrence, candidate) in enumerate(label_candidates.items()):
+            annotation, weighted_start, weight = candidate
+            text = intervention_label(annotation, volume_unit=self._selected_volume_unit(),
+                                      time_unit=self._selected_display_unit("x", SECOND))
+            prior = existing_labels.get(occurrence)
+            accent = self._annotation_accent(annotation)
+            if prior is None:
+                label = pg.TextItem(
+                    "",
+                    color=(238, 238, 238), anchor=(0.0, 0.5),
+                    border=pg.mkPen(accent), fill=pg.mkBrush(30, 30, 30, 210),
+                )
+                label.setHtml(text)
+                label.setFlag(
+                    QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True
+                )
+                # Keep right clicks/drags with the scene's plot navigation.
+                label.setAcceptedMouseButtons(QtCore.Qt.MouseButton.LeftButton)
+                label.setZValue(11)
+                self._plot_widget.addItem(label, ignoreBounds=True)
+                prior = _AnnotationLabel(label, QtCore.QPointF(label.pos()), weighted_start / weight, lane)
+            else:
+                label = prior.item
+                label.setHtml(text)
+                label.border = pg.mkPen(accent)
+                label.update()
+            prior.event_x = weighted_start / weight
+            prior.lane = lane
+            label.setOpacity(min(1.0, weight))
+            rendered_labels[occurrence] = prior
+        self._annotation_labels = rendered_labels
+        for occurrence, record in existing_labels.items():
+            if occurrence not in rendered_labels:
+                self._remove_annotation_item(record.item)
+        self._position_annotation_labels()
 
-else:
-    # PyQtGraph not available - provide a stub that warns users
-    class PyQtGraphPlotPanel(QtWidgets.QWidget):
-        """Stub class when PyQtGraph is not available."""
+    def _position_annotation_labels(self) -> None:
+        view_range = self._plot_widget.getViewBox().viewRange()
+        x_span = float(view_range[0][1] - view_range[0][0])
+        y_min, y_max = (float(value) for value in view_range[1])
+        y_span = y_max - y_min
+        if not np.isfinite(x_span) or x_span <= 0.0:
+            x_span = 1.0
+        if not np.isfinite(y_span) or y_span <= 0.0:
+            y_min, y_max, y_span = 0.0, 1.0, 1.0
+        for record in self._annotation_labels.values():
+            lane_offset = 0.10 + 0.08 * (record.lane % 4)
+            anchor = QtCore.QPointF(
+                record.event_x + x_span * (-0.012 if self._presentation.x_inverted else 0.012),
+                y_min + y_span * lane_offset
+                if self._presentation.y_inverted else y_max - y_span * lane_offset,
+            )
+            offset = record.item.pos() - record.anchor
+            record.anchor = anchor
+            record.item.setPos(anchor + offset)
 
-        # Signal emitted when series visibility changes
-        seriesVisibilityChanged = QtCore.Signal(str, bool)
+    @staticmethod
+    def _sample_indices(
+        count: int,
+        sampling_limit: int | None,
+    ) -> np.ndarray:
+        if sampling_limit is None or count <= sampling_limit:
+            return np.arange(count, dtype=int)
+        return np.linspace(0, count - 1, sampling_limit, dtype=int)
 
-        def __init__(
-            self,
-            parent: Optional[QtWidgets.QWidget] = None,
-            *,
-            embed_analysis_tabs: bool = True,
-            workspace_splitter_object_name: Optional[str] = None,
-            enable_axis_inversion_actions: bool = False,
-            enable_canonical_ghost_toggle_action: bool = False,
-            enable_copy_visible_data_action: bool = False,
+    @staticmethod
+    def _execution_region_endpoints(block: ResultDataBlock) -> np.ndarray:
+        count = int(block.t.size)
+        if count == 1:
+            return np.asarray((0,), dtype=int)
+        changes = np.fromiter(
+            (
+                index
+                for index in range(1, count)
+                if (
+                    int(block.segment_ids[index]) != int(block.segment_ids[index - 1])
+                    or block.segment_keys[index] != block.segment_keys[index - 1]
+                    or int(block.discontinuity_ids[index])
+                    != int(block.discontinuity_ids[index - 1])
+                )
+            ),
+            dtype=int,
+        )
+        starts = np.concatenate((np.asarray((0,), dtype=int), changes))
+        ends = np.concatenate((changes - 1, np.asarray((count - 1,), dtype=int)))
+        return np.unique(np.concatenate((starts, ends)))
+
+    def _remove_annotation_item(self, item: object) -> None:
+        self._plot_widget.removeItem(item)
+
+    def _clear_annotation_items(self) -> None:
+        for item in self._annotation_items.values():
+            self._remove_annotation_item(item)
+        self._annotation_items.clear()
+        self._clear_annotation_labels()
+
+    def _clear_annotation_labels(self) -> None:
+        labels, self._annotation_labels = self._annotation_labels, {}
+        for record in labels.values():
+            self._remove_annotation_item(record.item)
+
+    @staticmethod
+    def _scaled_optional(value: float | None, ratio: float) -> float | None:
+        return None if value is None else float(value) * ratio
+
+    def _apply_display_unit_change(self, axis: str, unit: str) -> None:
+        render_input = self._render_input
+        if render_input is None:
+            return
+        source = render_input.x_unit if axis == "x" else render_input.y_unit
+        if source is not None and source.compatible(CUBIC_METRE) and render_input.authored_volume_unit is not None:
+            self._apply_volume_unit_change(unit)
+            return
+        options = self._display_unit_choices(render_input, axis)
+        chosen = next((item for item in options if item.symbol == unit), None)
+        if chosen is None:
+            return
+        if self._selected_display_unit(axis, source).symbol == chosen.symbol:
+            return
+        self._axis_range = self._capture_view_range()
+        old_x_scale, old_y_scale = self._coordinate_scales(render_input)
+        self._axis_display_units[axis, chosen.dimensions] = chosen
+        self._refresh_display_units(old_x_scale, old_y_scale)
+
+    def _apply_volume_unit_change(self, symbol: str) -> None:
+        render_input = self._render_input
+        if render_input is None or render_input.authored_volume_unit is None:
+            return
+        chosen = None if symbol == "Authored" else next(unit for unit in self._volume_unit_choices() if unit.symbol == symbol)
+        current = self._volume_display_unit.symbol if self._volume_display_unit is not None else "Authored"
+        if symbol == current:
+            return
+        self._axis_range = self._capture_view_range()
+        old_x_scale, old_y_scale = self._coordinate_scales(render_input)
+        self._volume_display_unit = chosen
+        self._refresh_display_units(old_x_scale, old_y_scale)
+
+    def _refresh_display_units(self, old_x_scale: float, old_y_scale: float) -> None:
+        render_input = self._render_input
+        new_x_scale, new_y_scale = self._coordinate_scales(render_input)
+        x_ratio = new_x_scale / old_x_scale
+        y_ratio = new_y_scale / old_y_scale
+        self._axis_range = replace(
+            self._axis_range,
+            x_min=self._scaled_optional(self._axis_range.x_min, x_ratio),
+            x_max=self._scaled_optional(self._axis_range.x_max, x_ratio),
+            y_min=self._scaled_optional(self._axis_range.y_min, y_ratio),
+            y_max=self._scaled_optional(self._axis_range.y_max, y_ratio),
+        )
+        self._axis_toolbar.set_manual_ranges(
+            self._axis_range.x_min,
+            self._axis_range.x_max,
+            self._axis_range.y_min,
+            self._axis_range.y_max,
+        )
+        self.apply_result_input(render_input)
+
+    @QtCore.Slot(bool)
+    def _set_coarse_sampling(self, enabled: bool) -> None:
+        self._sampling_limit = 1000 if enabled else None
+        if self._render_input is not None:
+            self.apply_result_input(self._render_input)
+        self._sync_plot_controls()
+
+    def _capture_view_range(self) -> _AxisRangeSession:
+        current_x, current_y = self._plot_widget.getViewBox().viewRange()
+        return replace(
+            self._axis_range,
+            x_min=self._view_to_raw_coordinate(current_x[0], log_enabled=self._presentation.log_x),
+            x_max=self._view_to_raw_coordinate(current_x[1], log_enabled=self._presentation.log_x),
+            y_min=self._view_to_raw_coordinate(current_y[0], log_enabled=self._presentation.log_y),
+            y_max=self._view_to_raw_coordinate(current_y[1], log_enabled=self._presentation.log_y),
+        )
+
+    @QtCore.Slot(bool)
+    def _set_auto_range(self, enabled: bool) -> None:
+        self._axis_range = replace(self._capture_view_range(), auto_x=enabled, auto_y=enabled, visible_x=False)
+        self._apply_axis_range_state(self._axis_range, self._presentation)
+        self._project_manual_ranges()
+
+    def _set_navigation(self, option: str, value: bool | float) -> None:
+        state = self._capture_view_range()
+        changes = {option: value}
+        if option == "visible_x" and value:
+            changes.update(auto_x=False, auto_y=True, pan_y=False)
+        elif (option == "auto_y" and not value) or (option in ("auto_x", "pan_y") and value):
+            changes["visible_x"] = False
+        self._axis_range = replace(state, **changes)
+        self._apply_axis_range_state(self._axis_range, self._presentation)
+        self._project_manual_ranges()
+
+    def _fit_axes_once(self, axes: tuple[bool, bool]) -> None:
+        view = self._plot_widget.getViewBox()
+        bounds = view.childrenBounds()
+        ranges = {
+            f"{axis}Range": bounds[index]
+            for index, axis in enumerate(("x", "y"))
+            if axes[index] and bounds[index] is not None
+            and all(value is not None and np.isfinite(value) for value in bounds[index])
+        }
+        if ranges:
+            view.setRange(**ranges, disableAutoRange=False)
+        self._axis_range = self._capture_view_range()
+        self._project_manual_ranges()
+
+    @QtCore.Slot()
+    def _fit_once(self) -> None:
+        view = self._plot_widget.getViewBox()
+        view.disableAutoRange()
+        view.setAutoVisible(x=False, y=False)
+        self._axis_range = replace(self._axis_range, auto_x=False, auto_y=False, visible_x=False)
+        self._fit_axes_once((True, True))
+
+    def _on_manual_navigation(self, axes: Sequence[bool]) -> None:
+        view = self._plot_widget.getViewBox()
+        state = self._capture_view_range()
+        self._axis_range = replace(
+            state, auto_x=state.auto_x and not axes[0], auto_y=state.auto_y and not axes[1],
+            visible_x=state.visible_x and not axes[1],
+        )
+        view.enableAutoRange(x=self._axis_range.fraction_x if self._axis_range.auto_x else False,
+                             y=self._axis_range.fraction_y if self._axis_range.auto_y else False)
+        if view.state["autoVisibleOnly"][1] != self._axis_range.visible_x:
+            view.setAutoVisible(x=False, y=self._axis_range.visible_x)
+        elif self._axis_range.visible_x:
+            view.updateAutoRange()
+        self._axis_range = self._capture_view_range()
+        self._project_manual_ranges()
+
+    def _project_manual_ranges(self) -> None:
+        state = self._axis_range
+        self._axis_toolbar.set_manual_ranges(state.x_min, state.x_max, state.y_min, state.y_max)
+        self._sync_plot_controls()
+
+    @QtCore.Slot(str)
+    def _apply_axis_range(self, axis: str) -> None:
+        values = self._axis_toolbar.get_manual_ranges()
+        low, high = values[:2] if axis == "x" else values[2:]
+        state = self._capture_view_range()
+        if getattr(self._presentation, f"log_{axis}") and (
+            (low is not None and low <= 0) or (high is not None and high <= 0)
         ):
-            super().__init__(parent)
-            _ = workspace_splitter_object_name
-            _ = enable_axis_inversion_actions
-            _ = enable_canonical_ghost_toggle_action
-            _ = enable_copy_visible_data_action
-            layout = QtWidgets.QVBoxLayout(self)
-            layout.addWidget(make_pyqtgraph_fallback_widget(self))
-            self._main_splitter = None
-            self._details_tabs = None
-            self._analysis_tabs_detached = not bool(embed_analysis_tabs)
+            self._axis_range = state
+            self._project_manual_ranges()
+            self.resultDiagnostic.emit(f"{axis.upper()} limits must be positive for logarithmic display.")
+            return
+        if low is not None and high is not None and high > low:
+            state = replace(state, **{f"{axis}_min": low, f"{axis}_max": high})
+        self._axis_range = state
+        self._apply_axis_range_state(state, self._presentation)
+        self._project_manual_ranges()
 
-        def set_data(self, t, series):
-            """Stub method."""
-            pass
+    def _apply_axis_range_state(self, state: _AxisRangeSession, presentation: ProjectPresentationState) -> None:
+        view = self._plot_widget.getViewBox()
+        view.setMouseEnabled(x=state.mouse_x, y=state.mouse_y)
+        view.enableAutoRange(x=state.fraction_x if state.auto_x else False,
+                             y=state.fraction_y if state.auto_y else False)
+        for axis in ("x", "y"):
+            if getattr(state, f"auto_{axis}"):
+                continue
+            low = self._raw_to_view_coordinate(getattr(state, f"{axis}_min"), log_enabled=getattr(presentation, f"log_{axis}"))
+            high = self._raw_to_view_coordinate(getattr(state, f"{axis}_max"), log_enabled=getattr(presentation, f"log_{axis}"))
+            if low is not None and high is not None and high > low:
+                view.setRange(**{f"{axis}Range": (low, high)}, padding=0, disableAutoRange=False)
+        if view.state["autoPan"] != [state.pan_x, state.pan_y]:
+            view.setAutoPan(x=state.pan_x, y=state.pan_y)
+        if view.state["autoVisibleOnly"] != [False, state.visible_x]:
+            view.setAutoVisible(x=False, y=state.visible_x)
+        # Each curve draws Y data only within 1e6 view heights, so a fit from a
+        # nearly flat view sees trimmed bounds; refit until the range holds.
+        fitted = None
+        while fitted != view.viewRange():
+            fitted = view.viewRange()
+            view.updateAutoRange()
 
-        def render_dataset_layers(
-            self,
-            *,
-            data_t,
-            dataset_series,
-            model_t=None,
-            model_series=None,
-            visible_species=(),
-            xlabel="Time",
-            ylabel="Concentration",
+    @QtCore.Slot(bool)
+    def _set_zoom_enabled(self, enabled: bool) -> None:
+        self._zoom_enabled = enabled
+        self._apply_zoom_mode()
+        self._sync_plot_controls()
+
+    def _apply_zoom_mode(self) -> None:
+        view_box = self._plot_widget.getViewBox()
+        view_box.setMouseMode(view_box.RectMode if self._zoom_enabled else view_box.PanMode)
+
+    def _request_plot_presentation(
+        self,
+        option: str,
+        value: bool | float | str,
+    ) -> None:
+        # The WorkspaceTabRegistry is the sole accepted presentation owner.
+        # Do not mutate local state or visible pyqtgraph items until it has
+        # validated and stored this intent.
+        self.plotPresentationIntentRequested.emit(option, value)
+
+    def _apply_plot_presentation(
+        self,
+        state: ProjectPresentationState,
+        *,
+        axis_range: _AxisRangeSession | None = None,
+    ) -> None:
+        item = self._plot_widget.getPlotItem()
+        item.setLogMode(x=state.log_x, y=state.log_y)
+        item.invertX(state.x_inverted)
+        item.invertY(state.y_inverted)
+        item.showGrid(x=state.grid_x, y=state.grid_y, alpha=state.grid_opacity)
+        self._sync_plot_controls()
+        if self._legend is not None:
+            self._legend.setVisible(state.legend_visible)
+        if axis_range is not None:
+            self._apply_axis_range_state(axis_range, state)
+
+    def set_theme(self, *, dark_mode: bool) -> None:
+        dark = bool(dark_mode)
+        self._plot_widget.setBackground(plot_background_color(dark))
+        foreground = plot_foreground_color(dark)
+        if self._legend is not None:
+            self._legend.setLabelTextColor(foreground)
+        for axis_name in ("left", "bottom"):
+            axis = self._plot_widget.getPlotItem().getAxis(axis_name)
+            axis.setPen(foreground)
+            axis.setTextPen(foreground)
+
+
+_MAX_RENDERED_COPY_CELLS = 1_000_000
+_MAX_RENDERED_COPY_CHARACTERS = 64 * 1024 * 1024
+
+
+def _visible_sample_mask(
+    x: np.ndarray, y: np.ndarray, view_range: Sequence[Sequence[float]],
+    *, log_x: bool, log_y: bool,
+) -> np.ndarray:
+    """Compare existing samples in the native ViewBox coordinate space."""
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mapped_x = np.log10(x) if log_x else x
+        mapped_y = np.log10(y) if log_y else y
+    return (
+        np.isfinite(mapped_x) & np.isfinite(mapped_y)
+        & (mapped_x >= view_range[0][0]) & (mapped_x <= view_range[0][1])
+        & (mapped_y >= view_range[1][0]) & (mapped_y <= view_range[1][1])
+    )
+
+
+def _has_visible_samples(
+    roster: Sequence[_RenderedPointBlock], view_range: Sequence[Sequence[float]],
+    *, log_x: bool, log_y: bool,
+) -> bool:
+    """Stop at the first matching batch; never construct export columns."""
+
+    for block in roster:
+        for chunk in block.chunks:
+            for _name, y in chunk.series:
+                for start in range(0, chunk.x.size, 4096):
+                    sample = slice(start, start + 4096)
+                    if _visible_sample_mask(
+                        chunk.x[sample], y[sample], view_range, log_x=log_x, log_y=log_y,
+                    ).any():
+                        return True
+    return False
+
+
+def _visible_point_roster(
+    roster: Sequence[_RenderedPointBlock], view_range: Sequence[Sequence[float]],
+    *, log_x: bool, log_y: bool,
+) -> tuple[_RenderedPointBlock, ...]:
+    """Create call-local, independently paired series for the existing serializer."""
+
+    visible = []
+    for block in roster:
+        units = dict(block.y_units)
+        for name, label in block.y_names:
+            chunks = []
+            for chunk in block.chunks:
+                y = dict(chunk.series)[name]
+                mask = _visible_sample_mask(chunk.x, y, view_range, log_x=log_x, log_y=log_y)
+                if mask.any():
+                    chunks.append(_RenderedPointChunk(
+                        x=chunk.x[mask], series=((name, y[mask]),),
+                        sample_time=None if chunk.sample_time is None else chunk.sample_time[mask],
+                    ))
+            if chunks:
+                visible.append(replace(
+                    block, chunks=tuple(chunks), y_names=((name, label),),
+                    y_units=((name, units[name]),),
+                ))
+    return tuple(visible)
+
+
+def _iter_rendered_point_tsv_chunks(
+    roster: Sequence[_RenderedPointBlock],
+    *,
+    rows_per_chunk: int = 2048,
+    action_name: str = "Copy Plotted Data",
+) -> tuple[str, ...]:
+    """Serialize the captured roster as one rectangular TSV table."""
+
+    values = tuple(roster)
+    nonempty = tuple(
+        block
+        for block in values
+        if any(chunk.x.size for chunk in block.chunks)
+    )
+    if not nonempty:
+        raise ValueError("No plotted data is available to copy.")
+    # Per block: its column parts, the rows kept after de-duplication, and the row count.
+    _BlockPlan = tuple[tuple[tuple[np.ndarray, ...], ...], np.ndarray | None, int]
+    block_specs: list[tuple[_RenderedPointBlock, tuple[str, ...], _BlockPlan, int, bool]] = []
+    planned_rows = 0
+    planned_width = 0
+    previous_group = None
+    for block in nonempty:
+        chunks = tuple(chunk for chunk in block.chunks if chunk.x.size)
+        series_names = tuple(name for name, _values in chunks[0].series)
+        with_time = not block.x_is_time and chunks[0].sample_time is not None
+        columns = (
+            *((tuple(chunk.sample_time for chunk in chunks),) if with_time else ()),
+            tuple(chunk.x for chunk in chunks),
+            *(tuple(dict(chunk.series)[name] for chunk in chunks) for name in series_names),
+        )
+        rows = sum(int(chunk.x.size) for chunk in chunks)
+        keep = None
+        if block.kind != ResultLayerKind.EXPERIMENTAL.value and rows > 1:
+            # Chunk joins repeat shared endpoints; dataset rows keep repeats.
+            # One column at a time keeps the budget check ahead of the matrix.
+            repeated = np.ones(rows - 1, dtype=bool)
+            for parts in columns:
+                column = np.concatenate(parts).astype(float, copy=False)
+                repeated &= (column[1:] == column[:-1]) | (np.isnan(column[1:]) & np.isnan(column[:-1]))
+            keep = np.concatenate(([True], ~repeated))
+            rows = int(keep.sum())
+        width = len(columns)
+        plan = (columns, keep, rows)
+        group = (block.kind, block.group_id)
+        separator = bool(block_specs) and group != previous_group
+        previous_group = group
+        block_specs.append((block, series_names, plan, width, separator))
+        planned_rows = max(planned_rows, rows)
+        planned_width += width + separator
+    planned_cells = (planned_rows + 1) * planned_width
+    if planned_cells > _MAX_RENDERED_COPY_CELLS:
+        raise ValueError(
+            f"{action_name} payload exceeds the bounded cell limit "
+            f"({_MAX_RENDERED_COPY_CELLS:,})."
+        )
+
+    combined_headers: list[str] = []
+    for block, series_names, _rows, _width, separator in block_specs:
+        if separator:
+            combined_headers.append("")
+        chunks = tuple(chunk for chunk in block.chunks if chunk.x.size)
+        time_name = block.time_column_name if block.kind == ResultLayerKind.EXPERIMENTAL.value else "Time"
+        if block.left_endpoint:
+            time_name = f"{time_name} [left endpoint]"
+        headers = []
+        if not block.x_is_time and chunks[0].sample_time is not None:
+            headers.append(encode_clipboard_text(copy_column_header(block.label, time_name, "s")))
+        headers.append(encode_clipboard_text(copy_column_header(
+            block.label,
+            time_name if block.x_is_time else block.x_name,
+            block.x_unit,
+        )))
+        y_names, y_units = dict(block.y_names), dict(block.y_units)
+        headers.extend(
+            encode_clipboard_text(copy_column_header(block.label, y_names[name], y_units[name]))
+            for name in series_names
+        )
+        # Extend the one combined header in roster order.  Each block remains
+        # an adjacent, independently identified column group.
+        combined_headers.extend(headers)
+
+    def iter_block_rows(plan: _BlockPlan) -> Iterator[tuple[str, ...]]:
+        columns, keep, _rows = plan
+        matrix = np.column_stack([np.concatenate(parts).astype(float, copy=False) for parts in columns])
+        if keep is not None:
+            matrix = matrix[keep]
+        for row in matrix:
+            yield tuple(repr(value) if math.isfinite(value) else "" for value in row.tolist())
+
+    output_chunks: list[str] = []
+    total_characters = 0
+    output = io.StringIO()
+    output.write(encode_tsv_row(combined_headers))
+    rows_in_chunk = 1
+    row_iterators = [
+        iter_block_rows(plan)
+        for _block, _series_names, plan, _width, _separator in block_specs
+    ]
+    for row_index in range(planned_rows):
+        row: list[str] = []
+        for iterator, (_block, _series_names, plan, width, separator) in zip(
+            row_iterators, block_specs, strict=True
         ):
-            """Stub method."""
-            pass
-
-        def clear(self):
-            """Stub method."""
-            pass
-
-        def set_theme(self, dark_mode=False):
-            """Stub method."""
-            pass
-
-        def visible_series(self):
-            """Stub method."""
-            return []
-
-        def set_series_visible(self, name: str, visible: bool) -> None:
-            """Stub method."""
-            pass
-
-        def visible(self, name: str) -> bool:
-            """Stub method."""
-            return False
-
-        def set_overlay_catalog(self, datasets):
-            """Stub method."""
-            pass
-
-        def active_overlays(self):
-            """Stub method."""
-            return []
-
-        def overlay_snapshot(self):
-            """Stub method."""
-            return {}
-
-        def build_visible_export(self, scope: str):
-            """Stub method."""
-            raise RuntimeError("PyQtGraph is required for overlay exports.")
-
-        def analysis_tabs_widget(self):
-            """Stub method."""
-            return None
-
-        def workspace_splitter(self):
-            """Stub method."""
-            return None
-
-        def detach_analysis_tabs_for_dock(self):
-            """Stub method."""
-            return None
+            if separator:
+                row.append("")
+            if row_index < plan[2]:
+                row.extend(next(iterator))
+            else:
+                row.extend("" for _ in range(width))
+        output.write(encode_tsv_row(row))
+        rows_in_chunk += 1
+        if rows_in_chunk >= rows_per_chunk:
+            piece = output.getvalue()
+            total_characters += len(piece)
+            if total_characters > _MAX_RENDERED_COPY_CHARACTERS:
+                raise ValueError(
+                    f"{action_name} payload exceeds the bounded output-size limit."
+                )
+            output_chunks.append(piece)
+            output = io.StringIO()
+            rows_in_chunk = 0
+    piece = output.getvalue()
+    total_characters += len(piece)
+    if total_characters > _MAX_RENDERED_COPY_CHARACTERS:
+        raise ValueError(
+            f"{action_name} payload exceeds the bounded output-size limit."
+        )
+    if piece:
+        output_chunks.append(piece)
+    return tuple(output_chunks)
