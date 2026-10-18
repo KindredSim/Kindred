@@ -312,6 +312,9 @@ class FitSessionOwner(QtCore.QObject):
             return False
         self._record_setup_change(previous)
         self._install_setup(snapshot)
+        # An accepted edit is the user's latest action; an action that reports
+        # its outcome posts it after this returns.
+        window.set_status("")
         self._refresh_result_currency()
         window.project_setup_snapshot(snapshot)
         return True
