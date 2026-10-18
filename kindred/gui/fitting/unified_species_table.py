@@ -1548,7 +1548,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         copied_ranges = 0
         copied_weights = 0
         skipped = 0
-        not_copied: dict[str, list[str]] = {}
+        range_skipped = False
+        outside_range: dict[str, list[str]] = {}
         source_initials = {
             item.species: item
             for item in setup.initials
@@ -1594,10 +1595,16 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                     # The copied range cannot contain this destination's
                     # Starting IC (e.g. a percentage around zero), so this
                     # row is not compatible and stays as is, typed text included.
-                    not_copied.setdefault(
-                        destination_mapped.display_name, []
-                    ).append(species)
+                    range_skipped = True
                     skipped += 1
+                    if held is None and source_config.tolerance.mode == "absolute":
+                        # Only this skip leaves no mark on the row: a zero
+                        # Starting IC greys the percentage modes and held text
+                        # is red, but an applied Starting IC outside a
+                        # Minimum / Maximum range keeps valid old settings.
+                        outside_range.setdefault(
+                            destination_mapped.display_name, []
+                        ).append(species)
                     continue
                 self._drop_invalid_initial_row(*destination_key)
                 initials[destination_key] = copied_initial
@@ -1619,15 +1626,23 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             datasets=tuple(datasets[item.dataset_id] for item in setup.datasets),
             initials=tuple(initials[(item.set_id, item.species)] for item in setup.initials),
         ))
-        detail = " ".join(
-            f"Not copied to {name}: {', '.join(names)}; its Starting IC must be a number inside the copied range."
-            for name, names in not_copied.items()
-        )
         self.set_status(
             "Copy Species Weights and Vary IC: "
             f"{copied_ranges} ranges, {copied_weights} weights copied, "
             f"{skipped} skipped."
-            + (f" {detail}" if detail else "")
+            + (
+                " A range copies only to a Starting IC that is a number inside "
+                "it, and a percentage range never to a zero Starting IC."
+                if range_skipped else ""
+            )
+            + (
+                " Outside the Minimum / Maximum range: "
+                + ", ".join(
+                    f"{name} ({', '.join(names)})" for name, names in outside_range.items()
+                )
+                + "."
+                if outside_range else ""
+            )
         )
 
     # ------------------------------------------------------------------
