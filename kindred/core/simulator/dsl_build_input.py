@@ -7,7 +7,7 @@ from types import MappingProxyType
 import re
 from typing import Mapping
 
-from ..temperature import TemperatureSchedule
+from ..temperature import TemperatureChange
 from ..kinetics import ForwardRateModel
 
 __all__ = [
@@ -149,5 +149,5 @@ class DslMechanismBuildInput:
     energy_unit: str
     temperature_K: float
     standard_conc_M: float
-    temperature_schedule: TemperatureSchedule | None
+    temperature_changes: tuple[TemperatureChange, ...]
     steps: tuple[DslBuildStep, ...]

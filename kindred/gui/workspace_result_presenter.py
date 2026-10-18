@@ -434,8 +434,13 @@ class ResultRenderInput:
 
     def parameters_for_display(
         self, *, concentration_unit: Unit, time_unit: Unit, volume_unit: Unit,
-    ) -> dict[str, tuple[float | None, str, str, str]]:
-        """Project canonical parameters using the plot's Analysis unit choices."""
+    ) -> dict[str, tuple[float | None, float | None, str, str, str, str]]:
+        """Project canonical and derived parameters using the plot's Analysis
+        unit choices: name -> (low, high, unit, family, role, calculated from).
+
+        An input has one value; a derived value spans the temperatures its Run
+        executed at. A missing value is unavailable.
+        """
         result = self.statistics_result
         if result is None:
             return {}
@@ -443,17 +448,29 @@ class ResultRenderInput:
             name: (family, role)
             for name, family, role in result.parameter_classifications
         }
-        rows = {}
-        for name, value, unit_text in result.parameters:
+
+        def displayed(values, unit_text):
+            if not unit_text:
+                return (*values, "")
             source = parse_unit(unit_text)
             display = analysis_display_unit(
                 source, concentration=concentration_unit, time=time_unit, volume=volume_unit,
             )
             try:
-                display_value = convert_value(value, source, display)
+                converted = tuple(
+                    None if value is None else convert_value(value, source, display) for value in values
+                )
             except ValueError:
-                display_value = None
-            rows[name] = (display_value, display.symbol, *classifications[name])
+                converted = (None, None)
+            return (*converted, display.symbol)
+
+        rows = {}
+        for name, value, unit_text in result.parameters:
+            rows[name] = (*displayed((value, value), unit_text), *classifications[name], "")
+        for item in result.derived_parameters:
+            rows[item.name] = (
+                *displayed((item.low, item.high), item.unit), item.family, item.role, item.calculated_from,
+            )
         return rows
 
     @property

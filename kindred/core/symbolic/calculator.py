@@ -420,7 +420,7 @@ class CalculatorContext:
 def symbolic_calculator_available(mechanism: Any) -> tuple[bool, str]:
     """Cheap structural availability; expression construction is first-query work."""
     metadata = MechanismMetadataView.from_metadata(mechanism.metadata)
-    if metadata.temperature_schedule is not None:
+    if metadata.temperature_changes:
         return False, "Calculator does not support temperature schedules."
     step = fractional_order_step(mechanism)
     if step is not None:

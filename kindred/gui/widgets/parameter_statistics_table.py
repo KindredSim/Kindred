@@ -18,19 +18,20 @@ __all__ = ["ParameterStatisticsTable"]
 
 class ParameterStatisticsTable(QtWidgets.QTableWidget):
     """
-    Bottom panel showing current solver parameter values and units.
+    Bottom panel showing the Run's parameter values and units.
 
     Columns:
     - Name
-    - Value
+    - Value: one number, or the span over the temperatures the Run executed at
     - Unit
+    - Calculated From: how a derived value is calculated; empty for an input
     """
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
         self.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.setColumnCount(3)
-        self.setHorizontalHeaderLabels(["Name", "Value", "Unit"])
+        self.setColumnCount(4)
+        self.setHorizontalHeaderLabels(["Name", "Value", "Unit", "Calculated From"])
         self.setItemDelegateForColumn(0, ScientificNameDelegate(self))
         self.setItemDelegateForColumn(2, ScientificNameDelegate(self))
         header = self.horizontalHeader()
@@ -38,6 +39,7 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
         self.setAlternatingRowColors(True)
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
@@ -46,7 +48,7 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
 
     def update_parameters(
         self,
-        parameters: Mapping[str, tuple[float | None, str, str, str]],
+        parameters: Mapping[str, tuple[float | None, float | None, str, str, str, str]],
     ) -> None:
         """
         Update table with parameter values.
@@ -54,8 +56,8 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
         Parameters
         ----------
         parameters : dict
-            Mapping name -> (display value, unit, family, role).
-            A missing value means the display conversion is unavailable.
+            Mapping name -> (low, high, unit, family, role, calculated from).
+            A missing value means it is unavailable.
         """
         names = tuple(sorted(parameters.keys(), key=_param_sort_key))
         current_names = tuple(
@@ -71,12 +73,12 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
                 name_item.setData(QtCore.Qt.ItemDataRole.UserRole, name)
                 name_item.setTextAlignment(QtCore.Qt.AlignCenter)
                 self.setItem(row, 0, name_item)
-                for column in (1, 2):
+                for column in (1, 2, 3):
                     item = QtWidgets.QTableWidgetItem()
                     item.setTextAlignment(QtCore.Qt.AlignCenter)
                     self.setItem(row, column, item)
         for row, name in enumerate(names):
-            value, unit, family, role = parameters[name]
+            low, high, unit, family, role, calculated_from = parameters[name]
             name_item = self.item(row, 0)
             name_item.setText(name)
             name_item.setData(SCIENTIFIC_NAME_HTML_ROLE,
@@ -84,12 +86,20 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
             name_item.setData(QtCore.Qt.AccessibleTextRole,
                               scientific_symbol_spoken(name, family=family, role=role))
             name_item.setToolTip(literal_tooltip(name))
-            self.item(row, 1).setText("Unavailable" if value is None else six_digit_text(value))
+            self.item(row, 1).setText(_value_text(low, high))
             unit_item = self.item(row, 2)
             unit_item.setText(unit)
             unit_item.setData(SCIENTIFIC_NAME_HTML_ROLE, format_unit_for_display(unit))
             unit_item.setData(QtCore.Qt.AccessibleTextRole, unit)
             unit_item.setToolTip(literal_tooltip(unit))
+            self.item(row, 3).setText(calculated_from)
+
+
+def _value_text(low: float | None, high: float | None) -> str:
+    if low is None or high is None:
+        return "Unavailable"
+    low_text, high_text = six_digit_text(min(low, high)), six_digit_text(max(low, high))
+    return low_text if low_text == high_text else f"{low_text} – {high_text}"
 
 
 def _param_sort_key(name: str):

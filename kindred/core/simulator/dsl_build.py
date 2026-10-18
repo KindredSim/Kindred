@@ -29,7 +29,7 @@ def build_mechanism_from_ir(
     T = build_input.temperature_K
     C0 = build_input.standard_conc_M
     steps = build_input.steps
-    temperature_schedule = build_input.temperature_schedule
+    temperature_changes = build_input.temperature_changes
 
     mechanism = Mechanism()
     MechanismMetadataView(
@@ -115,6 +115,6 @@ def build_mechanism_from_ir(
         len(mechanism.equilibria),
     )
 
-    if temperature_schedule is not None:
-        mechanism.metadata[MechanismMetadataKeys.TEMPERATURE_SCHEDULE] = temperature_schedule
+    if temperature_changes:
+        mechanism.metadata[MechanismMetadataKeys.TEMPERATURE_CHANGES] = temperature_changes
     return mechanism

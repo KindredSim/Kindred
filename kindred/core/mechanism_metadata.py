@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, MutableMapping, Optional
 
-from kindred.core.temperature import TemperatureSchedule
+from kindred.core.temperature import TemperatureChange
 
 __all__ = [
     "MechanismMetadataKeys",
@@ -17,7 +17,7 @@ class MechanismMetadataKeys:
     TEMPERATURE_K = "temperature_K"
     STANDARD_CONC_M = "standard_conc_M"
     ENERGY_UNIT = "energy_unit"
-    TEMPERATURE_SCHEDULE = "temperature_schedule"
+    TEMPERATURE_CHANGES = "temperature_changes"
 
 
 class EquilibriumMetadataKeys:
@@ -32,7 +32,7 @@ class MechanismMetadataView:
     temperature_K: float = 298.15
     standard_conc_M: float = 1.0
     energy_unit: str = "kJ/mol"
-    temperature_schedule: Optional[TemperatureSchedule] = None
+    temperature_changes: tuple[TemperatureChange, ...] = ()
 
     @classmethod
     def from_metadata(cls, meta: Mapping[str, Any]) -> "MechanismMetadataView":
@@ -40,15 +40,15 @@ class MechanismMetadataView:
             temperature_K=meta[MechanismMetadataKeys.TEMPERATURE_K],
             standard_conc_M=meta[MechanismMetadataKeys.STANDARD_CONC_M],
             energy_unit=meta[MechanismMetadataKeys.ENERGY_UNIT],
-            temperature_schedule=meta.get(MechanismMetadataKeys.TEMPERATURE_SCHEDULE),
+            temperature_changes=meta.get(MechanismMetadataKeys.TEMPERATURE_CHANGES, ()),
         )
 
     def apply_to_metadata(self, meta: MutableMapping[str, Any]) -> None:
         meta[MechanismMetadataKeys.TEMPERATURE_K] = float(self.temperature_K)
         meta[MechanismMetadataKeys.STANDARD_CONC_M] = float(self.standard_conc_M)
         meta[MechanismMetadataKeys.ENERGY_UNIT] = str(self.energy_unit)
-        if self.temperature_schedule is not None:
-            meta[MechanismMetadataKeys.TEMPERATURE_SCHEDULE] = self.temperature_schedule
+        if self.temperature_changes:
+            meta[MechanismMetadataKeys.TEMPERATURE_CHANGES] = self.temperature_changes
 
 
 @dataclass(frozen=True)

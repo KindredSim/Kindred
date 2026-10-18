@@ -17,7 +17,7 @@ from kindred.core.exceptions import (
     SimulationCancelled,
     ValueDomainError,
 )
-from kindred.core.temperature import TemperatureSchedule
+from kindred.core.temperature import starting_temperature_segment
 from kindred.core.intervention_schedule import (
     InterventionSchedule,
     InterventionScheduleDependencyMetadata,
@@ -43,7 +43,7 @@ from kindred.core.simulator.parameter_coordinates import (
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulation_preparation_stages import (
     PreparedSolverConfig as _PreparedSolverConfig,
-    build_prepared_run_context,
+    build_runtime_symbolic_jacobian,
 )
 from kindred.core.time_grid import build_time_grid
 
@@ -74,7 +74,6 @@ class PreparedSimulationRun:
     rhs: Callable[..., np.ndarray]
     y0: np.ndarray
     species_names: tuple[str, ...]
-    temperature_schedule: TemperatureSchedule | None
     parameter_algebra_spec: Any
     intervention_execution: InterventionExecutionContract | None
     symbolic_jacobian: SymbolicJacobianExecution
@@ -117,7 +116,6 @@ def build_simulation_request_from_prepared_run(
         rtol=request.solver_config.rtol,
         atol=request.solver_config.atol,
         grid=request.solver_config.grid,
-        temperature_schedule=prepared_run.temperature_schedule,
         species_names=tuple(prepared_run.species_names),
         cancellation_control=cancellation_control,
         t_eval=t_eval,
@@ -313,7 +311,7 @@ def prepare_simulation_run(
     Prepare the shared scientific execution request.
 
     This function is the single owner for:
-    - Retaining the admitted DSL temperature schedule through execution
+    - Compiling the intervention schedule and temperature changes
     - Parameter algebra application
     - Generated symbolic Jacobian construction when supported by the solver path
     """
@@ -332,7 +330,6 @@ def prepare_simulation_run(
     rhs: Callable[..., np.ndarray] | None = None
     species_names = list(execution_request.species_names)
     y0 = np.asarray(execution_request.y0, dtype=float).reshape(-1).copy()
-    temperature_schedule_override = execution_request.prepared_dsl.temperature_schedule_for_execution()
     parameter_algebra_spec = execution_request.prepared_dsl.parameter_algebra_spec_for_execution()
     parameter_target_map = build_parameter_target_map(mechanism)
 
@@ -393,6 +390,7 @@ def prepare_simulation_run(
                         else None
                     ),
                     dependency_metadata=dependency_metadata,
+                    temperature_changes=execution_request.prepared_dsl.temperature_changes(),
                 )
             except (InterventionScheduleError, ValueDomainError) as exc:
                 locate_declaration(exc, execution_request.prepared_dsl.analysis.intervention_lines)
@@ -400,9 +398,8 @@ def prepare_simulation_run(
 
     _raise_if_cancelled(cancellation_control)
 
-    temperature_schedule, runtime_symbolic_jacobian = build_prepared_run_context(
+    runtime_symbolic_jacobian = build_runtime_symbolic_jacobian(
         mechanism=mechanism,
-        temperature_schedule=temperature_schedule_override,
         use_analytic_jacobian=prepared_solver_config.use_analytic_jacobian,
         symbolic_structure=symbolic_structure,
         coefficient_evaluator=_coefficient_evaluator,
@@ -412,7 +409,6 @@ def prepare_simulation_run(
     initials_for_algebra = {sp: float(y0[idx]) for idx, sp in enumerate(species_names)}
 
     from kindred.core.simulation_algebra_context import runtime_algebra_symbol_names
-    from kindred.core.temperature import temperature_at_execution_time
     runtime_names = runtime_algebra_symbol_names(parameter_algebra_spec)
     symbols = _coefficient_evaluator.parameter_values
     stop_observable_value = None
@@ -435,10 +431,11 @@ def prepare_simulation_run(
                             if root in parameter_algebra_spec.evaluation_dependencies and root in runtime_names)
                 for name in targets
             }
-            start_temperature = temperature_at_execution_time(
-                temperature_schedule, _coefficient_evaluator.nominal_temperature_K,
-                execution_request.t_span[0],
-            )
+            t_start = execution_request.t_span[0]
+            start_temperature = starting_temperature_segment(
+                intervention_execution.temperature_changes,
+                _coefficient_evaluator.nominal_temperature_K, t_start,
+            )(t_start)
             evaluator = PreparedAlgebraStopEvaluator(
                 observable_block,
                 species_names=tuple(species_names), initials=initials_for_algebra,
@@ -475,7 +472,6 @@ def prepare_simulation_run(
         rhs=rhs,
         y0=np.asarray(y0, dtype=float).reshape(-1),
         species_names=list(species_names),
-        temperature_schedule=temperature_schedule,
         parameter_algebra_spec=parameter_algebra_spec,
         intervention_execution=intervention_execution,
         symbolic_jacobian=runtime_symbolic_jacobian,

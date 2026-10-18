@@ -18,11 +18,10 @@ from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
 from kindred.core.symbolic.jacobian_execution import (
     SymbolicJacobianExecution,
 )
-from kindred.core.temperature import TemperatureSchedule
 
 __all__ = [
     "PreparedSolverConfig",
-    "build_prepared_run_context",
+    "build_runtime_symbolic_jacobian",
     "build_solver_config",
 ]
 
@@ -89,29 +88,19 @@ def _bind_symbolic_jacobian_for_current_mechanism(
     return SymbolicJacobianExecution.supported(jacobian_func=jacobian_func)
 
 
-def build_prepared_run_context(
+def build_runtime_symbolic_jacobian(
     *,
     mechanism: Any,
-    temperature_schedule: TemperatureSchedule | None,
     use_analytic_jacobian: bool,
     symbolic_structure: Any = None,
     coefficient_evaluator: Any,
-) -> tuple[
-    TemperatureSchedule | None,
-    SymbolicJacobianExecution,
-]:
-    """Prepare the retained temperature schedule and symbolic Jacobian."""
+) -> SymbolicJacobianExecution:
+    """Prepare the symbolic Jacobian a Run uses, or why it uses none."""
 
-    # The schedule has already been admitted by the source/metadata ingress;
-    # preserve that typed object through preparation and execution.
-    resolved_temperature_schedule = temperature_schedule
     if not use_analytic_jacobian:
-        return (
-            resolved_temperature_schedule,
-            SymbolicJacobianExecution.disabled(
-                code="policy-disabled",
-                reason="Analytic Jacobian preference is disabled.",
-            ),
+        return SymbolicJacobianExecution.disabled(
+            code="policy-disabled",
+            reason="Analytic Jacobian preference is disabled.",
         )
     try:
         symbolic_jacobian = _bind_symbolic_jacobian_for_current_mechanism(
@@ -120,4 +109,4 @@ def build_prepared_run_context(
         )
     except UnsupportedSymbolicExpressionError:
         symbolic_jacobian = _symbolic_jacobian_for_bind_failure(mechanism)
-    return resolved_temperature_schedule, symbolic_jacobian
+    return symbolic_jacobian

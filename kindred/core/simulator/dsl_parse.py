@@ -77,7 +77,7 @@ from .dsl_build_input import (
 if TYPE_CHECKING:
     from ..intervention_schedule import InterventionSchedule
     from ..intervention_schedule_compiler import InterventionExecutionContract
-    from ..temperature import TemperatureSchedule
+    from ..temperature import TemperatureChange
 
 
 __all__ = [
@@ -143,7 +143,7 @@ class DSLIR:
     energy_unit: str
     temperature_K: float
     standard_conc_M: float
-    temperature_schedule: Optional["TemperatureSchedule"]
+    temperature_changes: tuple["TemperatureChange", ...]
     intervention_schedule: Optional["InterventionSchedule"]
     steps: List[DslBuildStep]
     inline_initial_conditions: "DslInitialConditionAdmission"
@@ -331,12 +331,12 @@ class PreparedDslRequestSet:
                 structure = self.__symbolic_jacobian_structure
         return structure
 
-    def temperature_schedule_for_execution(self) -> Optional["TemperatureSchedule"]:
-        """Return the accepted mechanism's retained typed schedule directly."""
+    def temperature_changes(self) -> tuple["TemperatureChange", ...]:
+        """Return the accepted mechanism's temperature changes during a Run."""
 
-        from kindred.core.mechanism_metadata import MechanismMetadataKeys
+        from kindred.core.mechanism_metadata import MechanismMetadataView
 
-        return self.__mechanism.metadata.get(MechanismMetadataKeys.TEMPERATURE_SCHEDULE)
+        return MechanismMetadataView.from_metadata(self.__mechanism.metadata).temperature_changes
 
     def parameterized_intervention_schedule_for_binding(self) -> InterventionSchedule | None:
         return self.__intervention_schedule
@@ -1106,7 +1106,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
         _admit_inline_initial_conditions(text)
     )
 
-    # Build the temperature schedule after resolving the nominal temperature.
+    # Lower the temperature schedule after resolving the nominal temperature.
     from ..temperature_dsl import TemperatureDSLError, parse_temperature_schedule
     from ..intervention_schedule import _admit_intervention_directives
 
@@ -1187,11 +1187,11 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
                 str(exc), line_number=line_no, line_content=raw,
             ) from exc
 
-    temperature_schedule = None
+    temperature_changes = ()
     if temperature_directive is not None:
         line_no, raw = temperature_directive
         try:
-            temperature_schedule = parse_temperature_schedule(
+            temperature_changes = parse_temperature_schedule(
                 raw, nominal_temperature=temperature_K,
             )
         except TemperatureDSLError as exc:
@@ -1272,7 +1272,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
         energy_unit=str(energy_unit),
         temperature_K=float(temperature_K),
         standard_conc_M=float(standard_conc_M),
-        temperature_schedule=temperature_schedule,
+        temperature_changes=temperature_changes,
         intervention_schedule=intervention_schedule,
         steps=steps,
         inline_initial_conditions=inline_initial_conditions,
@@ -1596,7 +1596,7 @@ def _mechanism_build_input(ir: DSLIR):
         energy_unit=ir.energy_unit,
         temperature_K=ir.temperature_K,
         standard_conc_M=ir.standard_conc_M,
-        temperature_schedule=ir.temperature_schedule,
+        temperature_changes=ir.temperature_changes,
         steps=tuple(ir.steps),
     )
 
@@ -1697,7 +1697,9 @@ def prepare_dsl_request_set(
             intervention_execution = (
                 None
                 if parameterized_intervention_schedule is not None
-                else compile_intervention_schedule(intervention_schedule)
+                else compile_intervention_schedule(
+                    intervention_schedule, temperature_changes=ir.temperature_changes,
+                )
             )
         except InterventionScheduleError as exc:
             # Each of these refusals names its declaration, or the declarations
@@ -1705,7 +1707,9 @@ def prepare_dsl_request_set(
             line_number, line_content = declaration_line(exc, ir.intervention_lines)
             raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
     else:
-        intervention_execution = compile_intervention_schedule(None)
+        intervention_execution = compile_intervention_schedule(
+            None, temperature_changes=ir.temperature_changes,
+        )
     analysis = DslAnalysis(
         origins=_source_origins(
             text,

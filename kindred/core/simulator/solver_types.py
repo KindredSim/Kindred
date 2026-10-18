@@ -9,7 +9,6 @@ import numpy as np
 
 from kindred.core.intervention_schedule_compiler import InterventionExecutionContract
 from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
-from kindred.core.temperature import TemperatureSchedule
 from kindred.core.volume import SimulationBoundaryState, VolumeTrajectory
 
 DEFAULT_SOLVER_NAME = "BDF"
@@ -112,7 +111,6 @@ class SimulationRequest:
     t_eval: Optional[np.ndarray] = None
     grid: Optional[Mapping[str, float | int]] = None
 
-    temperature_schedule: TemperatureSchedule | None = None
     species_names: Optional[Tuple[str, ...]] = None
     cancellation_control: SimulationCancellationControl | None = None
     candidate_evaluation: bool = False
@@ -156,8 +154,8 @@ class FinalSimulationOutput:
         # Its sole producer, the schedule executor, admits these rows: solver
         # segments refuse nonfinite state, every published state is projected
         # nonnegative, rows are appended in strictly increasing time with one
-        # integer segment and discontinuity identity each, temperatures come
-        # from the admitted schedule, and the volume trajectory is sampled on
+        # integer segment and discontinuity identity each, temperatures are
+        # those each row executed at, and the volume trajectory is sampled on
         # these rows.  This carrier only freezes the owned buffers.
         for name in ("t", "Y", "temperature_K", "segment_ids", "discontinuity_ids"):
             getattr(self, name).setflags(write=False)
