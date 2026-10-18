@@ -4,7 +4,7 @@ from __future__ import annotations
 from kindred.core.exceptions import SimulationCancelled
 from kindred.core.quantity_units import convert_value
 from kindred.core.result_repository import SimulationResultValue
-from kindred.core.simulation_parameters import enumerate_simulation_parameters
+from kindred.core.simulation_parameters import derived_parameter_values, enumerate_simulation_parameters
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest, prepare_simulation_run,
     build_simulation_request_from_prepared_run,
@@ -35,6 +35,9 @@ def execute_simulation(
     prepared = prepare_simulation_run(execution_request=execution_request, cancellation_control=cancellation_control)
     solved = solve_ode(build_simulation_request_from_prepared_run(prepared))
     check_cancelled()
+    derived = derived_parameter_values(
+        execution_request.prepared_dsl, prepared.parameter_values_at_temperature, solved,
+    )
     result = finalize_simulation_result(
         result=solved, species_names=list(prepared.species_names),
         initials_for_algebra=prepared.initials_for_algebra, parameter_values_at_temperature=prepared.parameter_values_at_temperature,
@@ -42,6 +45,7 @@ def execute_simulation(
         parameter_classifications=tuple(
             (item.name, item.family, item.role) for item in coordinates
         ),
+        derived_parameters=derived,
         cancellation_control=cancellation_control,
     )
     check_cancelled()

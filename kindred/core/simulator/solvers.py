@@ -11,6 +11,7 @@ SciPy is a hard dependency; all integration routes through `scipy.integrate.solv
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict
 from typing import (
     Any,
     Callable,
@@ -144,7 +145,6 @@ def _build_provenance(req: _SimulationRequest, *, t_eval: np.ndarray) -> Dict[st
         "atol": float(req.atol),
         "grid_type": ("explicit" if req.t_eval is not None else "N"),
         "grid_params": ({"t_eval": list(t_eval)} if req.t_eval is not None else dict(req.grid or {})),
-        "has_temperature_schedule": req.temperature_schedule is not None,
     }
     prov.update(symbolic_jacobian.provenance_fields())
     intervention_execution = req.intervention_execution
@@ -154,8 +154,10 @@ def _build_provenance(req: _SimulationRequest, *, t_eval: np.ndarray) -> Dict[st
             intervention_execution.provenance_projection()
         )
 
-    if req.temperature_schedule is not None:
-        prov["temperature_schedule"] = req.temperature_schedule.to_dict()
+    if intervention_execution.temperature_changes:
+        prov["temperature_changes"] = [
+            asdict(change) for change in intervention_execution.temperature_changes
+        ]
 
     return prov
 

@@ -123,7 +123,7 @@ def _format_mechanism_reference(
 
     temperature_note = (
         " (nominal, runtime schedule defined)"
-        if metadata.temperature_schedule is not None
+        if metadata.temperature_changes
         else ""
     )
     lines = [

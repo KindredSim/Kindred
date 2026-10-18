@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Callable, Mapping
 
+import numpy as np
+
+from kindred.core.algebra.printer import expression_to_source
+from kindred.core.exceptions import KindredError
 from kindred.core.kinetics import ForwardRateModel, forward_rate_family
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.parameter_algebra import (
@@ -13,6 +17,7 @@ from kindred.core.simulator.parameter_coordinates import build_parameter_target_
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.dsl_build_input import source_coordinate_capabilities
 from kindred.core.simulator.step_indexing import get_step_index_map
+from kindred.core.simulator.solver_types import FinalSimulationOutput
 from kindred.core.quantity_units import convert_value
 from kindred.core.units import input_unit_bounds, role_domain
 
@@ -240,3 +245,100 @@ def enumerate_simulation_parameters(
             )
         )
     return tuple(coordinates)
+
+
+@dataclass(frozen=True, slots=True)
+class DerivedParameterValue:
+    """A value Kindred calculates from other values during a Run.
+
+    ``low`` and ``high`` span the values over the temperatures the Run
+    executed at; they are equal when the value does not depend on temperature
+    or the temperature did not change. Both are None when it cannot be
+    calculated.
+    """
+
+    name: str
+    family: str
+    role: str
+    calculated_from: str
+    unit: str
+    low: float | None
+    high: float | None
+
+
+# The rate family of a physical coordinate, as the coordinate roster names it.
+_PHYSICAL_FAMILIES = {
+    "A": "Arrhenius", "Ea": "Arrhenius",
+    "dG_act": "Eyring", "kappa": "Eyring", "degeneracy": "Eyring",
+    "dG_eq": "equilibrium",
+}
+
+
+def derived_parameter_values(
+    prepared_dsl: PreparedDslRequestSet,
+    parameter_values_at_temperature: Callable[[float, tuple[str, ...]], Mapping[str, float]],
+    solved: FinalSimulationOutput,
+) -> tuple[DerivedParameterValue, ...]:
+    """Calculate every derived value over the temperatures a Run executed at.
+
+    Derived values are the rate constants and equilibrium quantities a
+    reaction line calculates, and param lines that calculate a mechanism
+    coordinate or a scalar from other values.
+
+    Between temperature changes the temperature is constant or approaches its
+    target steadily, so its extremes lie on the rows at the start, at each
+    change and at the end; those rows alone give the span, however many
+    output points the Run has.
+    """
+
+    mechanism = prepared_dsl.mutable_mechanism_shell()
+    spec = prepared_dsl.parameter_algebra_spec_for_execution()
+    targets = build_parameter_target_map(mechanism)
+    units = dict(spec.quantity_units)
+    change_times = [change.time for change in solved.intervention_execution.temperature_changes]
+    boundary_rows = np.isin(solved.t, change_times)
+    boundary_rows[[0, -1]] = True
+    executed = tuple(dict.fromkeys(float(value) for value in solved.temperature_K[boundary_rows]))
+    rows: list[DerivedParameterValue] = []
+
+    def add(name: str, family: str, role: str, calculated_from: str) -> None:
+        # A value fixed by temperature is the same at every executed one.
+        at = executed if name in spec.temperature_dependent_names else executed[:1]
+        try:
+            values = [float(parameter_values_at_temperature(temperature, (name,))[name]) for temperature in at]
+        except KindredError:
+            # The Run never read it, or not at every executed temperature.
+            values = []
+        unit = units.get(name)
+        rows.append(DerivedParameterValue(
+            name=name, family=family, role=role, calculated_from=calculated_from,
+            unit="" if unit is None else unit.symbol,
+            low=min(values) if values else None, high=max(values) if values else None,
+        ))
+
+    def classification(name: str) -> tuple[str, str]:
+        route, kind, index, role, _entry = targets[name]
+        if route == "physical":
+            return _PHYSICAL_FAMILIES[role], role
+        if role in {"kr", "Keq"}:
+            return "reverse", role
+        step = mechanism.reactions[index] if kind == "reaction" else mechanism.equilibria[index]
+        return forward_rate_family(step.forward_model), role
+
+    for name, inputs in spec.chemistry_dependencies.items():
+        family, role = classification(name)
+        sources = [item for item in inputs if item != "T"]
+        if role in {"k", "kf"}:
+            calculated_from = f"{', '.join(sources)} ({family})"
+        elif len(sources) == 2:
+            calculated_from = f"{sources[0]} / {sources[1]}"
+        else:
+            calculated_from = f"{sources[0]} (thermodynamic)"
+        add(name, family, role, calculated_from)
+    for statement in spec.parameter_block.lines:
+        kind = spec.parameter_assignment_kind(statement.name)
+        if kind not in {"mechanism-bound", "derived scalar"}:
+            continue
+        family, role = classification(statement.name) if kind == "mechanism-bound" else ("scalar", "scalar")
+        add(statement.name, family, role, expression_to_source(statement.expr))
+    return tuple(rows)

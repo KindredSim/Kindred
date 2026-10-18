@@ -3,7 +3,7 @@ from __future__ import annotations
 from kindred.core.quantity_units import CUBIC_METRE, MOLAR, SECOND, Unit, presentation_unit
 
 from types import MappingProxyType
-from typing import Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 import numpy as np
 
@@ -20,6 +20,9 @@ from kindred.core.algebra.simulation_series import (
     evaluate_algebra_block_for_simulation_partial,
     let_dependency_facts,
 )
+
+if TYPE_CHECKING:
+    from kindred.core.simulation_parameters import DerivedParameterValue
 
 __all__ = [
     "finalize_simulation_result",
@@ -135,6 +138,7 @@ def finalize_simulation_result(
     parameter_algebra_spec: object,
     parameters: tuple[tuple[str, float, str], ...] = (),
     parameter_classifications: tuple[tuple[str, str, str], ...] = (),
+    derived_parameters: tuple[DerivedParameterValue, ...] = (),
     cancellation_control: SimulationCancellationControl | None = None,
 ) -> SimulationResultValue:
     """Admit one solver output through canonical row finalization.
@@ -249,6 +253,7 @@ def finalize_simulation_result(
         scalars=MappingProxyType(finalized_algebra_scalars),
         parameters=parameters,
         parameter_classifications=parameter_classifications,
+        derived_parameters=derived_parameters,
         solver_provenance=frozen_solver_provenance,
         requested_algebra_outputs=requested_algebra_outputs,
         succeeded_algebra_outputs=succeeded_algebra_outputs,

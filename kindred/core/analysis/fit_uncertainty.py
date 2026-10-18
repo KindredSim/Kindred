@@ -318,7 +318,7 @@ def rate_scale_undetermined(
                 or prepared_dsl.intervention_execution_contract().authored)
     if (
         all(item.x_name == "t" for item in datasets)
-        or prepared_dsl.temperature_schedule_for_execution() is not None
+        or prepared_dsl.temperature_changes()
         or any(
             not isinstance(item, InterventionTrigger) or item.min_interval
             for item in schedule.without_stops().operations

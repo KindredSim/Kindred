@@ -7,7 +7,7 @@ from kindred.core.volume import VolumeTrajectory
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
 import numpy as np
 
@@ -17,6 +17,9 @@ from kindred.core.simulation_failure import FactualCause
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
 )
+
+if TYPE_CHECKING:
+    from kindred.core.simulation_parameters import DerivedParameterValue
 
 __all__ = [
     "ResultRepository",
@@ -44,6 +47,7 @@ class SimulationResultValue:
     scalars: Mapping[str, float] = MappingProxyType({})
     parameters: tuple[tuple[str, float, str], ...] = ()
     parameter_classifications: tuple[tuple[str, str, str], ...] = ()
+    derived_parameters: tuple[DerivedParameterValue, ...] = ()
     presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
     quantity_units: tuple[tuple[str, Unit | None], ...] = ()
     presentation_units: tuple[tuple[str, Unit | None], ...] = ()

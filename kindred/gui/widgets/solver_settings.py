@@ -170,7 +170,8 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         self.atol_edit = QtWidgets.QLineEdit("1e-12", science_box)
         self.temperature_spin.setToolTip(
             "Default nominal temperature for this mechanism. An explicit T= directive "
-            "overrides it. Temperature schedules start from the resolved nominal temperature."
+            "overrides it. A temperature schedule uses it before its first listed time, "
+            "and a response schedule starts from it."
         )
         self.standard_conc_edit.setToolTip(
             "Default standard-state concentration in M for Eyring rates and thermodynamic "

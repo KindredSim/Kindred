@@ -29,6 +29,7 @@ from kindred.core.intervention_schedule import (
     intervention_schedule_parameter_dependencies,
     _resolved,
 )
+from kindred.core.temperature import TemperatureChange
 
 __all__ = [
     "ExecutableFlux",
@@ -355,6 +356,9 @@ class InterventionExecutionContract:
     trigger_firings: tuple[TriggerFiring, ...] = ()
     # Scheduled instants left unexecuted at a stopping boundary.
     skipped_instants: tuple[ExecutableInstant, ...] = ()
+    # Temperature changes during the Run, in time order. Each time is an
+    # integration boundary; the changes are not species actions.
+    temperature_changes: tuple[TemperatureChange, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -724,6 +728,7 @@ def compile_intervention_schedule(
     cancellation_check: Callable[[], bool] | None = None,
     dependency_metadata: InterventionScheduleDependencyMetadata | None = None,
     authored: InterventionSchedule | None = None,
+    temperature_changes: tuple[TemperatureChange, ...] = (),
 ) -> InterventionExecutionContract:
     _raise_if_cancelled(cancellation_check)
     schedule_obj = schedule or InterventionSchedule()
@@ -942,6 +947,7 @@ def compile_intervention_schedule(
         discontinuities=tuple(discontinuities),
         segment_identity=segments,
         protocol_lineage=tuple(lineage),
+        temperature_changes=temperature_changes,
     )
 
 

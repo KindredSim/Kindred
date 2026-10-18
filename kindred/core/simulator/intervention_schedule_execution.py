@@ -24,7 +24,7 @@ from kindred.core.intervention_schedule_compiler import (
     validate_boundary_conflicts,
     resolve_executable_values,
 )
-from kindred.core.temperature import declared_temperature_step_boundaries, temperature_at_execution_time
+from kindred.core.temperature import TemperatureSegment, starting_temperature_segment
 from .volume_execution import VolumeExecution
 from kindred.core.volume import SimulationBoundaryState
 from .nonnegative_invariant import (
@@ -159,17 +159,11 @@ class InterventionScheduleExecutionOwner:
 
     def execute(self, request: ScheduleExecutionRequest) -> FinalSimulationOutput:
         req = request.request
-
-        def temperature_at(time, *, side="following"):
-            return temperature_at_execution_time(
-                req.temperature_schedule, req.reference_temperature_K, time, side=side,
-            )
-
         t0, t1 = req.t_span
         t_eval = np.asarray(request.t_eval, dtype=float).reshape(-1)
         contract = req.intervention_execution
         has_stops = any(isinstance(item.then, InterventionStopAction) for item in contract.triggers)
-        dense_segments: list[tuple[SegmentIdentity, Callable[[np.ndarray], np.ndarray], tuple[ExecutableHold, ...], int]] = []
+        dense_segments: list[tuple[SegmentIdentity, Callable[[np.ndarray], np.ndarray], tuple[ExecutableHold, ...], int, TemperatureSegment]] = []
         segment_result = None
         dense = None
         try:
@@ -197,11 +191,25 @@ class InterventionScheduleExecutionOwner:
             segment_projections: dict[str, SegmentProjection] = {}
             segment_count = 0
             discontinuity_id = 0
-            temperature_boundaries = declared_temperature_step_boundaries(
-                req.temperature_schedule,
-                t_start=t0,
-                t_end=t1,
+            # The executor carries the temperature: each segment runs on the
+            # curve in force when it starts, and a change executes at its
+            # boundary like any intervention.
+            temperature = starting_temperature_segment(
+                contract.temperature_changes, req.reference_temperature_K, t0,
             )
+            temperature_changes = {
+                change.time: change
+                for change in contract.temperature_changes
+                if t0 < change.time <= t1
+            }
+
+            def changed_temperature(time: float) -> float | None:
+                nonlocal temperature
+                change = temperature_changes.get(time)
+                if change is None:
+                    return None
+                temperature = temperature.after(change)
+                return temperature(time)
 
             boundaries = {
                 t0,
@@ -211,7 +219,7 @@ class InterventionScheduleExecutionOwner:
                     for value in contract.discontinuities
                     if t0 <= float(value) <= t1
                 ),
-                *temperature_boundaries,
+                *temperature_changes,
             }
             if any(not math.isfinite(value) for value in boundaries):
                 raise InterventionScheduleError(
@@ -220,7 +228,7 @@ class InterventionScheduleExecutionOwner:
             ordered_boundaries = sorted(boundaries)
 
             _raise_if_cancelled(cancellation_check)
-            current_temperature = temperature_at(t0)
+            current_temperature = temperature(t0)
             if contract.initial_volume is not None:
                 volume.initialize(contract.initial_volume, t0, current_temperature)
             initial_state_transaction = t0 in contract.discontinuities
@@ -236,10 +244,8 @@ class InterventionScheduleExecutionOwner:
                 species_index=species_index,
                 cancellation_check=cancellation_check,
                 observable_value=req.stop_observable_value,
-                temperature_step=t0 in temperature_boundaries,
             parameter_values=req.parameter_values_at_temperature, executed_values=executed_values, volume=volume,
                                    temperature_K=current_temperature,
-                                   temperature_at=temperature_at,
                                )
             current_y = initial_boundary.continuation_state
             current_temperature = initial_boundary.temperature_K
@@ -296,11 +302,7 @@ class InterventionScheduleExecutionOwner:
                         parameter_values=req.parameter_values_at_temperature,
                     )
 
-                    def segment_temperature(time, end=sub_end):
-                        return temperature_at(time, side=(
-                            "preceding" if time == end and end in temperature_boundaries
-                            else "following"
-                        ))
+                    segment_temperature = temperature
 
                     # A drained species at zero whose free derivative is not
                     # positive is held at zero like an authored hold; a
@@ -389,7 +391,7 @@ class InterventionScheduleExecutionOwner:
                         t_eval,
                         start=sub_start,
                         end=sub_end,
-                        is_final=(sub_end == t1 and sub_end not in temperature_boundaries),
+                        is_final=(sub_end == t1 and sub_end not in temperature_changes),
                     )
                     if has_stops:
                         requested = np.empty(0, dtype=float)
@@ -480,7 +482,7 @@ class InterventionScheduleExecutionOwner:
                         t_end=actual_segment_end,
                     )
                     if has_stops:
-                        dense_segments.append((segment_output_identity, segment_result.dense_output, active_holds, discontinuity_id))
+                        dense_segments.append((segment_output_identity, segment_result.dense_output, active_holds, discontinuity_id, segment_temperature))
                     _record_segment_projection(
                         segment_projections,
                         segment_result,
@@ -501,9 +503,9 @@ class InterventionScheduleExecutionOwner:
                         "starts_after_discontinuity": bool(
                             segment_starts_after_discontinuity
                         ),
-                        "temperature_step_boundary": (
+                        "starts_at_temperature_change": (
                             segment_count > 0
-                            and sub_start in temperature_boundaries
+                            and sub_start in temperature_changes
                         ),
                         "symbolic_jacobian_used": bool(
                             segment_result.symbolic_jacobian_used
@@ -511,11 +513,7 @@ class InterventionScheduleExecutionOwner:
                     }
                     integration_segments.append(segment_payload)
                     segment_count += 1
-                    current_temperature = (
-                        float(seg_temperature[-1])
-                        if seg_t.size and seg_t[-1] == actual_segment_end
-                        else segment_temperature(actual_segment_end)
-                    )
+                    current_temperature = segment_temperature(actual_segment_end)
                     if trigger_hit is not None:
                         terminal_state = trigger_hit[2]
                     elif purge_hit is not None:
@@ -642,10 +640,8 @@ class InterventionScheduleExecutionOwner:
                                 species_index=species_index,
                                 cancellation_check=cancellation_check,
                                 observable_value=req.stop_observable_value,
-                                temperature_step=sub_end in temperature_boundaries,
                             parameter_values=req.parameter_values_at_temperature, executed_values=executed_values, volume=volume,
                                                   temperature_K=current_temperature,
-                                                  temperature_at=temperature_at,
                                               )
                             current_y = boundary_result.continuation_state
                             current_temperature = boundary_result.temperature_K
@@ -679,10 +675,9 @@ class InterventionScheduleExecutionOwner:
                                 species_index=species_index,
                                 cancellation_check=cancellation_check,
                                 observable_value=req.stop_observable_value,
-                                temperature_step=outer_end in temperature_boundaries,
+                                changed_temperature_K=changed_temperature(outer_end),
                             parameter_values=req.parameter_values_at_temperature, executed_values=executed_values, volume=volume,
                                                   temperature_K=current_temperature,
-                                                  temperature_at=temperature_at,
                                               )
                             current_y = boundary_result.continuation_state
                             current_temperature = boundary_result.temperature_K
@@ -721,7 +716,7 @@ class InterventionScheduleExecutionOwner:
                                 )
                                 segment_starts_after_discontinuity = outer_end < t1
                             elif (
-                                outer_end in temperature_boundaries
+                                outer_end in temperature_changes
                                 and outer_end < t1
                             ):
                                 post_segment_id = (
@@ -776,10 +771,9 @@ class InterventionScheduleExecutionOwner:
                         species_index=species_index,
                         cancellation_check=cancellation_check,
                         observable_value=req.stop_observable_value,
-                        temperature_step=root_time in temperature_boundaries,
+                        changed_temperature_K=changed_temperature(root_time),
                     parameter_values=req.parameter_values_at_temperature, executed_values=executed_values, volume=volume,
                                           temperature_K=current_temperature,
-                                          temperature_at=temperature_at,
                                       )
                     current_y = boundary_result.continuation_state
                     current_temperature = boundary_result.temperature_K
@@ -878,7 +872,7 @@ class InterventionScheduleExecutionOwner:
                 sample_times = final_times[sample_rows]
                 next_sample = 0
 
-                for dense_index, (identity_record, dense, holds, discontinuity) in enumerate(dense_segments):
+                for dense_index, (identity_record, dense, holds, discontinuity, dense_temperature) in enumerate(dense_segments):
                     _raise_if_cancelled(cancellation_check)
                     # An internal endpoint belongs to the following segment. Use
                     # executed bounds: SciPy's last step can extend past a root.
@@ -899,7 +893,7 @@ class InterventionScheduleExecutionOwner:
                         chunk_end = min(sample_start + 256, sample_end)
                         rows = sample_rows[sample_start:chunk_end]
                         selected_times = sample_times[sample_start:chunk_end]
-                        selected_temperatures = _selected_temperatures(selected_times, temperature_at, cancellation_check)
+                        selected_temperatures = _selected_temperatures(selected_times, dense_temperature, cancellation_check)
                         raw_states = dense(selected_times)
                         _raise_if_cancelled(cancellation_check)
                         raw_states = _apply_holds_to_trajectory(
@@ -1245,9 +1239,8 @@ def _apply_boundary(
     species_index: Mapping[str, int],
     cancellation_check: Callable[[], bool] | None,
     observable_value: Callable[[str, float, np.ndarray, float], float] | None = None,
-    temperature_step: bool = False,
+    changed_temperature_K: float | None = None,
     temperature_K: float,
-    temperature_at,
     parameter_values, executed_values: dict, volume,
 ) -> _BoundaryApplicationResult:
     _raise_if_cancelled(cancellation_check)
@@ -1300,13 +1293,16 @@ def _apply_boundary(
             ),
         )
 
-    def crossed_stop(before: np.ndarray, *, before_temperature_K: float | None = None) -> int | None:
+    def crossed_stop(before: np.ndarray, before_temperature_K: float) -> int | None:
+        # A stop the last change of state or temperature crossed.
+        if not stops or (before_temperature_K == temperature_K and np.array_equal(before, current)):
+            return None
         for index in stops:
             trigger = contract.triggers[index]
             previous = _trigger_value(trigger, boundary, before, species_index=species_index,
-                                      observable_value=observable_value, temperature_K=temperature_K if before_temperature_K is None else before_temperature_K)
+                                      observable_value=observable_value, temperature_K=before_temperature_K)
             following = _trigger_value(trigger, boundary, current, species_index=species_index, observable_value=observable_value, temperature_K=temperature_K)
-            previous_threshold = _resolve_items((trigger,), boundary, parameter_values, temperature_K=temperature_K if before_temperature_K is None else before_temperature_K)[0].threshold
+            previous_threshold = _resolve_items((trigger,), boundary, parameter_values, temperature_K=before_temperature_K)[0].threshold
             following_threshold = _resolve_items((trigger,), boundary, parameter_values, temperature_K=temperature_K)[0].threshold
             if _crossed(previous - previous_threshold, following - following_threshold, 0.0, trigger.direction):
                 return index
@@ -1315,22 +1311,22 @@ def _apply_boundary(
     eligible_stops = tuple(index for index in trigger_indices if index in stops)
     if eligible_stops:
         return finish(min(eligible_stops, key=lambda index: contract.triggers[index].declaration_ordinal))
-    if temperature_step:
-        temperature_K = temperature_at(boundary)
+    if changed_temperature_K is not None:
+        # The temperature change executes first; holds in force follow it.
+        before = current.copy()
+        temperature_K = changed_temperature_K
         snapshot()
+        current = _apply_holds(current, tuple(item for item in active_holds if item.start_time < boundary), species_index=species_index, cancellation_check=cancellation_check, time=boundary, temperature_K=temperature_K, parameter_values=parameter_values)
+        snapshot()
+        stop = crossed_stop(before, root_temperature)
+        if stop is not None:
+            return finish(stop)
     if not stops:
         validate_boundary_conflicts(
             instants=_resolve_items(static + trigger_instants, boundary, parameter_values, temperature_K=temperature_K),
             entering_holds=_resolve_items(entering_holds, boundary, parameter_values, temperature_K=temperature_K),
             cancellation_check=cancellation_check,
         )
-    if temperature_step and stops:
-        before_temperature = current.copy()
-        current = _apply_holds(current, tuple(item for item in active_holds if item.start_time < boundary), species_index=species_index, cancellation_check=cancellation_check, time=boundary, temperature_K=temperature_K, parameter_values=parameter_values)
-        snapshot()
-        stop = crossed_stop(before_temperature, before_temperature_K=root_temperature)
-        if stop is not None:
-            return finish(stop)
     executed_entering_holds: list[ExecutableHold] = []
     held_indices: set[int] = set()
     stages = (
@@ -1369,10 +1365,9 @@ def _apply_boundary(
                 current = _apply_holds(current, (action,), species_index=species_index, cancellation_check=cancellation_check, time=boundary, temperature_K=temperature_K, parameter_values=parameter_values)
                 held_indices.add(species_index[action.species])
             snapshot()
-            if stops and not np.array_equal(before, current):
-                stop = crossed_stop(before)
-                if stop is not None:
-                    return finish(stop)
+            stop = crossed_stop(before, temperature_K)
+            if stop is not None:
+                return finish(stop)
     return finish()
 
 

@@ -1,30 +1,26 @@
 """
 Temperature schedule DSL parsing for Kindred.
 
-Supports parsing temperature schedule definitions from DSL text:
-- temp_step: t=[0,50,100], T=[298,320]  (piecewise steps)
+Lowers one temperature schedule line to the temperature changes the
+intervention schedule executor applies:
+- temp_step: t=[0,50,100], T=[298,320]  (steps)
 - temp_response: t=[0,50,100], T=[298,320], tau=10  (first-order response)
 
-Integrates with TemperatureSchedule class from kindred.core.temperature.
-
 Example DSL:
-    # Piecewise temperature schedule
     temp_step: t=[0,50,100,150], T=[298,320,310]
-    # Creates intervals: [0,50)→298K, [50,100)→320K, [100,150)→310K;
-    # the final 310K temperature continues after t=150.
+    # 298 K from t=0, 320 K from t=50 and 310 K from t=100; the final
+    # 310 K continues after t=150.
 """
 
 from __future__ import annotations
 
-import logging
 import re
 from typing import List
 
 from .authored_source_errors import AuthoredSourceError
-from .temperature import TemperatureSchedule, TemperatureScheduleError
+from .species import validate_input_time_seconds, validate_temperature
+from .temperature import TemperatureChange
 from .validation import parse_finite_numeric_text
-
-logger = logging.getLogger(__name__)
 
 __all__ = ["parse_temperature_schedule", "TemperatureDSLError"]
 
@@ -146,39 +142,15 @@ def _parse_directive_fields(
 def parse_temperature_schedule(
     directive_line: str,
     *,
-    nominal_temperature: float = 298.15,
-) -> TemperatureSchedule:
+    nominal_temperature: float,
+) -> tuple[TemperatureChange, ...]:
     """
-    Parse one admitted temperature schedule directive.
+    Lower one admitted temperature schedule directive to its changes.
 
-    Recognizes:
-    - temp_step: t=[0,50,100], T=[298,320]  (piecewise)
-    - temp_response: t=[0,50,100], T=[298,320], tau=10
-
-    Parameters
-    ----------
-    directive_line : str
-        One top-level temperature schedule directive already admitted by the
-        simulator DSL owner.
-
-    Returns
-    -------
-    TemperatureSchedule
-        Parsed schedule
-
-    Raises
-    ------
-    TemperatureDSLError
-        If temperature schedule syntax is invalid
-
-    Examples
-    --------
-    >>> dsl = "temp_step: t=[0,50,100], T=[298,320]"
-    >>> schedule = parse_temperature_schedule(dsl)
-    >>> schedule(25.0)
-    298.0
-    >>> schedule(75.0)
-    320.0
+    Each temperature applies from its time until the next one; the final one
+    continues after the last time.  Before the first time the nominal
+    temperature applies.  A change to the temperature already in force is no
+    change and is left out.
     """
     lines = directive_line.splitlines()
     if len(lines) != 1:
@@ -186,113 +158,44 @@ def parse_temperature_schedule(
             "Temperature schedule parsing requires exactly one admitted directive."
         )
     line = lines[0].strip()
-    lower = line.lower()
-    if lower.startswith('temp_step:'):
-        return _parse_piecewise_temperature(
-            line,
-            nominal_temperature=nominal_temperature,
+    syntax_name = line.partition(":")[0].strip().lower()
+    if syntax_name not in {"temp_step", "temp_response"}:
+        raise TemperatureDSLError(
+            "Expected one admitted temp_step: or temp_response: directive."
         )
-    if lower.startswith('temp_response:'):
-        return _parse_response_temperature(
-            line,
-            nominal_temperature=nominal_temperature,
-        )
-    raise TemperatureDSLError(
-        "Expected one admitted temp_step: or temp_response: directive."
-    )
-
-def _parse_piecewise_temperature(
-    line: str,
-    *,
-    nominal_temperature: float,
-) -> TemperatureSchedule:
-    """
-    Parse piecewise temperature line.
-
-    Format: temp_step: t=[0,50,100], T=[298,320]
-
-    Creates intervals:
-    - [0, 50) → 298 K
-    - [50, 100) → 320 K
-    - [100, inf) → 320 K (the final temperature continues)
-
-    Parameters
-    ----------
-    line : str
-        DSL line
-
-    Returns
-    -------
-    TemperatureSchedule
-        Piecewise temperature schedule
-    """
+    response = syntax_name == "temp_response"
     fields = _parse_directive_fields(
         line,
-        syntax_name="temp_step",
-        expected_fields=frozenset({"t", "T"}),
+        syntax_name=syntax_name,
+        expected_fields=frozenset({"t", "T", "tau"} if response else {"t", "T"}),
     )
-    times = _parse_number_list(fields["t"], field="temp_step t")
-    temperatures = _parse_number_list(fields["T"], field="temp_step T")
-
-    # Validate
-    if len(times) < 2:
-        raise TemperatureDSLError("t needs at least two time points.")
-
-    if len(temperatures) != len(times) - 1:
-        raise TemperatureDSLError("T must have one temperature fewer than t has time points.")
-
-    # Build intervals: [(t_start, t_end, T), ...]
-    intervals = []
-    for i in range(len(temperatures)):
-        t_start = times[i]
-        t_end = times[i + 1]
-        temp = temperatures[i]
-        intervals.append((t_start, t_end, temp))
-
-    logger.info(f"Parsed piecewise temperature schedule with {len(intervals)} intervals")
-    for t_start, t_end, temp in intervals:
-        logger.debug(f"  t ∈ [{t_start}, {t_end}): T = {temp} K")
-
-    try:
-        return TemperatureSchedule.piecewise(
-            intervals,
-            baseline_temperature=nominal_temperature,
-        )
-    except TemperatureScheduleError as e:
-        raise TemperatureDSLError(str(e)) from e
-
-
-def _parse_response_temperature(
-    line: str,
-    *,
-    nominal_temperature: float,
-) -> TemperatureSchedule:
-    """
-    Parse first-order response temperature line.
-
-    Format: temp_response: t=[0,50,100], T=[298,320], tau=10
-    """
-    fields = _parse_directive_fields(
-        line,
-        syntax_name="temp_response",
-        expected_fields=frozenset({"t", "T", "tau"}),
-    )
-    times = _parse_number_list(fields["t"], field="temp_response t")
-    temperatures = _parse_number_list(
-        fields["T"], field="temp_response T"
-    )
-    tau = _parse_finite_number(fields["tau"], field="temp_response tau")
+    times = _parse_number_list(fields["t"], field=f"{syntax_name} t")
+    temperatures = _parse_number_list(fields["T"], field=f"{syntax_name} T")
     if len(times) < 2:
         raise TemperatureDSLError("t needs at least two time points.")
     if len(temperatures) != len(times) - 1:
         raise TemperatureDSLError("T must have one temperature fewer than t has time points.")
-
     try:
-        return TemperatureSchedule.response(
-            times,
-            temperatures,
-            tau=tau,
-            baseline_temperature=nominal_temperature,
+        times = [validate_input_time_seconds(time, field="t") for time in times]
+        temperatures = [validate_temperature(value, field="T") for value in temperatures]
+        tau = (
+            validate_input_time_seconds(
+                _parse_finite_number(fields["tau"], field="temp_response tau"),
+                field="tau", allow_zero=False,
+            )
+            if response else None
         )
-    except TemperatureScheduleError as e:
-        raise TemperatureDSLError(str(e)) from e
+    except ValueError as exc:
+        raise TemperatureDSLError(str(exc)) from exc
+    for earlier, later in zip(times, times[1:]):
+        if later <= earlier:
+            raise TemperatureDSLError(
+                f"Each time in t must be greater than the one before it ({later:g} s follows {earlier:g} s)."
+            )
+    changes: list[TemperatureChange] = []
+    current = nominal_temperature
+    for time, temperature in zip(times, temperatures):
+        if temperature != current:
+            changes.append(TemperatureChange(time, temperature, tau))
+            current = temperature
+    return tuple(changes)
