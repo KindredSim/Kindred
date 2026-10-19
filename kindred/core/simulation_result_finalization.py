@@ -261,6 +261,10 @@ def finalize_simulation_result(
         algebra_errors=finalized_algebra_errors,
         intervention_execution=getattr(result, "intervention_execution"),
         presentation_boundaries=result.presentation_boundaries,
+        species_ctc=(
+            None if result.species_ctc is None
+            else MappingProxyType(dict(zip(base_species_names, map(float, result.species_ctc))))
+        ),
         volume=result.volume,
         termination=result.termination,
     )

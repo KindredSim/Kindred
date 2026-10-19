@@ -117,6 +117,9 @@ class SimulationRequest:
     # Also return the solver's accepted steps as rows, so the curve between
     # rows is a straight line across one solver step (measured-X Fit).
     sample_solver_steps: bool = False
+    # Also return each species' CTC over the executed span, integrated on the
+    # solver's own step interpolant (Run and Preview without interventions).
+    species_ctc: bool = False
     stop_observable_value: Callable[[str, float, np.ndarray, float], float] | None = None
 
     def __post_init__(self) -> None:
@@ -149,6 +152,9 @@ class FinalSimulationOutput:
     presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
     termination: SimulationTermination
     volume: VolumeTrajectory | None = None
+    # Per species row, the integral of concentration minus its final state over
+    # the executed span; present only when requested.
+    species_ctc: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         # Its sole producer, the schedule executor, admits these rows: solver

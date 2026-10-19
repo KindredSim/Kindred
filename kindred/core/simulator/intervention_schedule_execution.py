@@ -88,6 +88,8 @@ class SegmentRunResult:
     event_state_projection: NonnegativeProjection
     symbolic_jacobian_used: bool = False
     dense_output: Callable[[np.ndarray], np.ndarray] | None = None
+    # Each species' integral of concentration minus this segment's end state.
+    species_ctc: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         # The solver adapter builds aligned rows and projects them nonnegative.
@@ -187,6 +189,10 @@ class InterventionScheduleExecutionOwner:
             output_segment_keys: list[tuple[str, ...]] = []
             output_discontinuity_ids: list[np.ndarray] = []
             presentation_boundaries: list[SimulationPresentationBoundary] = []
+            # (length, end state, CTC from that end state) of each segment.
+            ctc_segments: list[tuple[float, np.ndarray, np.ndarray]] | None = (
+                [] if req.species_ctc else None
+            )
             integration_segments: list[dict[str, object]] = []
             segment_projections: dict[str, SegmentProjection] = {}
             segment_count = 0
@@ -423,6 +429,10 @@ class InterventionScheduleExecutionOwner:
                         )
                     )
                     _raise_if_cancelled(cancellation_check)
+                    if ctc_segments is not None:
+                        ctc_segments.append(
+                            (sub_end - sub_start, segment_result.Y[:, -1], segment_result.species_ctc)
+                        )
                     event_times = segment_result.event_times
                     event_states = segment_result.raw_event_states
                     trigger_hit = (
@@ -961,11 +971,21 @@ class InterventionScheduleExecutionOwner:
                 provenance,
                 segment_projections,
             )
+            species_ctc = None
+            if ctc_segments is not None:
+                # Without interventions concentrations are continuous across
+                # segments; rebase each segment's CTC on the run's final state.
+                final_state = output_y[:, -1]
+                species_ctc = sum(
+                    ctc + length * (end - final_state)
+                    for length, end, ctc in ctc_segments
+                )
             _raise_if_cancelled(cancellation_check)
             return FinalSimulationOutput(
                 t=output_t,
                 Y=output_y,
                 volume=volume.trajectory(output_t),
+                species_ctc=species_ctc,
                 temperature_K=output_temperature,
                 provenance=provenance,
                 intervention_execution=final_contract,

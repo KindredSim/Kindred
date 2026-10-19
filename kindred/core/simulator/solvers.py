@@ -225,7 +225,7 @@ def _execute_scipy(
         base_kwargs["atol"] = np.append(np.full(species_count, req.atol), req.atol * volume.initial_value)
     from kindred.core.intervention_schedule import InterventionStopAction
     retain_dense = volume is not None or any(isinstance(item.then, InterventionStopAction) for item in req.intervention_execution.triggers)
-    dense_output = retain_dense or req.sample_solver_steps
+    dense_output = retain_dense or req.sample_solver_steps or req.species_ctc
     if dense_output:
         base_kwargs["dense_output"] = True
     boundary_events = tuple(boundary_events)
@@ -442,6 +442,7 @@ def _execute_scipy(
             raw_trajectory,
             context="Simulation",
         )
+        species_ctc = _step_ctc(local_dense, Y_out[:, -1]) if req.species_ctc else None
         event_count = len(boundary_events)
         event_times = tuple(
             tuple(absolute(value) for value in values)
@@ -473,10 +474,29 @@ def _execute_scipy(
             dense_output=((lambda times, dense=dense: dense(times)[:species_count]) if volume is not None
                           else dense if retain_dense else None),
             symbolic_jacobian_used=jac_callable is not None,
+            species_ctc=species_ctc,
         )
     finally:
         if dense_output:
             sol.sol = None
+
+
+_GAUSS_NODES, _GAUSS_WEIGHTS = np.polynomial.legendre.leggauss(3)
+
+
+def _step_ctc(dense, end: np.ndarray) -> np.ndarray:
+    # Integrate each species minus its segment end state directly, so a species
+    # that never changes integrates to exactly zero.  BDF and Radau interpolate
+    # each accepted step with a polynomial of degree at most five, which
+    # three-point Gauss-Legendre integrates exactly.  Concentrations are
+    # projected nonnegative as published, so a used-up species' small negative
+    # solver tail adds nothing.
+    starts, ends = dense.ts[:-1], dense.ts[1:]
+    half = 0.5 * (ends - starts)
+    nodes = (0.5 * (starts + ends))[:, None] + half[:, None] * _GAUSS_NODES
+    values, _ = project_nonnegative_trajectory(dense(nodes.ravel()), context="CTC")
+    values = values.reshape(-1, starts.size, _GAUSS_NODES.size)
+    return ((values - end[:, None, None]) @ _GAUSS_WEIGHTS) @ half
 
 
 def _run_scipy_segment(request: SegmentExecutionRequest) -> SegmentRunResult:

@@ -18,8 +18,14 @@ def execute_simulation(
     execution_request: SimulationExecutionRequest,
     *,
     cancellation_control: SimulationCancellationControl | None = None,
+    species_ctc: bool = False,
 ) -> SimulationResultValue:
-    """Prepare, solve, and finalize without application or GUI ownership."""
+    """Prepare, solve, and finalize without application or GUI ownership.
+
+    ``species_ctc`` asks for each species' cumulative temporal concentration,
+    which a Run with interventions other than temperature changes never
+    carries.
+    """
     def check_cancelled() -> None:
         if cancellation_control is not None and cancellation_control.cancel_requested():
             raise SimulationCancelled()
@@ -33,7 +39,10 @@ def execute_simulation(
     parameters = tuple((item.name, convert_value(overrides.get(item.name, item.value), inputs[item.name], quantities[item.name]), quantities[item.name].symbol) for item in coordinates)
     # Preparation resolves and compiles every schedule, an empty one included.
     prepared = prepare_simulation_run(execution_request=execution_request, cancellation_control=cancellation_control)
-    solved = solve_ode(build_simulation_request_from_prepared_run(prepared))
+    solved = solve_ode(build_simulation_request_from_prepared_run(
+        prepared,
+        species_ctc=species_ctc and prepared.intervention_execution.is_empty,
+    ))
     check_cancelled()
     derived = derived_parameter_values(
         execution_request.prepared_dsl, prepared.parameter_values_at_temperature, solved,
