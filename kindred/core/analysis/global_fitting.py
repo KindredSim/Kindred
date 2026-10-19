@@ -54,6 +54,7 @@ def fit_global(
     xtol: float,
     seed: Optional[int] = None,
     progress_callback: Callable[[_fit_execution.FitProgress], None],
+    search_evaluations_callback: Callable[[int], None],
     cancellation_check: Optional[Callable[[], bool]] = None,
     cancellation_control: SimulationCancellationControl | None = None,
     stop_check: Callable[[], bool],
@@ -68,7 +69,9 @@ def fit_global(
 
     After the fit, it checks for fitted values the data do not determine
     within their bounds, and for a rate scale they do not determine, and runs
-    the requested Profile likelihood.
+    the requested Profile likelihood.  ``search_evaluations_callback``
+    receives the primary optimizer's known objective-call count, as
+    :func:`fit_parameters` reports it.
     """
 
     # The Fit setup admits the method and evaluation budget (Fit defaults), and
@@ -111,6 +114,8 @@ def fit_global(
     )
     def new_objective(
         progress: Optional[Callable[[_fit_execution.FitProgress], None]] = None,
+        *,
+        honor_stop: bool = True,
     ) -> _fit_execution.GlobalFitObjective:
         return _fit_execution.GlobalFitObjective(
             fit_evaluators=evaluators,
@@ -120,8 +125,8 @@ def fit_global(
             layout=layout,
             penalty_value=penalty_value,
             progress_callback=progress,
-            cancellation_check=active_cancelled,
-            cancellation_control=active_control,
+            cancellation_check=active_cancelled if honor_stop else hard_cancelled,
+            cancellation_control=active_control if honor_stop else cancellation_control,
             executor=executor,
         )
 
@@ -141,6 +146,7 @@ def fit_global(
             ftol=ftol,
             xtol=xtol,
             cancellation_check=active_cancelled,
+            search_evaluations_callback=search_evaluations_callback,
         )
         ending = "converged" if optimizer_result.success else "not_converged"
         message = optimizer_result.message
@@ -212,7 +218,6 @@ def fit_global(
     # normalized weights, cancellation owner, and immutable captures.
     terminal_objective = new_objective()
     profile_result: ProfileLikelihoodResult | None = None
-    optional_analysis_stopped = primary_stopped
     terminal_parameters = {
         key: float(vector[index])
         for index, key in enumerate(keys)
@@ -223,6 +228,8 @@ def fit_global(
     base_residuals.setflags(write=False)
     # The noise model and the bound check evaluate on their own objective,
     # so their probes never change the penalty scale Profile refits use.
+    # They belong to the fit's result, so they finish on Stop; only hard
+    # cancellation ends them.
     noise = None
     noise_failure: Exception | None = None
     undetermined: tuple[_fit_execution.FitCoordinate, ...] = ()
@@ -231,7 +238,7 @@ def fit_global(
             # The post-fit stage starts here, so the progress says so
             # before the noise model and the bound check run.
             extension_progress_callback(FitExtensionProgress(status="running", stage="primary_complete"))
-            analysis_objective = new_objective()
+            analysis_objective = new_objective(honor_stop=False)
             noise = profile_noise_model(
                 objective=analysis_objective, vector=vector, keys=keys,
                 bounds=layout.bounds_dict(), dataset_info=result.dataset_info,
@@ -243,11 +250,7 @@ def fit_global(
                     base_residuals=base_residuals, cutoffs=noise.cutoffs,
                 )
         except (FittingCancelled, SimulationCancelled):
-            if hard_cancelled():
-                raise
-            optional_analysis_stopped = True
-            noise = None
-            undetermined = ()
+            raise
         except Exception as exc:
             # A fatal evaluation next to the estimate leaves the fit itself
             # intact; Profile then reports the actual cause.
@@ -268,7 +271,7 @@ def fit_global(
         if coordinate.scope == "group"
     }
     optimizer_keys = {target: key for key, target in group_targets.items()}
-    if profile_likelihood is not None and optional_analysis_stopped:
+    if profile_likelihood is not None and (primary_stopped or stop_check()):
         stopped_profile = profile_likelihood_settlement_result(
             config=profile_likelihood, status="stopped", cause=None,
         )

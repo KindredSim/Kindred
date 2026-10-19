@@ -447,7 +447,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._summary_body = ""
         self._summary_provenance = ""
         self._stale = False
-        self._progress = 0
+        self._progress = (0, 1)
         self._dark_mode = False
         self._copy_allowed = True
         self._curves: tuple[FitCurveDataset, ...] = ()
@@ -506,15 +506,17 @@ class RunResultsTab(QtWidgets.QWidget):
         self._refresh_summary()
         return self.copy_eligible()
 
-    def set_progress(self, value: int) -> None:
-        self._progress = value
+    def set_progress(self, done: int, total: int) -> None:
+        self._progress = (done, total)
         self._refresh_summary()
 
     def _summary_html(self) -> tuple[str, str]:
         """The Results and Provenance documents."""
         body = self._summary_body or self._tracker_panel.summary_html()
-        if not self._summary_body:
-            body += f"<p>Progress: {self._progress}%</p>"
+        done, total = self._progress
+        # A phase with no known end shows no percentage.
+        if not self._summary_body and total:
+            body += f"<p>Progress: {100 * done // total}%</p>"
         if self._stale:
             body = f"<p><b>{html.escape(STALE_RESULTS_TEXT)}</b></p>" + body
         return body, self._summary_provenance
@@ -634,7 +636,7 @@ class RunResultsTab(QtWidgets.QWidget):
 
     def set_waiting(self, request: FitExecutionRequest) -> None:
         self.clear_candidate()
-        self._progress = 0
+        self._progress = (0, 0)
         self._tracker_panel.start(
             request.setup,
             len(request.dispatch.included_dataset_ids),
@@ -646,7 +648,7 @@ class RunResultsTab(QtWidgets.QWidget):
     def restart_waiting(self) -> None:
         """Wait again for the running request the tracker already holds."""
         self.clear_candidate()
-        self._progress = 0
+        self._progress = (0, 0)
         self._tracker_panel.restart()
         if self._summary_dialog is not None and self._summary_dialog.isVisible():
             self._summary_dialog.refresh(self._summary_html(), reset=True)

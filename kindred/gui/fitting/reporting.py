@@ -53,7 +53,6 @@ __all__ = [
     "fit_candidate_presentation",
     "fit_identity_text",
     "fit_overview",
-    "fit_completion_presentation",
     "fit_live_presentation",
 ]
 
@@ -749,22 +748,19 @@ def fit_overview(phase: str, model: str, objective: str, datasets: int, fitted_v
 FitValueEntry = tuple[tuple[str, ...], str, str, str, float, str]
 
 
-def fit_completion_presentation(candidate: FitCandidate) -> tuple[str, bool]:
-    """Describe typed settlement facts and whether execution reached completion."""
+def _fit_completion_text(candidate: FitCandidate) -> str:
+    """Describe typed settlement facts."""
     result = candidate.result
-    stopped = result.ending == "stopped"
-    text = ("Fit stopped · Best complete candidate retained" if stopped else
+    text = ("Fit stopped · Best complete candidate retained" if result.ending == "stopped" else
             "Fit converged" if result.ending == "converged" and not result.endpoint_replaced else
             "Fit finished · Optimizer did not converge")
-    complete = not stopped
     analysis = result.profile_likelihood_result
     if analysis is not None:
         status = analysis.status
         if analysis.provenance.get("settlement") == "not_started_after_stop":
             status = "not started after Stop"
-        complete = complete and status == "available"
         text += f" · Profile {'complete' if status == 'available' else status}"
-    return text, complete
+    return text
 
 
 def fit_live_presentation(
@@ -833,7 +829,7 @@ def fit_candidate_presentation(
     result = candidate.result
     shared, individual = _estimate_rows(candidate)
     rows = shared + individual + _initial_rows(candidate)
-    phase, _complete = fit_completion_presentation(candidate)
+    phase = _fit_completion_text(candidate)
     model = candidate.origin.tab_name
     objective = _metric_text(_metric(result.weighted_residual_sse))
     fitted_values = len(candidate.request.dispatch.ordinary_optimizer_layout.opt_param_keys())

@@ -545,10 +545,8 @@ def profile_likelihood_result(
         for coordinate, (low, high) in bound_map.items()
     }
     options = config.options
-    planned_work = len(config.parameter_names) * 2 * (
-        options.max_bracketing_steps_per_side + 64
-    )
-    work_done = 0
+    planned_sides = 2 * len(config.parameter_names)
+    completed_sides = 0
     active_coordinate: str | None = None
     active_side: str | None = None
     active_discovery: int | None = None
@@ -571,8 +569,8 @@ def profile_likelihood_result(
                 side=side,
                 discovery_step=discovery_step,
                 refinement_step=refinement_step,
-                completed_work=work_done,
-                planned_work=planned_work,
+                completed_sides=completed_sides,
+                planned_sides=planned_sides,
             )
         )
 
@@ -630,7 +628,7 @@ def profile_likelihood_result(
             side: str,
             bound: float,
         ) -> tuple[float | None, ProfileLikelihoodEndpoint]:
-            nonlocal work_done, active_side, active_discovery, active_refinement
+            nonlocal active_side, active_discovery, active_refinement
             active_side = side
             if bound == best:
                 # The estimate sits on this side's bound, so the search range
@@ -671,7 +669,7 @@ def profile_likelihood_result(
                 refinement_step: int | None,
                 warm_start: Mapping[str, float],
             ) -> tuple[Mapping[str, object], object | None]:
-                nonlocal work_done, active_discovery, active_refinement
+                nonlocal active_discovery, active_refinement
                 if cancellation_check():
                     raise FittingCancelled()
                 fit = fit_parameters_with_fixed(
@@ -685,7 +683,6 @@ def profile_likelihood_result(
                     xtol=xtol,
                     cancellation_check=cancellation_check,
                 )
-                work_done += 1
                 active_discovery = discovery_step
                 active_refinement = refinement_step
                 emit_progress(
@@ -813,6 +810,9 @@ def profile_likelihood_result(
         for side, bound in (("lower", low), ("upper", high)):
             try:
                 side_results[side] = side_profile(side, bound)
+                completed_sides += 1
+                # The count shows now, not after the next side's first refit.
+                emit_progress(stage="side", coordinate=active_coordinate, side=side)
             except (FittingCancelled, SimulationCancelled):
                 raise
             except Exception as exc:
