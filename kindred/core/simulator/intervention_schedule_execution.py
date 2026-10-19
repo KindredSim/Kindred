@@ -178,8 +178,8 @@ class InterventionScheduleExecutionOwner:
                 if req.cancellation_control is not None
                 else None
             )
-            trigger_counts = [0 for _ in contract.triggers]
-            trigger_last_times: list[float | None] = [None for _ in contract.triggers]
+            # Each trigger's latest firing: its count, time and watched value.
+            trigger_last_firings: list[TriggerFiring | None] = [None for _ in contract.triggers]
             trigger_firings: list[TriggerFiring] = []
             executed_values: dict[ExecutableInstant, ExecutableInstant] = {}
             outputs_t: list[np.ndarray] = []
@@ -244,8 +244,7 @@ class InterventionScheduleExecutionOwner:
                 contract=contract,
                 trigger_indices=(),
                 trigger_state=None,
-                trigger_counts=trigger_counts,
-                trigger_last_times=trigger_last_times,
+                trigger_last_firings=trigger_last_firings,
                 trigger_firings=trigger_firings,
                 species_index=species_index,
                 cancellation_check=cancellation_check,
@@ -295,8 +294,7 @@ class InterventionScheduleExecutionOwner:
                         contract.triggers,
                         segment_start=sub_start,
                         segment_end=outer_end,
-                        trigger_counts=trigger_counts,
-                        trigger_last_times=trigger_last_times,
+                        trigger_last_firings=trigger_last_firings,
                     )
                     sub_end = outer_end if next_rearm is None else float(next_rearm)
                     active_fluxes = _active_fluxes(contract, sub_start)
@@ -344,7 +342,7 @@ class InterventionScheduleExecutionOwner:
                     trigger_callables, trigger_mapping = _trigger_callables(
                         contract.triggers, species_index=species_index,
                         segment_start=sub_start, segment_state=current_y,
-                        trigger_counts=trigger_counts, trigger_last_times=trigger_last_times,
+                        trigger_last_firings=trigger_last_firings,
                         observable_value=req.stop_observable_value,
                         temperature_at=segment_temperature,
                         parameter_values=req.parameter_values_at_temperature, holds=active_holds,
@@ -435,21 +433,16 @@ class InterventionScheduleExecutionOwner:
                         )
                     event_times = segment_result.event_times
                     event_states = segment_result.raw_event_states
-                    trigger_hit = (
-                        _first_trigger_hit(
-                            event_times,
-                            event_states,
-                            trigger_mapping=trigger_mapping,
-                        )
+                    trigger_hit = _first_hit(
+                        event_times, event_states, mapping=trigger_mapping,
                     )
-                    purge_hit = (
-                        _first_purge_hit(
-                            event_times,
-                            event_states,
-                            purge_mapping=purge_mapping,
-                            event_offset=len(trigger_observers),
-                        )
+                    purge_hit = _first_hit(
+                        event_times, event_states, mapping=purge_mapping,
+                        event_offset=len(trigger_observers),
                     )
+                    # A located zero places its drained species exactly at zero.
+                    if purge_hit is not None:
+                        purge_hit[2][list(purge_hit[1])] = 0.0
                     if (
                         trigger_hit is not None
                         and purge_hit is not None
@@ -570,18 +563,9 @@ class InterventionScheduleExecutionOwner:
                     emit_t = seg_t[emit_mask]
                     emit_y = seg_y[:, emit_mask]
                     emit_temperature = seg_temperature[emit_mask]
-                    if trigger_hit is not None:
-                        emit_mask = emit_t < float(trigger_hit[0])
-                        emit_t = emit_t[emit_mask]
-                        emit_y = emit_y[:, emit_mask]
-                        emit_temperature = emit_temperature[emit_mask]
-                    elif purge_hit is not None:
-                        emit_mask = emit_t < float(purge_hit[0])
-                        emit_t = emit_t[emit_mask]
-                        emit_y = emit_y[:, emit_mask]
-                        emit_temperature = emit_temperature[emit_mask]
-                    elif scheduled_discontinuity:
-                        emit_mask = emit_t < float(sub_end)
+                    # A root or a scheduled discontinuity emits its own row.
+                    if trigger_hit is not None or purge_hit is not None or scheduled_discontinuity:
+                        emit_mask = emit_t < actual_segment_end
                         emit_t = emit_t[emit_mask]
                         emit_y = emit_y[:, emit_mask]
                         emit_temperature = emit_temperature[emit_mask]
@@ -644,8 +628,7 @@ class InterventionScheduleExecutionOwner:
                                 contract=contract,
                                 trigger_indices=(),
                                 trigger_state=None,
-                                trigger_counts=trigger_counts,
-                                trigger_last_times=trigger_last_times,
+                                trigger_last_firings=trigger_last_firings,
                                 trigger_firings=trigger_firings,
                                 species_index=species_index,
                                 cancellation_check=cancellation_check,
@@ -679,8 +662,7 @@ class InterventionScheduleExecutionOwner:
                                 contract=contract,
                                 trigger_indices=(),
                                 trigger_state=None,
-                                trigger_counts=trigger_counts,
-                                trigger_last_times=trigger_last_times,
+                                trigger_last_firings=trigger_last_firings,
                                 trigger_firings=trigger_firings,
                                 species_index=species_index,
                                 cancellation_check=cancellation_check,
@@ -775,8 +757,7 @@ class InterventionScheduleExecutionOwner:
                         contract=contract,
                         trigger_indices=trigger_indices,
                         trigger_state=root_state,
-                        trigger_counts=trigger_counts,
-                        trigger_last_times=trigger_last_times,
+                        trigger_last_firings=trigger_last_firings,
                         trigger_firings=trigger_firings,
                         species_index=species_index,
                         cancellation_check=cancellation_check,
@@ -1253,8 +1234,7 @@ def _apply_boundary(
     contract: InterventionExecutionContract,
     trigger_indices: Sequence[int],
     trigger_state: np.ndarray | None,
-    trigger_counts: list[int],
-    trigger_last_times: list[float | None],
+    trigger_last_firings: list[TriggerFiring | None],
     trigger_firings: list[TriggerFiring],
     species_index: Mapping[str, int],
     cancellation_check: Callable[[], bool] | None,
@@ -1286,15 +1266,16 @@ def _apply_boundary(
 
     def record(index: int, action=None) -> None:
         trigger = contract.triggers[index]
-        trigger_counts[index] += 1
-        trigger_last_times[index] = boundary
+        last = trigger_last_firings[index]
         action_payload = trigger.then.to_payload() if action is None else action.to_payload()
-        trigger_firings.append(TriggerFiring(
+        firing = TriggerFiring(
             declaration_ordinal=trigger.declaration_ordinal, condition=trigger.condition,
             threshold=_resolve_items((trigger,), boundary, parameter_values, temperature_K=root_temperature if index in trigger_indices else temperature_K)[0].threshold, direction=trigger.direction, root_time=boundary,
             event_state=_project_public_event_state({name: float((current if isinstance(trigger.then, InterventionStopAction) else exact_root)[position]) for name, position in species_index.items()}),
-            firing_ordinal=trigger_counts[index], nested_action_payload=action_payload,
-        ))
+            firing_ordinal=1 if last is None else last.firing_ordinal + 1, nested_action_payload=action_payload,
+        )
+        trigger_last_firings[index] = firing
+        trigger_firings.append(firing)
 
     def finish(stop: int | None = None) -> _BoundaryApplicationResult:
         snapshot()
@@ -1724,21 +1705,16 @@ def _trigger_direction(direction: str) -> float:
 
 
 def _next_eligible_time(
-    trigger: ExecutableTrigger,
-    *,
-    index: int,
-    counts: Sequence[int],
-    last_times: Sequence[float | None],
+    trigger: ExecutableTrigger, last: TriggerFiring | None,
 ) -> float | None:
     if isinstance(trigger.then, InterventionStopAction):
         return -math.inf
-    if counts[index] >= trigger.max_count:
-        return None
-    last = last_times[index]
     if last is None:
         return -math.inf
-    added = float(last) + trigger.min_interval
-    return max(added, float(np.nextafter(float(last), np.inf)))
+    if last.firing_ordinal >= trigger.max_count:
+        return None
+    # Without a minimum interval a trigger re-arms at its own firing.
+    return last.root_time + trigger.min_interval
 
 
 def _trigger_callables(
@@ -1747,8 +1723,7 @@ def _trigger_callables(
     species_index: Mapping[str, int],
     segment_start: float,
     segment_state: np.ndarray,
-    trigger_counts: Sequence[int],
-    trigger_last_times: Sequence[float | None],
+    trigger_last_firings: Sequence[TriggerFiring | None],
     observable_value: Callable[[str, float, np.ndarray, float], float] | None = None,
     temperature_at,
     parameter_values, holds=(),
@@ -1756,17 +1731,25 @@ def _trigger_callables(
     callables: list[Callable[[float, np.ndarray], float]] = []
     mapping: list[int] = []
     for index, trigger in enumerate(triggers):
-        ready = _next_eligible_time(
-            trigger,
-            index=index,
-            counts=trigger_counts,
-            last_times=trigger_last_times,
-        )
+        last = trigger_last_firings[index]
+        ready = _next_eligible_time(trigger, last)
         if ready is None or segment_start < ready:
             continue
         initial_temperature = temperature_at(segment_start)
         threshold = _resolve_items((trigger,), segment_start, parameter_values, temperature_K=initial_temperature)[0].threshold
-        starts_at_threshold = _trigger_value(trigger, segment_start, _apply_holds(segment_state, holds, species_index=species_index, cancellation_check=None, time=segment_start, temperature_K=initial_temperature, parameter_values=parameter_values), species_index=species_index, observable_value=observable_value, temperature_K=initial_temperature) == threshold
+        start_value = _trigger_value(trigger, segment_start, _apply_holds(segment_state, holds, species_index=species_index, cancellation_check=None, time=segment_start, temperature_K=initial_temperature, parameter_values=parameter_values), species_index=species_index, observable_value=observable_value, temperature_K=initial_temperature)
+        # The located root lies on the threshold only to the root finder's
+        # precision.  A trigger re-armed at its own firing whose watched value
+        # that boundary left unchanged measures from that root's offset from
+        # the threshold it fired at, so the root's last ulp is not a crossing
+        # while a threshold change at the boundary still counts.
+        offset = (
+            last.event_state[trigger.condition.name] - last.threshold
+            if last is not None and last.root_time == segment_start
+            and start_value == last.event_state[trigger.condition.name]
+            else 0.0
+        )
+        starts_at_threshold = start_value - threshold - offset == 0.0
         directions = (
             ("rising", "falling")
             if trigger.direction == "either"
@@ -1774,15 +1757,13 @@ def _trigger_callables(
         )
         for direction in directions:
             # Initial equality is neutral: it is neither side of a crossing.
-            # At the immutable segment start, report the target side's sign so
-            # the first departure can only be neutral or look like the
-            # opposite direction, which SciPy ignores.  Every later evaluation
-            # is the pure threshold function. A target that remains exactly
-            # at its initial threshold stays neutral until departure.
-            # Thus analytic-Jacobian retry and a
-            # fresh solve observe identical event semantics.  ``either`` uses
-            # one rising and one falling event so genuine later crossings in
-            # both directions remain observable.
+            # While the target remains exactly at equality, including at the
+            # segment start, report the target side's sign so the first
+            # departure can only be neutral or look like the opposite
+            # direction, which SciPy ignores.  Every other evaluation is the
+            # pure threshold function.  ``either`` uses one rising and one
+            # falling event so genuine later crossings in both directions
+            # remain observable.
             neutral_value = 1.0 if direction == "rising" else -1.0
 
             def event(
@@ -1790,16 +1771,15 @@ def _trigger_callables(
                 state: np.ndarray,
                 *,
                 _trigger: ExecutableTrigger = trigger,
-                _threshold: float = threshold,
-                _segment_start: float = float(segment_start),
+                _offset: float = offset,
                 _starts_at_threshold: bool = starts_at_threshold,
                 _neutral_value: float = neutral_value,
             ) -> float:
                 temperature_K = temperature_at(time)
                 state = _apply_holds(state, holds, species_index=species_index, cancellation_check=None, time=time, temperature_K=temperature_K, parameter_values=parameter_values)
                 threshold = _resolve_items((_trigger,), time, parameter_values, temperature_K=temperature_K)[0].threshold
-                value = _trigger_value(_trigger, time, state, species_index=species_index, observable_value=observable_value, temperature_K=temperature_K) - threshold
-                if _starts_at_threshold and (float(time) == _segment_start or value == 0.0):
+                value = _trigger_value(_trigger, time, state, species_index=species_index, observable_value=observable_value, temperature_K=temperature_K) - threshold - _offset
+                if _starts_at_threshold and value == 0.0:
                     return _neutral_value
                 return value
 
@@ -1815,17 +1795,11 @@ def _next_rearm_boundary(
     *,
     segment_start: float,
     segment_end: float,
-    trigger_counts: Sequence[int],
-    trigger_last_times: Sequence[float | None],
+    trigger_last_firings: Sequence[TriggerFiring | None],
 ) -> float | None:
     candidates: list[float] = []
-    for index, trigger in enumerate(triggers):
-        ready = _next_eligible_time(
-            trigger,
-            index=index,
-            counts=trigger_counts,
-            last_times=trigger_last_times,
-        )
+    for trigger, last in zip(triggers, trigger_last_firings):
+        ready = _next_eligible_time(trigger, last)
         if (
             ready is not None
             and math.isfinite(ready)
@@ -1835,73 +1809,28 @@ def _next_rearm_boundary(
     return min(candidates) if candidates else None
 
 
-def _first_trigger_hit(
+def _first_hit(
     event_times: Sequence[Sequence[float]],
     event_states: Sequence[Sequence[np.ndarray]],
     *,
-    trigger_mapping: Sequence[int],
+    mapping: Sequence[int],
+    event_offset: int = 0,
 ) -> tuple[float, tuple[int, ...], np.ndarray] | None:
-    hits: list[tuple[float, int, np.ndarray]] = []
-    for offset, trigger_index in enumerate(trigger_mapping):
-        event_index = offset
-        if event_index >= len(event_times) or event_index >= len(event_states):
-            continue
-        for position, raw_time in enumerate(event_times[event_index]):
-            hits.append(
-                (
-                    float(raw_time),
-                    trigger_index,
-                    np.asarray(
-                        event_states[event_index][position], dtype=float
-                    ).reshape(-1),
-                )
-            )
+    """The earliest root of the mapped events, the sorted mapped indices with
+    a root at exactly that time, and a writable copy of the state there."""
+    hits = [
+        (float(raw_time), mapped, event_states[event_offset + offset][position])
+        for offset, mapped in enumerate(mapping)
+        for position, raw_time in enumerate(event_times[event_offset + offset])
+    ]
     if not hits:
         return None
     root_time = min(item[0] for item in hits)
     simultaneous = [item for item in hits if item[0] == root_time]
-    indices = tuple(
-        dict.fromkeys(
-            item[1]
-            for item in sorted(simultaneous, key=lambda item: item[1])
-        )
-    )
-    return root_time, indices, simultaneous[0][2]
-
-
-def _first_purge_hit(
-    event_times: Sequence[Sequence[float]],
-    event_states: Sequence[Sequence[np.ndarray]],
-    *,
-    purge_mapping: Sequence[int],
-    event_offset: int,
-) -> tuple[float, tuple[int, ...], np.ndarray] | None:
-    hits: list[tuple[float, int, np.ndarray]] = []
-    for offset, species_index in enumerate(purge_mapping):
-        event_index = event_offset + offset
-        if event_index >= len(event_times) or event_index >= len(event_states):
-            continue
-        for position, raw_time in enumerate(event_times[event_index]):
-            hits.append(
-                (
-                    float(raw_time),
-                    int(species_index),
-                    np.asarray(
-                        event_states[event_index][position], dtype=float
-                    ).reshape(-1),
-                )
-            )
-    if not hits:
-        return None
-    root_time = min(item[0] for item in hits)
-    simultaneous = [item for item in hits if item[0] == root_time]
-    state = simultaneous[0][2].copy()
-    for _time, species_index, _state in simultaneous:
-        state[species_index] = 0.0
     return (
         root_time,
-        tuple(dict.fromkeys(item[1] for item in simultaneous)),
-        state,
+        tuple(sorted({item[1] for item in simultaneous})),
+        np.array(simultaneous[0][2], dtype=float).reshape(-1),
     )
 
 

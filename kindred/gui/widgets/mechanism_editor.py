@@ -545,7 +545,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<tr><td><code>watch_species</code></td><td>Name of the species to watch</td></tr>"
             "<tr><td><code>threshold</code> or <code>threshold_param</code></td><td>Concentration threshold in M, entered directly or supplied by a parameter</td></tr>"
             "<tr><td><code>max_count</code></td><td>Maximum number of times this trigger can act</td></tr>"
-            "<tr><td><code>min_interval</code></td><td>Minimum time between its actions, in seconds. Use <code>0</code> for no additional waiting period.</td></tr>"
+            "<tr><td><code>min_interval</code></td><td>Minimum time between its actions, in seconds. Use <code>0</code> for no additional waiting period. A crossing during this period is ignored.</td></tr>"
             "<tr><td><code>then</code></td><td>One <code>set</code>, <code>jump</code>, <code>scale</code>, or <code>withdraw</code> action, enclosed in braces</td></tr>"
             "</table>"
             "<p><code>max_count</code> and <code>min_interval</code> are required for triggers that perform <code>set</code>, <code>jump</code>, <code>scale</code>, or <code>withdraw</code>.</p>"
