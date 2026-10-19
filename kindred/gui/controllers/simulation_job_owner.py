@@ -200,6 +200,7 @@ class _DirectSimulationWorker(QtCore.QThread):
         try:
             result = execute_simulation(
                 target.execution_request, cancellation_control=self._control,
+                species_ctc=True,
             )
         except SimulationCancelled:
             return _TargetTerminalOutcome(target, "cancelled", message="Simulation canceled.")

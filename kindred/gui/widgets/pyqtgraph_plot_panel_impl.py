@@ -1198,7 +1198,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._species_table.update_results(
             canonical_time=result.t,
             species_data={name: result.series[name] for name in render_input.statistics_series_names},
-            intervention_execution=result.intervention_execution,
+            species_ctc=result.species_ctc,
             presentation_boundaries=result.presentation_boundaries,
             concentration_display_unit=concentration_unit,
             time_display_unit=time_unit,

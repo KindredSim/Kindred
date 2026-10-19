@@ -52,6 +52,11 @@ class SimulationResultValue:
     quantity_units: tuple[tuple[str, Unit | None], ...] = ()
     presentation_units: tuple[tuple[str, Unit | None], ...] = ()
     volume: VolumeTrajectory | None = None
+    # Each species' cumulative temporal concentration in M·s, the integral of
+    # its concentration minus its final concentration over the executed span on
+    # the solver's steps; only Run and Preview results without interventions
+    # other than temperature changes carry it.
+    species_ctc: Mapping[str, float] | None = None
 
     def __post_init__(self) -> None:
         # Canonical finalization is the sole producer: it selects succeeded and

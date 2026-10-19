@@ -99,6 +99,7 @@ def build_simulation_request_from_prepared_run(
     t_eval: np.ndarray | None = None,
     candidate_evaluation: bool = False,
     sample_solver_steps: bool = False,
+    species_ctc: bool = False,
 ) -> SimulationRequest:
     """Solve exactly what preparation admitted: its starting state, schedule,
     Jacobian and cancellation owner."""
@@ -121,6 +122,7 @@ def build_simulation_request_from_prepared_run(
         t_eval=t_eval,
         candidate_evaluation=candidate_evaluation,
         sample_solver_steps=sample_solver_steps,
+        species_ctc=species_ctc,
         stop_observable_value=prepared_run.stop_observable_value,
         parameter_values_at_temperature=prepared_run.parameter_values_at_temperature,
         intervention_lines=request.prepared_dsl.analysis.intervention_lines,

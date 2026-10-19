@@ -1,10 +1,4 @@
-"""
-Canonical time-grid policies for Kindred.
-
-This module centralizes:
-- N-only generated time-grid construction
-- Uniform-grid detection using a median-spacing relative-deviation check
-"""
+"""Canonical N-only generated time-grid construction for Kindred."""
 
 from __future__ import annotations
 
@@ -12,9 +6,7 @@ from typing import Mapping
 
 import numpy as np
 
-__all__ = ["build_time_grid", "is_uniform_time_grid"]
-
-_EPS_T = 1e-15  # Guard the relative-uniformity denominator on tiny time steps.
+__all__ = ["build_time_grid"]
 
 
 def build_time_grid(t0: float, t1: float, grid: Mapping[str, int]) -> np.ndarray:
@@ -37,20 +29,3 @@ def build_time_grid(t0: float, t1: float, grid: Mapping[str, int]) -> np.ndarray
             "increasing binary64 values including both endpoints"
         )
     return t
-
-
-def is_uniform_time_grid(t: np.ndarray, eps: float) -> bool:
-    """
-    Return True if t is a strictly increasing (or size<3) grid with near-constant spacing.
-
-    Uniformity uses median(dt) and relative deviations against that median spacing.
-    """
-    if t.size < 3:
-        return True
-    dt = np.diff(t)
-    if not np.all(np.isfinite(dt)) or np.any(dt <= 0):
-        return False
-    med = float(np.median(dt))
-    denom = max(med, _EPS_T)
-    r = np.abs(dt - med) / denom
-    return bool(np.max(r) <= eps)

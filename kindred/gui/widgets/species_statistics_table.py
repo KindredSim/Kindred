@@ -16,10 +16,6 @@ from kindred.core.quantity_units import (
     format_unit_for_display,
 )
 from kindred.gui.ui_helpers import SCIENTIFIC_NAME_HTML_ROLE, ScientificNameHeaderView
-from kindred.core.intervention_schedule_compiler import (
-    InterventionExecutionContract,
-)
-from kindred.core.results import integrate_ctc
 from kindred.core.simulator.solver_types import SimulationPresentationBoundary
 
 __all__ = ["SpeciesStatisticsTable"]
@@ -41,10 +37,11 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
     - Final concentration at t_end
     - Maximum concentration reached
     - Time at which maximum occurs
-    - CTC (Concentration-Time Curve) - fixed-policy scalar integral
+    - CTC (cumulative temporal concentration) - the signed integral of the
+      concentration minus its final value over the simulated span
 
-    CTC uses the core's fixed native-grid integration policy. A nonfinite
-    numerical result is rendered as unavailable by the typed result owner.
+    The CTC is the result's own value, which results with interventions other
+    than temperature changes do not carry.
     """
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
@@ -75,11 +72,9 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
         self.horizontalHeaderItem(2).setToolTip("Maximum concentration reached.")
         self.horizontalHeaderItem(3).setToolTip("Time at which maximum concentration occurs.")
         self.horizontalHeaderItem(4).setToolTip(
-            "Concentration-time integral. If the final concentration is zero, "
-            "integrate the concentration over time. Otherwise, integrate its "
-            "absolute difference from the final concentration. Unavailable for "
-            "simulations with interventions or when the calculation produces a "
-            "nonfinite result."
+            "Cumulative temporal concentration, the integral over the simulated "
+            "time of the concentration minus its final concentration. Unavailable "
+            "for simulations with interventions other than temperature changes."
         )
 
         header.setStretchLastSection(True)
@@ -101,7 +96,7 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
         canonical_time: np.ndarray,
         species_data: Mapping[str, np.ndarray],
         *,
-        intervention_execution: InterventionExecutionContract,
+        species_ctc: Mapping[str, float] | None,
         presentation_boundaries: tuple[SimulationPresentationBoundary, ...],
         concentration_display_unit: Unit,
         time_display_unit: Unit,
@@ -116,9 +111,9 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
             at this scientific-statistics boundary.
         species_data : dict
             Dictionary of {species_name: concentration_array}
-        intervention_execution : InterventionExecutionContract
-            Accepted Run intervention truth. Any intervention makes CTC
-            inapplicable for the complete result.
+        species_ctc : Mapping, optional
+            Each species' cumulative temporal concentration in M·s, absent for
+            results with interventions other than temperature changes.
         presentation_boundaries : tuple, optional
             Every retained intervention boundary state of the primary result;
             these contribute to Max and t@Max without becoming table rows.
@@ -137,10 +132,6 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
                 SCIENTIFIC_NAME_HTML_ROLE,
                 f"{label} ({format_unit_for_display(unit)})",
             )
-            header_item.setToolTip(
-                f"{label} in {format_unit_for_display(unit)}."
-            )
-        ctc_applicable = intervention_execution.is_empty
         projected_roster = tuple(sorted(species_data))
         calculated: list[tuple[str, ...]] = []
         for species_name in projected_roster:
@@ -159,17 +150,8 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
             maximum_text = _display_statistic(max_conc, MOLAR, concentration_display_unit)
             time_text = _display_statistic(max_time, SECOND, time_display_unit)
             ctc_text = "—"
-            if ctc_applicable:
-                integrand = (
-                    concentrations
-                    if final_conc == 0.0
-                    else np.abs(concentrations - final_conc)
-                )
-                ctc = integrate_ctc(canonical_time, integrand)
-                ctc_text = "Unavailable"
-                if ctc.available:
-                    source_unit = MOLAR.multiply(SECOND)
-                    ctc_text = _display_statistic(ctc.value, source_unit, ctc_unit)
+            if species_ctc is not None:
+                ctc_text = _display_statistic(species_ctc[species_name], MOLAR.multiply(SECOND), ctc_unit)
             calculated.append(
                 (
                     species_name,
