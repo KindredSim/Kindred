@@ -43,7 +43,7 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
     - Time at which maximum occurs
     - CTC (Concentration-Time Curve) - fixed-policy scalar integral
 
-    CTC uses one deterministic native-grid trapezoid policy. A nonfinite
+    CTC uses the core's fixed native-grid integration policy. A nonfinite
     numerical result is rendered as unavailable by the typed result owner.
     """
 

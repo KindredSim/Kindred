@@ -197,7 +197,7 @@ class TemplateEditorDialog(QtWidgets.QDialog):
         tags_text = self._tags_edit.text().strip()
         tags = [t.strip() for t in tags_text.split(',') if t.strip()]
 
-        source = MechanismAuthoringSource.from_parts(
+        source = MechanismAuthoringSource(
             reactions_text=self._mechanism_edit.toPlainText()
         )
         return {
@@ -249,7 +249,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         self._template_manager = template_manager
         # Create and Replace both store the current mechanism with its
         # recorded initial-condition declarations restored.
-        self._current_mechanism_source = MechanismAuthoringSource.from_parts(
+        self._current_mechanism_source = MechanismAuthoringSource(
             reactions_text=restore_initial_condition_declarations(
                 current_mechanism_source.reactions_text
             )

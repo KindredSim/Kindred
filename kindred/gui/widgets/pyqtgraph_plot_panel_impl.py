@@ -137,6 +137,14 @@ def _undefined_edges(*arrays: np.ndarray) -> np.ndarray:
     return np.concatenate((changes, changes + 1))
 
 
+def _authored_volume_axis(source: Unit | None, render_input: ResultRenderInput | None) -> bool:
+    """Whether an axis shows a volume while the mechanism authors a volume unit."""
+    return (
+        source is not None and source.compatible(CUBIC_METRE)
+        and render_input is not None and render_input.authored_volume_unit is not None
+    )
+
+
 def _transform_samples(x: np.ndarray, y: np.ndarray, transform: str) -> tuple[np.ndarray, np.ndarray]:
     """Native adjacent-difference mapping, with undefined pairs kept as breaks."""
     if transform == "original":
@@ -751,7 +759,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def _selected_display_unit(self, axis: str, source: Unit | None) -> Unit | None:
         if source is None:
             return None
-        if source.compatible(CUBIC_METRE) and self._render_input is not None and self._render_input.authored_volume_unit is not None:
+        if _authored_volume_axis(source, self._render_input):
             return self._selected_volume_unit()
         return self._axis_display_units.get(
             (axis, source.dimensions), presentation_unit(scientific_unit(source.dimensions)),
@@ -770,7 +778,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         selected = self._selected_display_unit(axis, source)
         if selected is None:
             return ()
-        if source.compatible(CUBIC_METRE) and render_input.authored_volume_unit is not None:
+        if _authored_volume_axis(source, render_input):
             return self._volume_unit_choices() or (selected,)
         options = render_input.x_unit_options if axis == "x" else render_input.y_unit_options
         return reconcile_unit_choices(options, selected)
@@ -796,7 +804,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         common = None if render_input is None else render_input.x_unit if axis == "x" else render_input.y_unit
         if common is not None:
             shown = self._selected_display_unit(axis, common)
-        elif source.compatible(CUBIC_METRE) and render_input is not None and render_input.authored_volume_unit is not None:
+        elif _authored_volume_axis(source, render_input):
             shown = self._selected_volume_unit()
         else:
             shown = source
@@ -809,7 +817,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 (unit.symbol, format_unit_for_display(unit))
                 for unit in self._display_unit_choices(render_input, axis)
             )
-            if source is not None and source.compatible(CUBIC_METRE) and render_input.authored_volume_unit is not None:
+            if _authored_volume_axis(source, render_input):
                 return (("Authored", ""), *units), selected if self._volume_display_unit is not None else "Authored"
             return units, selected
         x_units, x_unit = options("x", render_input.x_unit, x_unit)
@@ -1495,7 +1503,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         if render_input is None:
             return
         source = render_input.x_unit if axis == "x" else render_input.y_unit
-        if source is not None and source.compatible(CUBIC_METRE) and render_input.authored_volume_unit is not None:
+        if _authored_volume_axis(source, render_input):
             self._apply_volume_unit_change(unit)
             return
         options = self._display_unit_choices(render_input, axis)

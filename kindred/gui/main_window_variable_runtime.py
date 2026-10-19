@@ -648,7 +648,7 @@ class TabSliderBinding(QtCore.QObject):
                 tab.prepared_dsl,
                 updates,
             )
-            visible_source = MechanismAuthoringSource.from_parts(
+            visible_source = MechanismAuthoringSource(
                 reactions_text=derived_text,
             )
             reconciliation = reconcile_tab_mechanism_source(

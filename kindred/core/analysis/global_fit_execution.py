@@ -599,7 +599,7 @@ class FitParameterLayout:
             values.setflags(write=False)
             object.__setattr__(self, name, values)
 
-    def _coordinate_keys(self) -> tuple[FitCoordinate, ...]:
+    def opt_param_keys(self) -> tuple[FitCoordinate, ...]:
         keys = tuple(FitCoordinate("shared", name) for name in self.param_names)
         keys += tuple(
             FitCoordinate("dataset", parameter_name, ds_id)
@@ -610,9 +610,6 @@ class FitParameterLayout:
             for item in self.coupled_var_order
         )
         return keys
-
-    def opt_param_keys(self) -> tuple[FitCoordinate, ...]:
-        return self._coordinate_keys()
 
     def initial_params(self) -> Dict[FitCoordinate, float]:
         keys = self.opt_param_keys()

@@ -13,6 +13,7 @@ from kindred.core.datasets.observation_mapping import (
     admit_measured_start,
     first_data_row,
     initial_samples,
+    initial_time,
     normalize_observation_mapping,
     suggest_observation_mapping,
     supplies_concentration,
@@ -415,7 +416,12 @@ class ObservationMappingWidget(QtWidgets.QWidget):
         reads_data = self._reads_data()
         # Usable even while unused: choosing a row can make data readable again.
         self._source_combo.setEnabled(bool(self._readable_species()))
-        self._source_note.setText("" if reads_data else "Not used (no row reads data)")
+        row_source = self._source_combo.currentData()
+        start = None if row_source is None else initial_time(self._record.observations, row_source)
+        self._source_note.setText(
+            "Not used (no row reads data)" if not reads_data
+            else "" if start is None else f"Run starts at t = {six_digit_text(start)} s"
+        )
         muted = self.palette().color(QtGui.QPalette.ColorRole.PlaceholderText)
         starts = self.starts()
         for start in starts:

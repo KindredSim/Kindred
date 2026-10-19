@@ -325,12 +325,11 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def __init__(
         self,
         *,
-        origin: FitOriginSnapshot,
+        setup: FitSetupSnapshot,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self._origin = origin
-        self._projected_setup: FitSetupSnapshot | None = None
+        self._projected_setup = setup
         self._last_fit_parameters: dict[str, FitParameterVariable] = {}
         self._last_fit_included: set[str] = set()
         self._tolerance_drafts: dict[str, str] = {}
@@ -606,26 +605,26 @@ class ParametersIcsTab(QtWidgets.QWidget):
             return f"Initial guess for dataset {self._dataset_display_name(field.removeprefix('dataset:'))}"
         return "Initial guess" if field == "starting" else _field_label(field)
 
+    @property
+    def _origin(self) -> FitOriginSnapshot:
+        return self._projected_setup.origin
+
     def _parameter_by_name(self, name: str) -> FitParameterVariable | None:
-        if self._projected_setup is None:
-            return None
         return next((item for item in self._projected_setup.parameters if item.name == name), None)
 
     def project_setup_snapshot(self, snapshot: FitSetupSnapshot) -> None:
         previous = self._projected_setup
-        self._origin = snapshot.origin
         self._projected_setup = snapshot
-        if previous is not None:
-            # A scope or group change discards that parameter's invalid text.
-            structure = {
-                item.name: (item.scope, item.per_dataset_config.groups) for item in previous.parameters
-            }
-            for parameter in snapshot.parameters:
-                if (
-                    structure[parameter.name] != (parameter.scope, parameter.per_dataset_config.groups)
-                    and self._retire_numeric_drafts({parameter.name})
-                ):
-                    self.statusMessage.emit(f"Invalid values for {parameter.display_name} discarded.")
+        # A scope or group change discards that parameter's invalid text.
+        structure = {
+            item.name: (item.scope, item.per_dataset_config.groups) for item in previous.parameters
+        }
+        for parameter in snapshot.parameters:
+            if (
+                structure[parameter.name] != (parameter.scope, parameter.per_dataset_config.groups)
+                and self._retire_numeric_drafts({parameter.name})
+            ):
+                self.statusMessage.emit(f"Invalid values for {parameter.display_name} discarded.")
         self._projecting = True
         try:
             self._render_roster()
@@ -643,8 +642,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._rerender_roster()
 
     def _rerender_roster(self) -> None:
-        if self._projected_setup is None:
-            return
         self._projecting = True
         try:
             self._render_roster()
@@ -1002,7 +999,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         """Each invalid cell as (parameter name, field, message) in table order."""
 
         cells = []
-        for parameter in self._projected_setup.parameters if self._projected_setup else ():
+        for parameter in self._projected_setup.parameters:
             draft = self._invalid_rows.get(parameter.name)
             if draft is None:
                 continue
@@ -1188,7 +1185,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self.setupSnapshotRequested.emit(updated)
 
     def _open_bounds_dialog(self) -> None:
-        if self._projecting or self._running or self._projected_setup is None:
+        if self._projecting or self._running:
             return
         setup = self._projected_setup
         dialog = _ParameterBoundsDialog(setup.parameters, parent=self)
@@ -1221,7 +1218,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self.setupSnapshotRequested.emit(updated)
 
     def _on_scope_changed(self, name: str, combo: QtWidgets.QComboBox) -> None:
-        if self._projecting or self._running or self._projected_setup is None:
+        if self._projecting or self._running:
             return
         parameter = self._parameter_by_name(name)
         if parameter is None:
@@ -1458,7 +1455,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         return labels
 
     def _emit_defaults_edit(self, *_args: object) -> None:
-        if self._projecting or self._running or self._projected_setup is None:
+        if self._projecting or self._running:
             return
         try:
             snapshot = replace(
@@ -1475,7 +1472,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._project_defaults(self._projected_setup.defaults)
 
     def _on_tolerance_text_changed(self, _text: str) -> None:
-        if self._projecting or self._projected_setup is None:
+        if self._projecting:
             return
         self._tolerance_drafts = {
             "ftol": self._ftol_edit.text(), "xtol": self._xtol_edit.text(),
@@ -1500,11 +1497,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def _discard_tolerance_drafts(self) -> None:
         self._tolerance_drafts.clear()
         self._set_defaults_error("")
-        if self._projected_setup is not None:
-            self._project_defaults(self._projected_setup.defaults)
+        self._project_defaults(self._projected_setup.defaults)
 
     def _emit_solver_edit(self, *_args: object) -> None:
-        if self._projecting or self._running or self._projected_setup is None:
+        if self._projecting or self._running:
             return
         self.setupSnapshotRequested.emit(
             replace(self._projected_setup, solver=self._solver_combo.currentData())
@@ -1519,12 +1515,12 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self.setupSnapshotRequested.emit(replace(setup, profile=replace(setup.profile, **changes)))
 
     def _on_profile_toggled(self, enabled: bool) -> None:
-        if self._projecting or self._running or self._projected_setup is None:
+        if self._projecting or self._running:
             return
         self._emit_profile(enabled=enabled)
 
     def _open_profile_dialog(self) -> None:
-        if self._projecting or self._running or self._projected_setup is None:
+        if self._projecting or self._running:
             return
         dialog = _ProfileLikelihoodDialog(options=self._projected_setup.profile.options, parent=self)
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
@@ -1599,5 +1595,4 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def clear_pending_setup_edits(self) -> None:
         self._retire_numeric_drafts()
         self._discard_tolerance_drafts()
-        if self._projected_setup is not None:
-            self.project_setup_snapshot(self._projected_setup)
+        self.project_setup_snapshot(self._projected_setup)

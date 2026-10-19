@@ -91,7 +91,7 @@ class JsonScanWriter:
                     "scipy": scipy.__version__}
         spec = design.prepared.parameter_algebra_spec_for_execution()
         constraint_units = {s.name: presentation_unit(s.expr.quantity_unit, s.declared_unit) for s in spec.observable_block.lines}
-        header = {"schema_version": 5,
+        header = {"schema_version": 6,
                   "input_units": {item.key: item.unit for item in design.catalog},
                   "constraint_units": {c.observable: constraint_units[c.observable].symbol if constraint_units[c.observable] is not None else None for c in config.constraints}, "created_utc": datetime.now(timezone.utc).isoformat(),
                   "versions": versions, "configuration": asdict(config),
@@ -109,6 +109,8 @@ class JsonScanWriter:
 
     def finish(self, progress):
         summary = asdict(progress)
+        # The file's state records the outcome; the progress phase is transient.
+        del summary["phase"]
         summary["path"] = self.destination if progress.state == "complete" else self.path
         summary["not_started"] = progress.requested - progress.attempted
         self.stream.write('],"summary":')

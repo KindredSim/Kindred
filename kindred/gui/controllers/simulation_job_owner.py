@@ -22,7 +22,7 @@ from kindred.core.simulation_preparation import (
     build_simulation_execution_request,
 )
 from kindred.core.simulation_execution import execute_simulation
-from kindred.core.simulation_preparation_stages import build_solver_config
+from kindred.core.simulation_preparation_stages import PreparedSolverConfig
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 from kindred.gui.computation_gate import ComputationGate
@@ -109,7 +109,7 @@ def build_execution_request(
     parameter_values: Mapping[str, float] | None = None,
 ) -> SimulationExecutionRequest:
     """Assemble Run or Preview science from its owner's captured inputs."""
-    solver_config = build_solver_config(
+    solver_config = PreparedSolverConfig(
         solver=execution_settings.solver,
         rtol=scientific_settings.rtol,
         atol=scientific_settings.atol,

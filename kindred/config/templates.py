@@ -90,7 +90,7 @@ def _validate_template_payload(data: Mapping[str, Any]) -> Dict[str, Any]:
     author = data["author"]
     if author is not None and type(author) is not str:
         raise TypeError("template payload field 'author' must be an exact str or None.")
-    source = MechanismAuthoringSource.from_parts(reactions_text=data["reactions_text"])
+    source = MechanismAuthoringSource(reactions_text=data["reactions_text"])
     return {
         "id": _nonblank_string(data["id"], "template ID"),
         "name": _template_name(data["name"]),
@@ -155,7 +155,7 @@ class Template:
     def source(self) -> MechanismAuthoringSource:
         """Return the structurally admitted current authoring source."""
 
-        return MechanismAuthoringSource.from_parts(reactions_text=self.reactions_text)
+        return MechanismAuthoringSource(reactions_text=self.reactions_text)
 
     @staticmethod
     def generate_id() -> str:
