@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
+from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 
@@ -100,25 +101,14 @@ def _protocol_boundary(
     field: str = "start_time",
     fields: Sequence[str] = (),
 ) -> float:
+    # Window times follow the decimals as written, so the window at 0.1 * 3
+    # is the 0.3 an authored time, data time or endpoint names, and adjacent
+    # windows share exactly one boundary.
+    value = Decimal(repr(start)) + Decimal(repr(every)) * index
+    if duration is not None:
+        value += Decimal(repr(duration))
     try:
-        if duration == every:
-            # Adjacent windows share exactly the same binary64 boundary.
-            value = start + every * (index + 1)
-        else:
-            value = start + every * index
-            if duration is not None:
-                value += duration
-    except (OverflowError, ValueError) as exc:
-        raise _annotated_schedule_error(
-            "Protocol boundary arithmetic must remain finite.",
-            operation=operation,
-            dependency_metadata=dependency_metadata,
-            field=field,
-            fields=fields,
-            domain="finite",
-        ) from exc
-    try:
-        return validate_time_seconds(value, field="Protocol boundary")
+        return validate_time_seconds(float(value), field="Protocol boundary")
     except (TypeError, ValueError) as exc:
         raise _annotated_schedule_error(
             str(exc),
@@ -351,7 +341,6 @@ class InterventionExecutionContract:
     holds: tuple[ExecutableHold, ...] = ()
     triggers: tuple[ExecutableTrigger, ...] = ()
     discontinuities: tuple[float, ...] = ()
-    segment_identity: tuple[tuple[float, float], ...] = ()
     protocol_lineage: tuple[Mapping[str, Any], ...] = ()
     trigger_firings: tuple[TriggerFiring, ...] = ()
     # Scheduled instants left unexecuted at a stopping boundary.
@@ -370,11 +359,6 @@ class InterventionExecutionContract:
             self,
             "discontinuities",
             tuple(float(value) for value in self.discontinuities),
-        )
-        object.__setattr__(
-            self,
-            "segment_identity",
-            tuple((float(start), float(end)) for start, end in self.segment_identity),
         )
 
     @property
@@ -410,10 +394,6 @@ class InterventionExecutionContract:
             "declarative": _plain(self.authored.to_payload()),
             "executable": {"operations": executable_operations},
             "discontinuities": list(self.discontinuities),
-            "segment_identity": [
-                {"start_time": start, "end_time": end}
-                for start, end in self.segment_identity
-            ],
             "protocol_lineage": [
                 _plain(item) for item in self.protocol_lineage
             ],
@@ -936,7 +916,6 @@ def compile_intervention_schedule(
             *(item.end_time for item in holds),
         }
     )
-    segments = tuple(zip(discontinuities, discontinuities[1:]))
     return InterventionExecutionContract(
         authored=schedule_obj if authored is None else authored,
         initial_volume=schedule_obj.initial_volume,
@@ -945,7 +924,6 @@ def compile_intervention_schedule(
         holds=tuple(holds),
         triggers=tuple(triggers),
         discontinuities=tuple(discontinuities),
-        segment_identity=segments,
         protocol_lineage=tuple(lineage),
         temperature_changes=temperature_changes,
     )
