@@ -168,7 +168,8 @@ class FittingWindow(QtWidgets.QDialog):
         messages.addStretch(1)
         row.addLayout(messages, 1)
         self._progress = QtWidgets.QProgressBar(footer)
-        self._progress.setRange(0, 100)
+        self._progress_counts = (0, 1)
+        self._progress.setRange(0, 1)
         self._progress.setValue(0)
         self._progress.setFormat("%p%")
         self._progress.setFixedWidth(self.fontMetrics().horizontalAdvance("100%") + 48)
@@ -753,11 +754,13 @@ class FittingWindow(QtWidgets.QDialog):
             self._paused = False
             self._pause_button.setText("&Pause")
             self._refresh_copy_allowed()
+            self._show_progress()
             self.resumeRequested.emit()
             return
         self._paused = True
         self._pause_button.setText("&Resume")
         self._refresh_copy_allowed()
+        self._show_progress()
         self.pauseRequested.emit()
 
     def prepare_fit_plots(self, request, *, waiting: bool) -> None:
@@ -769,19 +772,21 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_results_tab.finish_preparation()
 
     def set_executing(self, executing: bool) -> None:
-        was_executing = self._executing
         self._executing = bool(executing)
         if self._executing:
             self._status.clear()
             self._status.hide()
             self._layout_footer()
-            if not was_executing:
-                self._progress.setValue(0)
             self._paused = False
+            # A run starts with no known end.
+            self.set_progress(0, 0)
             self._tabs.setCurrentIndex(2)
             self.set_apply_available(False, "Fit is running.")
         else:
             self._paused = False
+            # Every run ends here, so the bar leaves busy mode empty; a
+            # presented result fills it.
+            self.set_progress(0, 1)
         self._refresh_copy_allowed()
         self._results_summary_button.setEnabled(True)
         self._cancel_button.setEnabled(self._executing)
@@ -800,10 +805,19 @@ class FittingWindow(QtWidgets.QDialog):
         self._observation_style = (shape, size, opacity)
         self._run_results_tab.set_observation_style(shape, size, opacity)
 
-    def set_progress(self, value: int) -> None:
-        progress = max(0, min(100, int(value)))
-        self._progress.setValue(progress)
-        self._run_results_tab.set_progress(progress)
+    def set_progress(self, done: int, total: int) -> None:
+        """Show ``done`` of ``total``; a total of 0 is a busy bar with no known end."""
+        self._progress_counts = (done, total)
+        self._show_progress()
+        self._run_results_tab.set_progress(done, total)
+
+    def _show_progress(self) -> None:
+        done, total = self._progress_counts
+        # A paused busy bar rests empty, without text, until Resume.
+        resting = self._paused and total == 0
+        self._progress.setTextVisible(not resting)
+        self._progress.setRange(0, 1 if resting else total)
+        self._progress.setValue(0 if resting else done)
 
     def set_status(self, text: str) -> None:
         if self._closing and not self._closing_after_cleanup:

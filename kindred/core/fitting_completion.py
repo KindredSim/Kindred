@@ -15,6 +15,7 @@ FitExtensionProgressStage = Literal[
     "primary_complete",
     "discovery",
     "refinement",
+    "side",
     "settlement",
 ]
 
@@ -23,12 +24,12 @@ FitExtensionProgressStage = Literal[
 class FitExtensionProgress:
     """Typed progress for the post-fit stage and the optional Profile analysis.
 
-    This projection carries only work counters and the current Profile
-    coordinate/side. It is transient callback data and deliberately has no
-    optimizer objective payload or timing estimate.  Global Fit composition
-    sends "primary_complete" when the post-fit stage starts; the Profile loop
-    passes literal statuses and stages, the admitted coordinate name and its
-    own work counters.
+    This projection carries only the Profile side counts and the current
+    Profile coordinate/side. It is transient callback data and deliberately
+    has no optimizer objective payload or timing estimate.  Global Fit
+    composition sends "primary_complete" when the post-fit stage starts; the
+    Profile loop passes literal statuses and stages, the admitted coordinate
+    name, the sides it has finished and the two sides of each profiled value.
     """
 
     status: FitExtensionProgressStatus
@@ -37,5 +38,5 @@ class FitExtensionProgress:
     side: Literal["lower", "upper"] | None = None
     discovery_step: int | None = None
     refinement_step: int | None = None
-    completed_work: int = 0
-    planned_work: int = 0
+    completed_sides: int = 0
+    planned_sides: int = 0

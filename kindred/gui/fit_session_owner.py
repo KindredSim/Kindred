@@ -31,7 +31,7 @@ from kindred.gui.fitting.launch import (
     create_initial_fit_setup,
     fit_parameter_overall,
 )
-from kindred.gui.fitting.reporting import fit_completion_presentation, fit_identity_text
+from kindred.gui.fitting.reporting import fit_identity_text
 from kindred.gui.fitting.window import FittingWindow
 from kindred.gui.fitting.execution import FitCandidate
 from kindred.gui.fitting.worker import GlobalFitWorker
@@ -249,7 +249,7 @@ class FitSessionOwner(QtCore.QObject):
             lambda w=worker, r=request: self._on_execution_started(w, r)
         )
         worker.progress.connect(
-            lambda value, text, w=worker: self._on_progress(w, value, text)
+            lambda done, total, text, w=worker: self._on_progress(w, done, total, text)
         )
         worker.best_updated.connect(
             lambda update, w=worker: self._on_best(w, update)
@@ -625,16 +625,16 @@ class FitSessionOwner(QtCore.QObject):
         self._notify_application_close_settled()
         self._set_status("Fit closed. All temporary fit state was discarded.")
 
-    def _on_progress(self, worker: GlobalFitWorker, value: int, text: str) -> None:
+    def _on_progress(self, worker: GlobalFitWorker, done: int, total: int, text: str) -> None:
         if (
             self._application_close_fenced
             or self._closing
             or self._worker is not worker
         ):
             return
-        if self._window is not None and value < 100:
-            self._window.set_progress(value)
-        self._set_status(text, present=value < 100)
+        if self._window is not None:
+            self._window.set_progress(done, total)
+        self._set_status(text)
 
     def _on_best(self, worker: GlobalFitWorker, update: object) -> None:
         if (
@@ -690,9 +690,11 @@ class FitSessionOwner(QtCore.QObject):
         window.project_setup_snapshot(terminal_setup)
         window.set_last_fit_reset_available(terminal_setup)
         curves = self._candidate_projection
-        _completion, complete = fit_completion_presentation(candidate)
-        if complete:
-            window.set_progress(100)
+        # A run that ended without Stop shows a full bar; its text states how
+        # Profile settled.
+        profile = candidate.result.profile_likelihood_result
+        if candidate.result.ending != "stopped" and (profile is None or profile.status != "stopped"):
+            window.set_progress(1, 1)
         window.set_terminal_presentation(
             candidate,
             curves=curves,

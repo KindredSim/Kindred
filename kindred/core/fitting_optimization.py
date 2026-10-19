@@ -159,9 +159,16 @@ def fit_parameters(
     xtol: float,
     method: str,
     cancellation_check: Callable[[], bool] | None = None,
+    search_evaluations_callback: Callable[[int], None] | None = None,
 ) -> FitResult:
     """Fit parameters by least squares, or by Differential Evolution polished
-    with Trust Region Reflective at the same tolerances."""
+    with Trust Region Reflective at the same tolerances.
+
+    ``search_evaluations_callback`` receives the most objective calls
+    Differential Evolution's generations can make when they start, and 0
+    when the polish starts; a least-squares fit has no known end and
+    reports nothing.
+    """
 
     # The method, evaluation budget, coordinates and their bounds arrive
     # admitted by the Fit setup or its Profile likelihood configuration.
@@ -218,6 +225,8 @@ def fit_parameters(
             # SciPy keeps the polish only when it succeeds, scores lower and
             # stays inside the bounds. Its score is the sum of squares, twice
             # the least-squares cost.
+            if search_evaluations_callback is not None:
+                search_evaluations_callback(0)
             polished = run_least_squares(np.asarray(start, dtype=float), "trf")
             polished.fun = 2.0 * polished.cost
             return polished
@@ -227,6 +236,8 @@ def fit_parameters(
         # evaluations, (maxiter + 1) * popsize * len(x0) at most.
         popsize = 15
         maxiter = max(0, max_nfev // (popsize * len(x0)) - 1)
+        if search_evaluations_callback is not None:
+            search_evaluations_callback((maxiter + 1) * popsize * len(x0))
         # SciPy rescales x0 to [0, 1] and refuses a start that rounds
         # just outside, as a start on its bound can; such a start moves
         # inside by a negligible fraction of the range.

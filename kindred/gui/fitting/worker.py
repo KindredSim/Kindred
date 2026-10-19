@@ -28,7 +28,7 @@ class GlobalFitWorker(QtCore.QThread):
     """Serialize, receive and settle off the GUI thread; controls never wait."""
 
     execution_started = QtCore.Signal()
-    progress = QtCore.Signal(int, str)
+    progress = QtCore.Signal(int, int, str)
     best_updated = QtCore.Signal(object)
     curves_updated = QtCore.Signal(object)
     candidate_ready = QtCore.Signal(object)

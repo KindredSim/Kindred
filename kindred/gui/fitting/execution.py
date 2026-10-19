@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import os
 import time
 import threading
@@ -742,23 +741,27 @@ class _FitExecution(_FitControl):
         if self._checkpoint(honor_stop=False):
             raise FittingCancelled()
         self._last_curve_emit = time.monotonic()
+        # The optimizer reports how many calls its current search makes when
+        # that is known (Differential Evolution's generations); 0 is no known
+        # end, as for a least-squares fit or the polish.
+        search_evaluations = 0
+
+        def search_evaluations_reported(count: int) -> None:
+            nonlocal search_evaluations
+            search_evaluations = count
+            if count == 0:
+                # Objective calls publish only on improvement or every tenth
+                # call, so the polish shows at once.
+                self._emit("progress", 0, 0, "Polishing the best Differential Evolution candidate")
+
         def progress(update: FitProgress) -> None:
             if self._checkpoint():
                 raise FittingCancelled()
             objective_calls = update.objective_calls
             cost = update.cost
             self._emit("progress",
-                min(
-                    95,
-                    max(
-                        1,
-                        int(
-                            100
-                            * objective_calls
-                            / max(1, setup.defaults.max_nfev)
-                        ),
-                    ),
-                ),
+                objective_calls if search_evaluations else 0,
+                search_evaluations,
                 f"Objective calls {objective_calls}"
                 + (f": best weighted SSE {six_digit_text(cost)}" if update.improved else ""),
             )
@@ -795,8 +798,6 @@ class _FitExecution(_FitControl):
             if setup.dataset_weight_mode == "user"
             else None
         )
-        extension_progress_value = 95
-
         def execution_cancellation_check() -> bool:
             return self._checkpoint(honor_stop=False)
 
@@ -813,22 +814,22 @@ class _FitExecution(_FitControl):
         }
 
         def extension_progress(update: FitExtensionProgress) -> None:
-            nonlocal extension_progress_value
+            if update.stage == "primary_complete":
+                # The checks after the primary fit finish on Stop.
+                if self._checkpoint(honor_stop=False):
+                    raise FittingCancelled()
+                self._emit("progress", 0, 0, "Primary global fit complete")
+                return
             if self._checkpoint():
                 raise FittingCancelled()
-            if update.stage == "primary_complete":
-                extension_progress_value = max(extension_progress_value, 95)
-                self._emit("progress", extension_progress_value, "Primary global fit complete")
-                return
-            fraction = (
-                float(update.completed_work) / float(update.planned_work)
-                if update.planned_work
-                else 0.0
-            )
-            percent = 95 + min(2, int(math.floor(3.0 * fraction)))
             # A settlement update can arrive before any coordinate started,
-            # so only discovery and refinement show one.
-            if update.stage == "discovery":
+            # so only discovery, refinement and a finished side show one.
+            if update.stage == "side":
+                detail = (
+                    f"Profile likelihood · {coordinate_labels[update.coordinate]} · {update.side} "
+                    "side finished"
+                )
+            elif update.stage == "discovery":
                 detail = (
                     f"Profile likelihood · {coordinate_labels[update.coordinate]} · {update.side} "
                     f"discovery {update.discovery_step}/"
@@ -841,8 +842,7 @@ class _FitExecution(_FitControl):
                 )
             else:
                 detail = f"Profile likelihood · {update.status}"
-            extension_progress_value = max(extension_progress_value, percent)
-            self._emit("progress", extension_progress_value, detail)
+            self._emit("progress", update.completed_sides, update.planned_sides, detail)
             if self._checkpoint():
                 raise FittingCancelled()
 
@@ -862,6 +862,7 @@ class _FitExecution(_FitControl):
             xtol=float(defaults.xtol),
             seed=int(defaults.seed) if defaults.use_seed else None,
             progress_callback=progress,
+            search_evaluations_callback=search_evaluations_reported,
             extension_progress_callback=extension_progress,
             cancellation_check=execution_cancellation_check,
             cancellation_control=execution_cancellation_control,
@@ -882,7 +883,6 @@ class _FitExecution(_FitControl):
             result=result,
             setup_snapshot=setup,
         )
-        self._emit("progress", 100, result.message)
         return candidate
 
     def _live_update(self, best_progress: FitProgress) -> FitLiveUpdate:
