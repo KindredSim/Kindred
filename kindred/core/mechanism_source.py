@@ -23,14 +23,6 @@ class MechanismAuthoringSource:
     reactions_text: str = ""
 
     @classmethod
-    def from_parts(
-        cls,
-        *,
-        reactions_text: str = "",
-    ) -> "MechanismAuthoringSource":
-        return cls(reactions_text=reactions_text)
-
-    @classmethod
     def from_payload(
         cls,
         payload: Mapping[str, object],
@@ -50,7 +42,7 @@ class MechanismAuthoringSource:
             )
         if type(payload["reactions_text"]) is not str:
             raise TypeError("reactions_text must be an exact str.")
-        return cls.from_parts(reactions_text=payload["reactions_text"])
+        return cls(reactions_text=payload["reactions_text"])
 
     def to_payload(self) -> dict[str, str]:
         return {"reactions_text": self.reactions_text}

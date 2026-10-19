@@ -574,7 +574,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<p>Stopping triggers do not accept <code>max_count</code> or <code>min_interval</code>.</p>"
             "<p>For a concentration threshold, enter <code>threshold</code> in M. For 1 mM, write <code>threshold=0.001</code>, including when the watched quantity has <code>; unit = mM</code>.</p>"
             "<pre>param floor = 1e-12; unit = M\nlet selectivity = [B] / max([A] + [B], floor)\nintervention: op=trigger; watch_observable=selectivity; threshold=0.9; direction=rising; then={op=stop}</pre>"
-            "<p>A stopping condition produces a completed result. The toolbar <b>Stop</b> button cancels a Run instead.</p>"
+            "<p>A stopping condition produces a completed result. <b>Stop</b> cancels a Run instead.</p>"
             "<h3>Stopping Order and Output</h3>"
             "<ul>"
             "<li>When a stopping crossing is detected, the simulation ends before any remaining actions at that time.</li>"
@@ -645,7 +645,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<p>A plain number, or a formula of plain numbers and parameters without a unit that reads no reaction parameter, is read in the unit declared on its line, as in <code>param k1 = 6; unit = 1/min</code> or <code>param pulse = 2*p0; unit = min</code>. "
             "On a line that sets <code>Ea1</code>, <code>dG_act1</code>, or <code>dG_eq1</code> without <code>unit=</code>, it is read in the <code>energy=</code> unit, so <code>param dG_act1 = 60</code> means 60 in that unit. "
             "Other reaction parameters without <code>unit=</code> use the SI units Kindred shows for them, such as <code>s^-1</code>.</p>"
-            "<p>Any other formula keeps the units of its result. That includes every formula that reads a reaction parameter, even one without a unit, so <code>param k3 = 40*Ea1/Ea2</code> is refused because its result has no unit. Write <code>param k0 = 40; unit = 1/s</code> and <code>param k3 = k0*Ea1/Ea2</code> instead. <code>unit=</code> must fit the result, and on a <code>let</code> line it sets the unit the result is shown in: Kindred refuses <code>unit = mM</code> on <code>1 - [A]/[A]_0</code> and <code>unit = 1</code> on <code>[B]/[A]^2</code>. "
+            "<p>Any other formula keeps the units of its result. That includes every formula that reads a reaction parameter, even one without a unit, so <code>param k3 = 40*Ea1/Ea2</code> is refused because its result has no unit. Write <code>param k0 = 40; unit = 1/s</code> and <code>param k3 = k0*Ea1/Ea2</code> instead. <code>unit=</code> must fit the result: Kindred refuses <code>unit = mM</code> on <code>1 - [A]/[A]_0</code> and <code>unit = 1</code> on <code>[B]/[A]^2</code>. "
             "If Kindred cannot determine the unit of a result, for example because a formula adds a plain number to a quantity with a unit other than an energy, such as <code>T</code> or a time, or takes <code>ln</code> or <code>exp</code> of a quantity whose unit is not built from concentration, time, and temperature units, its plain numbers are taken in SI units (J/mol, K, M, s), and that line can only carry <code>unit = 1</code>, which is refused where the value it sets has a unit, such as <code>k1</code>. "
             "With <code>energy=kcal/mol</code>, <code>param dG_act1 = 20 - 0.03*T</code> is about 11 J/mol, not 11 kcal/mol. Give the numbers units to use kcal/mol:</p>"
             "<pre>param dH = 20; unit = kcal/mol\nparam dS = 30; unit = cal/(mol*K)\nparam dG_act1 = dH - T*dS</pre>"
@@ -655,7 +655,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<h3>Entering Units</h3>"
             "<p>Add <code>; unit = ...</code> after a parameter or calculated quantity:</p>"
             "<pre>param dose = 5; unit = mM\nparam duration = 2; unit = min\nparam volume = 2; unit = mL\nparam doubled = 2*dose; unit = mM</pre>"
-            "<p>Enter a plain number, or a formula of plain numbers, in the declared unit. For a formula whose result has a unit, a compatible unit declaration leaves the value unchanged. On a <code>let</code> line, it sets the unit the result is shown in. On a line that sets a reaction parameter, the declared unit must fit that parameter, for example a rate-constant unit for <code>k1</code> and an energy per mole for <code>dG_act1</code>.</p>"
+            "<p>Enter a plain number, or a formula of plain numbers, in the declared unit. For a formula whose result has a unit, a compatible unit declaration leaves the value unchanged. On a <code>let</code> line, it is the unit Scan constraints use and Fit plots show when the plotted concentrations share it, and the plot offers it as a unit choice. On a line that sets a reaction parameter, the declared unit must fit that parameter, for example a rate-constant unit for <code>k1</code> and an energy per mole for <code>dG_act1</code>.</p>"
             "<h3>Supported Units</h3>"
             "<p>Use the spellings shown below after <code>; unit =</code>. The table includes unit symbols and useful compound forms.</p>"
             '<table border="1" cellpadding="5" cellspacing="0">'
@@ -1031,7 +1031,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         from kindred.core.mechanism_source import MechanismAuthoringSource
 
         self.sourceDraftEdited.emit(
-            MechanismAuthoringSource.from_parts(
+            MechanismAuthoringSource(
                 reactions_text=self.reactions_text(),
             )
         )

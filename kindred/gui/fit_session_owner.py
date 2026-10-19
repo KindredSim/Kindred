@@ -165,12 +165,8 @@ class FitSessionOwner(QtCore.QObject):
         def fit_color_resolver(species):
             return self._color_resolver(str(species), modeled_species)
 
-        # Maintenance: the window and its Parameters and species tabs are built
-        # from the origin and receive the setup only in the projection below,
-        # so each keeps its own origin copy and guards a "no setup yet" state
-        # that never occurs. Building them with the setup would remove both.
         window = FittingWindow(
-            origin,
+            setup,
             close_handler=self._request_window_close,
             color_resolver=fit_color_resolver,
             observation_style=self._observation_style_getter(),
@@ -342,7 +338,7 @@ class FitSessionOwner(QtCore.QObject):
         self._worker.pause()
         self._set_status(
             "Fit pause requested. The current evaluation will finish before execution pauses.",
-            phase="Pause requested", detail="Current evaluation is finishing"
+            phase="Pause requested", detail="Pauses after the current evaluation"
         )
         return True
 
@@ -878,7 +874,7 @@ class FitSessionOwner(QtCore.QObject):
             newline = "\r\n" if "\r\n" in source_text else "\n"
             separator = "" if source_text.endswith(("\n", "\r")) else newline
             source_text += separator + newline.join(comments)
-        source = MechanismAuthoringSource.from_parts(reactions_text=source_text)
+        source = MechanismAuthoringSource(reactions_text=source_text)
         if source == document.tab(tab_id).mechanism_source:
             # IC-only and unchanged-value Apply retain the accepted owner so
             # unaffected Run requests remain reusable by ordinary Preview.

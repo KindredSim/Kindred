@@ -14,6 +14,7 @@ from kindred.core.datasets.observation_mapping import (
     InitialConcentrationSource,
     ObservationMappingError,
     extract_initial_concentrations,
+    initial_time,
     normalize_observation_mapping,
     supplies_concentration,
 )
@@ -164,6 +165,8 @@ def apply_dataset_mapping_batch(
     records = {record.dataset_id: record for record in document.datasets}
     current = dict(tab.dataset_links)
     sets = list(tab.initial_condition_sets)
+    overrides = dict(tab.run_overrides_by_set_id)
+    defaults = tab.run_defaults
     used_names = {item.name.casefold() for item in sets}
     for item in batch.proposals:
         dataset = records[item.dataset_id]
@@ -215,6 +218,14 @@ def apply_dataset_mapping_batch(
             )
             sets.append(new_set)
             used_names.add(expected_name.casefold())
+            # Measured values describe the state at their recorded time, so the
+            # set's Run starts there; the end keeps the tab's, or its duration.
+            start = None if item.initial_concentration_source is None else initial_time(
+                dataset.observations, item.initial_concentration_source
+            )
+            if start is not None and start != defaults.t_start:
+                end = defaults.t_end if defaults.t_end > start else start + defaults.t_end - defaults.t_start
+                overrides[new_set.set_id] = replace(defaults, t_start=start, t_end=end)
             current[item.dataset_id] = DatasetLink(
                 set_id=new_set.set_id,
                 observation_mapping=normalized_mapping,
@@ -256,6 +267,9 @@ def apply_dataset_mapping_batch(
                         values=target_set.values,
                     )
                 )
+                # The values describe the state at the original's Run start.
+                if target in overrides:
+                    overrides[destination] = overrides[target]
                 used_names.add(expected_name.casefold())
             else:
                 raise DatasetMappingError("An occupied target requires an explicit disposition.")
@@ -269,6 +283,7 @@ def apply_dataset_mapping_batch(
         tab,
         initial_condition_sets=tuple(sets),
         dataset_links=tuple(sorted(current.items())),
+        run_overrides_by_set_id=tuple(overrides.items()),
     )
     return candidate
 

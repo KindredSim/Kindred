@@ -32,10 +32,7 @@ from kindred.core.project_document import (
 )
 from kindred.core.species import validate_concentration, validate_input_time_seconds
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
-from kindred.core.simulation_preparation_stages import (
-    PreparedSolverConfig,
-    build_solver_config,
-)
+from kindred.core.simulation_preparation_stages import PreparedSolverConfig
 from kindred.gui.parameter_enumeration import (
     admit_gui_parameter_value,
     enumerate_parameter_coordinates,
@@ -832,11 +829,16 @@ def fit_dataset_time_defaults(
     """Return the initial simulation span and observation range for a dataset."""
 
     times = [value for observation in mapped.observations for value in observation.t]
+    if not times:
+        return None, None, mapped.resolved_t_start, mapped.resolved_t_start
+    # Data before the Simulation start cannot be compared with the model, so
+    # the range begins at the start, never past the last recorded time.
+    latest = max(times)
     return (
-        mapped.resolved_t_start if times else None,
-        max(times, default=None),
-        min(times, default=mapped.resolved_t_start),
-        max(times, default=mapped.resolved_t_start),
+        mapped.resolved_t_start,
+        latest,
+        min(max(min(times), mapped.resolved_t_start), latest),
+        latest,
     )
 
 
@@ -1171,7 +1173,7 @@ def _prepare_fit_datasets(
                 retained_times=retained_times,
                 execution_t_start=execution_t_start,
                 execution_t_end=execution_t_end,
-                solver_config=build_solver_config(
+                solver_config=PreparedSolverConfig(
                     solver=setup.solver,
                     rtol=science.rtol,
                     atol=science.atol,

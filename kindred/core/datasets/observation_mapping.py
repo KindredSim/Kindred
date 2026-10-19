@@ -137,6 +137,28 @@ def first_data_row(observations: Sequence[ObservationSeries]) -> int:
     return min(row for series in observations for row in series.source_rows)
 
 
+def initial_time(
+    observations: Sequence[ObservationSeries],
+    source: InitialConcentrationSource,
+) -> float | None:
+    """The Run start the chosen row supplies, or None without recorded time.
+
+    A Run cannot start before zero, so a row recorded before it starts the Run
+    at zero.
+    """
+    if not any(series.t for series in observations):
+        return None
+    if source is InitialConcentrationSource.RECORDED_ZERO:
+        return 0.0
+    first_row = first_data_row(observations)
+    return max(0.0, next(
+        series.t[index]
+        for series in observations
+        for index, row in enumerate(series.source_rows)
+        if row == first_row
+    ))
+
+
 def initial_samples(
     series: ObservationSeries,
     *,

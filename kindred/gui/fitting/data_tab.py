@@ -488,10 +488,19 @@ class DataTab(QtWidgets.QWidget):
             config[_POINTS] = self._parse_points(
                 raw_points, self._available_observation_limit(dataset_id, config)
             )
-        inactive = {} if str(config.get("parametric_x") or "t") == "t" else {
-            key: text for key, text in self._invalid_raw.items()
-            if key[0] == dataset_id and key[1] in _RANGE_FIELDS
-        }
+        inactive = {}
+        if str(config.get("parametric_x") or "t") != "t":
+            # Typed range text, readable or not, waits for Time while the setup
+            # keeps its accepted range; Data Reset clears what was typed first.
+            accepted = self._owned_settings(self._settings_getter(dataset_id))
+            typed = self._changed_fields.get(dataset_id, set())
+            inactive = {
+                (dataset_id, field): self._invalid_raw.get((dataset_id, field), self._format(config[field]))
+                for field in _RANGE_FIELDS
+                if (dataset_id, field) in self._invalid_raw
+                or (field in typed and config[field] != accepted[field])
+            }
+            config.update((field, accepted[field]) for _dataset_id, field in inactive)
         self._discard_held(dataset_id)
         self._invalid_raw.update(inactive)
         if inactive:

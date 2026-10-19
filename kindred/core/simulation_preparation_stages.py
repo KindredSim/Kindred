@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from numbers import Real
 from types import MappingProxyType
 from typing import Any, Dict
 
@@ -22,7 +21,6 @@ from kindred.core.symbolic.jacobian_execution import (
 __all__ = [
     "PreparedSolverConfig",
     "build_runtime_symbolic_jacobian",
-    "build_solver_config",
 ]
 
 
@@ -43,25 +41,6 @@ class PreparedSolverConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "grid", MappingProxyType(dict(self.grid)))
-
-
-def build_solver_config(
-    *,
-    solver: str,
-    rtol: Real,
-    atol: Real,
-    grid: Mapping[str, Any],
-    use_analytic_jacobian: bool,
-) -> PreparedSolverConfig:
-    """Build one typed solver policy from admitted settings."""
-
-    return PreparedSolverConfig(
-        solver=solver,
-        rtol=rtol,
-        atol=atol,
-        grid=grid,
-        use_analytic_jacobian=use_analytic_jacobian,
-    )
 
 
 def _symbolic_jacobian_status_for_mechanism(mechanism: Any) -> Dict[str, Any]:

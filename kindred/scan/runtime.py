@@ -9,7 +9,7 @@ import time
 from kindred.core.exceptions import SimulationCancelled
 from kindred.core.simulation_execution import execute_simulation
 from kindred.core.simulation_preparation import build_simulation_execution_request
-from kindred.core.simulation_preparation_stages import build_solver_config
+from kindred.core.simulation_preparation_stages import PreparedSolverConfig
 from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 from kindred.core.units import UnitsModel
@@ -50,8 +50,8 @@ def _worker(config, connection, cancel):
             prepared = prepare_dsl_request_set(config.source, units=UnitsModel(
                 energy_unit=config.energy_unit, temperature_K=config.temperature_K,
                 standard_conc_M=config.standard_conc_M))
-            solver = build_solver_config(solver=config.solver, rtol=config.rtol, atol=config.atol,
-                                         grid={"N": config.points}, use_analytic_jacobian=config.analytic_jacobian)
+            solver = PreparedSolverConfig(solver=config.solver, rtol=config.rtol, atol=config.atol,
+                                          grid={"N": config.points}, use_analytic_jacobian=config.analytic_jacobian)
         except Exception as exc:
             connection.send(("bootstrap_failure", str(exc)))
             return

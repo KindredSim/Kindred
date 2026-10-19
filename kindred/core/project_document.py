@@ -1192,7 +1192,7 @@ def reconcile_tab_mechanism_source(
     accepted_source = (
         visible_source
         if not admission.has_declarations
-        else MechanismAuthoringSource.from_parts(
+        else MechanismAuthoringSource(
             reactions_text=admission.materialized_source
         )
     )
@@ -1299,7 +1299,7 @@ def _correction_proposal(
         source.reactions_text,
         corrections,
     )
-    return MechanismAuthoringSource.from_parts(reactions_text=updated_source), corrections
+    return MechanismAuthoringSource(reactions_text=updated_source), corrections
 
 
 def select_exact_correction_basis(

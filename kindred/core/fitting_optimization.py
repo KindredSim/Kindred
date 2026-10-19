@@ -148,6 +148,24 @@ def fit_parameters_with_fixed(
     )
 
 
+def _jacobian_rank_warning(jacobian: np.ndarray) -> Optional[str]:
+    """The identifiability warning for a rank-deficient fit Jacobian."""
+    J = np.asarray(jacobian, dtype=float)
+    param_count = J.shape[1]
+    # Rank of the column-scaled Jacobian, so parameters on very
+    # different scales are not mistaken for dependent ones.
+    # All-zero columns stay zero and count as deficient.
+    norms = np.linalg.norm(J, axis=0)
+    scaled = np.divide(J, norms, out=np.zeros_like(J), where=norms > 0.0)
+    rank = int(np.linalg.matrix_rank(scaled, rtol=_JACOBIAN_RANK_RTOL))
+    if rank == param_count:
+        return None
+    return (
+        "These data cannot determine every fitted value independently. "
+        f"The fit Jacobian has rank {rank} for {param_count} fitted value{'' if param_count == 1 else 's'}."
+    )
+
+
 def fit_parameters(
     objective_func: Callable[[np.ndarray], np.ndarray],
     initial_params: Dict[object, float],
@@ -221,6 +239,8 @@ def fit_parameters(
             residuals = np.asarray(wrapped_objective(params), dtype=float).reshape(-1)
             return float(np.dot(residuals, residuals))
 
+        polishes: list = []
+
         def polish(_scalar_objective, start, **_scipy_arguments):
             # SciPy keeps the polish only when it succeeds, scores lower and
             # stays inside the bounds. Its score is the sum of squares, twice
@@ -229,6 +249,7 @@ def fit_parameters(
                 search_evaluations_callback(0)
             polished = run_least_squares(np.asarray(start, dtype=float), "trf")
             polished.fun = 2.0 * polished.cost
+            polishes.append(polished)
             return polished
 
         # SciPy's default population size. Its first population is always
@@ -266,6 +287,9 @@ def fit_parameters(
         x_opt = np.asarray(result.x, dtype=float)
         success = bool(result.success)
         message = result.message
+        # A kept polish supplies the endpoint's least-squares Jacobian.
+        if polishes and np.array_equal(polishes[0].x, x_opt):
+            identifiability_warning = _jacobian_rank_warning(polishes[0].jac)
 
     else:
         result = run_least_squares(x0, method)
@@ -274,19 +298,7 @@ def fit_parameters(
         message = result.message
         if result.status == 1:
             message = "Fit stopped at zero computed first-order optimality."
-        J = np.asarray(result.jac, dtype=float)
-        param_count = len(x_opt)
-        # Rank of the column-scaled Jacobian, so parameters on very
-        # different scales are not mistaken for dependent ones.
-        # All-zero columns stay zero and count as deficient.
-        norms = np.linalg.norm(J, axis=0)
-        scaled = np.divide(J, norms, out=np.zeros_like(J), where=norms > 0.0)
-        rank = int(np.linalg.matrix_rank(scaled, rtol=_JACOBIAN_RANK_RTOL))
-        if rank < param_count:
-            identifiability_warning = (
-                "These data cannot determine every fitted value independently. "
-                f"The fit Jacobian has rank {rank} for {param_count} fitted value{'' if param_count == 1 else 's'}."
-            )
+        identifiability_warning = _jacobian_rank_warning(result.jac)
 
     fitted_params = {name: float(val) for name, val in zip(param_names, x_opt)}
 

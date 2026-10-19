@@ -202,12 +202,12 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     def __init__(
         self,
         *,
-        origin: FitOriginSnapshot,
+        setup: FitSetupSnapshot,
         mechanism_species: Sequence[str] = (),
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self._origin = origin
+        self._projected_setup = setup
         self._mechanism_species = tuple(
             dict.fromkeys(
                 str(species).strip()
@@ -219,12 +219,11 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._mechanism_species = tuple(
                 dict.fromkeys(
                     species
-                    for mapped in origin.mapped_datasets
+                    for mapped in setup.origin.mapped_datasets
                     for species, _value in mapped.initial_values
                 )
             )
 
-        self._projected_setup: FitSetupSnapshot | None = None
         self._current_dataset_id: str | None = None
         # Weight text that could not apply, keyed ("target_weight", dataset,
         # species) or ("dataset_weight", dataset).
@@ -432,7 +431,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     ) -> None:
         """Render an owner snapshot without reconstructing Fit state."""
 
-        self._origin = snapshot.origin
         available_ids = tuple(item.dataset_id for item in snapshot.datasets)
         requested_id = dataset_id or self._current_dataset_id
         self._projected_setup = snapshot
@@ -444,8 +442,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     def load_for_dataset(self, dataset_id: str) -> None:
         """Select one projected dataset and repaint the table."""
 
-        if self._projected_setup is None:
-            return
         self._current_dataset_id = dataset_id
         self._refresh_visible_presentation()
 
@@ -494,13 +490,12 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     # Snapshot lookup and presentation helpers
     # ------------------------------------------------------------------
-    def _current_setup(self) -> FitSetupSnapshot | None:
-        return self._projected_setup
+    @property
+    def _origin(self) -> FitOriginSnapshot:
+        return self._projected_setup.origin
 
     def _projected_dataset(self, dataset_id: str) -> FitDatasetLocalSettings | None:
-        setup = self._current_setup()
-        if setup is None:
-            return None
+        setup = self._projected_setup
         return next(
             (
                 item
@@ -511,7 +506,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         )
 
     def _current_dataset(self) -> FitDatasetLocalSettings | None:
-        if self._projected_setup is None or not self._current_dataset_id:
+        if not self._current_dataset_id:
             return None
         return self._projected_dataset(self._current_dataset_id)
 
@@ -571,7 +566,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         projected_initials = (
             [
                 item.species
-                for item in (self._current_setup().initials if self._current_setup() else ())
+                for item in self._projected_setup.initials
                 if mapped is not None and item.set_id == mapped.set_id
             ]
         )
@@ -590,9 +585,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         dataset: FitDatasetLocalSettings,
         species: str,
     ) -> FitInitialVariable | None:
-        setup = self._current_setup()
-        if setup is None:
-            return None
+        setup = self._projected_setup
         mapped = self._mapped_dataset(dataset.dataset_id)
         if mapped is None:
             return None
@@ -630,11 +623,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         dataset_id: str,
         species: str,
     ) -> FitSharedInitialGroup | None:
-        setup = self._current_setup()
         return next(
             (
                 item
-                for item in (setup.shared_initial_groups if setup is not None else ())
+                for item in self._projected_setup.shared_initial_groups
                 if item.species == species and dataset_id in item.member_dataset_ids
             ),
             None,
@@ -691,9 +683,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         Starting IC.
         """
 
-        setup = self._current_setup()
-        if setup is None:
-            return None
+        setup = self._projected_setup
         included = {item.dataset_id for item in setup.datasets if item.included}
         groups = tuple(
             group for group in setup.shared_initial_groups if group.species == species
@@ -759,7 +749,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         *,
         initials: Sequence[FitInitialVariable] | None = None,
     ) -> None:
-        setup = self._current_setup()
+        setup = self._projected_setup
         self._submit(replace(
             setup,
             shared_initial_groups=tuple(groups),
@@ -774,7 +764,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         and Vary IC, which membership never changed.
         """
 
-        setup = self._current_setup()
+        setup = self._projected_setup
         order = tuple(item.dataset_id for item in setup.datasets)
         remaining = tuple(sorted(
             (item for item in group.member_dataset_ids if item != dataset_id), key=order.index,
@@ -824,7 +814,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         # Every joiner takes the group's configuration over its invalid text.
         for member in (dataset_id, *added):
             self._drop_invalid_initial_row(self._mapped_dataset(member).set_id, species)
-        setup = self._current_setup()
+        setup = self._projected_setup
         if joined is None:
             self._submit_groups((
                 *setup.shared_initial_groups,
@@ -1130,11 +1120,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         set_id: str,
         species: str,
     ) -> FitInitialVariable | None:
-        setup = self._current_setup()
         return next(
             (
                 item
-                for item in (setup.initials if setup is not None else ())
+                for item in self._projected_setup.initials
                 if item.set_id == set_id and item.species == species
             ),
             None,
@@ -1147,10 +1136,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._weight_mode_combo.blockSignals(True)
         self._dataset_weight_edit.blockSignals(True)
         try:
-            setup = self._current_setup()
-            if setup is not None:
-                mode_index = self._weight_mode_combo.findData(setup.dataset_weight_mode)
-                self._weight_mode_combo.setCurrentIndex(max(0, mode_index))
+            mode_index = self._weight_mode_combo.findData(self._projected_setup.dataset_weight_mode)
+            self._weight_mode_combo.setCurrentIndex(max(0, mode_index))
             self._populate_table()
             self._refresh_dataset_weight_editor()
         finally:
@@ -1214,7 +1201,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._submit_dataset(replace(dataset, target_weights=tuple(weights.items())))
 
     def _submit_dataset(self, dataset: FitDatasetLocalSettings) -> None:
-        setup = self._current_setup()
+        setup = self._projected_setup
         self._submit(replace(
             setup,
             datasets=tuple(
@@ -1312,7 +1299,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._refresh_visible_presentation()
             return
         self._drop_invalid_initial_row(set_id, species)
-        setup = self._current_setup()
+        setup = self._projected_setup
         if group is not None:
             if initial.tolerance.mode == "disabled":
                 # Turning off Vary IC on the origin dissolves its group; every
@@ -1488,7 +1475,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._stage_visible_target_selection(self._current_dataset_id or "")
 
     def _copy_targets_to_compatible_datasets(self) -> None:
-        setup = self._current_setup()
+        setup = self._projected_setup
         source = self._current_dataset()
         if source is None:
             return
@@ -1535,9 +1522,9 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         measured X, in either role).
         """
 
-        setup = self._current_setup()
+        setup = self._projected_setup
         source = self._current_dataset()
-        if setup is None or source is None:
+        if source is None:
             return
 
         source_mapped = self._mapped_dataset(source.dataset_id)
@@ -1649,15 +1636,15 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     # Weight-mode and validation presentation
     # ------------------------------------------------------------------
     def _on_weight_mode_changed(self) -> None:
-        if self._refreshing or self._running or self._current_setup() is None:
+        if self._refreshing or self._running:
             return
         mode = str(self._weight_mode_combo.currentData() or "implicit")
-        if mode == self._current_setup().dataset_weight_mode:
+        if mode == self._projected_setup.dataset_weight_mode:
             self._refresh_dataset_weight_editor()
             return
         self._submit(
             replace(
-                self._current_setup(),
+                self._projected_setup,
                 dataset_weight_mode=mode,
             )
         )
@@ -1709,8 +1696,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     def _blocking_invalid_keys(self) -> tuple[tuple[str, ...], ...]:
         """Held weight text; a dataset weight counts only while Custom uses it."""
 
-        setup = self._current_setup()
-        custom = setup is not None and setup.dataset_weight_mode == "user"
+        setup = self._projected_setup
+        custom = setup.dataset_weight_mode == "user"
         return tuple(key for key in self._invalid_raw if custom or key[0] != "dataset_weight")
 
     def _current_has_invalid_entries(self) -> bool:
@@ -1741,7 +1728,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     def invalid_editor_locations(self) -> tuple[str, ...]:
         """Name each invalid entry by dataset, species, and column in table order."""
 
-        datasets = self._projected_setup.datasets if self._projected_setup else ()
+        datasets = self._projected_setup.datasets
         order = {item.dataset_id: index for index, item in enumerate(datasets)}
         rows = {item.dataset_id: self._row_species(item) for item in datasets}
         by_set = {item.set_id: item.dataset_id for item in self._origin.mapped_datasets}

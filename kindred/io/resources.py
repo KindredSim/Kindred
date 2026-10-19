@@ -131,7 +131,7 @@ def get_preset_mechanism_source(preset_id: str) -> MechanismAuthoringSource:
     MechanismAuthoringSource
         Complete mechanism source.
     """
-    return MechanismAuthoringSource.from_parts(
+    return MechanismAuthoringSource(
         reactions_text=get_resource_text(f"presets/{preset_id}.txt")
     )
 
@@ -150,7 +150,7 @@ def get_intervention_example_source(example_id: str) -> MechanismAuthoringSource
     MechanismAuthoringSource
         Complete mechanism source.
     """
-    return MechanismAuthoringSource.from_parts(
+    return MechanismAuthoringSource(
         reactions_text=get_resource_text(f"interventions/{example_id}.txt")
     )
 

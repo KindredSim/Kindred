@@ -54,7 +54,7 @@ class FittingWindow(QtWidgets.QDialog):
 
     def __init__(
         self,
-        origin: FitOriginSnapshot,
+        setup: FitSetupSnapshot,
         *,
         close_handler: Callable[[], bool],
         observation_style: tuple[str, float, float],
@@ -62,14 +62,13 @@ class FittingWindow(QtWidgets.QDialog):
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self._origin = origin
+        self._projected_setup = setup
         self._close_handler = close_handler
         self._color_resolver = color_resolver
         self._observation_style = observation_style
         self._closing = False
         self._closing_after_cleanup = False
         self._paused = False
-        self._projected_setup: FitSetupSnapshot | None = None
         self._executing = False
         self._setup_projecting = False
         self._last_fit_available = False
@@ -96,7 +95,7 @@ class FittingWindow(QtWidgets.QDialog):
         layout.setSpacing(8)
 
         self._species_table = UnifiedSpeciesTable(
-            origin=self._origin,
+            setup=self._projected_setup,
             mechanism_species=self._mechanism_species(),
             parent=self,
         )
@@ -112,7 +111,7 @@ class FittingWindow(QtWidgets.QDialog):
             parent=self,
         )
         self._params_ics_tab = ParametersIcsTab(
-            origin=self._origin,
+            setup=self._projected_setup,
             parent=self,
         )
         self._run_results_tab = RunResultsTab(
@@ -385,7 +384,6 @@ class FittingWindow(QtWidgets.QDialog):
     def project_setup_snapshot(self, snapshot: FitSetupSnapshot) -> None:
         """Project accepted baselines while retaining unrelated local edits."""
 
-        self._origin = snapshot.origin
         self._projected_setup = snapshot
         self._populate_dataset_list(snapshot)
         selected_dataset_id = (
@@ -421,13 +419,8 @@ class FittingWindow(QtWidgets.QDialog):
 
     @property
     def has_invalid_setup_edits(self) -> bool:
-        setup = self._projected_setup
-        data_issues = (
-            {}
-            if setup is None
-            else self._data_tab.data_edit_issues(
-                self._included_dataset_ids(setup)
-            )
+        data_issues = self._data_tab.data_edit_issues(
+            self._included_dataset_ids(self._projected_setup)
         )
         return bool(data_issues) or self._has_invalid_parameter_or_species_edits()
 
@@ -444,12 +437,12 @@ class FittingWindow(QtWidgets.QDialog):
         setup = self._projected_setup
         data_issues = self._data_tab.data_edit_issues(
             dataset.dataset_id for dataset in setup.datasets
-        ) if setup is not None else {}
-        included = set(self._included_dataset_ids(setup)) if setup is not None else set()
+        )
+        included = set(self._included_dataset_ids(setup))
         active_issues = {key: value for key, value in data_issues.items() if key in included}
         invalid = bool(active_issues) or self._has_invalid_parameter_or_species_edits()
         structural = None
-        if setup is not None and not invalid:
+        if not invalid:
             structural = fit_setup_readiness(
                 origin=self._origin,
                 datasets=setup.datasets,
@@ -458,7 +451,7 @@ class FittingWindow(QtWidgets.QDialog):
                 shared_initial_groups=setup.shared_initial_groups,
                 profile=setup.profile,
             )
-        ready = setup is not None and not invalid and structural is None
+        ready = not invalid and structural is None
         self._run_button.setEnabled(ready and not self._is_executing())
         listing = self._data_targets_tab.unified_list
         listing.set_data_edit_issues(data_issues)
@@ -510,6 +503,10 @@ class FittingWindow(QtWidgets.QDialog):
     # Fit data and setup presentation adapters
     # ------------------------------------------------------------------
 
+    @property
+    def _origin(self) -> FitOriginSnapshot:
+        return self._projected_setup.origin
+
     def _mechanism_species(self) -> tuple[str, ...]:
         analysis = self._origin.prepared_dsl.analysis
         return tuple(
@@ -538,13 +535,9 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _fit_settings_for_dataset(self, dataset_id: str) -> dict[str, object]:
         setup = self._projected_setup
-        dataset = (
-            next(
-                (item for item in setup.datasets if item.dataset_id == dataset_id),
-                None,
-            )
-            if setup is not None
-            else None
+        dataset = next(
+            (item for item in setup.datasets if item.dataset_id == dataset_id),
+            None,
         )
         if dataset is None:
             return self._fit_default_settings_for_dataset(dataset_id)
@@ -563,7 +556,7 @@ class FittingWindow(QtWidgets.QDialog):
     def _eligible_parametric_x(self, dataset_id: str) -> tuple[str, ...]:
         setup = self._projected_setup
         mapped = self._mapped_dataset(dataset_id)
-        if setup is None or mapped is None:
+        if mapped is None:
             return ()
         dataset = next(
             item for item in setup.datasets if item.dataset_id == dataset_id
@@ -621,7 +614,7 @@ class FittingWindow(QtWidgets.QDialog):
     ) -> tuple[object, ...]:
         setup = self._projected_setup
         mapped = self._mapped_dataset(dataset_id)
-        if setup is None or mapped is None:
+        if mapped is None:
             return ()
         current = next(
             item for item in setup.datasets if item.dataset_id == dataset_id
@@ -674,8 +667,6 @@ class FittingWindow(QtWidgets.QDialog):
         included: bool,
     ) -> None:
         setup = self._projected_setup
-        if setup is None:
-            return
         current = next(
             (item for item in setup.datasets if item.dataset_id == dataset_id),
             None,
@@ -695,8 +686,6 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _on_data_settings_applied(self, dataset_id: str, config: dict) -> None:
         setup = self._projected_setup
-        if setup is None:
-            return
         current = next(
             (item for item in setup.datasets if item.dataset_id == dataset_id),
             None,
@@ -838,21 +827,18 @@ class FittingWindow(QtWidgets.QDialog):
 
     def set_live_best(self, update: FitLiveUpdate) -> None:
         setup = self._projected_setup
-        included = set() if setup is None else {
-            dataset.dataset_id for dataset in setup.datasets if dataset.included
-        }
-        labels = {} if setup is None else {
+        included = {dataset.dataset_id for dataset in setup.datasets if dataset.included}
+        labels = {
             dataset.dataset_id: dataset.display_name
             for dataset in setup.origin.mapped_datasets if dataset.dataset_id in included
         }
         initial_labels: dict[str, str] = {}
-        if setup is not None:
-            for mapped in setup.origin.mapped_datasets:
-                if mapped.dataset_id in included:
-                    previous = initial_labels.get(mapped.set_id)
-                    initial_labels[mapped.set_id] = (
-                        mapped.display_name if previous is None else previous + ", " + mapped.display_name
-                    )
+        for mapped in setup.origin.mapped_datasets:
+            if mapped.dataset_id in included:
+                previous = initial_labels.get(mapped.set_id)
+                initial_labels[mapped.set_id] = (
+                    mapped.display_name if previous is None else previous + ", " + mapped.display_name
+                )
         self._run_results_tab.set_live_best(update, dataset_labels=labels, initial_labels=initial_labels)
 
     def set_live_curves(self, curves: tuple[FitCurveDataset, ...]) -> None:

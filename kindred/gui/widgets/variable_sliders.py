@@ -22,6 +22,7 @@ from PySide6.QtCore import Signal
 from kindred.gui.interactive_preview import SliderInteractionKind
 from kindred.gui.parameter_enumeration import GuiParameterCoordinate
 from kindred.gui.widgets.fine_drag_slider import FineDragSlider, NumericValueEdit, SliderPress
+from kindred.gui.widgets.species_sliders import format_slider_value
 from html import escape
 from kindred.gui.display_name_policy import (
     reaction_text,
@@ -235,7 +236,7 @@ class VariableSliders(QtWidgets.QWidget):
         if unit_label is not None:
             top_row.addWidget(unit_label)
 
-        value_label = NumericValueEdit(self._format_value(value))
+        value_label = NumericValueEdit(format_slider_value(value))
         configure_compact_numeric_edit(value_label, characters=15)
         value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
         value_label.editStarted.connect(
@@ -293,8 +294,8 @@ class VariableSliders(QtWidgets.QWidget):
         range_layout.setSpacing(0)
         lo, hi = self._slider_ranges[name]
         if scale == "linear":
-            min_label = QtWidgets.QLabel(self._format_value(float(lo)))
-            max_label = QtWidgets.QLabel(self._format_value(float(hi)))
+            min_label = QtWidgets.QLabel(format_slider_value(float(lo)))
+            max_label = QtWidgets.QLabel(format_slider_value(float(hi)))
         else:
             min_label = QtWidgets.QLabel(self._format_power_of_ten(lo))
             max_label = QtWidgets.QLabel(self._format_power_of_ten(hi))
@@ -382,31 +383,6 @@ class VariableSliders(QtWidgets.QWidget):
             interaction=interaction,
         )
 
-    def _format_value(self, value: float) -> str:
-        """
-        Format value for display.
-
-        Parameters
-        ----------
-        value : float
-            Value to format
-
-        Returns
-        -------
-        str
-            Formatted string
-        """
-        if value == 0:
-            return "0"
-        elif abs(value) < 0.001 or abs(value) >= 1000:
-            return f"{value:.3e}"
-        elif abs(value) < 0.1:
-            return f"{value:.4f}"
-        elif abs(value) < 10:
-            return f"{value:.3f}"
-        else:
-            return f"{value:.2f}"
-
     def get_variables(self) -> Dict[str, float]:
         """
         Get current variable values.
@@ -442,7 +418,7 @@ class VariableSliders(QtWidgets.QWidget):
             for name, value in normalized_variables.items():
                 if not preserve_editor_drafts:
                     self._set_value_projection(
-                        name, value, editor_text=self._format_value(value), emit=False
+                        name, value, editor_text=format_slider_value(value), emit=False
                     )
                 elif name in self._active_presses:
                     self.update_variable_readout(name, value)
@@ -692,7 +668,7 @@ class VariableSliders(QtWidgets.QWidget):
             return
         value = self._variables.get(str(name), 0.0)
         value, text, rejected = self._editor_pre_edit_state.get(
-            str(name), (value, self._format_value(value), False)
+            str(name), (value, format_slider_value(value), False)
         )
         self._set_value_projection(
             str(name), value, editor_text=text, emit=False
@@ -783,7 +759,7 @@ class VariableSliders(QtWidgets.QWidget):
                 return
             self._set_editor_text(
                 value_label,
-                self._format_value(value_f) if editor_text is None else editor_text,
+                format_slider_value(value_f) if editor_text is None else editor_text,
             )
             self._decorate_editor(name_s)
         logger.debug("Variable projected: %s = %.12g", name_s, value_f)
@@ -956,8 +932,8 @@ class VariableSliders(QtWidgets.QWidget):
         min_label, max_label = self._range_labels[name]
         if self._slider_scales.get(name, "log") == "linear":
             linear_min, linear_max = self._slider_ranges[name]
-            min_label.setText(self._format_value(float(linear_min)))
-            max_label.setText(self._format_value(float(linear_max)))
+            min_label.setText(format_slider_value(float(linear_min)))
+            max_label.setText(format_slider_value(float(linear_max)))
             return
         log_min, log_max = self._slider_ranges[name]
         min_label.setText(self._format_power_of_ten(log_min))
