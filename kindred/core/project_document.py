@@ -36,11 +36,10 @@ from kindred.core.simulator.source_correction import (
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.scipy_integrate import validate_scipy_rtol
 from kindred.core.units import UnitsModel
+from kindred.core.validation import parse_whole_number_text
 from kindred.core.species import (
     MAX_FIT_EVALUATIONS,
     MAX_GENERATED_TIME_ROWS,
-    TEMPERATURE_MAX_K,
-    TEMPERATURE_MIN_K,
     validate_concentration,
     validate_c0,
     validate_temperature,
@@ -65,7 +64,6 @@ __all__ = [
     "FIT_MAX_NFEV_RANGE",
     "FIT_SEED_RANGE",
     "SIMULATION_POINT_RANGE",
-    "TEMPERATURE_RANGE_K",
     "parse_points_text",
     "SUPPORTED_SOLVERS",
     "validate_fit_solver",
@@ -92,7 +90,6 @@ __all__ = [
 ]
 
 _SIMULATION_POINT_RANGE = (10, MAX_GENERATED_TIME_ROWS)
-_TEMPERATURE_RANGE_K = (TEMPERATURE_MIN_K, TEMPERATURE_MAX_K)
 _SOLVERS = ("Radau", "BDF")
 _FITTING_MAX_NFEV_RANGE = (10, MAX_FIT_EVALUATIONS)
 _FITTING_SEED_RANGE = (0, 999_999)
@@ -103,7 +100,6 @@ SUPPORTED_SOLVERS = _SOLVERS
 FIT_MAX_NFEV_RANGE = _FITTING_MAX_NFEV_RANGE
 FIT_SEED_RANGE = _FITTING_SEED_RANGE
 SIMULATION_POINT_RANGE = _SIMULATION_POINT_RANGE
-TEMPERATURE_RANGE_K = _TEMPERATURE_RANGE_K
 
 
 def _new_id(prefix: str) -> str:
@@ -815,14 +811,7 @@ def _validate_unique(
 def parse_points_text(text: str, *, field: str = "Points") -> int:
     """Admit authored Points text without clamping or reverting it."""
     minimum, maximum = _SIMULATION_POINT_RANGE
-    message = f"{field} {text!r} must be an integer between {minimum} and {maximum}."
-    try:
-        value = int(str(text).strip())
-    except ValueError as exc:
-        raise ValueError(message) from exc
-    if not minimum <= value <= maximum:
-        raise ValueError(message)
-    return value
+    return parse_whole_number_text(text, field=field, minimum=minimum, maximum=maximum)
 
 
 def validate_simulation_execution_settings(

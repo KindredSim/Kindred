@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterable, Mapping
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from kindred.core.validation import parse_finite_numeric_text, six_digit_text
+from kindred.core.validation import parse_finite_numeric_text, parse_whole_number_text, six_digit_text
 from kindred.gui.fitting.launch import fit_execution_span
 from kindred.gui.ui_helpers import (
     INVALID_EDITOR_STYLE,
@@ -390,9 +390,7 @@ class DataTab(QtWidgets.QWidget):
     def _parse_points(raw: str, limit: int) -> int | None:
         """Read a typed points count against the available count; all means no cap."""
 
-        value = int(raw.strip())
-        if not 2 <= value <= limit:
-            raise ValueError
+        value = parse_whole_number_text(raw, field="Points per target", minimum=2, maximum=limit)
         return None if value == limit else value
 
     @staticmethod
@@ -421,8 +419,8 @@ class DataTab(QtWidgets.QWidget):
             limit = self._available_observation_limit(dataset_id, config)
             try:
                 self._parse_points(raw_points, limit)
-            except ValueError:
-                return f"Points per target must be a whole number from 2 to {limit}."
+            except ValueError as exc:
+                return str(exc)
         try:
             start, end = fit_execution_span(config["t_start"], config["simulation_end"])
         except ValueError as exc:

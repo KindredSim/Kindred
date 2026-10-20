@@ -161,7 +161,7 @@ class ConfigController(QtCore.QObject):
                 success_message="Parallel execution maximum reset to Automatic.",
             )
             return None
-        # The dialog's spin box admits 1 to the physical cores.
+        # The dialog admits 1 to the physical cores.
         accepted = value
         settings = self._settings()
         snapshot = self._snapshot_settings(settings, (_PARALLEL_MAXIMUM_KEY,))

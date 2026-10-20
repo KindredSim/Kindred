@@ -29,7 +29,7 @@ from kindred.gui.ui_helpers import (
 from kindred.core.analysis.fit_uncertainty import ProfileLikelihoodOptions
 from kindred.core.analysis.global_fit_execution import FitCoordinate
 from kindred.core.quantity_units import format_unit_for_display
-from kindred.core.validation import parse_finite_numeric_text, six_digit_text
+from kindred.core.validation import parse_finite_numeric_text, parse_whole_number_text, six_digit_text
 
 from kindred.core.fitting_method_policy import SUPPORTED_FIT_METHODS, UNCERTAINTY_FIT_METHODS
 from kindred.gui.fitting.constants import FIT_METHOD_LABELS
@@ -100,16 +100,13 @@ class _ProfileLikelihoodDialog(QtWidgets.QDialog):
         self.setModal(True)
         form = QtWidgets.QFormLayout(self)
         self._confidence = QtWidgets.QLineEdit(_format_scientific(options.confidence_level), self)
-        self._points = QtWidgets.QSpinBox(self)
-        self._points.setRange(2, 10_000)
-        self._points.setValue(options.max_bracketing_steps_per_side)
-        self._budget = QtWidgets.QSpinBox(self)
-        self._budget.setRange(1, 100_000)
-        self._budget.setValue(options.max_nfev_per_point)
+        self._points = QtWidgets.QLineEdit(str(options.max_bracketing_steps_per_side), self)
+        self._budget = QtWidgets.QLineEdit(str(options.max_nfev_per_point), self)
         self._method = QtWidgets.QComboBox(self)
         ParametersIcsTab._add_method_items(self._method)
         self._method.setCurrentIndex(max(0, self._method.findData(options.optimizer_method)))
-        configure_compact_numeric_edit(self._confidence, characters=8)
+        for edit in (self._confidence, self._points, self._budget):
+            configure_compact_numeric_edit(edit, characters=8)
         form.addRow("Confidence level:", self._confidence)
         form.addRow("Maximum outward search steps per side:", self._points)
         form.addRow("Maximum evaluations per refit:", self._budget)
@@ -127,8 +124,15 @@ class _ProfileLikelihoodDialog(QtWidgets.QDialog):
             confidence_level=parse_finite_numeric_text(
                 self._confidence.text(), field="Confidence level"
             ),
-            max_bracketing_steps_per_side=self._points.value(),
-            max_nfev_per_point=self._budget.value(),
+            max_bracketing_steps_per_side=parse_whole_number_text(
+                self._points.text(),
+                field="Maximum outward search steps per side",
+                minimum=2,
+                maximum=10_000,
+            ),
+            max_nfev_per_point=parse_whole_number_text(
+                self._budget.text(), field="Maximum evaluations per refit", minimum=1, maximum=100_000,
+            ),
             optimizer_method=self._method.currentData(),
         )
 
@@ -332,7 +336,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._projected_setup = setup
         self._last_fit_parameters: dict[str, FitParameterVariable] = {}
         self._last_fit_included: set[str] = set()
-        self._tolerance_drafts: dict[str, str] = {}
+        self._defaults_drafts: dict[str, str] = {}
         self._defaults_error_text = ""
         self._roster_height_initialized = False
         self._invalid_rows: dict[str, _InvalidRow] = {}
@@ -494,24 +498,15 @@ class ParametersIcsTab(QtWidgets.QWidget):
             combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
             combo.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         defaults = default_fit_defaults()
-        self._max_eval_spin = QtWidgets.QSpinBox(settings_group)
-        self._max_eval_spin.setRange(*FIT_MAX_NFEV_RANGE)
-        self._max_eval_spin.setValue(defaults.max_nfev)
-        self._max_eval_spin.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        self._max_eval_edit = QtWidgets.QLineEdit(str(defaults.max_nfev), settings_group)
         self._seed_check = QtWidgets.QCheckBox(
             "Fixed Seed", settings_group
         )
-        self._seed_spin = QtWidgets.QSpinBox(settings_group)
-        self._seed_spin.setRange(*FIT_SEED_RANGE)
-        self._seed_spin.setValue(defaults.seed)
-        self._seed_spin.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-        for control in (self._solver_combo, self._method_combo, self._max_eval_spin, self._seed_spin):
+        self._seed_edit = QtWidgets.QLineEdit(str(defaults.seed), settings_group)
+        for control in (self._solver_combo, self._method_combo):
             ignore_wheel(control)
-        # A typed number applies on Enter or focus loss, as one setup change.
-        for spin in (self._max_eval_spin, self._seed_spin):
-            spin.setKeyboardTracking(False)
         self._seed_check.setChecked(defaults.use_seed)
-        self._seed_spin.setEnabled(defaults.use_seed)
+        self._seed_edit.setEnabled(defaults.use_seed)
         self._ftol_edit = QtWidgets.QLineEdit(settings_group)
         self._xtol_edit = QtWidgets.QLineEdit(settings_group)
         self._ftol_edit.setObjectName("fit_objective_tolerance")
@@ -519,8 +514,16 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._ftol_label = QtWidgets.QLabel(f"{FUNCTION_TOLERANCE_LABEL}:", settings_group)
         self._xtol_label = QtWidgets.QLabel(f"{STEP_TOLERANCE_LABEL}:", settings_group)
         for label, edit in ((self._ftol_label, self._ftol_edit), (self._xtol_label, self._xtol_edit)):
-            configure_compact_numeric_edit(edit, characters=8)
             label.setBuddy(edit)
+        # Each typed box names itself in its own parse message.
+        self._defaults_edits = {
+            "max_nfev": (self._max_eval_edit, "Maximum evaluations"),
+            "seed": (self._seed_edit, "Fixed Seed"),
+            "ftol": (self._ftol_edit, FUNCTION_TOLERANCE_LABEL),
+            "xtol": (self._xtol_edit, STEP_TOLERANCE_LABEL),
+        }
+        for edit, _name in self._defaults_edits.values():
+            configure_compact_numeric_edit(edit, characters=8)
         self._profile_check = QtWidgets.QCheckBox("Profile Likelihood", settings_group)
         self._profile_check.setToolTip("Profile the fitted values ticked in the Profile column.")
         self._profile_configure = QtWidgets.QPushButton("Configure…", settings_group)
@@ -530,9 +533,9 @@ class ParametersIcsTab(QtWidgets.QWidget):
         flow = ControlRowsLayout(flow_host)
         for label, control in (
             ("Optimization method:", self._method_combo),
-            ("Maximum evaluations:", self._max_eval_spin),
+            ("Maximum evaluations:", self._max_eval_edit),
             ("Simulation solver:", self._solver_combo),
-            (self._seed_check, self._seed_spin),
+            (self._seed_check, self._seed_edit),
             (self._ftol_label, self._ftol_edit),
             (self._xtol_label, self._xtol_edit),
             (self._profile_check, self._profile_configure),
@@ -545,11 +548,11 @@ class ParametersIcsTab(QtWidgets.QWidget):
             form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
             form.addRow(label, control)
             flow.addWidget(group)
-            if control is self._seed_spin:
+            if control is self._seed_edit:
                 self._seed_group = group
         settings_layout.addWidget(flow_host)
-        controls = (self._method_combo, self._max_eval_spin, self._solver_combo,
-                    self._seed_check, self._seed_spin, self._ftol_edit, self._xtol_edit,
+        controls = (self._method_combo, self._max_eval_edit, self._solver_combo,
+                    self._seed_check, self._seed_edit, self._ftol_edit, self._xtol_edit,
                     self._profile_check, self._profile_configure)
         for first, second in zip(controls, controls[1:]):
             QtWidgets.QWidget.setTabOrder(first, second)
@@ -557,12 +560,12 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._defaults_error.setWordWrap(True)
         self._defaults_error.hide()
         settings_layout.addWidget(self._defaults_error)
-        self._discard_tolerances_shortcut = QtGui.QShortcut(
+        self._discard_defaults_shortcut = QtGui.QShortcut(
             QtGui.QKeySequence(QtCore.Qt.Key_Escape), settings_group
         )
-        self._discard_tolerances_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
-        self._discard_tolerances_shortcut.setEnabled(False)
-        self._discard_tolerances_shortcut.activated.connect(self._discard_tolerance_drafts)
+        self._discard_defaults_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+        self._discard_defaults_shortcut.setEnabled(False)
+        self._discard_defaults_shortcut.activated.connect(self._discard_defaults_drafts)
 
         options_layout.addWidget(settings_group)
         options_layout.addStretch(1)
@@ -573,20 +576,15 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._method_combo.currentIndexChanged.connect(
             self._emit_defaults_edit
         )
-        self._max_eval_spin.valueChanged.connect(
-            self._emit_defaults_edit
-        )
-        self._seed_check.toggled.connect(self._seed_spin.setEnabled)
+        self._seed_check.toggled.connect(self._seed_edit.setEnabled)
         self._seed_check.toggled.connect(
-            self._emit_defaults_edit
-        )
-        self._seed_spin.valueChanged.connect(
             self._emit_defaults_edit
         )
         self._profile_check.toggled.connect(self._on_profile_toggled)
         self._profile_configure.clicked.connect(self._open_profile_dialog)
-        for edit in (self._ftol_edit, self._xtol_edit):
-            edit.textChanged.connect(self._on_tolerance_text_changed)
+        # A typed number applies on Enter or focus loss, as one setup change.
+        for edit, _name in self._defaults_edits.values():
+            edit.textChanged.connect(self._on_defaults_text_changed)
             edit.editingFinished.connect(self._emit_defaults_edit)
         self._project_defaults(defaults)
         return widget
@@ -1365,7 +1363,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if self._defaults_error_text:
             # Only the tolerance pair rule fails without one box failing alone.
             located += [
-                f"Fit Settings: {label}" for label in self._invalid_tolerance_labels()
+                f"Fit Settings: {label}" for label in self._invalid_defaults_labels()
             ] or ["Fit Settings: tolerances"]
         return tuple(located)
 
@@ -1405,20 +1403,24 @@ class ParametersIcsTab(QtWidgets.QWidget):
             QtCore.QSignalBlocker(control)
             for control in (
                 self._method_combo,
-                self._max_eval_spin,
+                self._max_eval_edit,
                 self._seed_check,
-                self._seed_spin,
+                self._seed_edit,
                 self._ftol_edit,
                 self._xtol_edit,
             )
         ]
         self._method_combo.setCurrentIndex(self._method_combo.findData(defaults.method))
-        self._max_eval_spin.setValue(defaults.max_nfev)
         self._seed_check.setChecked(defaults.use_seed)
-        self._seed_spin.setValue(defaults.seed)
-        self._seed_spin.setEnabled(defaults.use_seed)
-        self._ftol_edit.setText(self._tolerance_drafts.get("ftol", _format_scientific(defaults.ftol)))
-        self._xtol_edit.setText(self._tolerance_drafts.get("xtol", _format_scientific(defaults.xtol)))
+        self._seed_edit.setEnabled(defaults.use_seed)
+        accepted = {
+            "max_nfev": str(defaults.max_nfev),
+            "seed": str(defaults.seed),
+            "ftol": _format_scientific(defaults.ftol),
+            "xtol": _format_scientific(defaults.xtol),
+        }
+        for field, (edit, _name) in self._defaults_edits.items():
+            edit.setText(self._defaults_drafts.get(field, accepted[field]))
         # Only Differential Evolution draws random numbers.
         self._seed_group.setVisible(defaults.method == DIFFERENTIAL_EVOLUTION_METHOD)
         del blocker
@@ -1426,32 +1428,32 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def _defaults_projection(self) -> FitDefaults:
         defaults = self._projected_setup.defaults
         method = self._method_combo.currentData()
-        ftol = self._tolerance_value(self._ftol_edit, self._ftol_label)
-        xtol = self._tolerance_value(self._xtol_edit, self._xtol_label)
+        values = {field: self._defaults_value(field) for field in self._defaults_edits}
         return validate_fit_defaults(
             replace(
                 defaults,
                 method=method,
-                max_nfev=self._max_eval_spin.value(),
-                ftol=ftol,
-                xtol=xtol,
                 use_seed=self._seed_check.isChecked(),
-                seed=self._seed_spin.value(),
+                **values,
             )
         )
 
-    def _tolerance_value(self, edit: QtWidgets.QLineEdit, label: QtWidgets.QLabel) -> float:
-        """Parse one tolerance box, naming it by its visible label."""
+    def _defaults_value(self, field: str) -> int | float:
+        """Parse one Fit Settings box, naming it by its visible label."""
 
-        return admit_fit_tolerance(edit.text(), label.text().removesuffix(":"))
+        edit, name = self._defaults_edits[field]
+        if field in ("ftol", "xtol"):
+            return admit_fit_tolerance(edit.text(), name)
+        minimum, maximum = FIT_MAX_NFEV_RANGE if field == "max_nfev" else FIT_SEED_RANGE
+        return parse_whole_number_text(edit.text(), field=name, minimum=minimum, maximum=maximum)
 
-    def _invalid_tolerance_labels(self) -> list[str]:
+    def _invalid_defaults_labels(self) -> list[str]:
         labels = []
-        for edit, label in ((self._ftol_edit, self._ftol_label), (self._xtol_edit, self._xtol_label)):
+        for field, (_edit, name) in self._defaults_edits.items():
             try:
-                self._tolerance_value(edit, label)
+                self._defaults_value(field)
             except ValueError:
-                labels.append(label.text().removesuffix(":"))
+                labels.append(name)
         return labels
 
     def _emit_defaults_edit(self, *_args: object) -> None:
@@ -1466,16 +1468,16 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self._set_defaults_error(str(exc))
             self._project_defaults(self._projected_setup.defaults)
             return
-        self._tolerance_drafts.clear()
+        self._defaults_drafts.clear()
         self._set_defaults_error("")
         self.setupSnapshotRequested.emit(snapshot)
         self._project_defaults(self._projected_setup.defaults)
 
-    def _on_tolerance_text_changed(self, _text: str) -> None:
+    def _on_defaults_text_changed(self, _text: str) -> None:
         if self._projecting:
             return
-        self._tolerance_drafts = {
-            "ftol": self._ftol_edit.text(), "xtol": self._xtol_edit.text(),
+        self._defaults_drafts = {
+            field: edit.text() for field, (edit, _name) in self._defaults_edits.items()
         }
         try:
             self._defaults_projection()
@@ -1485,17 +1487,17 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self._set_defaults_error("")
 
     def _set_defaults_error(self, message: str) -> None:
-        # Readiness names each failing box, so every tolerance change refreshes it.
+        # Readiness names each failing box, so every typed change refreshes it.
         self._defaults_error_text = message
         self._defaults_error.setText(
-            message + "\nPress Esc in a tolerance box to restore the accepted tolerances." if message else ""
+            message + "\nPress Esc in a Fit Settings box to restore the accepted values." if message else ""
         )
         self._defaults_error.setVisible(bool(message))
-        self._discard_tolerances_shortcut.setEnabled(bool(self._tolerance_drafts))
+        self._discard_defaults_shortcut.setEnabled(bool(self._defaults_drafts))
         self.validityChanged.emit()
 
-    def _discard_tolerance_drafts(self) -> None:
-        self._tolerance_drafts.clear()
+    def _discard_defaults_drafts(self) -> None:
+        self._defaults_drafts.clear()
         self._set_defaults_error("")
         self._project_defaults(self._projected_setup.defaults)
 
@@ -1594,5 +1596,5 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
     def clear_pending_setup_edits(self) -> None:
         self._retire_numeric_drafts()
-        self._discard_tolerance_drafts()
+        self._discard_defaults_drafts()
         self.project_setup_snapshot(self._projected_setup)

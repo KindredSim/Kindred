@@ -25,6 +25,7 @@ from typing import Any, Iterator
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from kindred.core.validation import parse_whole_number_text
 from kindred.core.project_presentation_state import (
     ProjectPresentationState,
     SimulationSeriesAxisSelection,
@@ -33,9 +34,11 @@ from kindred.gui.curve_copy_headers import copy_column_header, copy_series_label
 from kindred.gui.display_name_policy import literal_tooltip
 from kindred.gui.theme_manager import plot_background_color, plot_foreground_color
 from kindred.gui.ui_helpers import (
+    INVALID_EDITOR_STYLE,
     SCIENTIFIC_NAME_HTML_ROLE,
     ScientificNameComboBox,
     clamp_initial_size,
+    configure_compact_numeric_edit,
 )
 import pyqtgraph as pg
 
@@ -343,7 +346,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._plot_menu = QtWidgets.QMenu(self)
         self._plot_menu.setToolTipsVisible(True)
         self._plot_actions: dict[str, QtGui.QAction] = {}
-        self._plot_percentages: dict[str, QtWidgets.QDoubleSpinBox] = {}
+        self._plot_percentages: dict[str, QtWidgets.QLineEdit] = {}
+        # A box whose text differs from the current setting's value holds a
+        # typed draft that projection leaves alone.
+        self._shown_percentages: dict[str, str] = {}
         appearance = self._plot_menu.addMenu("Appearance")
         appearance.menuAction().setToolTip(
             "Control grid lines, curve visibility, legends, and intervention annotations."
@@ -430,6 +436,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             tooltip="Adjust the visibility of simulation curves and their points. At 100%, references and previews "
             "keep their usual transparency. At 0%, the curves and points are invisible.",
         )
+        for menu in (appearance, *axis_menus.values()):
+            menu.installEventFilter(self)
         transform_group = QtGui.QActionGroup(self)
         transform_group.setExclusive(True)
         for transform in ("original", "derivative", "phase"):
@@ -536,23 +544,39 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         layout = QtWidgets.QHBoxLayout(host)
         caption = QtWidgets.QLabel(label, host)
         layout.addWidget(caption)
-        spin = QtWidgets.QDoubleSpinBox(host)
-        spin.setRange(minimum, 100)
-        spin.setDecimals(0)
-        spin.setSuffix(" %")
-        spin.setKeyboardTracking(False)
-        spin.setAccessibleName(label)
-        layout.addWidget(spin)
+        edit = QtWidgets.QLineEdit(host)
+        configure_compact_numeric_edit(edit, characters=4)
+        edit.setAccessibleName(label)
+        layout.addWidget(edit)
+        unit = QtWidgets.QLabel("%", host)
+        layout.addWidget(unit)
         action = QtWidgets.QWidgetAction(menu)
         action.setDefaultWidget(host)
-        for target in (action, host, caption, spin):
+        for target in (action, host, caption, edit, unit):
             target.setToolTip(tooltip)
         menu.addAction(action)
-        self._plot_percentages[key] = spin
+        self._plot_percentages[key] = edit
+        self._shown_percentages[key] = ""
+        # A typed number applies on Enter or focus loss.
+        edit.editingFinished.connect(lambda: self._apply_plot_percentage(key, label, minimum))
+
+    def _apply_plot_percentage(self, key: str, label: str, minimum: int) -> None:
+        edit = self._plot_percentages[key]
+        edit.setStyleSheet("")
+        if edit.text() == self._shown_percentages[key]:
+            return
+        try:
+            value = parse_whole_number_text(edit.text(), field=label, minimum=minimum, maximum=100)
+        except ValueError as exc:
+            edit.setStyleSheet(INVALID_EDITOR_STYLE)
+            self.resultDiagnostic.emit(str(exc))
+            return
+        # Applied text is no draft; the accepted value replaces it.
+        self._shown_percentages[key] = edit.text()
         if key.startswith("fraction_"):
-            spin.valueChanged.connect(lambda value: self._set_navigation(key, value / 100))
+            self._set_navigation(key, value / 100)
         else:
-            spin.valueChanged.connect(lambda value: self._request_plot_presentation(key, value / 100))
+            self._request_plot_presentation(key, value / 100)
 
     def _sync_plot_controls(self) -> None:
         """Project accepted presentation and plot-session navigation."""
@@ -573,9 +597,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             values[key] = bool(self._render_input and getattr(self._render_input, key))
         for key, checked in values.items():
             self._plot_actions[key].setChecked(checked)
-        for key, spin in self._plot_percentages.items():
-            with QtCore.QSignalBlocker(spin):
-                spin.setValue(100 * getattr(state if key.startswith("fraction_") else self._presentation, key))
+        for key, edit in self._plot_percentages.items():
+            value = getattr(state if key.startswith("fraction_") else self._presentation, key)
+            text = str(round(100 * value))
+            if edit.text() == self._shown_percentages[key]:
+                edit.setText(text)
+            self._shown_percentages[key] = text
         self._plot_actions["copy_all"].setEnabled(self._copy_all_available)
         self._plot_actions["copy_plotted"].setEnabled(
             any(chunk.x.size for block in self._rendered_point_roster for chunk in block.chunks)
@@ -607,6 +634,15 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._plot_menu.popup(event.screenPos().toPoint())
 
     def eventFilter(self, watched: object, event: QtCore.QEvent) -> bool:
+        if (
+            isinstance(watched, QtWidgets.QMenu)
+            and event.type() == QtCore.QEvent.Type.KeyPress
+            and event.key() in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter)
+            and watched.focusWidget() not in (None, watched)
+        ):
+            # Enter in a box or dropdown never triggers the menu's
+            # highlighted item or closes the menu; a box applies on Enter.
+            return True
         if watched is self._plot_widget.scene() and event.type() == QtCore.QEvent.Type.GraphicsSceneContextMenu:
             # Mouse menus belong to the scene's click/drag recognizer.
             if event.reason() != QtWidgets.QGraphicsSceneContextMenuEvent.Reason.Mouse:
@@ -703,6 +739,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             selected_y=None,
         )
         self._axis_toolbar.set_manual_ranges(None, None, None, None)
+        # Replacement discards typed drafts with the rest of the session.
+        for key, edit in self._plot_percentages.items():
+            edit.setStyleSheet("")
+            self._shown_percentages[key] = edit.text()
         self._sync_plot_controls()
         self._apply_zoom_mode()
 

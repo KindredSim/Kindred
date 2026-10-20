@@ -7,7 +7,6 @@ from kindred.gui.display_name_policy import scientific_symbol_html, scientific_s
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.project_document import (
-    TEMPERATURE_RANGE_K,
     SimulationExecutionSettings,
     SUPPORTED_SOLVERS,
     TabScientificSettings,
@@ -15,13 +14,22 @@ from kindred.core.project_document import (
     validate_simulation_execution_settings,
     validate_tab_scientific_settings,
 )
-from kindred.core.validation import parse_finite_numeric_text
+from kindred.core.validation import parse_finite_numeric_text, parse_whole_number_text
 from kindred.gui.ui_helpers import SOLVER_TOOLTIP, clamp_initial_size, ignore_wheel, make_scroll_area
 
 __all__ = [
     "SimulationSettingsDialog",
     "SolverSettingsDialog",
 ]
+
+
+def _number_edit(
+    parent: QtWidgets.QWidget, value: str, tooltip: str,
+) -> QtWidgets.QLineEdit:
+    edit = QtWidgets.QLineEdit(str(value), parent)
+    edit.setToolTip(str(tooltip))
+    edit.setMaximumWidth(190)
+    return edit
 
 
 class _RunSettingsFields:
@@ -31,9 +39,9 @@ class _RunSettingsFields:
         self.solver_combo = QtWidgets.QComboBox(parent)
         self.solver_combo.addItems(list(SUPPORTED_SOLVERS))
         self.solver_combo.setToolTip(SOLVER_TOOLTIP)
-        self.t_start_edit = self._time_edit(parent, "", "Absolute Run start time")
-        self.t_end_edit = self._time_edit(parent, "", "Absolute Run end time")
-        self.points_edit = self._time_edit(
+        self.t_start_edit = _number_edit(parent, "", "Absolute Run start time")
+        self.t_end_edit = _number_edit(parent, "", "Absolute Run end time")
+        self.points_edit = _number_edit(
             parent,
             "",
             "Number of evenly spaced base samples over the completed interval, "
@@ -52,15 +60,6 @@ class _RunSettingsFields:
                 name_label.setTextFormat(QtCore.Qt.RichText)
                 name_label.setText(scientific_symbol_html(label, family="time", role=label))
             widget.setAccessibleName(scientific_symbol_spoken(label, family="time", role=label))
-
-    @staticmethod
-    def _time_edit(
-        parent: QtWidgets.QWidget, value: str, tooltip: str,
-    ) -> QtWidgets.QLineEdit:
-        edit = QtWidgets.QLineEdit(str(value), parent)
-        edit.setToolTip(str(tooltip))
-        edit.setMaximumWidth(190)
-        return edit
 
     def set_settings(self, settings: SimulationExecutionSettings) -> None:
         self.solver_combo.setCurrentText(settings.solver)
@@ -155,11 +154,12 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         science_box = QtWidgets.QGroupBox("Mechanism Settings", body)
         science_form = QtWidgets.QFormLayout(science_box)
         factory = TabScientificSettings()
-        self.temperature_spin = self._positive_spin(
-            minimum=TEMPERATURE_RANGE_K[0],
-            maximum=TEMPERATURE_RANGE_K[1],
-            value=factory.temperature,
-            decimals=2,
+        self.temperature_edit = _number_edit(
+            science_box,
+            repr(float(factory.temperature)),
+            "Default nominal temperature for this mechanism. An explicit T= directive "
+            "overrides it. A temperature schedule uses it before its first listed time, "
+            "and a response schedule starts from it.",
         )
         self.standard_conc_edit = QtWidgets.QLineEdit(str(factory.standard_conc_M), science_box)
         self.energy_unit_combo = QtWidgets.QComboBox(science_box)
@@ -167,11 +167,6 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         self.energy_unit_combo.setCurrentText(factory.energy_unit)
         self.rtol_edit = QtWidgets.QLineEdit("1e-6", science_box)
         self.atol_edit = QtWidgets.QLineEdit("1e-12", science_box)
-        self.temperature_spin.setToolTip(
-            "Default nominal temperature for this mechanism. An explicit T= directive "
-            "overrides it. A temperature schedule uses it before its first listed time, "
-            "and a response schedule starts from it."
-        )
         self.standard_conc_edit.setToolTip(
             "Default standard-state concentration in M for Eyring rates and thermodynamic "
             "equilibrium constants. An explicit C0= directive overrides it."
@@ -208,7 +203,7 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             "preferences, as defaults for new projects and tabs. "
             "Existing tabs keep their settings."
         )
-        science_form.addRow("Default temperature (K)", self.temperature_spin)
+        science_form.addRow("Default temperature (K)", self.temperature_edit)
         science_form.addRow("Default standard concentration (M)", self.standard_conc_edit)
         science_form.addRow("Default energy units", self.energy_unit_combo)
         science_form.addRow("Relative tolerance", self.rtol_edit)
@@ -250,20 +245,19 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
 
         preview_box = QtWidgets.QGroupBox("Preview", body)
         preview_form = QtWidgets.QFormLayout(preview_box)
-        self.preview_points_edit = QtWidgets.QLineEdit(str(int(preview_points)), preview_box)
-        self.preview_points_edit.setMaximumWidth(190)
-        self.preview_delay_spin = self._integer_spin(
-            0, 1000, preview_delay_ms, preview_box,
+        self.preview_points_edit = _number_edit(
+            preview_box,
+            str(int(preview_points)),
+            "Output points for all slider previews, including release and typed changes.",
         )
-        self.preview_points_edit.setToolTip(
-            "Output points for all slider previews, including release and typed changes."
-        )
-        self.preview_delay_spin.setToolTip(
+        self.preview_delay_edit = _number_edit(
+            preview_box,
+            str(int(preview_delay_ms)),
             "Delay before requesting a preview while dragging any slider. "
-            "Release, clicks, and typed changes request a preview immediately."
+            "Release, clicks, and typed changes request a preview immediately.",
         )
         preview_form.addRow("Preview points", self.preview_points_edit)
-        preview_form.addRow("Preview delay (ms)", self.preview_delay_spin)
+        preview_form.addRow("Preview delay (ms)", self.preview_delay_edit)
         body_layout.addWidget(preview_box)
 
         parallel_box = QtWidgets.QGroupBox("Parallel Execution", body)
@@ -272,45 +266,47 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             "Automatic",
             parallel_box,
         )
-        self.parallel_maximum_spin = self._integer_spin(1, 1, 1, parallel_box)
         self.parallel_automatic_check.setToolTip(
             "Run one simulation fewer at once than the machine has physical cores."
         )
-        self.parallel_maximum_spin.setToolTip(
+        # The box and its "/ cores" label share one tooltip on their row.
+        parallel_row = QtWidgets.QWidget(parallel_box)
+        parallel_row.setToolTip(
             "How many simulations Run, Fit and Chemical Space Scan may run at once, "
             "from 1 to the machine's physical cores."
         )
+        self.parallel_maximum_edit = _number_edit(parallel_row, "", "")
+        self._parallel_cores_label = QtWidgets.QLabel(parallel_row)
+        parallel_row_layout = QtWidgets.QHBoxLayout(parallel_row)
+        parallel_row_layout.setContentsMargins(0, 0, 0, 0)
+        parallel_row_layout.addWidget(self.parallel_maximum_edit)
+        parallel_row_layout.addWidget(self._parallel_cores_label)
+        parallel_row_layout.addStretch(1)
+        self._physical_cores = 1
         self._automatic_parallel_workers = 1
         self.parallel_automatic_check.toggled.connect(self._show_parallel_automatic)
         parallel_form.addRow("Simultaneous simulations", self.parallel_automatic_check)
-        parallel_form.addRow("Explicit maximum", self.parallel_maximum_spin)
+        parallel_form.addRow("Explicit maximum", parallel_row)
         body_layout.addWidget(parallel_box)
 
         cache_box = QtWidgets.QGroupBox("Result Cache", body)
         cache_form = QtWidgets.QFormLayout(cache_box)
-        self.cache_capacity_spin = self._integer_spin(
-            1,
-            (1 << 31) - 1,
-            32,
+        self.cache_capacity_edit = _number_edit(
             cache_box,
-        )
-        self.cache_capacity_spin.setToolTip(
+            "32",
             "Number of past simulation results kept in memory per mechanism tab. "
             "Matching results can be restored when enabled for plotting. Larger "
             "values use more memory. When the cache is full, the least recently "
-            "used results are removed."
+            "used results are removed.",
         )
         cache_form.addRow(
             "Explicit-result cache capacity",
-            self.cache_capacity_spin,
+            self.cache_capacity_edit,
         )
         body_layout.addWidget(cache_box)
         scroll.setWidget(body)
         layout.addWidget(scroll, 1)
-        for control in (
-            self.temperature_spin, self.energy_unit_combo, self._run_default_fields.solver_combo,
-            self.preview_delay_spin, self.parallel_maximum_spin, self.cache_capacity_spin,
-        ):
+        for control in (self.energy_unit_combo, self._run_default_fields.solver_combo):
             ignore_wheel(control)
 
         for form in (science_form, run_form, preview_form, parallel_form, cache_form):
@@ -350,33 +346,6 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             + body.sizeHint().height() + chrome,
         )
 
-    @staticmethod
-    def _integer_spin(
-        minimum: int,
-        maximum: int,
-        value: int,
-        parent: QtWidgets.QWidget,
-    ) -> QtWidgets.QSpinBox:
-        spin = QtWidgets.QSpinBox(parent)
-        spin.setRange(int(minimum), int(maximum))
-        spin.setValue(int(value))
-        return spin
-
-    @staticmethod
-    def _positive_spin(
-        *,
-        minimum: float,
-        maximum: float,
-        value: float,
-        decimals: int,
-    ) -> QtWidgets.QDoubleSpinBox:
-        spin = QtWidgets.QDoubleSpinBox()
-        spin.setDecimals(int(decimals))
-        spin.setRange(float(minimum), float(maximum))
-        spin.setValue(float(value))
-        spin.setMaximumWidth(190)
-        return spin
-
     def set_stopping_declarations(self, declarations: tuple[str, ...]) -> None:
         self._stopping_declarations = declarations
         self.stopping_info_button.setEnabled(bool(declarations))
@@ -390,7 +359,7 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         message.exec()
 
     def set_scientific_settings(self, settings: TabScientificSettings) -> None:
-        self.temperature_spin.setValue(settings.temperature)
+        self.temperature_edit.setText(repr(float(settings.temperature)))
         self.standard_conc_edit.setText(repr(float(settings.standard_conc_M)))
         self.energy_unit_combo.setCurrentText(settings.energy_unit)
         self.rtol_edit.setText(repr(float(settings.rtol)))
@@ -400,7 +369,9 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
 
     def scientific_settings(self) -> TabScientificSettings:
         candidate = TabScientificSettings(
-            temperature=float(self.temperature_spin.value()),
+            temperature=parse_finite_numeric_text(
+                self.temperature_edit.text(), field="Default temperature"
+            ),
             standard_conc_M=parse_finite_numeric_text(
                 self.standard_conc_edit.text(), field="Default standard concentration"
             ),
@@ -430,7 +401,9 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
     def preview_settings(self) -> tuple[int, int]:
         return (
             parse_points_text(self.preview_points_edit.text(), field="Preview points"),
-            self.preview_delay_spin.value(),
+            parse_whole_number_text(
+                self.preview_delay_edit.text(), field="Preview delay (ms)", minimum=0, maximum=1000,
+            ),
         )
 
     def set_parallel_maximum(
@@ -440,8 +413,8 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         physical_cores: int,
         automatic_workers: int,
     ) -> None:
-        self.parallel_maximum_spin.setRange(1, physical_cores)
-        self.parallel_maximum_spin.setSuffix(f" / {physical_cores}")
+        self._physical_cores = physical_cores
+        self._parallel_cores_label.setText(f"/ {physical_cores}")
         self._automatic_parallel_workers = automatic_workers
         automatic = value is None
         blocker = QtCore.QSignalBlocker(self.parallel_automatic_check)
@@ -451,24 +424,34 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             del blocker
         self._show_parallel_automatic(automatic)
         if not automatic:
-            self.parallel_maximum_spin.setValue(value)
+            self.parallel_maximum_edit.setText(str(value))
 
     def _show_parallel_automatic(self, automatic: bool) -> None:
-        self.parallel_maximum_spin.setDisabled(automatic)
+        self.parallel_maximum_edit.setDisabled(automatic)
         # While Automatic is ticked the box shows the count it chooses.
         if automatic:
-            self.parallel_maximum_spin.setValue(self._automatic_parallel_workers)
+            self.parallel_maximum_edit.setText(str(self._automatic_parallel_workers))
 
     def parallel_maximum(self) -> int | None:
         if self.parallel_automatic_check.isChecked():
             return None
-        return int(self.parallel_maximum_spin.value())
+        return parse_whole_number_text(
+            self.parallel_maximum_edit.text(),
+            field="Explicit maximum",
+            minimum=1,
+            maximum=self._physical_cores,
+        )
 
     def set_result_cache_capacity(self, value: int) -> None:
-        self.cache_capacity_spin.setValue(int(value))
+        self.cache_capacity_edit.setText(str(int(value)))
 
     def result_cache_capacity(self) -> int:
-        return int(self.cache_capacity_spin.value())
+        return parse_whole_number_text(
+            self.cache_capacity_edit.text(),
+            field="Explicit-result cache capacity",
+            minimum=1,
+            maximum=(1 << 31) - 1,
+        )
 
     @QtCore.Slot()
     def _accept_candidate(self) -> None:
