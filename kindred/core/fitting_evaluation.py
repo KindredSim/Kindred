@@ -180,27 +180,13 @@ class FittingEvaluator:
         context: PreparedFittingExecutionContext,
     ) -> None:
         self._context = context
-        self._cancellation_control: SimulationCancellationControl | None = None
-
-    def set_cancellation_control(
-        self,
-        cancellation_control: SimulationCancellationControl | None,
-    ) -> "FittingEvaluator":
-        self._cancellation_control = cancellation_control
-        return self
-
-    def _raise_if_cancel_requested(self) -> None:
-        if (
-            self._cancellation_control is not None
-            and self._cancellation_control.cancel_requested()
-        ):
-            raise FittingCancelled()
 
     def evaluate_series_with_parameter_origins(
         self,
         params: Mapping[str, float],
         origins: Mapping[str, str],
         outputs: tuple[str, ...],
+        cancellation_control: SimulationCancellationControl,
     ) -> SimulationResultValue | ScientificUnavailable:
         """Evaluate one candidate, returning only natural scientific values.
 
@@ -209,11 +195,12 @@ class FittingEvaluator:
         always does; one fed only by configured values stays an error, as do
         cancellation and every other failure. Of the Algebra outputs, only the
         dataset's ``outputs`` and the lets they read can reject the candidate;
-        other failures stay diagnostics.
+        other failures stay diagnostics.  Concurrent candidates of one dataset
+        each pass their own ``cancellation_control``.
         """
 
         try:
-            result = self._evaluate_series(params)
+            result = self._evaluate_series(params, cancellation_control)
         except _VALUE_FAILURES as exc:
             # The values a refusal names, through any value calculated from them.
             inputs = self._context.prepared_run.parameter_algebra_spec.input_dependencies(
@@ -305,8 +292,13 @@ class FittingEvaluator:
     def _evaluate_series(
         self,
         params: Mapping[str, float],
+        cancellation_control: SimulationCancellationControl,
     ) -> SimulationResultValue | SimulationScientificUnavailability:
-        self._raise_if_cancel_requested()
+        def raise_if_cancel_requested() -> None:
+            if cancellation_control.cancel_requested():
+                raise FittingCancelled()
+
+        raise_if_cancel_requested()
         prefix = self._context.initial_prefix
         non_initial_parameters = self._parameter_overrides(params)
         prepared_request = self._context.prepared_run.request
@@ -327,7 +319,7 @@ class FittingEvaluator:
                 parameter_overrides=non_initial_parameters or None,
                 use_authored_stops=self._context.use_authored_stops,
             ),
-            cancellation_control=self._cancellation_control,
+            cancellation_control=cancellation_control,
         )
         request = build_simulation_request_from_prepared_run(
             prepared_run,
@@ -341,14 +333,14 @@ class FittingEvaluator:
         result = solve_ode(request)
         if isinstance(result, SimulationScientificUnavailability):
             return result
-        self._raise_if_cancel_requested()
+        raise_if_cancel_requested()
         admitted = finalize_simulation_result(
             result=result,
             species_names=list(prepared_run.species_names),
             initials_for_algebra=prepared_run.initials_for_algebra,
             parameter_values_at_temperature=prepared_run.parameter_values_at_temperature,
             parameter_algebra_spec=prepared_run.parameter_algebra_spec,
-            cancellation_control=self._cancellation_control,
+            cancellation_control=cancellation_control,
         )
-        self._raise_if_cancel_requested()
+        raise_if_cancel_requested()
         return admitted

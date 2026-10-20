@@ -1872,10 +1872,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 for set_id in selected
             ),
         )
+        # The tab refreshes once, after its settled drafts are cleared.
         published = self._publish_source_proposal(
             target,
             source_proposal,
             expected_token=capture_token,
+            refresh_after_admission=False,
         )
         if published is None:
             self.set_status_text("The project changed during the confirmation, so Run did not start. Click Run again.")

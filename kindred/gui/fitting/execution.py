@@ -524,7 +524,7 @@ class _FitControl:
         return self._cancelled.is_set() or (honor_stop and self._stopped.is_set())
 
 class _FitExecution(_FitControl):
-    """Numerical execution, including the existing dataset thread pool."""
+    """Numerical execution, including its dataset evaluation thread pool."""
 
     def __init__(self, request: FitExecutionRequest, emit: Callable) -> None:
         self._request = request
@@ -624,14 +624,12 @@ class _FitExecution(_FitControl):
                 cancellation_control=self._cancellation_control,
                 initial_prefix=INITIAL_PREFIX,
             )
-            evaluator = FittingEvaluator(
-                context,
-            )
-            evaluator.set_cancellation_control(self._cancellation_control)
-            evaluators[local.dataset_id] = evaluator
+            evaluators[local.dataset_id] = FittingEvaluator(context)
 
+        # Each optimizer step evaluates its Jacobian points' datasets
+        # together, so the pool spans the machine whatever the dataset count.
         self._executor = ThreadPoolExecutor(
-            max_workers=min(len(included), os.cpu_count() or 1),
+            max_workers=os.cpu_count() or 1,
             thread_name_prefix="kindred-fit-dataset",
         )
 
@@ -849,8 +847,6 @@ class _FitExecution(_FitControl):
         execution_cancellation_control = SimulationCancellationControl(
             self._cancelled.is_set
         )
-        for evaluator in evaluators.values():
-            evaluator.set_cancellation_control(self._cancellation_control)
         defaults = request.setup.defaults
         result_or_unavailable = fit_global(
             fit_evaluators=evaluators,

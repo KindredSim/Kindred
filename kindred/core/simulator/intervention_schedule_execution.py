@@ -386,8 +386,7 @@ class InterventionScheduleExecutionOwner:
                                 segment_symbolic_jacobian,
                                 jacobian_func=_InterventionJacobian(
                                     segment_symbolic_jacobian.jacobian_func,
-                                    rhs=segment_rhs, holds=active_holds, fluxes=active_fluxes,
-                                    species_index=species_index,
+                                    rhs=segment_rhs,
                                 ),
                             ),
                         )
@@ -1521,9 +1520,11 @@ class _InterventionRhs:
     ) -> None:
         self._rhs = rhs
         self.volume = volume
-        self._fluxes = tuple(fluxes)
+        self.fluxes = tuple(fluxes)
         self._holds = tuple(holds)
         self._species_index = dict(species_index)
+        # The held species, whose derivatives are zero.
+        self.fixed = frozenset(self._species_index[hold.species] for hold in self._holds)
         self._parameter_values = parameter_values
         self.temperature_at = temperature_at
         self.cancellation_check = cancellation_check
@@ -1532,7 +1533,7 @@ class _InterventionRhs:
         sums = {}
         negative = set()
         for flux in _resolve_items(
-            self._fluxes, time, self._parameter_values, temperature_K=temperature_K
+            self.fluxes, time, self._parameter_values, temperature_K=temperature_K
         ):
             if flux.physical is not None:
                 continue
@@ -1542,17 +1543,17 @@ class _InterventionRhs:
                 negative.add(index)
         return sums, negative
 
-    def _base_evaluation_state(
+    def base_evaluation_state(
         self,
         state: np.ndarray,
         time: float,
         temperature_K: float,
-    ) -> tuple[np.ndarray, set[int]]:
+    ) -> tuple[np.ndarray, dict[int, float], set[int]]:
+        """The state the mechanism is evaluated at, with the flux sums and
+        draining species at this time."""
         raw = np.asarray(state, dtype=float).reshape(-1)
-        evaluation_state = raw[:len(self._species_index)].copy()
-        fixed: set[int] = set()
         evaluation_state = _apply_holds(
-            evaluation_state,
+            raw[:len(self._species_index)].copy(),
             self._holds,
             species_index=self._species_index,
             cancellation_check=None,
@@ -1560,39 +1561,29 @@ class _InterventionRhs:
             temperature_K=temperature_K,
             parameter_values=self._parameter_values,
         )
-        fixed = {self._species_index[hold.species] for hold in self._holds}
-        _sums, negative = self._flux_values(time, temperature_K)
+        sums, negative = self._flux_values(time, temperature_K)
         for index in negative:
             if evaluation_state[index] < 0.0:
                 evaluation_state[index] = 0.0
-        return evaluation_state, fixed
+        return evaluation_state, sums, negative
 
     def __call__(self, time: float, state: np.ndarray) -> np.ndarray:
         _raise_if_cancelled(self.cancellation_check)
         temperature_K = self.temperature_at(time)
         raw_state = np.asarray(state, dtype=float).reshape(-1)
-        evaluation_state, fixed = self._base_evaluation_state(raw_state, time, temperature_K)
-        derivative = np.asarray(
-            self._rhs(time, evaluation_state, T=temperature_K), dtype=float
-        ).copy()
+        evaluation_state, sums, _negative = self.base_evaluation_state(raw_state, time, temperature_K)
+        # The mechanism's right-hand side returns a fresh array.
+        derivative = self._rhs(time, evaluation_state, T=temperature_K)
         volume_rate = 0.0
         if self.volume.value is not None:
             vessel = raw_state[-1]
-            volume_rate, mixing = self.volume.flow(self._fluxes, time, temperature_K, vessel, evaluation_state, fixed)
+            volume_rate, mixing = self.volume.flow(self.fluxes, time, temperature_K, vessel, evaluation_state, self.fixed)
             derivative += mixing
-        sums, _negative = self._flux_values(time, temperature_K)
         for index, rate in sums.items():
             derivative[index] += rate
-        for index in fixed:
+        for index in self.fixed:
             derivative[index] = 0.0
         return np.append(derivative, volume_rate) if self.volume.value is not None else derivative
-
-    def clamped_columns(self, time: float, state: np.ndarray, temperature_K: float) -> set[int]:
-        """Drained species evaluated at zero past an unlocated root."""
-
-        raw_state = np.asarray(state, dtype=float).reshape(-1)
-        _sums, negative = self._flux_values(time, temperature_K)
-        return {index for index in negative if raw_state[index] < 0.0}
 
 
 def _drain_release_events(
@@ -1658,34 +1649,21 @@ class _InterventionJacobian:
         jacobian: Callable[..., np.ndarray],
         *,
         rhs: _InterventionRhs,
-        holds: Sequence[ExecutableHold],
-        fluxes: Sequence[ExecutableFlux],
-        species_index: Mapping[str, int],
     ) -> None:
         self._jacobian = jacobian
         self._rhs = rhs
-        self._holds = tuple(holds)
-        self._fluxes = tuple(fluxes)
-        self._species_index = dict(species_index)
-
-    def _evaluate_state(self, state: np.ndarray, time: float, temperature_K: float) -> tuple[np.ndarray, set[int]]:
-        values = np.asarray(state, dtype=float).reshape(-1)
-        held = {
-            self._species_index[hold.species]
-            for hold in self._holds
-        }
-        used, _fixed = self._rhs._base_evaluation_state(values, time, temperature_K)
-        return used, held
 
     def __call__(self, time: float, state: np.ndarray) -> np.ndarray:
         _raise_if_cancelled(self._rhs.cancellation_check)
         temperature_K = self._rhs.temperature_at(time)
-        used, held = self._evaluate_state(state, time, temperature_K)
+        raw_state = np.asarray(state, dtype=float).reshape(-1)
+        used, _sums, negative = self._rhs.base_evaluation_state(raw_state, time, temperature_K)
+        held = self._rhs.fixed
         matrix = np.asarray(self._jacobian(time, used, T=temperature_K), dtype=float).copy()
         size = used.size
         if self._rhs.volume.value is not None:
             vessel = float(state[-1])
-            rate, mixing = self._rhs.volume.flow(self._fluxes, time, temperature_K, vessel, used, held)
+            rate, mixing = self._rhs.volume.flow(self._rhs.fluxes, time, temperature_K, vessel, used, held)
             matrix -= np.eye(size) * (rate / vessel)
             coupled = np.zeros((size + 1, size + 1))
             coupled[:size, :size] = matrix
@@ -1695,7 +1673,8 @@ class _InterventionJacobian:
             indices = np.fromiter(sorted(held), dtype=np.int64)
             matrix[indices, :] = 0.0
             matrix[:, indices] = 0.0
-        purge_columns = self._rhs.clamped_columns(float(time), state, temperature_K)
+        # Drained species evaluated at zero past an unlocated root.
+        purge_columns = {index for index in negative if raw_state[index] < 0.0}
         if purge_columns:
             matrix[:, np.fromiter(sorted(purge_columns), dtype=np.int64)] = 0.0
         return matrix
@@ -1750,6 +1729,25 @@ def _trigger_callables(
             else 0.0
         )
         starts_at_threshold = start_value - threshold - offset == 0.0
+        # SciPy evaluates the observer and stopper copies, and both directions
+        # of "either", at the same time and state.
+        last_value: list[object] = [None, None]
+
+        def threshold_distance(
+            time: float,
+            state: np.ndarray,
+            *,
+            _trigger: ExecutableTrigger = trigger,
+            _last: list[object] = last_value,
+        ) -> float:
+            key = (time, state.tobytes())
+            if _last[0] != key:
+                temperature_K = temperature_at(time)
+                held = _apply_holds(state, holds, species_index=species_index, cancellation_check=None, time=time, temperature_K=temperature_K, parameter_values=parameter_values)
+                threshold = _resolve_items((_trigger,), time, parameter_values, temperature_K=temperature_K)[0].threshold
+                _last[0], _last[1] = key, _trigger_value(_trigger, time, held, species_index=species_index, observable_value=observable_value, temperature_K=temperature_K) - threshold
+            return _last[1]
+
         directions = (
             ("rising", "falling")
             if trigger.direction == "either"
@@ -1770,15 +1768,12 @@ def _trigger_callables(
                 time: float,
                 state: np.ndarray,
                 *,
-                _trigger: ExecutableTrigger = trigger,
+                _distance: Callable[[float, np.ndarray], float] = threshold_distance,
                 _offset: float = offset,
                 _starts_at_threshold: bool = starts_at_threshold,
                 _neutral_value: float = neutral_value,
             ) -> float:
-                temperature_K = temperature_at(time)
-                state = _apply_holds(state, holds, species_index=species_index, cancellation_check=None, time=time, temperature_K=temperature_K, parameter_values=parameter_values)
-                threshold = _resolve_items((_trigger,), time, parameter_values, temperature_K=temperature_K)[0].threshold
-                value = _trigger_value(_trigger, time, state, species_index=species_index, observable_value=observable_value, temperature_K=temperature_K) - threshold - _offset
+                value = _distance(time, state) - _offset
                 if _starts_at_threshold and value == 0.0:
                     return _neutral_value
                 return value

@@ -1131,15 +1131,18 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                             pen=pg.mkPen(color=color, width=2, style=(QtCore.Qt.PenStyle.DashLine if block.dashed else QtCore.Qt.PenStyle.SolidLine)),
                             name=legend_name, connect="finite", connectors=instantaneous,
                         )
-                else:
+                elif marker:
                     item.setData(x, y, connect="finite", connectors=instantaneous)
-                    if marker:
-                        item.setSymbolBrush(pg.mkBrush(color))
-                        item.setSymbolPen(pg.mkPen(color))
-                        item.setSymbol(block.point_shape)
-                        item.setSymbolSize(block.point_size)
-                    else:
-                        item.setPen(pg.mkPen(color=color, width=2, style=(QtCore.Qt.PenStyle.DashLine if block.dashed else QtCore.Qt.PenStyle.SolidLine)))
+                    item.setSymbolBrush(pg.mkBrush(color))
+                    item.setSymbolPen(pg.mkPen(color))
+                    item.setSymbol(block.point_shape)
+                    item.setSymbolSize(block.point_size)
+                else:
+                    # The pen goes with the data, so the item is built once.
+                    item.setData(
+                        x, y, connect="finite", connectors=instantaneous,
+                        pen=pg.mkPen(color=color, width=2, style=(QtCore.Qt.PenStyle.DashLine if block.dashed else QtCore.Qt.PenStyle.SolidLine)),
+                    )
                 self._update_plot_item_legend(item, legend_name)
                 item.setVisible(True)
                 self._style_simulation_item(item, block.kind is not ResultLayerKind.EXPERIMENTAL, color, block.opacity)
@@ -1711,6 +1714,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         foreground = plot_foreground_color(dark)
         if self._legend is not None:
             self._legend.setLabelTextColor(foreground)
+            # A label takes the new colour when its text is set again.
+            for _sample, label in self._legend.items:
+                label.setText(label.text)
         for axis_name in ("left", "bottom"):
             axis = self._plot_widget.getPlotItem().getAxis(axis_name)
             axis.setPen(foreground)

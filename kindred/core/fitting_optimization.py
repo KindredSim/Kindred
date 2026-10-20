@@ -2,7 +2,8 @@
 Optimization primitives for parameter fitting.
 
 This module intentionally does *not* own simulation preparation or DSL parsing; it only
-operates on an objective callable that returns residual vectors.
+operates on an objective callable that returns the residual vector of each point
+it is given.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from __future__ import annotations
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Callable, Dict, Literal, Mapping, Optional, Tuple
+from typing import Callable, Dict, Literal, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -26,6 +27,9 @@ __all__ = [
 ]
 
 FitBoundPosition = Literal["lower", "upper", "interior"]
+# Evaluates candidate points together and returns each one's residual vector,
+# in order.
+BatchObjective = Callable[[Sequence[np.ndarray]], Sequence[np.ndarray]]
 
 # Finite-difference Jacobians resolve exactly dependent fitted values only to
 # singular-value ratios of roughly 1e-8 to 1e-5, far above numpy's default
@@ -79,7 +83,7 @@ class FitResult:
 
 
 def fit_parameters_with_fixed(
-    objective_func: Callable[[np.ndarray], np.ndarray],
+    objective_func: BatchObjective,
     initial_params: Dict[object, float],
     *,
     fixed_parameters: Dict[object, float],
@@ -120,12 +124,11 @@ def fit_parameters_with_fixed(
             message="All optimizer coordinates were fixed.",
         )
 
-    def reduced_objective(vector: np.ndarray) -> np.ndarray:
-        values = {
-            name: float(vector[index])
-            for index, name in enumerate(free)
-        }
-        return objective_func(full_vector(values))
+    def reduced_objective(vectors: Sequence[np.ndarray]) -> Sequence[np.ndarray]:
+        return objective_func([
+            full_vector({name: float(vector[index]) for index, name in enumerate(free)})
+            for vector in vectors
+        ])
 
     reduced = fit_parameters(
         reduced_objective,
@@ -167,7 +170,7 @@ def _jacobian_rank_warning(jacobian: np.ndarray) -> Optional[str]:
 
 
 def fit_parameters(
-    objective_func: Callable[[np.ndarray], np.ndarray],
+    objective_func: BatchObjective,
     initial_params: Dict[object, float],
     bounds: Dict[object, Tuple[float, float]],
     max_nfev: int = 1000,
@@ -200,10 +203,21 @@ def fit_parameters(
 
     identifiability_warning: Optional[str] = None
 
-    def wrapped_objective(params):
+    def evaluate(points: Sequence[np.ndarray]) -> Sequence[np.ndarray]:
         if cancellation_check is not None and cancellation_check():
             raise FittingCancelled()
-        return objective_func(params)
+        return objective_func(points)
+
+    def wrapped_objective(params):
+        return evaluate([params])[0]
+
+    def finite_difference_points(_fun, points):
+        # SciPy hands its finite-difference points to this map-like callable
+        # together with its own wrapper of the objective, which in SciPy 1.18
+        # only casts and counts; the points are evaluated as one batch
+        # instead.  SciPy reports a TypeError raised in here as a malformed
+        # map-like callable.
+        return evaluate(list(points))
 
     def run_least_squares(start: np.ndarray, least_squares_method: str):
         least_squares, _de = load_scipy_optimize()
@@ -216,6 +230,7 @@ def fit_parameters(
             method=least_squares_method,
             bounds=scipy_bounds,
             verbose=0,
+            workers=finite_difference_points,
         )
         with warnings.catch_warnings():
             # The zero-only gradient stop deliberately sits below epsilon.

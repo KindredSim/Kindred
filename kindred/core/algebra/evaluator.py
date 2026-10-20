@@ -166,7 +166,7 @@ def _as_float(x: Any, *, stmt: LetStatement) -> float:
     if isinstance(x, bool):
         raise AlgebraBoolCastError("A true/false result cannot be used as a number.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
     xf = float(x)
-    if not np.isfinite(xf):
+    if not math.isfinite(xf):
         raise AlgebraNonFiniteError("The result is not a finite number.", line=stmt.line, col=stmt.col,
                                     line_text=stmt.line_text)
     return xf
@@ -514,7 +514,7 @@ class _Evaluator:
             except ValueError as e:
                 # e.g., sqrt of negative
                 raise AlgebraDomainError(str(e), line=stmt.line, col=stmt.col, line_text=stmt.line_text) from None
-            if not np.isfinite(out):
+            if not math.isfinite(out):
                 raise AlgebraNonFiniteError("The function result is not a finite number.", line=stmt.line, col=stmt.col,
                                             line_text=stmt.line_text)
             return out

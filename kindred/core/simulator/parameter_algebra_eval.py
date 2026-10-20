@@ -1,7 +1,6 @@
 """Bind the admitted chemistry/Algebra order to current candidate values."""
 from __future__ import annotations
 
-from collections.abc import Mapping
 
 from kindred.core.algebra.evaluator import bind_scalar_expression_evaluator
 from kindred.core.exceptions import ErrorContext, KindredError
@@ -17,7 +16,6 @@ from kindred.core.simulator.parameter_coordinates import (
 def bind_parameter_evaluation(
     spec: ParameterAlgebraSpec,
     mechanism: object,
-    base_values: Mapping[str, float] | None = None,
 ):
     """Bind once; calculate the requested values, and what they read, at the current temperature."""
     targets = build_parameter_target_map(mechanism)
@@ -43,7 +41,6 @@ def bind_parameter_evaluation(
     for name, value in metadata["scalar_params"].items():
         if name in independent:
             values[name] = float(value)
-    values.update(base_values or {})
     values["T"] = float(MechanismMetadataView.from_metadata(metadata).temperature_K)
     operations = {}
     completed: set[str] = set()

@@ -39,7 +39,9 @@ __all__ = [
     "InterventionStopAction",
     "SpeciesTriggerCondition",
     "ObservableTriggerCondition",
+    "INTERVENTION_CLOCK_FIELDS",
     "admit_intervention_parameter_units",
+    "intervention_schedule_clock_parameters",
     "intervention_schedule_parameter_dependencies",
     "intervention_schedule_parameter_names",
     "declaration_line",
@@ -397,10 +399,6 @@ class PhysicalAction:
             items.append(("initial_volume", self.initial_volume))
         return tuple(items)
 
-    @property
-    def is_parameterized(self) -> bool:
-        return any(value.parameter is not None for _, value in self.quantities())
-
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {}
         if self.op in {"jump", "flux"}:
@@ -446,10 +444,6 @@ class InterventionPhysical:
     @property
     def clock_fields(self) -> tuple[str, ...]:
         return ("start_time", "end_time") if self.op == "flux" else ("time",)
-
-    @property
-    def is_parameterized(self) -> bool:
-        return self.physical.is_parameterized or any(getattr(self, field + "_param") is not None for field in self.clock_fields)
 
     def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> InterventionPhysical:
         updates = {}
@@ -507,10 +501,6 @@ class InterventionSet:
     def op(self) -> str:
         return "set"
 
-    @property
-    def is_parameterized(self) -> bool:
-        return self.time_param is not None or self.value_param is not None
-
     def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> "InterventionSet":
         return InterventionSet(
             species=self.species,
@@ -564,10 +554,6 @@ class InterventionJump:
     @property
     def op(self) -> str:
         return "jump"
-
-    @property
-    def is_parameterized(self) -> bool:
-        return self.time_param is not None or self.delta_param is not None
 
     def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> "InterventionJump":
         return InterventionJump(
@@ -635,17 +621,6 @@ class InterventionFlux:
     @property
     def op(self) -> str:
         return "flux"
-
-    @property
-    def is_parameterized(self) -> bool:
-        return any(
-            value is not None
-            for value in (
-                self.start_time_param,
-                self.end_time_param,
-                self.flux_rate_param,
-            )
-        )
 
     def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> "InterventionFlux":
         start_time = _resolved(
@@ -732,17 +707,6 @@ class InterventionHold:
     @property
     def op(self) -> str:
         return "hold"
-
-    @property
-    def is_parameterized(self) -> bool:
-        return any(
-            value is not None
-            for value in (
-                self.start_time_param,
-                self.end_time_param,
-                self.value_param,
-            )
-        )
 
     def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> "InterventionHold":
         start_time = _resolved(
@@ -833,15 +797,6 @@ class InterventionProtocolOperation:
             object.__setattr__(self, field, value)
             object.__setattr__(self, f"{field}_param", parameter)
 
-    @property
-    def is_parameterized(self) -> bool:
-        if self.physical is not None:
-            return self.physical.is_parameterized
-        return any(
-            item is not None
-            for item in (self.value_param, self.delta_param, self.flux_rate_param)
-        )
-
     def resolve_parameters(
         self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()
     ) -> "InterventionProtocolOperation":
@@ -928,13 +883,6 @@ class InterventionProtocol:
     def kind(self) -> str:
         return "repeat"
 
-    @property
-    def is_parameterized(self) -> bool:
-        return self.start_time_param is not None or any(
-            operation.is_parameterized
-            for operation in self.before + self.during + self.after
-        )
-
     def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> "InterventionProtocol":
         resolved_phases: dict[str, tuple[InterventionProtocolOperation, ...]] = {}
         for phase in ("before", "during", "after"):
@@ -1008,12 +956,6 @@ class InterventionTriggerAction:
         object.__setattr__(self, selected, value)
         object.__setattr__(self, f"{selected}_param", parameter)
 
-    @property
-    def is_parameterized(self) -> bool:
-        if self.physical is not None:
-            return self.physical.is_parameterized
-        return self.value_param is not None or self.delta_param is not None
-
     def resolve_parameters(
         self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()
     ) -> "InterventionTriggerAction":
@@ -1069,10 +1011,6 @@ class InterventionStopAction:
     def op(self) -> str:
         return "stop"
 
-    @property
-    def is_parameterized(self) -> bool:
-        return False
-
     def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> InterventionStopAction:
         return self
 
@@ -1112,10 +1050,6 @@ class InterventionTrigger:
     @property
     def op(self) -> str:
         return "trigger"
-
-    @property
-    def is_parameterized(self) -> bool:
-        return self.threshold_param is not None or self.then.is_parameterized
 
     def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> InterventionTrigger:
         then = self.then.resolve_parameters(values, runtime_parameters=runtime_parameters)
@@ -1200,18 +1134,12 @@ class InterventionSchedule:
     def is_empty(self) -> bool:
         return not self.operations
 
-    @property
-    def is_parameterized(self) -> bool:
-        return any(item.is_parameterized for item in self.operations)
-
     def resolve_parameters(
         self,
         parameter_values: Mapping[str, Any] | None,
         *,
         runtime_parameters: frozenset[str] = frozenset(),
     ) -> "InterventionSchedule":
-        if not self.is_parameterized:
-            return self
         values = dict(parameter_values or {})
         resolved: list[InterventionOperation] = []
         for item in self.operations:
@@ -1868,6 +1796,22 @@ def intervention_schedule_parameter_dependencies(
                 getattr(operation, f"{field}_param", None),
             )
     return MappingProxyType(dict(dependencies))
+
+
+# The authored fields that place an operation on the clock.
+INTERVENTION_CLOCK_FIELDS = frozenset({"time", "start_time", "end_time"})
+
+
+def intervention_schedule_clock_parameters(schedule: InterventionSchedule | None) -> frozenset[str]:
+    """The params a schedule's clock fields name.
+
+    A schedule without them has one timeline for every candidate, so
+    admission compiles it; the others are compiled per candidate.
+    """
+    return frozenset(
+        name for identity, names in intervention_schedule_parameter_dependencies(schedule).items()
+        if identity[2] in INTERVENTION_CLOCK_FIELDS for name in names
+    )
 
 
 

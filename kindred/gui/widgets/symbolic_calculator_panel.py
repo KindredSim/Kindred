@@ -41,6 +41,8 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         self._on_cancel = on_cancel
         self._latest_query = ""
         self._latest_is_error = False
+        # The state last rendered; an equal state leaves scroll and selection.
+        self._last_state: SymbolicCalculatorViewState | None = None
         self._help_dialog: QtWidgets.QDialog | None = None
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -130,6 +132,8 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         return bool(self._query_edit.isEnabled() and self._evaluate_button.isEnabled())
 
     def render_state(self, state: SymbolicCalculatorViewState) -> None:
+        if state == self._last_state:
+            return
         available = bool(state.available)
         previous_index = self._solution_combo.currentIndex() if self._latest_query == state.latest_query else 0
         # An unavailable current mechanism has no result.  Do not let a
@@ -166,6 +170,7 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
             )
         else:
             self._result_view.clear()
+        self._last_state = state
 
     @QtCore.Slot()
     def use_result(self) -> None:

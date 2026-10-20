@@ -188,8 +188,9 @@ def profile_noise_model(
         forward, backward = x.copy(), x.copy()
         forward[index] = min(x[index] + step, high)
         backward[index] = max(x[index] - step, low)
-        upper = objective.evaluate_scientific_residuals(forward)
-        lower = objective.evaluate_scientific_residuals(backward)
+        # One pair at a time: an unavailable column ends the model before
+        # the next column runs.
+        upper, lower = objective.evaluate_scientific_residuals([forward, backward])
         if upper is None or lower is None:
             return None
         columns.append((upper - lower) / (forward[index] - backward[index]))
@@ -274,7 +275,7 @@ def undetermined_coordinates(
             trial = x.copy()
             trial[index] = bound
             try:
-                residuals = objective.evaluate_scientific_residuals(trial)
+                [residuals] = objective.evaluate_scientific_residuals([trial])
             except (FittingCancelled, SimulationCancelled):
                 raise
             except Exception:
@@ -487,6 +488,14 @@ class ProfileLikelihoodResult:
         object.__setattr__(self, "provenance", MappingProxyType(dict(self.provenance)))
 
 
+class _SideEnd(Exception):
+    """Ends one Profile side from inside SciPy's root finder."""
+
+    def __init__(self, value: float | None, resolution: ProfileLikelihoodEndpoint) -> None:
+        super().__init__()
+        self.endpoint = (value, resolution)
+
+
 def profile_likelihood_settlement_result(
     *,
     config: ProfileLikelihoodConfig,
@@ -508,7 +517,7 @@ def profile_likelihood_settlement_result(
 
 def profile_likelihood_result(
     *,
-    objective: Callable[[np.ndarray], np.ndarray],
+    objective: _fit_execution.GlobalFitObjective,
     initial_parameters: Mapping[object, float],
     bounds: Mapping[object, tuple[float, float]],
     config: ProfileLikelihoodConfig,
@@ -636,8 +645,10 @@ def profile_likelihood_result(
                 return None, ProfileLikelihoodEndpoint("bound", "search_limit_reached")
             inner_x = best
             inner_parameters = dict(initial)
+            # The optimum is the first inner refit.
+            inner_record: Mapping[str, object] = {"status": "success", "rise": 0.0, "converged": True}
             bracket: tuple[
-                float, float, float, Mapping[str, float], Mapping[str, float]
+                float, float, Mapping[str, object], Mapping[str, object], Mapping[str, float], Mapping[str, float]
             ] | None = None
 
             def threshold_resolution(parameters: Mapping[str, float]) -> ProfileLikelihoodEndpoint:
@@ -673,7 +684,7 @@ def profile_likelihood_result(
                 if cancellation_check():
                     raise FittingCancelled()
                 fit = fit_parameters_with_fixed(
-                    objective,
+                    objective.evaluate_points,
                     dict(warm_start),
                     fixed_parameters={name: float(fixed)},
                     bounds=bound_map,
@@ -693,12 +704,12 @@ def profile_likelihood_result(
                     refinement_step=refinement_step,
                 )
                 # A scientific residual call, never an optimizer penalty.
-                evaluation_residuals = objective.evaluate_scientific_residuals(
+                [evaluation_residuals] = objective.evaluate_scientific_residuals([
                     np.asarray(
                         [fit.parameters[item] for item in initial],
                         dtype=float,
                     ),
-                )
+                ])
                 if evaluation_residuals is None:
                     record = {
                         "fixed_optimizer_value": float(fixed),
@@ -745,66 +756,72 @@ def profile_likelihood_result(
                     bracket = (
                         inner_x,
                         float(fixed),
-                        rise,
+                        inner_record,
+                        record,
                         dict(inner_parameters),
                         dict(fitted_parameters),
                     )
                     break
                 inner_x = float(fixed)
+                inner_record = record
                 inner_parameters = dict(fitted_parameters or inner_parameters)
             if bracket is None:
                 # The last discovery step refits at the bound itself.
                 return None, ProfileLikelihoodEndpoint("bound", "search_limit_reached")
-            left_x, right_x, right_rise, left_parameters, right_parameters = bracket
+            left_x, right_x, left_record, right_record, left_parameters, right_parameters = bracket
             rise_tolerance = 1e-4 * threshold
-            representability_exhausted = False
-            for refinement_step in range(1, 65):
-                coordinate_scale = max(
-                    abs(best),
-                    abs(bound),
-                    abs(bound - best),
-                )
-                coordinate_tolerance = max(
-                    1e-6 * coordinate_scale,
-                    32.0
-                    * max(
-                        math.ulp(float(left_x)),
-                        math.ulp(float(right_x)),
-                    ),
-                )
-                midpoint = left_x + (right_x - left_x) / 2.0
-                if midpoint == left_x or midpoint == right_x:
-                    representability_exhausted = True
-                    break
-                record, fitted_parameters = append_fit(
-                    midpoint,
-                    stage="refinement",
-                    discovery_step=None,
-                    refinement_step=refinement_step,
-                    warm_start=left_parameters,
-                )
-                if record["status"] != "success":
-                    return None, ProfileLikelihoodEndpoint("failed", "scientific_unavailable")
-                midpoint_rise = float(record["rise"])
-                if midpoint_rise >= threshold - rise_tolerance and not record["converged"]:
-                    return None, ProfileLikelihoodEndpoint("unavailable", "refit_not_converged")
-                width = abs(right_x - left_x)
-                if abs(midpoint_rise - threshold) <= rise_tolerance and width <= coordinate_tolerance:
-                    return midpoint, threshold_resolution(fitted_parameters)
-                if abs(right_rise - threshold) <= rise_tolerance and width <= coordinate_tolerance:
-                    return right_x, threshold_resolution(right_parameters)
-                if midpoint_rise >= threshold:
-                    right_x, right_rise = midpoint, midpoint_rise
-                    right_parameters = dict(fitted_parameters)
+            # SciPy's root finder evaluates both bracket ends first; they are
+            # the refits discovery already made.
+            known = {
+                left_x: (left_record, left_parameters),
+                right_x: (right_record, right_parameters),
+            }
+            refinement_step = 0
+            warm_start = left_parameters
+
+            def signed_rise(fixed: float) -> float:
+                """√rise − √cut-off at one refit, nearly linear in the
+                coordinate on a quadratic profile.  A refit that ends the side
+                raises its endpoint."""
+
+                nonlocal refinement_step, warm_start
+                fixed = float(fixed)
+                if fixed in known:
+                    record, fitted_parameters = known.pop(fixed)
                 else:
-                    left_x = midpoint
-                    left_parameters = dict(fitted_parameters or left_parameters)
-            return None, ProfileLikelihoodEndpoint(
-                "unavailable",
-                "binary64_representability_exhausted"
-                if representability_exhausted
-                else "midpoint_refit_budget_exhausted",
-            )
+                    refinement_step += 1
+                    record, fitted_parameters = append_fit(
+                        fixed,
+                        stage="refinement",
+                        discovery_step=None,
+                        refinement_step=refinement_step,
+                        # The root finder keeps a sign change, so its latest
+                        # inner refit is the bracket's inner end.
+                        warm_start=warm_start,
+                    )
+                if record["status"] != "success":
+                    raise _SideEnd(None, ProfileLikelihoodEndpoint("failed", "scientific_unavailable"))
+                rise = float(record["rise"])
+                if rise >= threshold - rise_tolerance and not record["converged"]:
+                    raise _SideEnd(None, ProfileLikelihoodEndpoint("unavailable", "refit_not_converged"))
+                if abs(rise - threshold) <= rise_tolerance:
+                    raise _SideEnd(fixed, threshold_resolution(fitted_parameters))
+                if rise < threshold:
+                    warm_start = dict(fitted_parameters)
+                return math.sqrt(max(rise, 0.0)) - math.sqrt(threshold)
+
+            from scipy.optimize import brentq
+
+            try:
+                # A crossing within the rise tolerance ends the side; the
+                # root finder's own result is never an endpoint.
+                brentq(
+                    signed_rise, left_x, right_x, xtol=math.ulp(0.0), maxiter=64,
+                    full_output=True, disp=False,
+                )
+            except _SideEnd as end:
+                return end.endpoint
+            return None, ProfileLikelihoodEndpoint("unavailable", "threshold_not_located")
 
         side_results: dict[str, tuple[float | None, ProfileLikelihoodEndpoint]] = {}
         for side, bound in (("lower", low), ("upper", high)):

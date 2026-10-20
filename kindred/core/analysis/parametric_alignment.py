@@ -61,9 +61,7 @@ def align_parametric(
     model_x: np.ndarray,
     model_y: Mapping[str, np.ndarray],
     model_time: np.ndarray,
-    segment_ids: np.ndarray,
-    segment_keys: Sequence[str],
-    discontinuity_ids: np.ndarray,
+    regions: np.ndarray,
     multipliers: Mapping[str, float],
     x_name: str,
     cancellation_control: SimulationCancellationControl | None,
@@ -72,21 +70,17 @@ def align_parametric(
 
     Every available selected quantity contributes once. Recorded observation
     time is deliberately absent. Endpoints also participate, including isolated
-    samples beside a jump. No segment crosses an executor-issued boundary. A row
-    is placed only on segments whose ends define every quantity it measures; a
-    row with no such segment raises UndefinedComparedTargets with the quantities
-    it measures.
+    samples beside a jump. No segment crosses from one of the ``regions`` to the
+    next. A row is placed only on segments whose ends define every quantity it
+    measures; a row with no such segment raises UndefinedComparedTargets with
+    the quantities it measures.
     """
     if cancellation_control is not None and cancellation_control.cancel_requested():
         raise FittingCancelled()
     names = tuple(sorted(observations))
     model = np.column_stack((model_x, *(model_y[name] for name in names)))
-    segments = np.asarray(segment_ids)
-    discontinuities = np.asarray(discontinuity_ids)
-    keys = tuple(segment_keys)
-    continuous = ((segments[1:] == segments[:-1])
-                  & (discontinuities[1:] == discontinuities[:-1])
-                  & np.asarray([a == b for a, b in zip(keys, keys[1:])]))
+    region_ids = np.asarray(regions)
+    continuous = region_ids[1:] == region_ids[:-1]
     if np.any(np.diff(model_time)[continuous] <= 0.0):
         raise FitSimulationError("Model time must increase within uninterrupted segments.")
     # Direct samples guarantee bounded matches even when no adjacent pair is valid.
@@ -101,6 +95,8 @@ def align_parametric(
     weight = np.asarray([multipliers[x_name], *(multipliers[name] for name in names)])
     defined = np.isfinite(model)
     ends_defined = defined[left] & defined[right]
+    # Rows that measure the same quantities share their candidate segments.
+    segment_groups: dict[bytes, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]] = {}
     chosen_rows: list[int] = []
     chosen_fractions: list[float] = []
     for row, x_value in zip(source_rows, observed_x, strict=True):
@@ -108,16 +104,22 @@ def align_parametric(
             raise FittingCancelled()
         observed = np.asarray([x_value, *(observed_by_row[name].get(row, np.nan) for name in names)])
         available = np.isfinite(observed)
-        candidates = np.flatnonzero(np.all(ends_defined[:, available], axis=1))
-        if not candidates.size:
-            raise UndefinedComparedTargets(tuple(
-                name for name, measured in zip((x_name, *names), available) if measured
-            ))
-        start = model[left[candidates]][:, available]
-        direction = (model[right[candidates]][:, available] - start) * weight[available]
-        offset = (observed[available] - start) * weight[available]
+        group = segment_groups.get(available.tobytes())
+        if group is None:
+            candidates = np.flatnonzero(np.all(ends_defined[:, available], axis=1))
+            if not candidates.size:
+                raise UndefinedComparedTargets(tuple(
+                    name for name, measured in zip((x_name, *names), available) if measured
+                ))
+            start = model[left[candidates]][:, available]
+            direction = (model[right[candidates]][:, available] - start) * weight[available]
+            group = segment_groups[available.tobytes()] = (
+                candidates, start, direction, weight[available], float(np.max(np.abs(direction))),
+            )
+        candidates, start, direction, measured_weight, direction_scale = group
+        offset = (observed[available] - start) * measured_weight
         # Scale the calculation together, preserving the weighted minimizer.
-        scale = max(float(np.max(np.abs(direction))), float(np.max(np.abs(offset))))
+        scale = max(direction_scale, float(np.max(np.abs(offset))))
         if scale:
             direction = direction / scale
             offset = offset / scale

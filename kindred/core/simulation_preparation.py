@@ -19,11 +19,12 @@ from kindred.core.exceptions import (
 )
 from kindred.core.temperature import starting_temperature_segment
 from kindred.core.intervention_schedule import (
+    INTERVENTION_CLOCK_FIELDS,
     InterventionSchedule,
     InterventionScheduleDependencyMetadata,
     InterventionScheduleError,
+    intervention_schedule_clock_parameters,
     intervention_schedule_parameter_dependencies,
-    intervention_schedule_parameter_names,
     locate_declaration,
 )
 from kindred.core.intervention_schedule_compiler import (
@@ -199,12 +200,9 @@ def _schedule_parameters_deferred_to_prepared_request(
     *,
     parameter_algebra_spec: Any,
 ) -> frozenset[str]:
-    if not unresolved_intervention_schedule.is_parameterized:
-        return frozenset()
     requested = execution_request.requested_parameter_names
     supplied = set(dict(execution_request.parameter_overrides or {}).keys())
-    referenced = set(intervention_schedule_parameter_names(unresolved_intervention_schedule))
-    if not requested or not referenced:
+    if not requested:
         return frozenset()
 
     requested_names = set(requested)
@@ -217,7 +215,7 @@ def _schedule_parameters_deferred_to_prepared_request(
     for identity, direct_names in intervention_schedule_parameter_dependencies(
         unresolved_intervention_schedule
     ).items():
-        if identity[2] not in {"time", "start_time", "end_time"}:
+        if identity[2] not in INTERVENTION_CLOCK_FIELDS:
             continue
         expanded_names = set(expanded_metadata.get(identity, ()))
         if not expanded_names.intersection(requested_names - supplied_names):
@@ -340,18 +338,15 @@ def prepare_simulation_run(
             execution_request
         )
     )
-    schedule_only_values = _bind_request_parameter_overrides(
+    _bind_request_parameter_overrides(
         mechanism=mechanism,
         parameter_algebra_spec=parameter_algebra_spec,
         parameter_overrides=execution_request.parameter_overrides,
-        unresolved_intervention_schedule=unresolved_intervention_schedule,
         parameter_target_map=parameter_target_map,
     )
     _raise_if_cancelled(cancellation_control)
 
-    _coefficient_evaluator, rhs = topology.bind_target(
-        mechanism, base_values=schedule_only_values
-    )
+    _coefficient_evaluator, rhs = topology.bind_target(mechanism)
 
     intervention_execution = execution_request.prepared_dsl.intervention_execution_contract()
     if intervention_execution is not None and not execution_request.use_authored_stops:
@@ -366,21 +361,20 @@ def prepare_simulation_run(
                 unresolved_intervention_schedule,
                 parameter_algebra_spec=parameter_algebra_spec,
             )
-            direct_dependencies = intervention_schedule_parameter_dependencies(unresolved_intervention_schedule)
-            clock_fields = {"time", "start_time", "end_time"}
-            clock_roots = tuple(sorted({
-                name for identity, names in direct_dependencies.items()
-                if identity[2] in clock_fields for name in names
-            }))
+            # Only a schedule whose clock fields read params is compiled per
+            # candidate; its payload params are read as it executes.
+            clock_roots = tuple(sorted(intervention_schedule_clock_parameters(unresolved_intervention_schedule)))
             payload_names = frozenset(
-                name for identity, names in direct_dependencies.items()
-                if identity[2] not in clock_fields for name in names
+                name for identity, names in intervention_schedule_parameter_dependencies(
+                    unresolved_intervention_schedule
+                ).items()
+                if identity[2] not in INTERVENTION_CLOCK_FIELDS for name in names
             )
             try:
                 resolved_schedule = unresolved_intervention_schedule.resolve_parameters(
-                    (_coefficient_evaluator.parameter_values(
+                    _coefficient_evaluator.parameter_values(
                         _coefficient_evaluator.nominal_temperature_K, clock_roots
-                    ) if clock_roots else {}),
+                    ),
                     runtime_parameters=payload_names,
                 )
                 intervention_execution = compile_intervention_schedule(
@@ -490,10 +484,9 @@ def _bind_request_parameter_overrides(
     mechanism: Any,
     parameter_algebra_spec: Any,
     parameter_overrides: Mapping[str, float] | None,
-    unresolved_intervention_schedule: Any,
     parameter_target_map: Mapping[str, ParameterTarget],
-) -> Mapping[str, float]:
-    """Apply owned coordinates and return admitted schedule-only bindings.
+) -> None:
+    """Apply the overrides to their coordinates and scalars.
 
     Override names are enumerated independent coordinates and scalars of this
     accepted mechanism.  Their values are admitted here, which Fit trial values
@@ -502,7 +495,6 @@ def _bind_request_parameter_overrides(
 
     declared_scalar_names = _independent_scalar_names(parameter_algebra_spec)
     raw_values = dict(parameter_overrides or {})
-    schedule_names = set(intervention_schedule_parameter_names(unresolved_intervention_schedule))
     mechanism_names = {name for name in raw_values if name in parameter_target_map}
     scalar_names = {
         name for name in raw_values
@@ -516,8 +508,3 @@ def _bind_request_parameter_overrides(
         scalar_parameter_names=scalar_names,
         parameter_target_map=parameter_target_map,
     )
-    return {
-        name: value
-        for name, value in raw_values.items()
-        if name in schedule_names and name not in mechanism_names | scalar_names
-    }
