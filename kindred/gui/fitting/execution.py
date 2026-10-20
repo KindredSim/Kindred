@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 import threading
 import traceback
@@ -627,9 +626,10 @@ class _FitExecution(_FitControl):
             evaluators[local.dataset_id] = FittingEvaluator(context)
 
         # Each optimizer step evaluates its Jacobian points' datasets
-        # together, so the pool spans the machine whatever the dataset count.
+        # together, so the pool takes the setting's full count whatever the
+        # dataset count.
         self._executor = ThreadPoolExecutor(
-            max_workers=os.cpu_count() or 1,
+            max_workers=request.workers,
             thread_name_prefix="kindred-fit-dataset",
         )
 

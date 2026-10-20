@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
+import sys
 
 
 logger = logging.getLogger(__name__)
@@ -63,6 +65,37 @@ def apply_qt_startup_workarounds(*, qt_core: object) -> bool:
     qt_core.QCoreApplication.setAttribute(_software_opengl_attribute(qt_core), True)
     logger.warning("Applying Qt startup workaround: software OpenGL (reason: %s)", reason)
     return True
+
+
+def physical_core_count() -> int:
+    """Return the machine's physical processor cores; Kindred asks once, at startup."""
+    if sys.platform == "win32":
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        relation_processor_core = 0
+        size = ctypes.c_ulong(0)
+        # The first call only reports the buffer size the records need.
+        kernel32.GetLogicalProcessorInformationEx(relation_processor_core, None, ctypes.byref(size))
+        buffer = ctypes.create_string_buffer(size.value)
+        if not kernel32.GetLogicalProcessorInformationEx(
+            relation_processor_core, buffer, ctypes.byref(size)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        # One variable-length record per core; each gives its own size after
+        # its relationship.
+        cores = offset = 0
+        while offset < size.value:
+            offset += int.from_bytes(buffer.raw[offset + 4:offset + 8], "little")
+            cores += 1
+        return cores
+    if sys.platform.startswith("linux"):
+        topology = Path("/sys/devices/system/cpu")
+        return len({
+            ((path / "physical_package_id").read_text().strip(), (path / "core_id").read_text().strip())
+            for path in topology.glob("cpu[0-9]*/topology")
+        })
+    raise RuntimeError(f"Counting processor cores is not supported on {sys.platform}.")
 
 
 def load_app_icon(q_icon_type: object):

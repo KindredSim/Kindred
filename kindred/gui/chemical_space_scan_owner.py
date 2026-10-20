@@ -60,11 +60,12 @@ class ChemicalSpaceScanOwner(QtCore.QObject):
     status = QtCore.Signal(str)
     application_close_settlement_changed = QtCore.Signal()
 
-    def __init__(self, gate, exports, session, parent):
+    def __init__(self, gate, exports, session, parallel_workers, parent):
         super().__init__(parent)
         self.gate = gate
         self.exports = exports
         self._session = session
+        self._parallel_workers = parallel_workers
         self.parent_widget = parent
         self.dialog = None
         self.capture = None
@@ -170,6 +171,8 @@ class ChemicalSpaceScanOwner(QtCore.QObject):
             raise ValueError("Cannot overwrite the currently open project archive.")
         if not self.gate.try_acquire(self, "scan"):
             return False
+        # Each Start takes the Parallel Execution setting as it stands.
+        config = replace(config, workers=self._parallel_workers())
         self.worker = _ScanThread(config, self.capture.prepared_dsl, check_only, self)
         self.worker.progress.connect(self.progress)
         self.worker.finished.connect(self._settled)

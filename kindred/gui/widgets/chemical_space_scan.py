@@ -6,7 +6,6 @@ import html
 from kindred.core.quantity_units import format_unit_for_display, presentation_unit
 
 from dataclasses import replace
-import os
 import secrets
 
 from PySide6 import QtCore, QtWidgets
@@ -14,7 +13,6 @@ from PySide6 import QtCore, QtWidgets
 from kindred.core.project_document import canonical_initial_values, parse_points_text, SUPPORTED_SOLVERS
 from kindred.core.scipy_integrate import validate_scipy_rtol
 from kindred.core.validation import parse_finite_numeric_text
-from kindred.gui.controllers.simulation_job_owner import resolve_run_parallel_capacity
 from kindred.gui.widgets.scan_range_dialog import ScanRangeDialog, ScanConstraintDialog, entry
 from kindred.gui.display_name_policy import scientific_symbol_html, scientific_symbol_spoken
 from kindred.gui.ui_helpers import SCIENTIFIC_NAME_HTML_ROLE, SOLVER_TOOLTIP, ScientificNameDelegate, ignore_wheel
@@ -188,12 +186,6 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         form.addRow(note)
         self.outputs = QtWidgets.QListWidget()
         form.addRow("Exported quantities (time always included)", self.outputs)
-        self.workers = QtWidgets.QSpinBox()
-        capacity = resolve_run_parallel_capacity(cpu_count=os.cpu_count(), user_max=None, target_count=2**31 - 1)
-        maximum = resolve_run_parallel_capacity(cpu_count=os.cpu_count(), user_max=2**31 - 1, target_count=2**31 - 1)
-        self.workers.setRange(1, maximum)
-        self.workers.setValue(capacity)
-        form.addRow("Local workers", self.workers)
         self.tabs.addTab(page, "Execution and Output")
 
     def _baseline_config(self):
@@ -419,7 +411,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
                        boundary_attempts=_whole_number(self.boundary_count, "Joint endpoint attempts") if boundary and not grouped else 0,
                        parameter_boundaries=_whole_number(self.parameter_boundaries, "Parameter/time endpoint sets") if boundary and grouped else 0,
                        initial_boundaries=_whole_number(self.initial_boundaries, "Initial-condition endpoint sets") if boundary and grouped else 0,
-                       workers=self.workers.value(), constraints=tuple(self.constraints))
+                       constraints=tuple(self.constraints))
 
     def _start(self, check_only):
         try:
