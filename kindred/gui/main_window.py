@@ -234,9 +234,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._simulation_jobs = SimulationJobOwner(
             gate=self._computation_gate,
             repository_for_tab=self._repository_for_tab,
-            user_parallel_maximum=(
-                self.config_controller.run_user_maximum_preference
-            ),
+            parallel_workers=self.config_controller.parallel_workers,
             parent=self,
         )
         self._workspace_tab_registry = WorkspaceTabRegistry(
@@ -251,6 +249,7 @@ class MainWindow(QtWidgets.QMainWindow):
             registry=self._workspace_tab_registry,
             gate=self._computation_gate,
             color_resolver=self.config_controller.species_color,
+            parallel_workers=self.config_controller.parallel_workers,
             observation_style_getter=lambda: (
                 self.config_controller.experimental_point_shape(),
                 self.config_controller.experimental_point_size(),
@@ -269,7 +268,8 @@ class MainWindow(QtWidgets.QMainWindow):
         from kindred.gui.chemical_space_scan_owner import ChemicalSpaceScanOwner
 
         self._scan_owner = ChemicalSpaceScanOwner(
-            self._computation_gate, self._xlsx_export_owner, self._project_session, self
+            self._computation_gate, self._xlsx_export_owner, self._project_session,
+            self.config_controller.parallel_workers, self,
         )
         self._scan_owner.application_close_settlement_changed.connect(self._refresh_actions)
         self._scan_owner.status.connect(self.set_status_text)
@@ -3762,8 +3762,11 @@ class MainWindow(QtWidgets.QMainWindow):
             () if tab.prepared_dsl is None
             else tab.prepared_dsl.authored_stop_declarations()
         )
-        current_max = self.config_controller.run_user_maximum_preference()
-        dialog.set_run_user_maximum(current_max)
+        dialog.set_parallel_maximum(
+            self.config_controller.parallel_maximum_preference(),
+            physical_cores=self.config_controller.physical_cores,
+            automatic_workers=self.config_controller.automatic_parallel_workers(),
+        )
         dialog.set_result_cache_capacity(
             self.config_controller.result_cache_capacity()
         )
@@ -3774,7 +3777,7 @@ class MainWindow(QtWidgets.QMainWindow):
             settings = dialog.scientific_settings()
             run_defaults = dialog.new_tab_run_defaults()
             preview_points, preview_delay = dialog.preview_settings()
-            run_maximum = dialog.run_user_maximum()
+            parallel_maximum = dialog.parallel_maximum()
             cache_capacity = dialog.result_cache_capacity()
             persist_scientific_defaults = (
                 dialog.persist_scientific_defaults_requested()
@@ -3795,7 +3798,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.config_controller.persist_run_defaults(run_defaults)
             self.config_controller.set_preview_points(preview_points)
             self.config_controller.set_preview_delay_ms(preview_delay)
-            self.config_controller.set_run_user_maximum(run_maximum)
+            self.config_controller.set_parallel_maximum(parallel_maximum)
             self.config_controller.set_result_cache_capacity(cache_capacity)
         except ValueError as exc:
             message = str(exc)

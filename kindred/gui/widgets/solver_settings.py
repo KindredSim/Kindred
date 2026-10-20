@@ -15,7 +15,6 @@ from kindred.core.project_document import (
     validate_simulation_execution_settings,
     validate_tab_scientific_settings,
 )
-from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.validation import parse_finite_numeric_text
 from kindred.gui.ui_helpers import SOLVER_TOOLTIP, clamp_initial_size, ignore_wheel, make_scroll_area
 
@@ -269,30 +268,22 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
 
         parallel_box = QtWidgets.QGroupBox("Parallel Execution", body)
         parallel_form = QtWidgets.QFormLayout(parallel_box)
-        self.run_maximum_automatic_check = QtWidgets.QCheckBox(
-            "Automatic (CPU Fallback)",
+        self.parallel_automatic_check = QtWidgets.QCheckBox(
+            "Automatic",
             parallel_box,
         )
-        self.run_maximum_spin = self._integer_spin(
-            1,
-            MAX_PARALLEL_WORKERS_CEILING,
-            1,
-            parallel_box,
+        self.parallel_maximum_spin = self._integer_spin(1, 1, 1, parallel_box)
+        self.parallel_automatic_check.setToolTip(
+            "Run one simulation fewer at once than the machine has physical cores."
         )
-        self.run_maximum_automatic_check.setToolTip(
-            "Choose parallel execution capacity from the available logical CPUs, "
-            "reserving one when possible and using at most 16 simultaneous simulations."
+        self.parallel_maximum_spin.setToolTip(
+            "How many simulations Run, Fit and Chemical Space Scan may run at once, "
+            "from 1 to the machine's physical cores."
         )
-        self.run_maximum_spin.setToolTip(
-            "Maximum number of initial-condition sets simulated simultaneously. "
-            "Execution also respects available CPU capacity and the number of sets. "
-            "Set to 1 for sequential execution."
-        )
-        self.run_maximum_automatic_check.toggled.connect(
-            self.run_maximum_spin.setDisabled
-        )
-        parallel_form.addRow("Run user maximum", self.run_maximum_automatic_check)
-        parallel_form.addRow("Explicit maximum", self.run_maximum_spin)
+        self._automatic_parallel_workers = 1
+        self.parallel_automatic_check.toggled.connect(self._show_parallel_automatic)
+        parallel_form.addRow("Simultaneous simulations", self.parallel_automatic_check)
+        parallel_form.addRow("Explicit maximum", self.parallel_maximum_spin)
         body_layout.addWidget(parallel_box)
 
         cache_box = QtWidgets.QGroupBox("Result Cache", body)
@@ -318,7 +309,7 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         layout.addWidget(scroll, 1)
         for control in (
             self.temperature_spin, self.energy_unit_combo, self._run_default_fields.solver_combo,
-            self.preview_delay_spin, self.run_maximum_spin, self.cache_capacity_spin,
+            self.preview_delay_spin, self.parallel_maximum_spin, self.cache_capacity_spin,
         ):
             ignore_wheel(control)
 
@@ -442,22 +433,36 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             self.preview_delay_spin.value(),
         )
 
-    def set_run_user_maximum(self, value: int | None) -> None:
-        self.run_maximum_spin.setRange(1, MAX_PARALLEL_WORKERS_CEILING)
+    def set_parallel_maximum(
+        self,
+        value: int | None,
+        *,
+        physical_cores: int,
+        automatic_workers: int,
+    ) -> None:
+        self.parallel_maximum_spin.setRange(1, physical_cores)
+        self.parallel_maximum_spin.setSuffix(f" / {physical_cores}")
+        self._automatic_parallel_workers = automatic_workers
         automatic = value is None
-        blocker = QtCore.QSignalBlocker(self.run_maximum_automatic_check)
+        blocker = QtCore.QSignalBlocker(self.parallel_automatic_check)
         try:
-            self.run_maximum_automatic_check.setChecked(automatic)
+            self.parallel_automatic_check.setChecked(automatic)
         finally:
             del blocker
-        self.run_maximum_spin.setDisabled(automatic)
+        self._show_parallel_automatic(automatic)
         if not automatic:
-            self.run_maximum_spin.setValue(int(value))
+            self.parallel_maximum_spin.setValue(value)
 
-    def run_user_maximum(self) -> int | None:
-        if self.run_maximum_automatic_check.isChecked():
+    def _show_parallel_automatic(self, automatic: bool) -> None:
+        self.parallel_maximum_spin.setDisabled(automatic)
+        # While Automatic is ticked the box shows the count it chooses.
+        if automatic:
+            self.parallel_maximum_spin.setValue(self._automatic_parallel_workers)
+
+    def parallel_maximum(self) -> int | None:
+        if self.parallel_automatic_check.isChecked():
             return None
-        return int(self.run_maximum_spin.value())
+        return int(self.parallel_maximum_spin.value())
 
     def set_result_cache_capacity(self, value: int) -> None:
         self.cache_capacity_spin.setValue(int(value))
@@ -471,7 +476,7 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             self.scientific_settings()
             self.new_tab_run_defaults()
             self.preview_settings()
-            self.run_user_maximum()
+            self.parallel_maximum()
             self.result_cache_capacity()
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(

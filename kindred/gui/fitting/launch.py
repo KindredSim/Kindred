@@ -758,6 +758,8 @@ class _FitDispatchCompilation:
 class FitExecutionRequest:
     setup: FitSetupSnapshot
     dispatch: _FitDispatchCompilation
+    # The Parallel Execution setting's simulations at once, resolved at Run Fit.
+    workers: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1346,6 +1348,7 @@ def _compile_fit_dispatch(
 def build_fit_execution_request(
     *,
     setup: FitSetupSnapshot,
+    workers: int,
 ) -> FitExecutionRequest:
     """Compile one exact accepted setup into its immutable execution request."""
     readiness = fit_setup_readiness(
@@ -1369,4 +1372,5 @@ def build_fit_execution_request(
     return FitExecutionRequest(
         setup=setup,
         dispatch=dispatch,
+        workers=workers,
     )

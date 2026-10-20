@@ -19,6 +19,10 @@ from kindred.scan.config import START, END, ScanProgress
 from kindred.scan.json_export import JsonScanWriter, input_record, result_record
 from kindred.scan.sampling import PreparedScanDesign
 
+# Windows waits on at most 63 handles at once, and the supervisor waits on one
+# pipe per worker.
+_MAX_WORKERS = 63
+
 
 def execute_input(config, prepared, solver, run, cancellation):
     record = input_record(run)
@@ -96,6 +100,8 @@ def _pending(connection):
 
 def run_scan(config, prepared, cancel, progress_callback):
     """Run off the GUI thread. Own processes, generator and the sole file writer."""
+    # The export header records the workers actually started.
+    config = replace(config, workers=min(config.workers, config.requested, _MAX_WORKERS))
     progress = ScanProgress(config.requested)
     process_cancel = None
     children = []
@@ -179,7 +185,7 @@ def run_scan(config, prepared, cancel, progress_callback):
         progress.path = writer.path
         writing = True
         iterator = iter(design.inputs())
-        for _ in range(min(config.workers, config.requested)):
+        for _ in range(config.workers):
             check()
             parent, child = context.Pipe()
             process = context.Process(target=_worker, args=(config, child, process_cancel), daemon=True)
@@ -198,7 +204,7 @@ def run_scan(config, prepared, cancel, progress_callback):
             if cancel.is_set():
                 process_cancel.value = True
                 progress.phase = "Canceling"
-            ready = wait([handle for child in children for handle in (child.connection, child.process.sentinel)], timeout=0.1)
+            ready = wait([child.connection for child in children], timeout=0.1)
             for child in list(children):
                 connection_closed = False
                 if child.connection in ready:
@@ -219,8 +225,10 @@ def run_scan(config, prepared, cancel, progress_callback):
                         elif kind == "bootstrap_failure":
                             fail(f"Worker preparation failed: {payload}")
                             child.run = None
-                # Drain the pipe before declaring a started attempt lost.
-                if connection_closed or (child.process.sentinel in ready and not _pending(child.connection)):
+                # Drain the pipe before declaring a started attempt lost. A worker
+                # that dies before adopting its pipe end never closes it, so its
+                # exit is read from the process itself.
+                if connection_closed or (not child.process.is_alive() and not _pending(child.connection)):
                     if child.run is not None:
                         if child.started:
                             record = input_record(child.run)

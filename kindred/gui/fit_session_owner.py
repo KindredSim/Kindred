@@ -69,6 +69,7 @@ class FitSessionOwner(QtCore.QObject):
         gate: ComputationGate,
         observation_style_getter: Callable[[], tuple[str, float, float]],
         color_resolver: ColorResolver,
+        parallel_workers: Callable[[], int],
         parent_widget: QtWidgets.QWidget | None = None,
         parent: QtCore.QObject | None = None,
     ) -> None:
@@ -78,6 +79,7 @@ class FitSessionOwner(QtCore.QObject):
         self._gate = gate
         self._color_resolver = color_resolver
         self._observation_style_getter = observation_style_getter
+        self._parallel_workers = parallel_workers
         self._parent_widget = parent_widget
         self._window: FittingWindow | None = None
         self._worker: GlobalFitWorker | None = None
@@ -1071,7 +1073,10 @@ class FitSessionOwner(QtCore.QObject):
         )
 
     def _build_request(self) -> FitExecutionRequest:
-        return build_fit_execution_request(setup=self._accepted_setup())
+        return build_fit_execution_request(
+            setup=self._accepted_setup(),
+            workers=self._parallel_workers(),
+        )
 
     def _accepted_setup(self) -> FitSetupSnapshot | None:
         """Return the one accepted setup owner for the current route."""

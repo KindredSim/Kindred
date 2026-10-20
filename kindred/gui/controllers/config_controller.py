@@ -10,7 +10,6 @@ from types import MappingProxyType
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.project_document import (
     FitDefaults,
     SIMULATION_POINT_RANGE,
@@ -26,6 +25,7 @@ from kindred.core.project_document import (
     validate_tab_scientific_settings,
 )
 from kindred.core.simulator.solvers import normalize_solver_name
+from kindred.gui.startup import physical_core_count
 from kindred.gui.theme_manager import readable_plot_color
 
 logger = logging.getLogger(__name__)
@@ -61,7 +61,7 @@ _FIT_SETTINGS_KEYS = {
     "use_seed": "fitting/use_seed",
     "seed": "fitting/seed",
 }
-_RUN_USER_MAXIMUM_KEY = "simulation/run_user_maximum"
+_PARALLEL_MAXIMUM_KEY = "simulation/parallel_maximum"
 _RESULT_CACHE_CAPACITY_KEY = "results/cache_capacity"
 _PREVIEW_POINTS_KEY = "sliders/preview_points"
 _PREVIEW_DELAY_KEY = "sliders/preview_delay_ms"
@@ -111,6 +111,8 @@ class ConfigController(QtCore.QObject):
         super().__init__()
         self._settings_store = settings
         self._species_palette = self._build_species_palette()
+        # The machine's physical processor cores, counted once at startup.
+        self.physical_cores = physical_core_count()
 
     def _settings(self) -> QtCore.QSettings:
         return self._settings_store
@@ -125,39 +127,50 @@ class ConfigController(QtCore.QObject):
                 return int(text)
         return None
 
-    def run_user_maximum_preference(self) -> int | None:
-        """Return a clamped explicit Run maximum, or ``None`` for Run fallback."""
+    def automatic_parallel_workers(self) -> int:
+        """Automatic leaves one physical core free when there is more than one."""
+
+        return max(1, self.physical_cores - 1)
+
+    def parallel_maximum_preference(self) -> int | None:
+        """Return the explicit maximum within the physical cores, or ``None`` for Automatic."""
 
         settings = self._settings()
-        if not settings.contains(_RUN_USER_MAXIMUM_KEY):
+        if not settings.contains(_PARALLEL_MAXIMUM_KEY):
             return None
-        parsed = self._parsed_int(settings.value(_RUN_USER_MAXIMUM_KEY))
+        parsed = self._parsed_int(settings.value(_PARALLEL_MAXIMUM_KEY))
         if parsed is None:
             return None
-        return min(MAX_PARALLEL_WORKERS_CEILING, max(1, parsed))
+        return min(self.physical_cores, max(1, parsed))
 
-    def set_run_user_maximum(self, value: int | None) -> int | None:
+    def parallel_workers(self) -> int:
+        """How many simulations Run, Fit and Chemical Space Scan may run at once."""
+
+        explicit = self.parallel_maximum_preference()
+        return self.automatic_parallel_workers() if explicit is None else explicit
+
+    def set_parallel_maximum(self, value: int | None) -> int | None:
         if value is None:
             settings = self._settings()
-            snapshot = self._snapshot_settings(settings, (_RUN_USER_MAXIMUM_KEY,))
-            settings.remove(_RUN_USER_MAXIMUM_KEY)
+            snapshot = self._snapshot_settings(settings, (_PARALLEL_MAXIMUM_KEY,))
+            settings.remove(_PARALLEL_MAXIMUM_KEY)
             self._sync_or_report(
                 settings,
-                "Run user maximum",
+                "Parallel execution maximum",
                 snapshot=snapshot,
-                success_message="Run parallel maximum reset to Automatic.",
+                success_message="Parallel execution maximum reset to Automatic.",
             )
             return None
-        # The dialog's spin box admits 1 to the ceiling.
+        # The dialog's spin box admits 1 to the physical cores.
         accepted = value
         settings = self._settings()
-        snapshot = self._snapshot_settings(settings, (_RUN_USER_MAXIMUM_KEY,))
-        settings.setValue(_RUN_USER_MAXIMUM_KEY, accepted)
+        snapshot = self._snapshot_settings(settings, (_PARALLEL_MAXIMUM_KEY,))
+        settings.setValue(_PARALLEL_MAXIMUM_KEY, accepted)
         self._sync_or_report(
             settings,
-            "Run user maximum",
+            "Parallel execution maximum",
             snapshot=snapshot,
-            success_message=f"Run parallel maximum set to {accepted}.",
+            success_message=f"Parallel execution maximum set to {accepted}.",
         )
         return accepted
 

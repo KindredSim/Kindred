@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-import os
 from threading import Event
 from typing import Callable, Iterable, Literal, Mapping
 
@@ -16,7 +15,6 @@ from kindred.core.project_document import (
     TabScientificSettings,
 )
 from kindred.core.result_repository import ResultRepository, SimulationResultValue
-from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
     build_simulation_execution_request,
@@ -39,14 +37,6 @@ __all__ = [
     "build_explicit_target",
     "build_execution_request",
 ]
-
-
-def resolve_run_parallel_capacity(*, cpu_count: object, user_max: object, target_count: int) -> int:
-    cpu = int(cpu_count) if type(cpu_count) is int and cpu_count > 0 else 1
-    budget = max(1, cpu - 1)
-    default = min(budget, 16)
-    resolved = max(1, min(int(user_max), MAX_PARALLEL_WORKERS_CEILING)) if type(user_max) is int else default
-    return min(target_count, budget, resolved, MAX_PARALLEL_WORKERS_CEILING)
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,7 +200,6 @@ class _DirectSimulationWorker(QtCore.QThread):
 
 
 RepositoryResolver = Callable[[str], ResultRepository | None]
-RawUserParallelMaximum = Callable[[], object]
 class SimulationJobOwner(QtCore.QObject):
     """Own Run, exact Preview, and interactive Preview computation."""
 
@@ -221,12 +210,12 @@ class SimulationJobOwner(QtCore.QObject):
     run_dispatched = QtCore.Signal(str, object)
 
     def __init__(self, *, gate: ComputationGate, repository_for_tab: RepositoryResolver,
-                 user_parallel_maximum: RawUserParallelMaximum,
+                 parallel_workers: Callable[[], int],
                  parent: QtCore.QObject | None = None) -> None:
         super().__init__(parent)
         self._gate = gate
         self._repository_for_tab = repository_for_tab
-        self._user_parallel_maximum = user_parallel_maximum
+        self._parallel_workers = parallel_workers
         # The operation and its worker are set and cleared together; the
         # worker's cancel event is the one record of a cancellation.
         self._operation: dict[str, object] | None = None
@@ -445,11 +434,7 @@ class SimulationJobOwner(QtCore.QObject):
         )
 
     def _capacity(self, count: int) -> int:
-        return resolve_run_parallel_capacity(
-            cpu_count=os.cpu_count(),
-            user_max=self._user_parallel_maximum(),
-            target_count=count,
-        )
+        return min(count, self._parallel_workers())
 
     def _start(
         self,
