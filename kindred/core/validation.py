@@ -27,6 +27,17 @@ def parse_finite_numeric_text(text: str, *, field: str = "Value") -> float:
     return value
 
 
+def parse_whole_number_text(text: str, *, field: str, minimum: int, maximum: int) -> int:
+    """Admit a typed whole number within its range, never clamping it."""
+    try:
+        value = int(text)
+    except ValueError:
+        value = None
+    if value is None or not minimum <= value <= maximum:
+        raise ValueError(f"{field} must be a whole number from {minimum} to {maximum}.")
+    return value
+
+
 def and_join(items: Sequence[str]) -> str:
     """Names in a sentence: "a", "a and b", or "a, b, and c"."""
     if len(items) < 3:

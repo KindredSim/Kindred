@@ -12,7 +12,8 @@ from kindred.core.datasets.foundation import RawDatasetRecord
 from kindred.gui.controllers.config_controller import ConfigController
 from kindred.gui.dataset_payload_snapshot import ActiveDatasetLinkSnapshot
 from kindred.gui.display_name_policy import literal_tooltip
-from kindred.gui.ui_helpers import ControlRowsLayout
+from kindred.core.validation import parse_whole_number_text
+from kindred.gui.ui_helpers import INVALID_EDITOR_STYLE, ControlRowsLayout, configure_compact_numeric_edit
 
 __all__ = ["DatasetOverlayPanel"]
 
@@ -68,7 +69,6 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         self._experimental_point_opacity = experimental_point_opacity
         self._links_by_dataset_id: dict[str, ActiveDatasetLinkSnapshot] = {}
         self._known_species: tuple[str, ...] = ()
-        self._preferences_loaded = False
         self._color_buttons: dict[tuple[str, str], QtWidgets.QPushButton] = {}
         self._raw_columns_by_key: dict[tuple[str, str], str] = {}
         self._has_rendered_snapshot = False
@@ -124,23 +124,27 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         for label, code in ConfigController.EXPERIMENTAL_POINT_SHAPES:
             self._shape_combo.addItem(label, code)
         self._shape_combo.currentIndexChanged.connect(self._on_shape_changed)
-        self._size_spin = QtWidgets.QSpinBox()
-        self._size_spin.setAccessibleName("Experimental point size")
-        self._size_spin.setRange(1, 20)
-        self._size_spin.setValue(6)
-        self._size_spin.valueChanged.connect(self._on_size_changed)
-        self._opacity_spin = QtWidgets.QSpinBox()
-        self._opacity_spin.setAccessibleName("Experimental point opacity (%)")
-        self._opacity_spin.setRange(0, 100)
-        self._opacity_spin.setValue(71)
-        self._opacity_spin.valueChanged.connect(self._on_opacity_changed)
-        for spin in (self._size_spin, self._opacity_spin):
-            spin.setMinimumWidth(max(100, spin.sizeHint().width() + 24))
+        self._size_edit = QtWidgets.QLineEdit()
+        self._size_edit.setAccessibleName("Experimental point size")
+        self._size_edit.editingFinished.connect(self._on_size_edited)
+        self._opacity_edit = QtWidgets.QLineEdit()
+        self._opacity_edit.setAccessibleName("Experimental point opacity (%)")
+        self._opacity_edit.editingFinished.connect(self._on_opacity_edited)
+        for edit in (self._size_edit, self._opacity_edit):
+            configure_compact_numeric_edit(edit, characters=4)
         appearance_layout.addWidget(_MarkerControls([
             ("Shape", self._shape_combo, "Shape of Experimental Data Markers."),
-            ("Size", self._size_spin, "Size of Marker (1–20)."),
-            ("Opacity (%)", self._opacity_spin, "Opacity of Marker (0–100%)."),
+            ("Size", self._size_edit, "Size of Marker (1–20)."),
+            ("Opacity (%)", self._opacity_edit, "Opacity of Marker (0–100%)."),
         ]))
+        # A box whose text differs from the current setting's value holds a
+        # typed draft that projection leaves alone; a rejected one is named here.
+        self._shown_marker_text = {self._size_edit: "", self._opacity_edit: ""}
+        self._invalid_marker_edits: dict[QtWidgets.QLineEdit, str] = {}
+        self._marker_error = QtWidgets.QLabel()
+        self._marker_error.setWordWrap(True)
+        self._marker_error.hide()
+        appearance_layout.addWidget(self._marker_error)
         scope = QtWidgets.QLabel("Applies to experimental data in all plots.")
         scope.setWordWrap(True)
         appearance_layout.addWidget(scope)
@@ -426,31 +430,46 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
             self._tree.blockSignals(False)
 
     def _on_shape_changed(self, _index: int) -> None:
-        if self._preferences_loaded:
-            self.experimentalPointShapeRequested.emit(self._shape_combo.currentData())
+        self.experimentalPointShapeRequested.emit(self._shape_combo.currentData())
 
-    def _on_size_changed(self, value: int) -> None:
-        if not self._preferences_loaded:
-            return
-        self.experimentalPointSizeRequested.emit(int(value))
+    def _on_size_edited(self) -> None:
+        value = self._typed_marker_value(self._size_edit, "Size", 1, 20)
+        if value is not None:
+            self.experimentalPointSizeRequested.emit(value)
 
-    def _on_opacity_changed(self, value: int) -> None:
-        if not self._preferences_loaded:
-            return
-        self.experimentalPointOpacityRequested.emit(float(value) / 100.0)
+    def _on_opacity_edited(self) -> None:
+        value = self._typed_marker_value(self._opacity_edit, "Opacity (%)", 0, 100)
+        if value is not None:
+            self.experimentalPointOpacityRequested.emit(value / 100.0)
+
+    def _typed_marker_value(
+        self, edit: QtWidgets.QLineEdit, field: str, minimum: int, maximum: int,
+    ) -> int | None:
+        """Admit one marker box's draft; None leaves nothing to apply."""
+        value = None
+        self._invalid_marker_edits.pop(edit, None)
+        if edit.text() != self._shown_marker_text[edit]:
+            try:
+                value = parse_whole_number_text(edit.text(), field=field, minimum=minimum, maximum=maximum)
+            except ValueError as exc:
+                self._invalid_marker_edits[edit] = str(exc)
+            else:
+                # Applied text is no draft; the accepted value replaces it.
+                self._shown_marker_text[edit] = edit.text()
+        edit.setStyleSheet(INVALID_EDITOR_STYLE if edit in self._invalid_marker_edits else "")
+        self._marker_error.setText("\n".join(self._invalid_marker_edits.values()))
+        self._marker_error.setVisible(bool(self._invalid_marker_edits))
+        return value
 
     def _render_application_style(self) -> None:
         size = int(self._experimental_point_size())
         opacity = float(self._experimental_point_opacity())
-        self._preferences_loaded = True
         self._shape_combo.blockSignals(True)
-        self._size_spin.blockSignals(True)
-        self._opacity_spin.blockSignals(True)
         try:
             self._shape_combo.setCurrentIndex(self._shape_combo.findData(self._experimental_point_shape()))
-            self._size_spin.setValue(size)
-            self._opacity_spin.setValue(round(opacity * 100))
         finally:
-            self._opacity_spin.blockSignals(False)
-            self._size_spin.blockSignals(False)
             self._shape_combo.blockSignals(False)
+        for edit, text in ((self._size_edit, str(size)), (self._opacity_edit, str(round(opacity * 100)))):
+            if edit.text() == self._shown_marker_text[edit]:
+                edit.setText(text)
+            self._shown_marker_text[edit] = text

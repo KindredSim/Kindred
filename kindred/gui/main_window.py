@@ -62,6 +62,7 @@ from kindred.core.result_repository import (
     ResultRepository,
 )
 from kindred.core.species import concentration_from_text
+from kindred.core.validation import parse_whole_number_text
 from kindred.gui.computation_gate import ComputationGate
 from kindred.gui.app_wiring import (
     ANALYSIS_DOCK_SPEC,
@@ -3912,19 +3913,15 @@ class MainWindow(QtWidgets.QMainWindow):
             method.setCurrentIndex(method.findData(method_id))
 
         select_method(defaults.method)
-        max_nfev = QtWidgets.QSpinBox(dialog)
-        max_nfev.setRange(*FIT_MAX_NFEV_RANGE)
-        max_nfev.setValue(defaults.max_nfev)
+        max_nfev = QtWidgets.QLineEdit(str(defaults.max_nfev), dialog)
         ftol = QtWidgets.QLineEdit(dialog)
         xtol = QtWidgets.QLineEdit(dialog)
         ftol.setText(repr(float(defaults.ftol)))
         xtol.setText(repr(float(defaults.xtol)))
         use_seed = QtWidgets.QCheckBox("Use Deterministic Seed", dialog)
         use_seed.setChecked(defaults.use_seed)
-        seed = QtWidgets.QSpinBox(dialog)
-        seed.setRange(*FIT_SEED_RANGE)
-        seed.setValue(defaults.seed)
-        for control in (scope, method, max_nfev, seed):
+        seed = QtWidgets.QLineEdit(str(defaults.seed), dialog)
+        for control in (scope, method):
             ignore_wheel(control)
 
         def project_tolerance(editor: QtWidgets.QLineEdit, value: object) -> None:
@@ -3939,11 +3936,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 else self.config_controller.application_fit_defaults()
             )
             select_method(selected.method)
-            max_nfev.setValue(selected.max_nfev)
+            max_nfev.setText(str(selected.max_nfev))
             project_tolerance(ftol, selected.ftol)
             project_tolerance(xtol, selected.xtol)
             use_seed.setChecked(selected.use_seed)
-            seed.setValue(selected.seed)
+            seed.setText(str(selected.seed))
+            show_seed()
 
         scope.currentIndexChanged.connect(load_selected_defaults)
         form.addRow("Save to", scope)
@@ -3954,10 +3952,22 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow(use_seed)
         form.addRow("Seed", seed)
 
+        def admitted_seed() -> int:
+            return parse_whole_number_text(
+                seed.text(), field="Seed", minimum=FIT_SEED_RANGE[0], maximum=FIT_SEED_RANGE[1],
+            )
+
         def show_seed(_index: int = 0) -> None:
-            # Only Differential Evolution draws random numbers.
+            # Only Differential Evolution draws random numbers; a Seed that
+            # would refuse OK stays visible for correction.
+            try:
+                admitted_seed()
+            except ValueError:
+                visible = True
+            else:
+                visible = method.currentData() == DIFFERENTIAL_EVOLUTION_METHOD
             for row in (use_seed, seed):
-                form.setRowVisible(row, method.currentData() == DIFFERENTIAL_EVOLUTION_METHOD)
+                form.setRowVisible(row, visible)
 
         method.currentIndexChanged.connect(show_seed)
         show_seed()
@@ -3970,11 +3980,16 @@ class MainWindow(QtWidgets.QMainWindow):
         def read_candidate() -> FitDefaults:
             return FitDefaults(
                 method=method.currentData(),
-                max_nfev=int(max_nfev.value()),
+                max_nfev=parse_whole_number_text(
+                    max_nfev.text(),
+                    field="Maximum evaluations",
+                    minimum=FIT_MAX_NFEV_RANGE[0],
+                    maximum=FIT_MAX_NFEV_RANGE[1],
+                ),
                 ftol=admit_fit_tolerance(ftol.text(), FUNCTION_TOLERANCE_LABEL),
                 xtol=admit_fit_tolerance(xtol.text(), STEP_TOLERANCE_LABEL),
                 use_seed=bool(use_seed.isChecked()),
-                seed=int(seed.value()),
+                seed=admitted_seed(),
             )
 
         def accept_candidate() -> None:
