@@ -375,91 +375,24 @@ def _normalized_target_weight_multipliers(
     }
 
 
-def _align_series(
-    series: np.ndarray,
-    sim_time: np.ndarray,
-    target_time: np.ndarray,
-    segment_ids: np.ndarray,
-    segment_keys: Sequence[str],
-    discontinuity_ids: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, tuple[str, ...], np.ndarray, tuple[str, ...]]:
-    """Align values and their direct canonical row identity together.
-
-    The canonical result supplies one value and one segment, key and
-    discontinuity identity per strictly increasing row.
-    """
-    values = np.asarray(series, dtype=float).reshape(-1)
-    sim_t = np.asarray(sim_time, dtype=float).reshape(-1)
-    target_t = np.asarray(target_time, dtype=float).reshape(-1)
-    segments = np.asarray(segment_ids, dtype=np.int64).reshape(-1)
-    keys = tuple(segment_keys)
-    discontinuities = np.asarray(discontinuity_ids, dtype=np.int64).reshape(-1)
-
-    aligned = np.empty(target_t.size, dtype=float)
-    aligned_segments = np.empty(target_t.size, dtype=np.int64)
-    aligned_discontinuities = np.empty(target_t.size, dtype=np.int64)
-    aligned_keys: list[str] = []
-    selection: list[str] = []
-    insertion_positions = np.searchsorted(sim_t, target_t, side="left")
-    for index, time_value in enumerate(target_t):
-        right = int(insertion_positions[index])
-        if right < sim_t.size and sim_t[right] == time_value:
-            aligned[index] = values[right]
-            aligned_segments[index] = segments[right]
-            aligned_discontinuities[index] = discontinuities[right]
-            aligned_keys.append(keys[right])
-            selection.append("direct")
-            continue
-        left = right - 1
-        if left < 0 or right >= sim_t.size:
-            raise ValueError("Dataset time lies outside the simulation time span.")
-        if (
-            segments[left] != segments[right]
-            or keys[left] != keys[right]
-            or discontinuities[left] != discontinuities[right]
-        ):
-            raise FitSimulationError(
-                "Time-fit interpolation cannot cross an executor-issued region."
-            )
-        width = float(sim_t[right] - sim_t[left])
-        fraction = float((time_value - sim_t[left]) / width)
-        aligned[index] = float(
-            values[left] + fraction * (values[right] - values[left])
-        )
-        aligned_segments[index] = segments[left]
-        aligned_discontinuities[index] = discontinuities[left]
-        aligned_keys.append(keys[left])
-        selection.append("interpolated")
-    return (
-        aligned,
-        aligned_segments,
-        tuple(aligned_keys),
-        aligned_discontinuities,
-        tuple(selection),
-    )
-
-
 def _select_fit_rows(
     *,
     model_y: np.ndarray,
     sim_time: np.ndarray,
     observation_time: np.ndarray,
-    segment_ids: np.ndarray,
-    segment_keys: Sequence[str],
-    discontinuity_ids: np.ndarray,
 ) -> np.ndarray:
-    """Align one time-based Y series to its admitted observation times."""
+    """One time-based Y series at its admitted observation times.
 
+    The Fit requests every selected observation time from the solver, and
+    the result keeps each one as a row.
+    """
+
+    sim_t = np.asarray(sim_time, dtype=float).reshape(-1)
     obs_t = np.asarray(observation_time, dtype=float).reshape(-1)
-    selected = _align_series(
-        np.asarray(model_y, dtype=float),
-        np.asarray(sim_time, dtype=float),
-        obs_t,
-        np.asarray(segment_ids, dtype=np.int64),
-        segment_keys,
-        np.asarray(discontinuity_ids, dtype=np.int64),
-    )
-    return np.asarray(selected[0], dtype=float)
+    rows = np.searchsorted(sim_t, obs_t, side="left")
+    if np.any(rows == sim_t.size) or np.any(sim_t[np.minimum(rows, sim_t.size - 1)] != obs_t):
+        raise FitSimulationError("Expected every observation time to be a row of the simulation.")
+    return np.asarray(model_y, dtype=float).reshape(-1)[rows]
 
 
 def _objective_dataset_weight_multiplier(weight: float) -> float:
@@ -953,10 +886,6 @@ def _build_dataset_fit_info(
     observations = _payload_observations(payload)
     x_name = payload.x_name
     x_projection: ParametricProjection | None = None
-    sim_time = np.asarray(simulation.t, dtype=float)
-    segment_ids = np.asarray(simulation.segment_ids, dtype=np.int64)
-    segment_keys = tuple(simulation.segment_keys)
-    discontinuity_ids = np.asarray(simulation.discontinuity_ids, dtype=np.int64)
     target_multipliers = _normalized_target_weight_multipliers(
         species_list=payload.target_roster,
         target_weights=dict(payload.target_weights),
@@ -979,9 +908,7 @@ def _build_dataset_fit_info(
             source_rows=x_observations["source_rows"],
             model_time=alignment_time,
             model_x=alignment_x,
-            segment_ids=alignment_regions,
-            segment_keys=tuple(str(region) for region in alignment_regions),
-            discontinuity_ids=np.zeros_like(alignment_regions),
+            regions=alignment_regions,
             observations=payload.observations,
             model_y=alignment_y,
             multipliers=target_multipliers,
@@ -1000,17 +927,12 @@ def _build_dataset_fit_info(
     for species_name in sorted(payload.species_list):
         _raise_if_fitting_cancel_requested(cancellation_control)
         species_obs = observations[species_name]
-        obs_t = np.asarray(species_obs["t"], dtype=float).reshape(-1)
         y_exp = np.asarray(species_obs["y"], dtype=float).reshape(-1)
-        model_values = fit_result_target_values(simulation, species_name, dataset_id=dataset_id)
         if x_name == "t":
             y_sim = _select_fit_rows(
-                model_y=np.asarray(model_values, dtype=float),
-                sim_time=sim_time,
-                observation_time=obs_t,
-                segment_ids=segment_ids,
-                segment_keys=segment_keys,
-                discontinuity_ids=discontinuity_ids,
+                model_y=fit_result_target_values(simulation, species_name, dataset_id=dataset_id),
+                sim_time=simulation.t,
+                observation_time=species_obs["t"],
             )
         else:
             assert x_projection is not None
@@ -1113,11 +1035,11 @@ def evaluate_dataset_simulation(
         _raise_if_fitting_cancel_requested(worker_cancel)
         # The dispatch compiled one evaluator per included dataset.
         evaluator = fit_evaluators[ds_id]
-        evaluator.set_cancellation_control(task_control)
         series_result = evaluator.evaluate_series_with_parameter_origins(
             item.full_params,
             origins=item.parameter_origins,
             outputs=item.payload.target_roster,
+            cancellation_control=task_control,
         )
         _raise_if_fitting_cancel_requested(worker_cancel)
         if time.monotonic() >= deadline:
@@ -1161,6 +1083,38 @@ def evaluate_dataset_simulation(
         raise
 
 
+def _join_dataset_simulations(
+    fit_evaluators: Mapping[str, FittingEvaluator],
+    items: Sequence[ObjectiveDatasetInput],
+    *,
+    cancellation_control: SimulationCancellationControl | None,
+    executor: Executor,
+    weights: Mapping[str, float],
+) -> list[DatasetFitInfo | ScientificUnavailable | BaseException]:
+    """Evaluate every item concurrently; each outcome, or the exception it
+    raised, in item order."""
+    futures = [
+        executor.submit(
+            evaluate_dataset_simulation,
+            fit_evaluators,
+            item,
+            cancellation_control=cancellation_control,
+            weights=weights,
+        )
+        for item in items
+    ]
+    outcomes: list[DatasetFitInfo | ScientificUnavailable | BaseException] = []
+    for future in futures:
+        # Every submitted task is joined before propagating cancellation or
+        # a worker exception; the owning executor must never abandon native
+        # solver work behind an early return.
+        try:
+            outcomes.append(future.result())
+        except BaseException as exc:
+            outcomes.append(exc)
+    return outcomes
+
+
 def evaluate_dataset_simulations(
     fit_evaluators: Mapping[str, FittingEvaluator],
     items: Sequence[ObjectiveDatasetInput],
@@ -1170,35 +1124,15 @@ def evaluate_dataset_simulations(
     executor: Executor,
     weights: Mapping[str, float],
 ) -> list[DatasetFitInfo | ScientificUnavailable]:
-    ordered = tuple(items)
     _raise_if_fitting_cancelled(cancellation_check)
     _raise_if_fitting_cancel_requested(cancellation_control)
-    futures = [
-        executor.submit(
-            evaluate_dataset_simulation,
-            fit_evaluators,
-            item,
-            cancellation_control=cancellation_control,
-            weights=weights,
-        )
-        for item in ordered
-    ]
-    results: list[DatasetFitInfo | ScientificUnavailable] = []
-    first_exception: BaseException | None = None
-    for future in futures:
-        try:
-            result = future.result()
-        except BaseException as exc:
-            # Every submitted task is joined before propagating cancellation or
-            # a worker exception; the owning executor must never abandon native
-            # solver work behind an early return.
-            if first_exception is None:
-                first_exception = exc
-            continue
-        results.append(result)
-    if first_exception is not None:
-        raise first_exception
-    return results
+    outcomes = _join_dataset_simulations(
+        fit_evaluators, items, cancellation_control=cancellation_control, executor=executor, weights=weights,
+    )
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
+    return outcomes
 
 
 class GlobalFitObjective:
@@ -1225,8 +1159,6 @@ class GlobalFitObjective:
         self._weights = weights
         self._layout = layout
         self._penalty_value = float(penalty_value)
-        # Whether the latest call settled a scientifically unavailable candidate.
-        self._candidate_unavailable = False
         self._progress_callback = progress_callback
         self._cancellation_check = cancellation_check
         self._cancellation_control = cancellation_control
@@ -1238,22 +1170,24 @@ class GlobalFitObjective:
         self.best_complete_facts: tuple[DatasetFitInfo, ...] = ()
         self._warned_objective_keys: set[tuple[str, str, str]] = set()
 
+    def evaluate_points(self, points: Sequence[np.ndarray]) -> list[np.ndarray]:
+        """The optimizer's residual vector for each candidate point, in order."""
+
+        return [residuals for residuals, _unavailable in self._evaluate(points)]
+
     def evaluate_scientific_residuals(
         self,
-        params: np.ndarray,
-    ) -> np.ndarray | None:
-        """Evaluate one candidate and refuse penalty residuals as evidence.
+        points: Sequence[np.ndarray],
+    ) -> list[np.ndarray | None]:
+        """Evaluate candidates and refuse penalty residuals as evidence.
 
         The optimizer-facing call necessarily returns finite penalty residuals
         for scientifically unavailable candidates.  Profile likelihood uses
-        this call-local route so it can distinguish that settlement from a
+        this route so it can distinguish that settlement, None, from a
         scientific residual vector without introducing a second result store.
         """
 
-        residuals = self(np.asarray(params, dtype=float))
-        if self._candidate_unavailable:
-            return None
-        return residuals
+        return [None if unavailable else residuals for residuals, unavailable in self._evaluate(points)]
 
     @property
     def best_complete_vector(self) -> np.ndarray | None:
@@ -1279,9 +1213,19 @@ class GlobalFitObjective:
             self._best_vector = np.asarray(vector, dtype=float).copy()
             self.best_complete_facts = facts
 
-    def __call__(self, params: np.ndarray) -> np.ndarray:
+    def _evaluate(self, points: Sequence[np.ndarray]) -> list[tuple[np.ndarray, bool]]:
+        """Each point's residuals and whether it was scientifically unavailable.
+
+        Every point's datasets run concurrently on the one executor; the points
+        then settle one by one in order, exactly as consecutive single calls
+        would, so penalty scaling, best retention and progress never depend on
+        timing.  A point's first failure is raised at its turn, after the points
+        before it settled.  When Stop or cancellation interrupts settlement,
+        every point whose datasets all completed is still offered to best
+        retention, in order, before the interruption propagates.
+        """
+
         _raise_if_fitting_cancelled(self._cancellation_check)
-        self._candidate_unavailable = False
 
         def dataset_penalty_residuals(payload: FitDatasetSpec) -> np.ndarray:
             target_multipliers = _normalized_target_weight_multipliers(
@@ -1503,7 +1447,6 @@ class GlobalFitObjective:
         def record_candidate_unavailability(
             unavailability: ScientificUnavailable,
         ) -> None:
-            self._candidate_unavailable = True
             key = ("__candidate__", unavailability.producer, unavailability.stage)
             if key not in self._warned_objective_keys:
                 self._warned_objective_keys.add(key)
@@ -1513,95 +1456,119 @@ class GlobalFitObjective:
                     unavailability.stage,
                 )
 
-        self._layout.validate_optimizer_vector(params)
-        param_dict = self._layout.shared_param_dict_from_vector(params)
-        dataset_inputs: List[ObjectiveDatasetInput] = []
-        for payload in self._payloads:
-            _raise_if_fitting_cancel_requested(self._cancellation_control)
-            dataset_inputs.append(
-                _objective_dataset_input(
-                    payload,
-                    layout=self._layout,
-                    vector=params,
-                    shared_values=param_dict,
-                    fixed_values=self._dataset_params[payload.dataset_id],
-                )
-            )
-
-        simulation_evaluations = tuple(
-            evaluate_dataset_simulations(
-                self._fit_evaluators,
+        def settle_point(
+            params: np.ndarray,
+            dataset_inputs: Sequence[ObjectiveDatasetInput],
+            simulation_evaluations: tuple[DatasetFitInfo | ScientificUnavailable, ...],
+        ) -> tuple[np.ndarray, bool]:
+            timeout_unavailability = _aggregate_dataset_deadline_unavailability(
                 dataset_inputs,
-                cancellation_check=self._cancellation_check,
-                cancellation_control=self._cancellation_control,
-                executor=self._executor,
-                weights=self._weights,
+                simulation_evaluations,
             )
-        )
+            timed_out_dataset_ids = set(
+                timeout_unavailability.factual_cause.details["datasets"]
+                if timeout_unavailability is not None
+                else ()
+            )
 
-        timeout_unavailability = _aggregate_dataset_deadline_unavailability(
-            dataset_inputs,
-            simulation_evaluations,
-        )
-        timed_out_dataset_roster = (
-            timeout_unavailability.factual_cause.details["datasets"]
-            if timeout_unavailability is not None
-            else ()
-        )
-        timed_out_dataset_ids = set(timed_out_dataset_roster)
-        if timeout_unavailability is not None:
-            self._candidate_unavailable = True
-
-        residual_blocks: list[np.ndarray] = []
-        artificial_block_indexes: set[int] = set()
-        nondeadline_unavailability_recorded = False
-        for item, evaluation in zip(dataset_inputs, simulation_evaluations, strict=True):
-            if isinstance(evaluation, ScientificUnavailable):
-                if (
-                    item.payload.dataset_id not in timed_out_dataset_ids
-                    and not nondeadline_unavailability_recorded
-                ):
-                    record_candidate_unavailability(evaluation)
-                    nondeadline_unavailability_recorded = True
-                artificial_block_indexes.add(len(residual_blocks))
+            residual_blocks: list[np.ndarray] = []
+            artificial_block_indexes: set[int] = set()
+            nondeadline_unavailability_recorded = False
+            for item, evaluation in zip(dataset_inputs, simulation_evaluations, strict=True):
+                if isinstance(evaluation, ScientificUnavailable):
+                    if (
+                        item.payload.dataset_id not in timed_out_dataset_ids
+                        and not nondeadline_unavailability_recorded
+                    ):
+                        record_candidate_unavailability(evaluation)
+                        nondeadline_unavailability_recorded = True
+                    artificial_block_indexes.add(len(residual_blocks))
+                    residual_blocks.append(
+                        dataset_penalty_residuals(item.payload)
+                    )
+                    continue
                 residual_blocks.append(
-                    dataset_penalty_residuals(item.payload)
+                    np.asarray(evaluation.weighted_residuals, dtype=float)
                 )
-                continue
-            residual_blocks.append(
-                np.asarray(evaluation.weighted_residuals, dtype=float)
-            )
-            continue
 
-        if artificial_block_indexes:
-            residuals, cost = settle_unavailable_residuals(
-                residual_blocks,
-                artificial_block_indexes,
+            if artificial_block_indexes:
+                residuals, cost = settle_unavailable_residuals(
+                    residual_blocks,
+                    artificial_block_indexes,
+                )
+            else:
+                residuals = np.concatenate(tuple(residual_blocks)).astype(
+                    float, copy=False
+                )
+                cost = finite_sum_of_squares(residuals)
+            candidate_evaluations = {
+                evaluation.dataset_id: evaluation.simulation_result
+                for evaluation in simulation_evaluations
+                if isinstance(evaluation, DatasetFitInfo)
+            }
+            complete_evaluations = len(candidate_evaluations) == len(dataset_inputs)
+            improved = complete_evaluations and cost < self._best_cost
+            if improved:
+                self.retain_complete_candidate(params, simulation_evaluations)
+            finalize_candidate(
+                optimizer_vector=params,
+                cost=cost,
+                improved=improved,
+                best_results=candidate_evaluations if improved else {},
+                publish_every_call=nondeadline_unavailability_recorded,
             )
-        else:
-            residuals = np.concatenate(tuple(residual_blocks)).astype(
-                float, copy=False
-            )
-            cost = finite_sum_of_squares(residuals)
-        candidate_evaluations = {
-            evaluation.dataset_id: evaluation.simulation_result
-            for evaluation in simulation_evaluations
-            if isinstance(evaluation, DatasetFitInfo)
-        }
-        complete_evaluations = len(candidate_evaluations) == len(dataset_inputs)
-        improved = complete_evaluations and cost < self._best_cost
-        if improved:
-            self.retain_complete_candidate(params, tuple(simulation_evaluations))
-        finalize_candidate(
-            optimizer_vector=params,
-            cost=cost,
-            improved=improved,
-            best_results=candidate_evaluations if improved else {},
-            publish_every_call=nondeadline_unavailability_recorded,
-        )
+            return residuals, bool(artificial_block_indexes)
+
+        vectors = [np.asarray(point, dtype=float) for point in points]
+        point_inputs: list[list[ObjectiveDatasetInput]] = []
+        for params in vectors:
+            self._layout.validate_optimizer_vector(params)
+            param_dict = self._layout.shared_param_dict_from_vector(params)
+            dataset_inputs: list[ObjectiveDatasetInput] = []
+            for payload in self._payloads:
+                _raise_if_fitting_cancel_requested(self._cancellation_control)
+                dataset_inputs.append(
+                    _objective_dataset_input(
+                        payload,
+                        layout=self._layout,
+                        vector=params,
+                        shared_values=param_dict,
+                        fixed_values=self._dataset_params[payload.dataset_id],
+                    )
+                )
+            point_inputs.append(dataset_inputs)
+
         _raise_if_fitting_cancelled(self._cancellation_check)
-
-        return residuals
+        _raise_if_fitting_cancel_requested(self._cancellation_control)
+        outcomes = _join_dataset_simulations(
+            self._fit_evaluators,
+            [item for dataset_inputs in point_inputs for item in dataset_inputs],
+            cancellation_control=self._cancellation_control,
+            executor=self._executor,
+            weights=self._weights,
+        )
+        dataset_count = len(self._payloads)
+        point_evaluations = [
+            tuple(outcomes[index * dataset_count:(index + 1) * dataset_count])
+            for index in range(len(vectors))
+        ]
+        settled: list[tuple[np.ndarray, bool]] = []
+        try:
+            for params, dataset_inputs, simulation_evaluations in zip(vectors, point_inputs, point_evaluations):
+                for outcome in simulation_evaluations:
+                    if isinstance(outcome, BaseException):
+                        raise outcome
+                settled.append(settle_point(params, dataset_inputs, simulation_evaluations))
+                _raise_if_fitting_cancelled(self._cancellation_check)
+        except (FittingCancelled, SimulationCancelled):
+            # Stop keeps the best complete candidate, including points this
+            # batch completed but had not settled; retention keeps only a
+            # strict improvement, so settled points change nothing.
+            for params, simulation_evaluations in zip(vectors, point_evaluations):
+                if all(isinstance(outcome, DatasetFitInfo) for outcome in simulation_evaluations):
+                    self.retain_complete_candidate(params, simulation_evaluations)
+            raise
+        return settled
 
 
 def _replay_fit_result(

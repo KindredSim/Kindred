@@ -235,6 +235,8 @@ class PreparedDslRequestSet:
         "__compiled_ode_topology",
         "__symbolic_jacobian_structure",
         "__symbolic_structure_initialized",
+        "__symbolic_equations_text",
+        "__symbolic_equations_initialized",
         "__structure_lock",
     )
 
@@ -247,8 +249,8 @@ class PreparedDslRequestSet:
         intervention_execution: InterventionExecutionContract | None,
         parameter_algebra_spec: object,
     ) -> None:
-        # Its sole producer retains a parameterized schedule declaratively
-        # and compiles every other schedule, including none.
+        # Its sole producer retains a schedule whose clock fields read params
+        # declaratively and compiles every other schedule, including none.
         self.analysis = analysis
         self.__mechanism = mechanism
         self.__intervention_schedule = intervention_schedule
@@ -257,32 +259,22 @@ class PreparedDslRequestSet:
         self.__compiled_ode_topology = None
         self.__symbolic_jacobian_structure = None
         self.__symbolic_structure_initialized = False
+        self.__symbolic_equations_text = None
+        self.__symbolic_equations_initialized = False
         self.__structure_lock = Lock()
 
     def mutable_mechanism_shell(self) -> object:
-        from collections.abc import Mapping
+        """A mechanism one execution rebinds: its own metadata mapping and
+        step lists, sharing the accepted mechanism's immutable steps and
+        nested values, which writers replace rather than mutate."""
 
         from kindred.core.mechanism import Mechanism
 
-        def clone_metadata(value: object) -> object:
-            if isinstance(value, Mapping):
-                return {key: clone_metadata(item) for key, item in value.items()}
-            if isinstance(value, list):
-                return [clone_metadata(item) for item in value]
-            if isinstance(value, tuple):
-                return tuple(clone_metadata(item) for item in value)
-            if isinstance(value, (set, frozenset)):
-                return type(value)(clone_metadata(item) for item in value)
-            return value
-
         shell = Mechanism()
         shell.species = self.__mechanism.species
-        shell.metadata = clone_metadata(self.__mechanism.metadata)
+        shell.metadata = dict(self.__mechanism.metadata)
         shell.reactions = list(self.__mechanism.reactions)
-        shell.equilibria = [
-            replace(equilibrium, metadata=clone_metadata(equilibrium.metadata))
-            for equilibrium in self.__mechanism.equilibria
-        ]
+        shell.equilibria = list(self.__mechanism.equilibria)
         return shell
 
     def accepted_mechanism_for_structure(self) -> object:
@@ -309,7 +301,6 @@ class PreparedDslRequestSet:
     def symbolic_jacobian_structure(self) -> object:
         """Lazily retain one symbolic structure for this accepted mechanism."""
 
-        structure = self.__symbolic_jacobian_structure
         if not self.__symbolic_structure_initialized:
             with self.__structure_lock:
                 if not self.__symbolic_structure_initialized:
@@ -328,8 +319,30 @@ class PreparedDslRequestSet:
                         structure = None
                     self.__symbolic_jacobian_structure = structure
                     self.__symbolic_structure_initialized = True
-                structure = self.__symbolic_jacobian_structure
-        return structure
+        # Read after the flag, which is set only once the structure is.
+        return self.__symbolic_jacobian_structure
+
+    def symbolic_equations_text(self) -> object:
+        """Lazily retain the canonical symbolic equations shown for reading;
+        None for a fractional order."""
+
+        if not self.__symbolic_equations_initialized:
+            with self.__structure_lock:
+                if not self.__symbolic_equations_initialized:
+                    from kindred.core.symbolic.errors import (
+                        UnsupportedSymbolicExpressionError,
+                    )
+                    from kindred.core.symbolic.jacobian import (
+                        build_symbolic_equations_text,
+                    )
+
+                    try:
+                        text = build_symbolic_equations_text(self.__mechanism)
+                    except UnsupportedSymbolicExpressionError:
+                        text = None
+                    self.__symbolic_equations_text = text
+                    self.__symbolic_equations_initialized = True
+        return self.__symbolic_equations_text
 
     def temperature_changes(self) -> tuple["TemperatureChange", ...]:
         """Return the accepted mechanism's temperature changes during a Run."""
@@ -1650,12 +1663,6 @@ def prepare_dsl_request_set(
     except AlgebraError as exc:
         raise _DSLError(exc.message, line_number=exc.line, line_content=exc.line_text) from exc
     species_names = tuple(str(item) for item in mechanism.species_names())
-    parameterized_intervention_schedule = (
-        intervention_schedule
-        if intervention_schedule is not None
-        and intervention_schedule.is_parameterized
-        else None
-    )
     for statement in parameter_algebra_spec.observable_block.lines:
         if statement.name in species_names:
             raise _DSLError(
@@ -1663,14 +1670,21 @@ def prepare_dsl_request_set(
                 line_number=statement.line,
                 line_content=statement.line_text,
             )
+    # A schedule whose clock fields read params is compiled per candidate;
+    # every other schedule has one timeline and is compiled here.
+    parameterized_intervention_schedule = None
     if intervention_schedule is not None:
+        from kindred.core.exceptions import ValueDomainError
         from kindred.core.intervention_schedule import (
             InterventionScheduleError,
             ObservableTriggerCondition,
             admit_intervention_parameter_units,
             declaration_line,
+            intervention_schedule_clock_parameters,
             intervention_schedule_parameter_dependencies,
         )
+        if intervention_schedule_clock_parameters(intervention_schedule):
+            parameterized_intervention_schedule = intervention_schedule
         try:
             intervention_schedule.validate_species(species_names)
             observable_names = {statement.name for statement in parameter_algebra_spec.observable_block.lines}
@@ -1701,9 +1715,10 @@ def prepare_dsl_request_set(
                     intervention_schedule, temperature_changes=ir.temperature_changes,
                 )
             )
-        except InterventionScheduleError as exc:
+        except (InterventionScheduleError, ValueDomainError) as exc:
             # Each of these refusals names its declaration, or the declarations
-            # that conflict.
+            # that conflict; a conflict involving a field a param supplies is a
+            # ValueDomainError.
             line_number, line_content = declaration_line(exc, ir.intervention_lines)
             raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
     else:

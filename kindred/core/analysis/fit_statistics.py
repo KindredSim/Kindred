@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Iterable, Mapping, Optional
+from typing import Mapping, Optional
 
 import numpy as np
 
@@ -80,10 +80,10 @@ def finite_positive_mean_normalize(
     }
 
 
-def finite_sum_of_squares(values: Iterable[object]) -> float:
-    """Return the SSE, or ``inf`` when it is not a finite float."""
+def finite_sum_of_squares(values: np.ndarray) -> float:
+    """Return the SSE, or ``inf`` when it is not a finite float; never NaN."""
 
-    array = np.asarray(tuple(values), dtype=float).reshape(-1)
+    array = np.asarray(values, dtype=float).reshape(-1)
     if array.size == 0:
         return 0.0
     if not np.all(np.isfinite(array)):
@@ -91,9 +91,8 @@ def finite_sum_of_squares(values: Iterable[object]) -> float:
     maximum = float(np.max(np.abs(array)))
     if maximum == 0.0:
         return 0.0
-    scaled_square_sum = math.fsum(
-        float(value / maximum) ** 2 for value in array
-    )
+    scaled = array / maximum
+    scaled_square_sum = math.fsum((scaled * scaled).tolist())
     if maximum > math.sqrt(np.finfo(float).max / scaled_square_sum):
         return math.inf
     return float((maximum * maximum) * scaled_square_sum)

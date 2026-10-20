@@ -37,7 +37,7 @@ def execute_simulation(
     spec = execution_request.prepared_dsl.parameter_algebra_spec_for_execution()
     inputs, quantities = dict(spec.input_units), dict(spec.quantity_units)
     parameters = tuple((item.name, convert_value(overrides.get(item.name, item.value), inputs[item.name], quantities[item.name]), quantities[item.name].symbol) for item in coordinates)
-    # Preparation resolves and compiles every schedule, an empty one included.
+    # Every prepared run carries a compiled schedule, an empty one included.
     prepared = prepare_simulation_run(execution_request=execution_request, cancellation_control=cancellation_control)
     solved = solve_ode(build_simulation_request_from_prepared_run(
         prepared,

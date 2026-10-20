@@ -1,6 +1,7 @@
 """Bounded local processes calling the complete shared simulation operation."""
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass, replace
 from multiprocessing import get_context
 from multiprocessing.connection import wait
@@ -55,12 +56,12 @@ def _worker(config, connection, cancel):
         except Exception as exc:
             connection.send(("bootstrap_failure", str(exc)))
             return
-        control = SimulationCancellationControl(cancel.is_set)
+        control = SimulationCancellationControl(lambda: cancel.value)
         while True:
             run = connection.recv()
             if run is None:
                 return
-            if cancel.is_set():
+            if cancel.value:
                 connection.send(("not_started", run.run_id))
                 continue
             connection.send(("started", run.run_id))
@@ -120,18 +121,18 @@ def run_scan(config, prepared, cancel, progress_callback):
         progress.error = f"{progress.error}\n{message}" if progress.error else message
         progress.state = "incomplete"
         if process_cancel is not None:
-            process_cancel.set()
+            process_cancel.value = True
 
     def dispatch(child):
         nonlocal exhausted
         child.run, child.started = None, False
-        if not exhausted and not process_cancel.is_set():
+        if not exhausted and not process_cancel.value:
             try:
                 child.run = next(iterator)
             except StopIteration:
                 exhausted = True
             except SimulationCancelled:
-                process_cancel.set()
+                process_cancel.value = True
             except Exception as exc:
                 fail(str(exc))
         if child.run is None:
@@ -160,7 +161,9 @@ def run_scan(config, prepared, cancel, progress_callback):
     try:
         emit(True)
         context = get_context("spawn")
-        process_cancel = context.Event()
+        # Workers poll one lock-free shared flag on every solver step; a
+        # lock would serialize them and could be left held by a dead worker.
+        process_cancel = context.RawValue(ctypes.c_bool, False)
         try:
             design = PreparedScanDesign(config, prepared, check)
         except ValueError as exc:
@@ -193,7 +196,7 @@ def run_scan(config, prepared, cancel, progress_callback):
         progress.phase = "Running"
         while children:
             if cancel.is_set():
-                process_cancel.set()
+                process_cancel.value = True
                 progress.phase = "Canceling"
             ready = wait([handle for child in children for handle in (child.connection, child.process.sentinel)], timeout=0.1)
             for child in list(children):
@@ -239,12 +242,12 @@ def run_scan(config, prepared, cancel, progress_callback):
     except SimulationCancelled:
         progress.state = "cancelled"
         if process_cancel is not None:
-            process_cancel.set()
+            process_cancel.value = True
     except Exception as exc:
         fail(str(exc))
     finally:
         if process_cancel is not None:
-            process_cancel.set()
+            process_cancel.value = True
         # On an outer infrastructure error, keep draining senders during cleanup.
         for child in children:
             try:

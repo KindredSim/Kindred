@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from kindred.core.kinetics import forward_rate_model_payload
 
-import logging
 from dataclasses import dataclass
 from typing import Callable, Mapping
 
@@ -22,13 +21,6 @@ from .equilibrium_rate_authority import (
     json_safe_equilibrium_authority_payload,
 )
 from .mechanism import Equilibrium, FrozenDict, Mechanism, Reaction
-from .simulator.solver_types import (
-    SIMULATION_NONFINITE_MESSAGE,
-    SimulationScientificUnavailability,
-    _SimulationScientificUnavailabilitySignal,
-)
-
-logger = logging.getLogger(__name__)
 
 __all__ = [
     "CompiledOdeTopology",
@@ -43,21 +35,16 @@ def _stoichiometric_flux_product(
     rates: np.ndarray,
     *,
     workspace: np.ndarray,
-    out: np.ndarray,
 ) -> np.ndarray:
-    """Compute species fluxes without entering the BLAS matrix-vector path."""
-    stoich_arr = np.asarray(stoichiometry, dtype=float)
-    rate_arr = np.asarray(rates, dtype=float).reshape(-1)
-    np.multiply(stoich_arr, rate_arr, out=workspace)
-    np.sum(workspace, axis=1, out=out)
-    return out.copy()
+    """Compute fresh species fluxes without entering the BLAS matrix-vector path."""
+    np.multiply(stoichiometry, rates, out=workspace)
+    return np.sum(workspace, axis=1)
 
 
 @dataclass(frozen=True, slots=True)
 class EffectiveRateCoefficients:
     """Immutable effective forward/reverse coefficients for one temperature."""
 
-    temperature_K: float
     forward: tuple[float, ...]
     reverse: tuple[float, ...]
 
@@ -79,15 +66,12 @@ class EffectiveRateCoefficientEvaluator:
         roots = tuple(name for pair in self._parameter_names for name in pair if name is not None)
         values = self.parameter_values(temperature, roots)
         return EffectiveRateCoefficients(
-            temperature_K=temperature,
             forward=tuple(float(values[name]) for name, _reverse in self._parameter_names),
             reverse=tuple(float(values[name]) if name else 0.0 for _forward, name in self._parameter_names),
         )
 
 def build_effective_rate_coefficient_evaluator(
     mechanism: Mechanism,
-    *,
-    base_values: Mapping[str, float] | None = None,
 ) -> EffectiveRateCoefficientEvaluator:
     """Build the sole effective-rate authority consumed by RHS and Jacobian."""
 
@@ -100,7 +84,7 @@ def build_effective_rate_coefficient_evaluator(
 
     # Admission always retains the spec; its absence is a producer error.
     spec = mechanism.metadata["parameter_algebra_spec"]
-    evaluate = bind_parameter_evaluation(spec, mechanism, base_values=base_values)
+    evaluate = bind_parameter_evaluation(spec, mechanism)
     entries = {(entry["kind"], int(entry["reaction_index" if entry["kind"] == "reaction" else "equilibrium_index"])): entry
                for entry in get_step_index_map(mechanism)}
     step_kinds = []
@@ -136,7 +120,6 @@ class CompiledOdeTopology:
     mutable solver workspace or rate bindings is retained here.
     """
 
-    species_names: tuple[str, ...]
     step_kinds: tuple[str, ...]
     stoichiometry: np.ndarray
     forward_exponents: np.ndarray
@@ -145,7 +128,6 @@ class CompiledOdeTopology:
     reverse_mask: np.ndarray
     fractional_forward_mask: np.ndarray
     fractional_reverse_mask: np.ndarray
-    reaction_count: int
 
     @classmethod
     def from_mechanism(cls, mechanism: Mechanism) -> "CompiledOdeTopology":
@@ -195,7 +177,6 @@ class CompiledOdeTopology:
         for array in arrays:
             array.setflags(write=False)
         return cls(
-            species_names=species_names,
             step_kinds=tuple(step_kinds),
             stoichiometry=stoichiometry,
             forward_exponents=forward_exponents,
@@ -204,14 +185,11 @@ class CompiledOdeTopology:
             reverse_mask=reverse_mask,
             fractional_forward_mask=fractional_forward_mask,
             fractional_reverse_mask=fractional_reverse_mask,
-            reaction_count=len(mechanism.reactions),
         )
 
     def bind_target(
         self,
         mechanism: Mechanism,
-        *,
-        base_values: Mapping[str, float] | None = None,
     ) -> tuple[EffectiveRateCoefficientEvaluator, Callable[..., np.ndarray]]:
         """Bind one target's rate authority and mutable RHS workspace.
 
@@ -219,9 +197,7 @@ class CompiledOdeTopology:
         so its species and step order are this topology's.
         """
 
-        coefficient_evaluator = build_effective_rate_coefficient_evaluator(
-            mechanism, base_values=base_values
-        )
+        coefficient_evaluator = build_effective_rate_coefficient_evaluator(mechanism)
         return coefficient_evaluator, _build_bound_ode_rhs(
             self,
             mechanism,
@@ -257,11 +233,6 @@ def _build_bound_ode_rhs(
       (stoichiometry is not duplicated into two irreversible columns).
     - Stoichiometry determines species changes via a BLAS-free reduction.
     """
-    species_names = topology.species_names
-    n_species = len(species_names)
-
-    n_steps = len(topology.step_kinds)
-    n_reactions = topology.reaction_count
     S = topology.stoichiometry
     exp_forward = topology.forward_exponents
     exp_reverse = topology.reverse_exponents
@@ -269,234 +240,53 @@ def _build_bound_ode_rhs(
     reverse_mask = topology.reverse_mask
     fractional_forward_mask = topology.fractional_forward_mask
     fractional_reverse_mask = topology.fractional_reverse_mask
+    has_reverse_terms = bool(mechanism.equilibria)
+    has_fractional_orders = bool(
+        fractional_forward_mask.any()
+        or (has_reverse_terms and fractional_reverse_mask.any())
+    )
+    # Unmasked entries stay 1.0, so each row's product runs over its orders.
     forward_buffer = np.ones_like(exp_forward)
-    forward_power_bases = np.empty_like(exp_forward)
     reverse_buffer = np.ones_like(exp_reverse)
+    power_bases = np.empty_like(exp_forward)
+    stoich_rate_buffer = np.empty_like(S)
 
+    n_steps = len(topology.step_kinds)
     k_forward_dyn = np.zeros(n_steps, dtype=float)
     k_reverse_dyn = np.zeros(n_steps, dtype=float)
-    has_reverse_terms = bool(mechanism.equilibria)
+    # The coefficients are a function of temperature alone, so they are
+    # refilled only when it changes; set after a successful evaluation.
+    coefficients_T: float | None = None
 
-    # Buffers for stable reversible net rate evaluation (avoids overflow and inf-inf cancellation).
-    log_y = np.empty(n_species, dtype=float)
-    log_k_forward_dyn = np.empty(n_steps, dtype=float)
-    log_k_reverse_dyn = np.empty(n_steps, dtype=float)
-    log_prod_forward = np.empty(n_steps, dtype=float)
-    log_prod_reverse = np.empty(n_steps, dtype=float)
-    log_rate_forward = np.empty(n_steps, dtype=float)
-    log_rate_reverse = np.empty(n_steps, dtype=float)
-    net_rates = np.empty(n_steps, dtype=float)
-    stoich_rate_buffer = np.empty_like(S)
-    stoich_flux = np.empty(n_species, dtype=float)
-
-    def _runtime_dependency_details(indices: object = ()) -> dict[str, object]:
-        selected = np.asarray(indices, dtype=int).reshape(-1)
-        names: list[str] = []
-        step_names: list[str] = []
-        for index in selected:
-            idx = int(index)
-            if 0 <= idx < len(topology.step_kinds):
-                step_type = topology.step_kinds[idx]
-                step_names.append(f"{step_type}{idx}")
-                names.extend(name for name in coefficient_evaluator._parameter_names[idx]
-                             if name is not None)
-        payload = {
-            "step_names": tuple(step_names),
-            "step_indices": tuple(int(index) for index in selected),
-            "authority_names": tuple(sorted(set(names))),
-            "parameter_names": tuple(sorted(set(names))),
-            "value_dependencies": tuple(sorted(set(names))),
-        }
-        return payload
-
-    def _stable_diff_exp_logs(log_f: np.ndarray, log_r: np.ndarray, out: np.ndarray) -> None:
-        """
-        Compute exp(log_f) - exp(log_r) stably from logs.
-
-        This avoids `inf - inf -> nan` when both sides overflow, and reduces
-        catastrophic cancellation when rates are nearly equal.
-        """
-        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-            out.fill(0.0)
-            if np.any(np.isnan(log_f)) or np.any(np.isnan(log_r)):
-                raise _SimulationScientificUnavailabilitySignal(
-                    SimulationScientificUnavailability(
-                        producer="ode_builder",
-                        stage="reversible_rate_logarithm",
-                        message=SIMULATION_NONFINITE_MESSAGE,
-                        details=_runtime_dependency_details(
-                            np.flatnonzero(np.isnan(log_f) | np.isnan(log_r))
-                        ),
-                    )
-                )
-            max_lr = np.maximum(log_f, log_r)
-            min_lr = np.minimum(log_f, log_r)
-            finite_max = np.isfinite(max_lr)
-            unrepresentable = ~finite_max & (max_lr > 0.0)
-            if np.any(unrepresentable):
-                raise _SimulationScientificUnavailabilitySignal(
-                    SimulationScientificUnavailability(
-                        producer="ode_builder",
-                        stage="reversible_rate_difference",
-                        message=SIMULATION_NONFINITE_MESSAGE,
-                        details=_runtime_dependency_details(
-                            np.flatnonzero(unrepresentable)
-                        ),
-                    )
-                )
-            if not np.any(finite_max):
-                # Both rates are exactly zero in log space (-inf - -inf).
-                return
-            indices = np.flatnonzero(finite_max)
-            d = min_lr[indices] - max_lr[indices]  # <= 0
-            small = -np.expm1(d)  # 1 - exp(d), in [0, 1]
-            log_mag = max_lr[indices] + np.log(small)
-            mag = np.exp(log_mag)
-            if np.any(~np.isfinite(mag)):
-                raise _SimulationScientificUnavailabilitySignal(
-                    SimulationScientificUnavailability(
-                        producer="ode_builder",
-                        stage="reversible_rate_difference",
-                        message=SIMULATION_NONFINITE_MESSAGE,
-                        details=_runtime_dependency_details(
-                            indices
-                        ),
-                    )
-                )
-            sign = np.where(log_f[indices] >= log_r[indices], 1.0, -1.0)
-            out[indices] = sign * mag
+    def powers(
+        y: np.ndarray,
+        exponents: np.ndarray,
+        mask: np.ndarray,
+        fractional_mask: np.ndarray,
+        out: np.ndarray,
+    ) -> np.ndarray:
+        if has_fractional_orders:
+            # Implicit solvers may briefly trial a negative internal state.
+            # Restrict only non-integral power evaluation to its physical
+            # domain; this leaves both the solver state and integer powers
+            # unchanged and does not alter published concentration truth.
+            power_bases[:] = y
+            np.maximum(power_bases, 0.0, out=power_bases, where=fractional_mask)
+            y = power_bases
+        np.power(y, exponents, out=out, where=mask)
+        return out.prod(axis=1)
 
     def ode_rhs(t: float, y: np.ndarray, *, T: float) -> np.ndarray:
         """ODE right-hand side from stoichiometry and reaction rates."""
-        y_arr = y
-        coefficients = coefficient_evaluator(float(T))
-        k_forward_dyn[:] = coefficients.forward
-        k_reverse_dyn[:] = coefficients.reverse
-
-        if not has_reverse_terms:
-            forward_buffer.fill(1.0)
-            if np.any(
-                fractional_forward_mask & (y_arr[np.newaxis, :] < 0.0)
-            ):
-                # Implicit solvers may briefly trial a negative internal state.
-                # Restrict only non-integral power evaluation to its physical
-                # domain; this leaves both the solver state and integer powers
-                # unchanged and does not alter published concentration truth.
-                forward_power_bases[:] = y_arr
-                np.maximum(
-                    forward_power_bases,
-                    0.0,
-                    out=forward_power_bases,
-                    where=fractional_forward_mask,
-                )
-                np.power(
-                    forward_power_bases,
-                    exp_forward,
-                    out=forward_buffer,
-                    where=forward_mask,
-                )
-            else:
-                np.power(
-                    y_arr,
-                    exp_forward,
-                    out=forward_buffer,
-                    where=forward_mask,
-                )
-            rates_forward = k_forward_dyn * forward_buffer.prod(axis=1)
-            return _stoichiometric_flux_product(
-                S,
-                rates_forward,
-                workspace=stoich_rate_buffer,
-                out=stoich_flux,
-            )
-
-        if np.any(y_arr < 0.0):
-            # The log-domain path below cannot retain the sign of integer
-            # powers at a solver's negative trial state.  Evaluate those
-            # powers directly while limiting only non-integral powers to a
-            # scratch physical-domain base; leave y_arr itself untouched.
-            forward_buffer.fill(1.0)
-            forward_power_bases[:] = y_arr
-            np.maximum(
-                forward_power_bases,
-                0.0,
-                out=forward_power_bases,
-                where=fractional_forward_mask,
-            )
-            np.power(
-                forward_power_bases,
-                exp_forward,
-                out=forward_buffer,
-                where=forward_mask,
-            )
-            np.prod(forward_buffer, axis=1, out=log_prod_forward)
-            np.multiply(k_forward_dyn, log_prod_forward, out=net_rates)
-
-            reverse_buffer.fill(1.0)
-            forward_power_bases[:] = y_arr
-            np.maximum(
-                forward_power_bases,
-                0.0,
-                out=forward_power_bases,
-                where=fractional_reverse_mask,
-            )
-            np.power(
-                forward_power_bases,
-                exp_reverse,
-                out=reverse_buffer,
-                where=reverse_mask,
-            )
-            np.prod(reverse_buffer, axis=1, out=log_prod_reverse)
-            np.multiply(k_reverse_dyn, log_prod_reverse, out=log_rate_reverse)
-            np.subtract(net_rates, log_rate_reverse, out=net_rates)
-            return _stoichiometric_flux_product(
-                S,
-                net_rates,
-                workspace=stoich_rate_buffer,
-                out=stoich_flux,
-            )
-
-        # Reversible/equilibrium path: work in log-space and combine stably.
-        with np.errstate(divide="ignore", invalid="ignore"):
-            log_y.fill(-np.inf)
-            pos = y_arr > 0.0
-            log_y[pos] = np.log(y_arr[pos])
-
-            log_k_forward_dyn.fill(-np.inf)
-            np.log(k_forward_dyn, out=log_k_forward_dyn, where=(k_forward_dyn > 0.0))
-            log_k_reverse_dyn.fill(-np.inf)
-            np.log(k_reverse_dyn, out=log_k_reverse_dyn, where=(k_reverse_dyn > 0.0))
-
-            forward_buffer.fill(0.0)
-            np.multiply(exp_forward, log_y, out=forward_buffer, where=forward_mask)
-            np.sum(forward_buffer, axis=1, out=log_prod_forward)
-            np.add(log_k_forward_dyn, log_prod_forward, out=log_rate_forward)
-
-            reverse_buffer.fill(0.0)
-            np.multiply(exp_reverse, log_y, out=reverse_buffer, where=reverse_mask)
-            np.sum(reverse_buffer, axis=1, out=log_prod_reverse)
-            np.add(log_k_reverse_dyn, log_prod_reverse, out=log_rate_reverse)
-
-        _stable_diff_exp_logs(log_rate_forward, log_rate_reverse, net_rates)
-        if n_reactions:
-            forward_buffer[:n_reactions].fill(1.0)
-            # Negative trial states returned above, so every base here is
-            # nonnegative.
-            np.power(
-                y_arr,
-                exp_forward[:n_reactions],
-                out=forward_buffer[:n_reactions],
-                where=forward_mask[:n_reactions],
-            )
-            net_rates[:n_reactions] = (
-                k_forward_dyn[:n_reactions]
-                * forward_buffer[:n_reactions].prod(axis=1)
-            )
-        return _stoichiometric_flux_product(
-            S,
-            net_rates,
-            workspace=stoich_rate_buffer,
-            out=stoich_flux,
-        )
+        nonlocal coefficients_T
+        if T != coefficients_T:
+            coefficients = coefficient_evaluator(float(T))
+            k_forward_dyn[:] = coefficients.forward
+            k_reverse_dyn[:] = coefficients.reverse
+            coefficients_T = T
+        rates = k_forward_dyn * powers(y, exp_forward, forward_mask, fractional_forward_mask, forward_buffer)
+        if has_reverse_terms:
+            rates -= k_reverse_dyn * powers(y, exp_reverse, reverse_mask, fractional_reverse_mask, reverse_buffer)
+        return _stoichiometric_flux_product(S, rates, workspace=stoich_rate_buffer)
 
     return ode_rhs

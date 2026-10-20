@@ -137,7 +137,7 @@ def fit_global(
     primary_stopped = False
     try:
         optimizer_result = fit_parameters(
-            objective,
+            objective.evaluate_points,
             layout.initial_params(),
             bounds=layout.bounds_dict(),
             method=method,

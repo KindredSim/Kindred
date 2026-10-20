@@ -1,6 +1,8 @@
 """Pure focused Fit quantities, unit conversion, and retained curve projection."""
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 from kindred.core.analysis.global_fit_execution import fit_result_target_values
@@ -60,7 +62,7 @@ def scale_values(values, source, destination):
         return tuple(float(value) for value in values)
     scale = conversion_scale(source, destination)
     # Model gaps retain their presentation meaning; observations are admitted finite.
-    return tuple(scale.apply(float(value)) if np.isfinite(value) else float(value) for value in values)
+    return tuple(scale.apply(float(value)) if math.isfinite(value) else float(value) for value in values)
 
 
 def simulated_quantities(result):

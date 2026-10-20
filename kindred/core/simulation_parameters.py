@@ -10,11 +10,7 @@ from kindred.core.algebra.printer import expression_to_source
 from kindred.core.exceptions import KindredError
 from kindred.core.kinetics import ForwardRateModel, forward_rate_family
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
-from kindred.core.simulator.parameter_algebra import (
-    apply_parameter_algebra_spec_to_mechanism,
-)
 from kindred.core.simulator.parameter_coordinates import build_parameter_target_map, coordinate_allows_zero
-from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.dsl_build_input import source_coordinate_capabilities
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.core.simulator.solver_types import FinalSimulationOutput
@@ -52,16 +48,12 @@ def enumerate_simulation_parameters(
 ) -> tuple[SimulationParameter, ...]:
     """Enumerate writable coordinates from one accepted typed DSL authority."""
 
-    mechanism = prepared_dsl.mutable_mechanism_shell()
+    # Admission seeded every independent input into the accepted mechanism.
+    mechanism = prepared_dsl.accepted_mechanism_for_structure()
     metadata = mechanism.metadata
     parameter_spec = prepared_dsl.parameter_algebra_spec_for_execution()
     parameter_target_map = build_parameter_target_map(mechanism)
-    apply_parameter_algebra_spec_to_mechanism(
-        parameter_spec,
-        mechanism=mechanism,
-        parameter_target_map=parameter_target_map,
-    )
-    namespace = build_namespace_from_mechanism(mechanism)
+    namespace = parameter_spec.mechanism_namespace
     source_coordinate_names = namespace.source_coordinate_names
     step_by_index: dict[int, Mapping[str, object]] = {}
     for entry in get_step_index_map(mechanism):
@@ -291,7 +283,7 @@ def derived_parameter_values(
     output points the Run has.
     """
 
-    mechanism = prepared_dsl.mutable_mechanism_shell()
+    mechanism = prepared_dsl.accepted_mechanism_for_structure()
     spec = prepared_dsl.parameter_algebra_spec_for_execution()
     targets = build_parameter_target_map(mechanism)
     units = dict(spec.quantity_units)

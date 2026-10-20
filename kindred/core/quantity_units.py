@@ -68,7 +68,8 @@ class UnitScale:
         value = float(value)
         if not math.isfinite(value):
             raise ValueError("Unit conversion requires a finite value.")
-        if value == 0.0:
+        if value == 0.0 or not self.powers:
+            # An empty scale is the identity.
             return value
         try:
             # Numerical conversion can use logarithms when exact expansion is

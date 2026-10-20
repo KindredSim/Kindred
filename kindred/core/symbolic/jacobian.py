@@ -21,10 +21,6 @@ from .jacobian_execution import symbolic_status_payload
 
 @dataclass(frozen=True, slots=True)
 class SymbolicJacobianStructure:
-    species_names: tuple[str, ...]
-    parameter_symbols: tuple[str, ...]
-    rhs_expressions: tuple[str, ...]
-    jacobian_expressions: tuple[tuple[str, ...], ...]
     _compiled: Callable[..., Any]
 
     def bind(
@@ -74,6 +70,16 @@ class SymbolicMechanismPublicProjection:
     rhs_expressions: tuple[Any, ...]
     jacobian_expressions: tuple[tuple[Any, ...], ...]
     state_symbols: tuple[Any, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolicEquationsText:
+    """The canonical public equations, as text for display."""
+
+    species_names: tuple[str, ...]
+    parameter_symbols: tuple[str, ...]
+    rhs_expressions: tuple[str, ...]
+    jacobian_expressions: tuple[tuple[str, ...], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,12 +338,14 @@ def _build_symbolic_mechanism_expression_model(
     rhs_matrix = sympy.Matrix(rhs)
     jacobian_matrix = rhs_matrix.jacobian(sympy.Matrix(state_symbols))
     parameter_symbols = _symbolic_coefficient_parameter_symbols(mechanism)
+    # Execution compiles these polynomial forms directly; only the public
+    # projection simplifies them for reading.
     return _SymbolicMechanismExpressionModel(
         species_names=species_names,
         parameter_symbols=parameter_symbols,
-        rhs_expressions=tuple(sympy.simplify(expr) for expr in rhs_matrix),
+        rhs_expressions=tuple(rhs_matrix),
         jacobian_expressions=tuple(
-            tuple(sympy.simplify(jacobian_matrix[i, j]) for j in range(len(species_names)))
+            tuple(jacobian_matrix[i, j] for j in range(len(species_names)))
             for i in range(len(species_names))
         ),
         state_symbols=state_symbols,
@@ -383,13 +391,15 @@ def _project_symbolic_mechanism_expression_model(
         }
     )
 
+    # Simplified before and after renaming, since simplify depends on the
+    # symbols' names.
     rhs_expressions = tuple(
-        sympy.simplify(expression.xreplace(replacements))
+        sympy.simplify(sympy.simplify(expression).xreplace(replacements))
         for expression in model.rhs_expressions
     )
     jacobian_expressions = tuple(
         tuple(
-            sympy.simplify(expression.xreplace(replacements))
+            sympy.simplify(sympy.simplify(expression).xreplace(replacements))
             for expression in row
         )
         for row in model.jacobian_expressions
@@ -423,41 +433,34 @@ def build_symbolic_mechanism_public_projection(
     )
 
 
+def build_symbolic_equations_text(mechanism: Mechanism) -> SymbolicEquationsText:
+    """The canonical public equations of the mechanism as display text."""
+
+    projection = build_symbolic_mechanism_public_projection(mechanism)
+    return SymbolicEquationsText(
+        species_names=projection.species_names,
+        parameter_symbols=projection.parameter_symbols,
+        rhs_expressions=tuple(str(expression) for expression in projection.rhs_expressions),
+        jacobian_expressions=tuple(
+            tuple(str(expression) for expression in row)
+            for row in projection.jacobian_expressions
+        ),
+    )
+
+
 def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianStructure:
     sympy = require_sympy()
     model = _build_symbolic_mechanism_expression_model(
         mechanism,
         exact_stoichiometric_coefficients=False,
     )
-    projection = _project_symbolic_mechanism_expression_model(
-        mechanism,
-        model=model,
-    )
-    species_names = model.species_names
-    state_symbols = model.state_symbols
-    jacobian_matrix = sympy.Matrix(model.jacobian_expressions)
-    rhs_strings = tuple(
-        str(expression)
-        for expression in projection.rhs_expressions
-    )
-    jacobian_strings = tuple(
-        tuple(
-            str(expression)
-            for expression in row
-        )
-        for row in projection.jacobian_expressions
-    )
-    coefficient_parameter_symbols = model.parameter_symbols
-    parameter_symbols = projection.parameter_symbols
     parameter_sympy_symbols = tuple(
         sympy.Symbol(name)
-        for name in coefficient_parameter_symbols
+        for name in model.parameter_symbols
     )
-    compiled = sympy.lambdify((*state_symbols, *parameter_sympy_symbols), jacobian_matrix, modules="numpy")
-    return SymbolicJacobianStructure(
-        species_names=species_names,
-        parameter_symbols=parameter_symbols,
-        rhs_expressions=rhs_strings,
-        jacobian_expressions=jacobian_strings,
-        _compiled=compiled,
+    compiled = sympy.lambdify(
+        (*model.state_symbols, *parameter_sympy_symbols),
+        sympy.Matrix(model.jacobian_expressions),
+        modules="numpy",
     )
+    return SymbolicJacobianStructure(_compiled=compiled)

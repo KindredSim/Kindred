@@ -496,13 +496,11 @@ def _diagnostic(value: object, origin: FitOriginSnapshot) -> str:
 
 
 _SEARCH_LIMIT_REACHED = "not limited within the search range"
-_NO_CROSSING = "threshold crossing could not be located"
 # Plain words for each reason the core records for a Profile side.
 _ENDPOINT_REASONS = {
     "search_limit_reached": _SEARCH_LIMIT_REACHED,
     "scientific_unavailable": "a refit on this side failed",
-    "binary64_representability_exhausted": _NO_CROSSING,
-    "midpoint_refit_budget_exhausted": _NO_CROSSING,
+    "threshold_not_located": "threshold crossing could not be located",
     "refit_not_converged": "a refit on this side reached its evaluation limit",
 }
 

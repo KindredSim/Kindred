@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import fields, is_dataclass, asdict
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -49,7 +50,7 @@ def result_record(run, result, outputs):
     for name in outputs:
         if name in result.series:
             # An undefined calculated value is null; JSON has no NaN.
-            data[name] = [value if np.isfinite(value) else None for value in result.series[name].tolist()]
+            data[name] = [value if math.isfinite(value) else None for value in result.series[name].tolist()]
         elif name in result.scalars:
             scalars[name] = result.scalars[name]
         else:
@@ -65,7 +66,6 @@ def result_record(run, result, outputs):
         "algebra_errors": [error.to_payload() for error in result.algebra_errors],
         "boundaries": [{"time": b.time, "states": plain(b.states)}
                        for b in result.presentation_boundaries],
-        "interventions": result.intervention_execution.provenance_projection(),
     })
     if result.volume is not None:
         record["volume"] = {
@@ -91,7 +91,7 @@ class JsonScanWriter:
                     "scipy": scipy.__version__}
         spec = design.prepared.parameter_algebra_spec_for_execution()
         constraint_units = {s.name: presentation_unit(s.expr.quantity_unit, s.declared_unit) for s in spec.observable_block.lines}
-        header = {"schema_version": 6,
+        header = {"schema_version": 7,
                   "input_units": {item.key: item.unit for item in design.catalog},
                   "constraint_units": {c.observable: constraint_units[c.observable].symbol if constraint_units[c.observable] is not None else None for c in config.constraints}, "created_utc": datetime.now(timezone.utc).isoformat(),
                   "versions": versions, "configuration": asdict(config),
@@ -101,9 +101,8 @@ class JsonScanWriter:
         self.stream.write(encoded[:-1] + ',"runs":[\n')
 
     def write(self, record):
-        if self.count:
-            self.stream.write(",\n")
-        json.dump(record, self.stream, allow_nan=False, ensure_ascii=False, separators=(",", ":"))
+        encoded = json.dumps(record, allow_nan=False, ensure_ascii=False, separators=(",", ":"))
+        self.stream.write(",\n" + encoded if self.count else encoded)
         self.stream.flush()
         self.count += 1
 

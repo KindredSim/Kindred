@@ -25,10 +25,6 @@ from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
 from kindred.core.quantity_units import Unit, format_unit_for_display
 from kindred.core.simulator.dsl_parse import DslAnalysis, PreparedDslRequestSet
 from kindred.core.symbolic.jacobian import fractional_order_step
-from kindred.core.simulator.parameter_algebra import (
-    apply_parameter_algebra_spec_to_mechanism,
-)
-from kindred.core.simulator.parameter_coordinates import build_parameter_target_map
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
 from kindred.gui.display_name_policy import reaction_text
 from kindred.core.simulator.step_indexing import (
@@ -58,16 +54,6 @@ def build_mechanism_inspector_sections(
     """Build read-only inspector sections from the same core authorities used at runtime."""
     accepted_mechanism = prepared_dsl.accepted_mechanism_for_structure()
     parameter_spec = prepared_dsl.parameter_algebra_spec_for_execution()
-    if parameter_spec.param_statements:
-        mechanism = prepared_dsl.mutable_mechanism_shell()
-        parameter_target_map = build_parameter_target_map(mechanism)
-        apply_parameter_algebra_spec_to_mechanism(
-            parameter_spec,
-            mechanism=mechanism,
-            parameter_target_map=parameter_target_map,
-        )
-    else:
-        mechanism = accepted_mechanism
     parameterized_schedule = (
         prepared_dsl.parameterized_intervention_schedule_for_binding()
     )
@@ -78,9 +64,9 @@ def build_mechanism_inspector_sections(
             parameter_spec=parameter_spec,
             analysis=prepared_dsl.analysis,
         ),
-        steps_text=_format_steps_from_authority(mechanism, parameter_spec=parameter_spec),
+        steps_text=_format_steps_from_authority(accepted_mechanism, parameter_spec=parameter_spec),
         equations_text=_format_equations(
-            prepared_dsl.symbolic_jacobian_structure(),
+            prepared_dsl.symbolic_equations_text(),
             accepted_mechanism,
             has_interventions=(
                 parameterized_schedule is not None
@@ -388,10 +374,10 @@ def _rate_authority_for_step(
     return authority_snapshot[len(mechanism.reactions) + entry["equilibrium_index"]]
 
 
-def _format_equations(structure: object, mechanism: object, *, has_interventions: bool) -> str:
+def _format_equations(equations: object, mechanism: object, *, has_interventions: bool) -> str:
     # Symbolic equations exist only for whole-number orders; an accepted
     # mechanism always has species.
-    if structure is None:
+    if equations is None:
         step = fractional_order_step(mechanism)
         return f"Equations are not shown because line {step['line']} has a fractional reaction order."
     lines = ["Canonical symbolic RHS equations:"]
@@ -401,21 +387,21 @@ def _format_equations(structure: object, mechanism: object, *, has_interventions
         )
         lines.append("")
     for species_name, rhs_expression in zip(
-        structure.species_names,
-        structure.rhs_expressions,
+        equations.species_names,
+        equations.rhs_expressions,
         strict=True,
     ):
         lines.append(f"d[{species_name}]/dt = {rhs_expression}")
     lines.append("")
     lines.append("Jacobian rows:")
     for species_name, row in zip(
-        structure.species_names, structure.jacobian_expressions, strict=True
+        equations.species_names, equations.jacobian_expressions, strict=True
     ):
         lines.append(f"{species_name}: {', '.join(row)}")
     lines.append("")
     lines.append(
         "Canonical parameter symbols: "
-        + (", ".join(structure.parameter_symbols) or "none")
+        + (", ".join(equations.parameter_symbols) or "none")
     )
     return "\n".join(lines)
 
