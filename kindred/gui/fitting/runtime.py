@@ -1,4 +1,4 @@
-"""Installed Windows fitting runtime (stdlib only)."""
+"""Installed Windows fitting runtime (stdlib and Kindred's stdlib-only startup)."""
 
 from __future__ import annotations
 
@@ -7,14 +7,15 @@ from pathlib import Path
 import sys
 import sysconfig
 
+from kindred.gui.startup import SCIENTIFIC_THREAD_LIMITS
+
 
 def scientific_environment() -> dict[str, str]:
     env = {
         key: value for key, value in os.environ.items()
         if key.upper() not in {"PYTHONHOME", "PYTHONPATH", "PYTHON_GIL"}
     }
-    for name in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS"):
-        env[name] = "1"
+    env.update(SCIENTIFIC_THREAD_LIMITS)
     return env
 
 
