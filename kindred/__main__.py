@@ -8,6 +8,7 @@ This module launches the Kindred desktop GUI:
 
 from __future__ import annotations
 
+import os
 import sys
 from multiprocessing import freeze_support
 
@@ -18,6 +19,9 @@ def main() -> int:
     freeze_support()
 
     from kindred.gui import startup as gui_startup
+
+    # Before numpy loads; spawned children inherit it.
+    os.environ.update(gui_startup.SCIENTIFIC_THREAD_LIMITS)
 
     if len(sys.argv) > 1:
         print("Kindred launches the desktop GUI and does not accept command-line arguments.", file=sys.stderr)

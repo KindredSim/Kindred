@@ -8,6 +8,10 @@ import sys
 
 logger = logging.getLogger(__name__)
 
+# Every Kindred process runs BLAS and OpenMP on one thread. Each extra OpenBLAS
+# thread commits a buffer on Windows, and Kindred's small solves gain nothing.
+SCIENTIFIC_THREAD_LIMITS = {"OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"}
+
 
 def detect_wsl_environment() -> bool:
     """Return True when running under Windows Subsystem for Linux."""
