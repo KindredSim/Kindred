@@ -141,14 +141,12 @@ class SimulationExecutionRequest:
     y0: tuple[float, ...]
     t_span: tuple[float, float]
     solver_config: _PreparedSolverConfig
-    requested_parameter_names: tuple[str, ...] = ()
     parameter_overrides: Mapping[str, float] | None = None
     use_authored_stops: bool = False
 
     def __post_init__(self) -> None:
         # Its producers pass admitted values: initial concentrations from the
-        # document, Slider and Scan admission, or a Fit candidate (exact zeros
-        # in the Fit's base request), the span
+        # document, Slider and Scan admission, or a Fit candidate, the span
         # from Run settings or Scan and Fit admission, and override values from
         # Slider, Scan or Fit candidate admission.  The request keeps its own
         # copy of the caller's override mapping.
@@ -168,60 +166,14 @@ def _expanded_intervention_schedule_dependency_metadata(
     *,
     parameter_algebra_spec: Any,
 ) -> InterventionScheduleDependencyMetadata:
-    """Expand direct schedule names through the admitted Algebra dependency map."""
+    """The independent inputs and starting concentrations each schedule field reads."""
 
     direct_metadata = intervention_schedule_parameter_dependencies(schedule)
-    if not direct_metadata:
-        return direct_metadata
-    # Admission rejected dependency cycles in this graph.
-    admitted_dependencies = parameter_algebra_spec.evaluation_dependencies
-
-    expanded: dict[tuple[int, int | None, str], tuple[str, ...]] = {}
-    for identity, raw_names in direct_metadata.items():
-        leaves: set[str] = set()
-
-        def visit(name: str) -> None:
-            dependencies = admitted_dependencies.get(name)
-            if not dependencies:
-                leaves.add(name)
-                return
-            for dependency in dependencies:
-                visit(dependency)
-
-        for raw_name in raw_names:
-            visit(raw_name)
-        expanded[identity] = tuple(sorted(leaves))
+    expanded = {
+        identity: parameter_algebra_spec.input_dependencies(raw_names)
+        for identity, raw_names in direct_metadata.items()
+    }
     return MappingProxyType(expanded)
-
-
-def _schedule_parameters_deferred_to_prepared_request(
-    execution_request: SimulationExecutionRequest,
-    unresolved_intervention_schedule: InterventionSchedule,
-    *,
-    parameter_algebra_spec: Any,
-) -> frozenset[str]:
-    requested = execution_request.requested_parameter_names
-    supplied = set(dict(execution_request.parameter_overrides or {}).keys())
-    if not requested:
-        return frozenset()
-
-    requested_names = set(requested)
-    supplied_names = supplied
-    expanded_metadata = _expanded_intervention_schedule_dependency_metadata(
-        unresolved_intervention_schedule,
-        parameter_algebra_spec=parameter_algebra_spec,
-    )
-    deferred: set[str] = set()
-    for identity, direct_names in intervention_schedule_parameter_dependencies(
-        unresolved_intervention_schedule
-    ).items():
-        if identity[2] not in INTERVENTION_CLOCK_FIELDS:
-            continue
-        expanded_names = set(expanded_metadata.get(identity, ()))
-        if not expanded_names.intersection(requested_names - supplied_names):
-            continue
-        deferred.update(str(raw_name) for raw_name in direct_names)
-    return frozenset(deferred)
 
 
 def build_simulation_execution_request(
@@ -330,6 +282,8 @@ def prepare_simulation_run(
     rhs: Callable[..., np.ndarray] | None = None
     species_names = list(execution_request.species_names)
     y0 = np.asarray(execution_request.y0, dtype=float).reshape(-1).copy()
+    # Params and lets read the run's starting concentrations as [X]_0.
+    initials_for_algebra = {sp: float(y0[idx]) for idx, sp in enumerate(species_names)}
     parameter_algebra_spec = execution_request.prepared_dsl.parameter_algebra_spec_for_execution()
     parameter_target_map = build_parameter_target_map(mechanism)
 
@@ -346,51 +300,46 @@ def prepare_simulation_run(
     )
     _raise_if_cancelled(cancellation_control)
 
-    _coefficient_evaluator, rhs = topology.bind_target(mechanism)
+    _coefficient_evaluator, rhs = topology.bind_target(mechanism, initials_for_algebra)
 
     intervention_execution = execution_request.prepared_dsl.intervention_execution_contract()
     if intervention_execution is not None and not execution_request.use_authored_stops:
         intervention_execution = intervention_execution.without_stops()
     if unresolved_intervention_schedule is not None:
-        if not _schedule_parameters_deferred_to_prepared_request(
-            execution_request,
+        dependency_metadata = _expanded_intervention_schedule_dependency_metadata(
             unresolved_intervention_schedule,
             parameter_algebra_spec=parameter_algebra_spec,
-        ):
-            dependency_metadata = _expanded_intervention_schedule_dependency_metadata(
-                unresolved_intervention_schedule,
-                parameter_algebra_spec=parameter_algebra_spec,
+        )
+        # The clock fields' params are resolved here, from this run's values;
+        # its payload params are read as it executes.
+        clock_roots = tuple(sorted(intervention_schedule_clock_parameters(unresolved_intervention_schedule)))
+        payload_names = frozenset(
+            name for identity, names in intervention_schedule_parameter_dependencies(
+                unresolved_intervention_schedule
+            ).items()
+            if identity[2] not in INTERVENTION_CLOCK_FIELDS for name in names
+        )
+        try:
+            resolved_schedule = unresolved_intervention_schedule.resolve_parameters(
+                _coefficient_evaluator.parameter_values(
+                    _coefficient_evaluator.nominal_temperature_K, clock_roots
+                ),
+                runtime_parameters=payload_names,
             )
-            # Only a schedule whose clock fields read params is compiled per
-            # candidate; its payload params are read as it executes.
-            clock_roots = tuple(sorted(intervention_schedule_clock_parameters(unresolved_intervention_schedule)))
-            payload_names = frozenset(
-                name for identity, names in intervention_schedule_parameter_dependencies(
-                    unresolved_intervention_schedule
-                ).items()
-                if identity[2] not in INTERVENTION_CLOCK_FIELDS for name in names
+            intervention_execution = compile_intervention_schedule(
+                resolved_schedule,
+                authored=unresolved_intervention_schedule,
+                cancellation_check=(
+                    cancellation_control.cancel_requested
+                    if cancellation_control is not None
+                    else None
+                ),
+                dependency_metadata=dependency_metadata,
+                temperature_changes=execution_request.prepared_dsl.temperature_changes(),
             )
-            try:
-                resolved_schedule = unresolved_intervention_schedule.resolve_parameters(
-                    _coefficient_evaluator.parameter_values(
-                        _coefficient_evaluator.nominal_temperature_K, clock_roots
-                    ),
-                    runtime_parameters=payload_names,
-                )
-                intervention_execution = compile_intervention_schedule(
-                    resolved_schedule,
-                    authored=unresolved_intervention_schedule,
-                    cancellation_check=(
-                        cancellation_control.cancel_requested
-                        if cancellation_control is not None
-                        else None
-                    ),
-                    dependency_metadata=dependency_metadata,
-                    temperature_changes=execution_request.prepared_dsl.temperature_changes(),
-                )
-            except (InterventionScheduleError, ValueDomainError) as exc:
-                locate_declaration(exc, execution_request.prepared_dsl.analysis.intervention_lines)
-                raise
+        except (InterventionScheduleError, ValueDomainError) as exc:
+            locate_declaration(exc, execution_request.prepared_dsl.analysis.intervention_lines)
+            raise
 
     _raise_if_cancelled(cancellation_control)
 
@@ -401,8 +350,6 @@ def prepare_simulation_run(
         coefficient_evaluator=_coefficient_evaluator,
     )
     _raise_if_cancelled(cancellation_control)
-
-    initials_for_algebra = {sp: float(y0[idx]) for idx, sp in enumerate(species_names)}
 
     from kindred.core.simulation_algebra_context import runtime_algebra_symbol_names
     runtime_names = runtime_algebra_symbol_names(parameter_algebra_spec)

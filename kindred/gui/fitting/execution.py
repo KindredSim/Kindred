@@ -598,7 +598,6 @@ class _FitExecution(_FitControl):
             item.dataset_id: dict(item.fixed_params)
             for item in dispatch.ordinary_dataset_overrides
         }
-        candidate_names = list(dispatch.candidate_names)
         prepared_datasets = {
             item.dataset_id: item for item in dispatch.prepared_datasets
         }
@@ -610,7 +609,6 @@ class _FitExecution(_FitControl):
             measured_x = dataset_context.parametric_x_observation is not None
             context = prepare_fitting_execution_context(
                 prepared_dsl=setup.origin.prepared_dsl,
-                param_names=candidate_names,
                 t_start=dataset_context.execution_t_start,
                 t_end=dataset_context.execution_t_end,
                 objective_sample_times=dataset_context.retained_times,

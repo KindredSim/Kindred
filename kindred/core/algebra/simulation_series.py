@@ -14,12 +14,8 @@ from kindred.core.algebra.evaluator import (
 )
 from kindred.core.algebra.parser import (
     AlgebraBlock,
-    BinaryNode,
-    CallNode,
-    ExprNode,
-    SpeciesRefNode,
-    UnaryNode,
     _iter_identifiers,
+    _iter_species_refs,
 )
 from kindred.core.algebra.symbols import SymbolTable
 
@@ -30,29 +26,12 @@ __all__ = [
 ]
 
 
-def _iter_species_refs(expr: ExprNode):
-    if isinstance(expr, SpeciesRefNode):
-        yield str(expr.name)
-        return
-    if isinstance(expr, UnaryNode):
-        yield from _iter_species_refs(expr.rhs)
-        return
-    if isinstance(expr, BinaryNode):
-        yield from _iter_species_refs(expr.lhs)
-        yield from _iter_species_refs(expr.rhs)
-        return
-    if isinstance(expr, CallNode):
-        for arg in expr.args:
-            yield from _iter_species_refs(arg)
-        return
-
-
 def reject_unknown_species_references(
     block: AlgebraBlock,
     *,
     species_names: set[str],
 ) -> None:
-    """Refuse a let line that reads a species the mechanism does not have."""
+    """Refuse a param or let line that reads a species the mechanism does not have."""
     for stmt in block.lines:
         unknown_species = sorted(
             set(_iter_species_refs(stmt.expr)) - species_names
@@ -77,10 +56,13 @@ def observable_closure(block: AlgebraBlock, names: Iterable[str]) -> frozenset[s
     return frozenset(closure)
 
 
-def observable_reads_species(block: AlgebraBlock, name: str) -> bool:
-    """Whether one retained observable closure reads a concentration."""
+def observable_species_refs(block: AlgebraBlock, name: str, kind: str) -> frozenset[str]:
+    """The species one retained observable closure reads, of ``kind``."""
     statements = {stmt.name: stmt for stmt in block.lines}
-    return any(statements[let].expr.has_species_ref() for let in observable_closure(block, (name,)))
+    return frozenset(
+        species for let in observable_closure(block, (name,))
+        for species in _iter_species_refs(statements[let].expr, kind)
+    )
 
 
 def observable_parameter_roots(block: AlgebraBlock, name: str) -> tuple[str, ...]:
@@ -105,10 +87,13 @@ def observable_parameter_roots(block: AlgebraBlock, name: str) -> tuple[str, ...
 
 def let_dependency_facts(spec, name: str) -> dict[str, object]:
     """What a let that cannot be calculated depends on: the independent inputs
-    its closure reads, and whether it reads a concentration."""
+    and starting concentrations its closure reads, and whether it reads a
+    current concentration."""
+    roots = observable_parameter_roots(spec.observable_block, name)
+    starting = observable_species_refs(spec.observable_block, name, "init")
     return {
-        "parameter_names": spec.input_dependencies(observable_parameter_roots(spec.observable_block, name)),
-        "reads_species": observable_reads_species(spec.observable_block, name),
+        "parameter_names": tuple(sorted({*spec.input_dependencies(roots), *(f"[{species}]_0" for species in starting)})),
+        "reads_species": bool(observable_species_refs(spec.observable_block, name, "now")),
     }
 
 

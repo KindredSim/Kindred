@@ -21,7 +21,7 @@ from kindred.core.intervention_schedule import (
 )
 from kindred.core.kinetics import ArrheniusRateModel, EyringRateModel
 from kindred.core.mechanism_metadata import MechanismMetadataView
-from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
+from kindred.core.ode_builder import rate_authority_snapshot
 from kindred.core.quantity_units import Unit, format_unit_for_display
 from kindred.core.simulator.dsl_parse import DslAnalysis, PreparedDslRequestSet
 from kindred.core.symbolic.jacobian import fractional_order_step
@@ -282,10 +282,9 @@ def _format_number(value: object) -> str:
 
 
 def _format_steps_from_authority(mechanism: object, *, parameter_spec: ParameterAlgebraSpec) -> str:
-    coefficient_authority = build_effective_rate_coefficient_evaluator(mechanism)
     return _format_steps(
         mechanism,
-        authority_snapshot=coefficient_authority.authority_snapshot,
+        authority_snapshot=rate_authority_snapshot(mechanism),
         parameter_spec=parameter_spec,
     )
 
@@ -365,9 +364,9 @@ def _rate_authority_for_step(
     entry: Mapping[str, object],
     authority_snapshot: tuple[Mapping[str, object], ...],
 ) -> Mapping[str, object]:
-    """Select the evaluator-owned snapshot for one indexed mechanism step.
+    """Select the rate-authority snapshot for one indexed mechanism step.
 
-    The evaluator lists reactions, then equilibria, in their mechanism order.
+    The snapshot lists reactions, then equilibria, in their mechanism order.
     """
     if entry["kind"] == "reaction":
         return authority_snapshot[entry["reaction_index"]]

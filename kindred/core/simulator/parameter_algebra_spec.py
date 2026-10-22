@@ -20,6 +20,7 @@ from kindred.core.algebra.parser import (
     SpeciesRefNode,
     UnaryNode,
     _iter_identifiers,
+    _iter_species_refs,
     parse_algebra,
 )
 from kindred.core.algebra.symbols import SymbolTable
@@ -205,11 +206,11 @@ class ParameterAlgebraSpec:
       a mechanism parameter (k1, kf1, Keq1, dG_act1, ...). The param line is
       that coordinate's adjustable authored value, in its line's unit.
     - Mechanism-bound parameters: a `param` on a mechanism parameter whose
-      expression reads T, other names, or a physical constant. The param line
-      calculates that coordinate.
+      expression reads T, other names, a physical constant, or a starting
+      concentration [X]_0. The param line calculates that coordinate.
     - Derived parameters: a `param` whose expression references other solver
-      parameters, T, or a physical constant. Derived parameters are
-      re-evaluated whenever their inputs change.
+      parameters, T, a physical constant, or a starting concentration [X]_0.
+      Derived parameters are re-evaluated whenever their inputs change.
     """
 
     param_statements: Tuple[ParameterAssignment, ...]
@@ -249,15 +250,19 @@ class ParameterAlgebraSpec:
 
     def input_dependencies(self, names: Iterable[str]) -> tuple[str, ...]:
         """The independent inputs the named values read, through every
-        calculated value; a name nothing calculates is its own input."""
+        calculated value, with each starting concentration as ``[X]_0``; a
+        name nothing calculates is its own input."""
+        statements = {statement.name: statement for statement in self.parameter_block.lines}
         inputs: set[str] = set()
         pending = list(names)
         while pending:
             name = pending.pop()
             dependencies = self.evaluation_dependencies.get(name, ())
+            starting = {f"[{species}]_0" for species in _iter_species_refs(statements[name].expr)} if name in statements else set()
+            inputs.update(starting)
             if dependencies:
                 pending.extend(dependencies)
-            else:
+            elif not starting:
                 inputs.add(name)
         return tuple(sorted(inputs))
 
@@ -317,8 +322,12 @@ class ParameterAlgebraSpec:
             return "source identity"
         statement = next(line for line in self.parameter_block.lines if line.name == requested)
         # A formula of plain numbers is an authored value; one that reads
-        # another name, T, or a physical constant is calculated.
-        calculated = next(_iter_identifiers(statement.expr), None) is not None
+        # another name, T, a physical constant or a starting concentration is
+        # calculated.
+        calculated = (
+            statement.expr.has_species_ref()
+            or next(_iter_identifiers(statement.expr), None) is not None
+        )
         if requested in self.mechanism_param_names:
             return "mechanism-bound" if calculated else "mechanism input"
         return "derived scalar" if calculated else "independent scalar"
@@ -635,7 +644,8 @@ def _validate_retained_parameter_program(
     namespace = spec.namespace_model()
     defined = {str(assignment.name) for assignment in assignments}
     # Parameter algebra may follow temperature, which the evaluation graph
-    # tracks. Runtime state and row-local time belong to dynamic ``let``
+    # tracks, and read starting concentrations, which are fixed for a run.
+    # Runtime state and row-local time belong to dynamic ``let``
     # observables and are rejected here before any source or mechanism
     # mutation.
     allowed_constants = set(namespace.protected_symbol_names) - {"T"}
@@ -645,9 +655,10 @@ def _validate_retained_parameter_program(
     for assignment, statement in zip(assignments, block.lines):
         identifier_order = tuple(dict.fromkeys(_iter_identifiers(statement.expr)))
         idents = set(identifier_order)
-        if statement.expr.has_species_ref() or "t" in idents:
+        if statement.expr.has_species_ref("now") or "t" in idents:
             raise DSLError(
-                f"Parameter expression for {assignment.name!r} cannot use species concentrations or time t. "
+                f"Parameter expression for {assignment.name!r} cannot use a species concentration [X] or time t; "
+                "it can use a starting concentration [X]_0. "
                 "Put expressions that change during the simulation in a let line.",
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
@@ -685,7 +696,8 @@ def _validate_retained_parameter_program(
             raise DSLError(
                 f"Unknown name{'s' * (len(unknown) > 1)} in parameter expression: "
                 + ", ".join(repr(name) for name in sorted(unknown))
-                + ". A param formula reads other parameters, T, and the constants k_B, h, h_bar, N_A, and R.",
+                + ". A param formula reads other parameters, T, starting concentrations [X]_0, "
+                "and the constants k_B, h, h_bar, N_A, and R.",
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )
