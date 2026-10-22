@@ -305,7 +305,8 @@ def rate_scale_undetermined(
     multiplied by one factor; only the time to reach each point changes.  The
     scale is undetermined when the fitted values can multiply one measured-X
     dataset's rate constants by a common factor without changing a time-X
-    dataset's rate constants, any value a target reads or a trigger's inputs.
+    dataset's rate constants, any value a target reads, a trigger's inputs or
+    a starting concentration.
     A value a target's formula names that cannot be calculated at the fitted
     values lies in an ifelse branch no target took, and is not read.
     The test is linear, on the relative changes of the rate constants and of
@@ -350,7 +351,10 @@ def rate_scale_undetermined(
             if target in prepared_dsl.analysis.observable_names
             for root in observable_parameter_roots(spec.observable_block, target)
         }
-        reads = tuple(sorted({root for root in roots if root in spec.evaluation_dependencies} | triggers))
+        # The curve starts from the starting concentrations, which a common
+        # factor leaves unchanged.
+        starting = {f"[{name}]_0" for name in prepared_dsl.analysis.species_names}
+        reads = tuple(sorted({root for root in roots if root in spec.evaluation_dependencies} | triggers | starting))
 
         def values(names: tuple[str, ...], index: int | None = None, offset: float = 0.0) -> np.ndarray:
             trial = x.copy()

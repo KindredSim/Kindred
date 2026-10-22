@@ -26,7 +26,7 @@ __all__ = [
     "CompiledOdeTopology",
     "EffectiveRateCoefficients",
     "EffectiveRateCoefficientEvaluator",
-    "build_effective_rate_coefficient_evaluator",
+    "rate_authority_snapshot",
 ]
 
 
@@ -51,11 +51,10 @@ class EffectiveRateCoefficients:
 
 @dataclass(frozen=True, slots=True)
 class EffectiveRateCoefficientEvaluator:
-    """One typed per-mechanism runtime coefficient authority."""
+    """One typed per-run runtime coefficient authority."""
 
     nominal_temperature_K: float
     step_kinds: tuple[str, ...]
-    authority_snapshot: tuple[Mapping[str, object], ...]
     parameter_values: Callable[[float, tuple[str, ...]], dict[str, float]]
     _parameter_names: tuple[tuple[str, str | None], ...]
 
@@ -70,44 +69,64 @@ class EffectiveRateCoefficientEvaluator:
             reverse=tuple(float(values[name]) if name else 0.0 for _forward, name in self._parameter_names),
         )
 
-def build_effective_rate_coefficient_evaluator(
+def _step_coefficient_names(
     mechanism: Mechanism,
-) -> EffectiveRateCoefficientEvaluator:
-    """Build the sole effective-rate authority consumed by RHS and Jacobian."""
+) -> tuple[tuple[str, Reaction | Equilibrium, str, str | None], ...]:
+    """Each step's kind, the step, and its forward and reverse coefficient
+    names, reactions first, as the topology orders them."""
 
-    from .mechanism_metadata import MechanismMetadataView
-
-    mech_meta = MechanismMetadataView.from_metadata(mechanism.metadata)
-    nominal_temperature = float(mech_meta.temperature_K)
-    from .simulator.parameter_algebra_eval import bind_parameter_evaluation
     from .simulator.step_indexing import get_step_index_map
+
+    entries = {(entry["kind"], int(entry["reaction_index" if entry["kind"] == "reaction" else "equilibrium_index"])): entry
+               for entry in get_step_index_map(mechanism)}
+    steps = []
+    for kind, members in (("reaction", mechanism.reactions), ("equilibrium", mechanism.equilibria)):
+        for index, step in enumerate(members):
+            number = entries[kind, index]["step_index"]
+            if kind == "reaction":
+                steps.append((kind, step, f"k{number}", None))
+            else:
+                steps.append((kind, step, f"kf{number}", f"kr{number}"))
+    return tuple(steps)
+
+
+def rate_authority_snapshot(mechanism: Mechanism) -> tuple[Mapping[str, object], ...]:
+    """Each step's rate model and the values its coefficient reads, in
+    topology order, without calculating any value."""
 
     # Admission always retains the spec; its absence is a producer error.
     spec = mechanism.metadata["parameter_algebra_spec"]
-    evaluate = bind_parameter_evaluation(spec, mechanism)
-    entries = {(entry["kind"], int(entry["reaction_index" if entry["kind"] == "reaction" else "equilibrium_index"])): entry
-               for entry in get_step_index_map(mechanism)}
-    step_kinds = []
     snapshots = []
-    names = []
-    for kind, steps in (("reaction", mechanism.reactions), ("equilibrium", mechanism.equilibria)):
-        for index, step in enumerate(steps):
-            number = entries[kind, index]["step_index"]
-            forward_name = f"k{number}" if kind == "reaction" else f"kf{number}"
-            reverse_name = None if kind == "reaction" else f"kr{number}"
-            model = step.forward_model
-            snapshot = {"kind": kind, "forward_model": forward_rate_model_payload(model),
-                        "binding_name" if kind == "reaction" else "forward_binding_name": forward_name,
-                        "value_dependencies": tuple(spec.evaluation_dependencies[forward_name]),
-                        "temperature_dependent": forward_name in spec.temperature_dependent_names}
-            if kind == "equilibrium":
-                snapshot.update(authority=json_safe_equilibrium_authority_payload(dict(step.authority.identity_items())), reverse_binding_name=reverse_name)
-            names.append((forward_name, reverse_name))
-            step_kinds.append(kind)
-            snapshots.append(FrozenDict(snapshot))
+    for kind, step, forward_name, reverse_name in _step_coefficient_names(mechanism):
+        snapshot = {"kind": kind, "forward_model": forward_rate_model_payload(step.forward_model),
+                    "binding_name" if kind == "reaction" else "forward_binding_name": forward_name,
+                    "value_dependencies": tuple(spec.evaluation_dependencies[forward_name]),
+                    "temperature_dependent": forward_name in spec.temperature_dependent_names}
+        if kind == "equilibrium":
+            snapshot.update(authority=json_safe_equilibrium_authority_payload(dict(step.authority.identity_items())), reverse_binding_name=reverse_name)
+        snapshots.append(FrozenDict(snapshot))
+    return tuple(snapshots)
+
+
+def _build_effective_rate_coefficient_evaluator(
+    mechanism: Mechanism,
+    initials: Mapping[str, float],
+) -> EffectiveRateCoefficientEvaluator:
+    """Build the sole effective-rate authority consumed by RHS and Jacobian,
+    for one run's starting concentrations."""
+
+    from .mechanism_metadata import MechanismMetadataView
+    from .simulator.parameter_algebra_eval import bind_parameter_evaluation
+
+    mech_meta = MechanismMetadataView.from_metadata(mechanism.metadata)
+    # Admission always retains the spec; its absence is a producer error.
+    spec = mechanism.metadata["parameter_algebra_spec"]
+    steps = _step_coefficient_names(mechanism)
     return EffectiveRateCoefficientEvaluator(
-        nominal_temperature_K=nominal_temperature, step_kinds=tuple(step_kinds),
-        authority_snapshot=tuple(snapshots), parameter_values=evaluate, _parameter_names=tuple(names),
+        nominal_temperature_K=float(mech_meta.temperature_K),
+        step_kinds=tuple(kind for kind, _step, _forward, _reverse in steps),
+        parameter_values=bind_parameter_evaluation(spec, mechanism, initials),
+        _parameter_names=tuple((forward, reverse) for _kind, _step, forward, reverse in steps),
     )
 
 
@@ -176,14 +195,16 @@ class CompiledOdeTopology:
     def bind_target(
         self,
         mechanism: Mechanism,
+        initials: Mapping[str, float],
     ) -> tuple[EffectiveRateCoefficientEvaluator, Callable[..., np.ndarray]]:
         """Bind one target's rate authority and mutable RHS workspace.
 
         The target is a shell of the prepared owner that compiled this topology,
-        so its species and step order are this topology's.
+        so its species and step order are this topology's. ``initials`` are
+        the run's starting concentrations, which params may read.
         """
 
-        coefficient_evaluator = build_effective_rate_coefficient_evaluator(mechanism)
+        coefficient_evaluator = _build_effective_rate_coefficient_evaluator(mechanism, initials)
         return coefficient_evaluator, _build_bound_ode_rhs(
             self,
             mechanism,

@@ -409,11 +409,13 @@ def bind_scalar_expression_evaluator(
     block: AlgebraBlock, values: dict[str, float], *,
     literal_reader: Callable[[NumberNode], float] | None = None,
     resolver: Callable[[str, int], float | None] | None = None,
+    initials: Mapping[str, float] | None = None,
 ):
     """Bind admitted scalar AST arithmetic to one current numerical map; a
-    name missing from it is asked of ``resolver`` when read and kept there."""
+    name missing from it is asked of ``resolver`` when read and kept there.
+    ``[X]_0`` reads ``initials``, the starting concentrations of one run."""
     context = EvaluationContext(
-        t=np.array([0.0]), species_series={}, initials={}, symtab=SymbolTable(),
+        t=np.array([0.0]), species_series={}, initials=dict(initials or {}), symtab=SymbolTable(),
         symbol_resolver=resolver,
     )
     evaluator = _Evaluator(block, context, literal_reader=literal_reader)

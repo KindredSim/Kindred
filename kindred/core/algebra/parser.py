@@ -123,7 +123,8 @@ class ExprNode:
     unit_scale: UnitScale = field(default=ONE_SCALE, compare=False, repr=False)
     unit_factor: float = field(default=1.0, compare=False, repr=False)
 
-    def has_species_ref(self) -> bool:
+    def has_species_ref(self, kind: str | None = None) -> bool:
+        """Whether a species is read, of ``kind`` ("now" or "init") when given."""
         return False
 
 @dataclass(frozen=True)
@@ -150,8 +151,8 @@ class UnaryNode(ExprNode):
     op: str
     rhs: ExprNode
 
-    def has_species_ref(self) -> bool:
-        return self.rhs.has_species_ref()
+    def has_species_ref(self, kind: str | None = None) -> bool:
+        return self.rhs.has_species_ref(kind)
 
 @dataclass(frozen=True)
 class BinaryNode(ExprNode):
@@ -159,16 +160,16 @@ class BinaryNode(ExprNode):
     lhs: ExprNode
     rhs: ExprNode
 
-    def has_species_ref(self) -> bool:
-        return self.lhs.has_species_ref() or self.rhs.has_species_ref()
+    def has_species_ref(self, kind: str | None = None) -> bool:
+        return self.lhs.has_species_ref(kind) or self.rhs.has_species_ref(kind)
 
 @dataclass(frozen=True)
 class CallNode(ExprNode):
     name: str
     args: Tuple[ExprNode, ...]
 
-    def has_species_ref(self) -> bool:
-        return any(a.has_species_ref() for a in self.args)
+    def has_species_ref(self, kind: str | None = None) -> bool:
+        return any(a.has_species_ref(kind) for a in self.args)
 
 @dataclass(frozen=True)
 class SpeciesRefNode(ExprNode):
@@ -179,8 +180,8 @@ class SpeciesRefNode(ExprNode):
         if self.kind not in {"now", "init"}:
             raise ValueError("Species reference kind must be 'now' or 'init'.")
 
-    def has_species_ref(self) -> bool:
-        return True
+    def has_species_ref(self, kind: str | None = None) -> bool:
+        return kind is None or self.kind == kind
 
 @dataclass(frozen=True)
 class LetStatement:
@@ -208,6 +209,24 @@ def _iter_identifiers(node: ExprNode):
     if isinstance(node, CallNode):
         for argument in node.args:
             yield from _iter_identifiers(argument)
+
+
+def _iter_species_refs(node: ExprNode, kind: str | None = None):
+    """The species a formula reads, of ``kind`` ("now" or "init") when given."""
+    if isinstance(node, SpeciesRefNode):
+        if kind is None or node.kind == kind:
+            yield str(node.name)
+        return
+    if isinstance(node, UnaryNode):
+        yield from _iter_species_refs(node.rhs, kind)
+        return
+    if isinstance(node, BinaryNode):
+        yield from _iter_species_refs(node.lhs, kind)
+        yield from _iter_species_refs(node.rhs, kind)
+        return
+    if isinstance(node, CallNode):
+        for argument in node.args:
+            yield from _iter_species_refs(argument, kind)
 
 
 def circular_definition_message(target: str, steps: Sequence[str]) -> str:

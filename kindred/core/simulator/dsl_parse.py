@@ -1656,10 +1656,10 @@ def prepare_dsl_request_set(
     # in the builder) would reparse the same Algebra text and violate the
     # parse-once boundary.
     try:
-        reject_unknown_species_references(
-            parameter_algebra_spec.observable_block,
-            species_names={str(item) for item in mechanism.species_names()},
-        )
+        for block in (parameter_algebra_spec.parameter_block, parameter_algebra_spec.observable_block):
+            reject_unknown_species_references(
+                block, species_names={str(item) for item in mechanism.species_names()},
+            )
     except AlgebraError as exc:
         raise _DSLError(exc.message, line_number=exc.line, line_content=exc.line_text) from exc
     species_names = tuple(str(item) for item in mechanism.species_names())

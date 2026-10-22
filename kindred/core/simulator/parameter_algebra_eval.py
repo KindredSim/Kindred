@@ -1,6 +1,7 @@
 """Bind the admitted chemistry/Algebra order to current candidate values."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 
 from kindred.core.algebra.evaluator import bind_scalar_expression_evaluator
 from kindred.core.exceptions import ErrorContext, KindredError
@@ -16,8 +17,10 @@ from kindred.core.simulator.parameter_coordinates import (
 def bind_parameter_evaluation(
     spec: ParameterAlgebraSpec,
     mechanism: object,
+    initials: Mapping[str, float],
 ):
-    """Bind once; calculate the requested values, and what they read, at the current temperature."""
+    """Bind once to one run's starting concentrations; calculate the requested
+    values, and what they read, at the current temperature."""
     targets = build_parameter_target_map(mechanism)
     graph = spec.evaluation_dependencies
     statements = {statement.name: statement for statement in spec.parameter_block.lines}
@@ -63,7 +66,9 @@ def bind_parameter_evaluation(
         ensure(name)
         return values[name]
 
-    expression = bind_scalar_expression_evaluator(spec.parameter_block, values, resolver=resolve)
+    expression = bind_scalar_expression_evaluator(
+        spec.parameter_block, values, resolver=resolve, initials=initials,
+    )
     for name in graph:
         if name in spec.identity_checks or name in inputs:
             continue
@@ -87,7 +92,7 @@ def bind_parameter_evaluation(
             if not check:
                 values[name] = value
         except KindredError as exc:
-            # The value that failed names itself and its inputs, on the line
+            # The value that failed names itself and its inputs on the line
             # that calculates it: its param line, else its reaction line; the
             # values that read it add nothing.
             statement = statements.get(name)

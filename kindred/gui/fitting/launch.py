@@ -750,7 +750,6 @@ class _FitDispatchCompilation:
     ordinary_shared_variables: tuple[FitSharedVariableParamSpec, ...]
     ordinary_coupled_variables: tuple[FitCoupledVariableParamSpec, ...]
     ordinary_dataset_overrides: tuple[FitDatasetParameterOverrides, ...]
-    candidate_names: tuple[str, ...]
     ordinary_optimizer_layout: FitParameterLayout
 
 
@@ -1340,7 +1339,6 @@ def _compile_fit_dispatch(
         ordinary_shared_variables=tuple(shared_variables),
         ordinary_coupled_variables=tuple(coupled_variables),
         ordinary_dataset_overrides=overrides,
-        candidate_names=tuple(sorted(parameter.name for parameter in setup.parameters)),
         ordinary_optimizer_layout=layout,
     )
 
