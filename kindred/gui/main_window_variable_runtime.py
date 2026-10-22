@@ -567,17 +567,18 @@ class TabSliderBinding(QtCore.QObject):
         interaction: SliderInteractionKind,
     ) -> bool:
         self._stop_preview_timers()
-        if interaction is SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
-            # A dragged set is plotted, as Run plots its sets, so its first
-            # drag Preview shows even before any Run.
-            self.plotSetsRequested.emit(targets)
-            return self._simulation_jobs.request_interactive_preview(
-                self.capture_interactive_preview(targets, tab=tab)
-            )
-        if not self._registry.tab_runtime(tab.tab_id).has_slider_draft:
+        drag = interaction is SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE
+        if not drag and not self._registry.tab_runtime(tab.tab_id).has_slider_draft:
             # Released, clicked or typed back at the accepted values.
             self._simulation_jobs.reconcile_canonical_targets(tab.tab_id, targets)
             return True
+        # A set a Slider Preview is computed for is plotted, as Run plots its
+        # sets, so the Preview shows even on a set that was not plotted.
+        self.plotSetsRequested.emit(targets)
+        if drag:
+            return self._simulation_jobs.request_interactive_preview(
+                self.capture_interactive_preview(targets, tab=tab)
+            )
         capture = self.capture_exact_preview(targets, tab=tab)
         accepted = self._simulation_jobs.request_preview(capture)
         self._exact_preview_capture = capture if accepted else None

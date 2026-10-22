@@ -1214,7 +1214,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str, object)
     def _plot_sets(self, tab_id: str, set_ids: object) -> None:
-        """Add a Run's or a slider drag's sets to the plot."""
+        """Add a Run's or a Slider Preview's sets to the plot."""
 
         target = str(tab_id)
         bundle = self._tab_surfaces.get(target)
