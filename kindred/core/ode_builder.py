@@ -122,12 +122,11 @@ class CompiledOdeTopology:
 
     step_kinds: tuple[str, ...]
     stoichiometry: np.ndarray
-    forward_exponents: np.ndarray
-    reverse_exponents: np.ndarray
-    forward_mask: np.ndarray
-    reverse_mask: np.ndarray
-    fractional_forward_mask: np.ndarray
-    fractional_reverse_mask: np.ndarray
+    # One row per forward term, then, when the mechanism has equilibria, one
+    # per reverse term in the same step order.
+    exponents: np.ndarray
+    mask: np.ndarray
+    fractional_mask: np.ndarray
 
     @classmethod
     def from_mechanism(cls, mechanism: Mechanism) -> "CompiledOdeTopology":
@@ -157,34 +156,21 @@ class CompiledOdeTopology:
                     forward_exponents[index, species_index[name]] = float(coefficient)
                 for name, coefficient in equilibrium.stoich_back.items():
                     reverse_exponents[index, species_index[name]] = float(coefficient)
-        forward_mask = forward_exponents != 0.0
-        reverse_mask = reverse_exponents != 0.0
-        fractional_forward_mask = forward_mask & (
-            forward_exponents != np.rint(forward_exponents)
+        exponents = (
+            np.vstack((forward_exponents, reverse_exponents))
+            if mechanism.equilibria
+            else forward_exponents
         )
-        fractional_reverse_mask = reverse_mask & (
-            reverse_exponents != np.rint(reverse_exponents)
-        )
-        arrays = (
-            stoichiometry,
-            forward_exponents,
-            reverse_exponents,
-            forward_mask,
-            reverse_mask,
-            fractional_forward_mask,
-            fractional_reverse_mask,
-        )
-        for array in arrays:
+        mask = exponents != 0.0
+        fractional_mask = mask & (exponents != np.rint(exponents))
+        for array in (stoichiometry, exponents, mask, fractional_mask):
             array.setflags(write=False)
         return cls(
             step_kinds=tuple(step_kinds),
             stoichiometry=stoichiometry,
-            forward_exponents=forward_exponents,
-            reverse_exponents=reverse_exponents,
-            forward_mask=forward_mask,
-            reverse_mask=reverse_mask,
-            fractional_forward_mask=fractional_forward_mask,
-            fractional_reverse_mask=fractional_reverse_mask,
+            exponents=exponents,
+            mask=mask,
+            fractional_mask=fractional_mask,
         )
 
     def bind_target(
@@ -234,37 +220,31 @@ def _build_bound_ode_rhs(
     - Stoichiometry determines species changes via a BLAS-free reduction.
     """
     S = topology.stoichiometry
-    exp_forward = topology.forward_exponents
-    exp_reverse = topology.reverse_exponents
-    forward_mask = topology.forward_mask
-    reverse_mask = topology.reverse_mask
-    fractional_forward_mask = topology.fractional_forward_mask
-    fractional_reverse_mask = topology.fractional_reverse_mask
-    has_reverse_terms = bool(mechanism.equilibria)
-    has_fractional_orders = bool(
-        fractional_forward_mask.any()
-        or (has_reverse_terms and fractional_reverse_mask.any())
-    )
-    # Unmasked entries stay 1.0, so each row's product runs over its orders.
-    forward_buffer = np.ones_like(exp_forward)
-    reverse_buffer = np.ones_like(exp_reverse)
-    power_bases = np.empty_like(exp_forward)
-    stoich_rate_buffer = np.empty_like(S)
-
+    exponents = topology.exponents
+    mask = topology.mask
+    fractional_mask = topology.fractional_mask
     n_steps = len(topology.step_kinds)
-    k_forward_dyn = np.zeros(n_steps, dtype=float)
-    k_reverse_dyn = np.zeros(n_steps, dtype=float)
+    has_reverse_terms = bool(mechanism.equilibria)
+    has_fractional_orders = bool(fractional_mask.any())
+    # Unmasked entries stay 1.0, so each row's product runs over its orders.
+    terms_buffer = np.ones_like(exponents)
+    power_bases = np.empty_like(exponents)
+    stoich_rate_buffer = np.empty_like(S)
+    coefficients = np.zeros(exponents.shape[0], dtype=float)
     # The coefficients are a function of temperature alone, so they are
     # refilled only when it changes; set after a successful evaluation.
     coefficients_T: float | None = None
 
-    def powers(
-        y: np.ndarray,
-        exponents: np.ndarray,
-        mask: np.ndarray,
-        fractional_mask: np.ndarray,
-        out: np.ndarray,
-    ) -> np.ndarray:
+    def ode_rhs(t: float, y: np.ndarray, *, T: float) -> np.ndarray:
+        """ODE right-hand side from stoichiometry and reaction rates."""
+        nonlocal coefficients_T
+        if T != coefficients_T:
+            values = coefficient_evaluator(float(T))
+            coefficients[:n_steps] = values.forward
+            if has_reverse_terms:
+                coefficients[n_steps:] = values.reverse
+            coefficients_T = T
+        bases = y
         if has_fractional_orders:
             # Implicit solvers may briefly trial a negative internal state.
             # Restrict only non-integral power evaluation to its physical
@@ -272,21 +252,10 @@ def _build_bound_ode_rhs(
             # unchanged and does not alter published concentration truth.
             power_bases[:] = y
             np.maximum(power_bases, 0.0, out=power_bases, where=fractional_mask)
-            y = power_bases
-        np.power(y, exponents, out=out, where=mask)
-        return out.prod(axis=1)
-
-    def ode_rhs(t: float, y: np.ndarray, *, T: float) -> np.ndarray:
-        """ODE right-hand side from stoichiometry and reaction rates."""
-        nonlocal coefficients_T
-        if T != coefficients_T:
-            coefficients = coefficient_evaluator(float(T))
-            k_forward_dyn[:] = coefficients.forward
-            k_reverse_dyn[:] = coefficients.reverse
-            coefficients_T = T
-        rates = k_forward_dyn * powers(y, exp_forward, forward_mask, fractional_forward_mask, forward_buffer)
-        if has_reverse_terms:
-            rates -= k_reverse_dyn * powers(y, exp_reverse, reverse_mask, fractional_reverse_mask, reverse_buffer)
+            bases = power_bases
+        np.power(bases, exponents, out=terms_buffer, where=mask)
+        terms = coefficients * terms_buffer.prod(axis=1)
+        rates = terms[:n_steps] - terms[n_steps:] if has_reverse_terms else terms
         return _stoichiometric_flux_product(S, rates, workspace=stoich_rate_buffer)
 
     return ode_rhs

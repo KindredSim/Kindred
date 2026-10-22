@@ -186,7 +186,6 @@ class InterventionScheduleExecutionOwner:
             outputs_y: list[np.ndarray] = []
             outputs_temperature: list[np.ndarray] = []
             output_segment_ids: list[np.ndarray] = []
-            output_segment_keys: list[tuple[str, ...]] = []
             output_discontinuity_ids: list[np.ndarray] = []
             presentation_boundaries: list[SimulationPresentationBoundary] = []
             # (length, end state, CTC from that end state) of each segment.
@@ -264,12 +263,10 @@ class InterventionScheduleExecutionOwner:
                 outputs_t,
                 outputs_y,
                 output_segment_ids,
-                output_segment_keys,
                 output_discontinuity_ids,
                 t0,
                 current_y,
                 segment_id=0,
-                segment_key="integration:0",
                 discontinuity_id=discontinuity_id,
                 output_temperatures=outputs_temperature,
                 temperature_K=current_temperature,
@@ -461,7 +458,7 @@ class InterventionScheduleExecutionOwner:
                     ):
                         trigger_hit = None
                     seg_t = segment_result.t
-                    seg_temperature = _selected_temperatures(seg_t, segment_temperature, cancellation_check)
+                    seg_temperature = segment_temperature.values(seg_t)
                     seg_y = _apply_holds_to_trajectory(
                         segment_result.Y,
                         active_holds,
@@ -572,12 +569,10 @@ class InterventionScheduleExecutionOwner:
                         outputs_t,
                         outputs_y,
                         output_segment_ids,
-                        output_segment_keys,
                         output_discontinuity_ids,
                         emit_t,
                         emit_y,
                         segment_id=segment_identity.ordinal,
-                        segment_key=segment_identity.key,
                         discontinuity_id=discontinuity_id,
                         output_temperatures=outputs_temperature,
                         temperatures=emit_temperature,
@@ -588,12 +583,10 @@ class InterventionScheduleExecutionOwner:
                                 outputs_t,
                                 outputs_y,
                                 output_segment_ids,
-                                output_segment_keys,
                                 output_discontinuity_ids,
                                 float(purge_hit[0]),
                                 np.asarray(purge_hit[2], dtype=float).reshape(-1),
                                 segment_id=segment_count,
-                                segment_key=f"integration:{segment_count}",
                                 discontinuity_id=discontinuity_id,
                                 output_temperatures=outputs_temperature,
                                 temperature_K=current_temperature,
@@ -611,12 +604,10 @@ class InterventionScheduleExecutionOwner:
                                     outputs_t,
                                     outputs_y,
                                     output_segment_ids,
-                                    output_segment_keys,
                                     output_discontinuity_ids,
                                     float(purge_hit[0]),
                                     np.asarray(purge_hit[2], dtype=float).reshape(-1),
                                     segment_id=segment_count,
-                                    segment_key=f"integration:{segment_count}",
                                     discontinuity_id=discontinuity_id,
                                     output_temperatures=outputs_temperature,
                                     temperature_K=current_temperature,
@@ -695,12 +686,10 @@ class InterventionScheduleExecutionOwner:
                                     outputs_t,
                                     outputs_y,
                                     output_segment_ids,
-                                    output_segment_keys,
                                     output_discontinuity_ids,
                                     float(outer_end),
                                     np.asarray(current_y, dtype=float).reshape(-1),
                                     segment_id=post_segment_id,
-                                    segment_key=f"integration:{post_segment_id}",
                                     discontinuity_id=discontinuity_id,
                                     output_temperatures=outputs_temperature,
                                     temperature_K=current_temperature,
@@ -719,12 +708,10 @@ class InterventionScheduleExecutionOwner:
                                     outputs_t,
                                     outputs_y,
                                     output_segment_ids,
-                                    output_segment_keys,
                                     output_discontinuity_ids,
                                     float(outer_end),
                                     np.asarray(current_y, dtype=float).reshape(-1),
                                     segment_id=post_segment_id,
-                                    segment_key=f"integration:{post_segment_id}",
                                     discontinuity_id=discontinuity_id,
                                     output_temperatures=outputs_temperature,
                                     temperature_K=current_temperature,
@@ -735,12 +722,10 @@ class InterventionScheduleExecutionOwner:
                                     outputs_t,
                                     outputs_y,
                                     output_segment_ids,
-                                    output_segment_keys,
                                     output_discontinuity_ids,
                                     float(outer_end),
                                     np.asarray(current_y, dtype=float).reshape(-1),
                                     segment_id=segment_output_identity.ordinal,
-                                    segment_key=segment_output_identity.key,
                                     discontinuity_id=discontinuity_id,
                                     output_temperatures=outputs_temperature,
                                     temperature_K=current_temperature,
@@ -790,12 +775,10 @@ class InterventionScheduleExecutionOwner:
                         outputs_t,
                         outputs_y,
                         output_segment_ids,
-                        output_segment_keys,
                         output_discontinuity_ids,
                         float(root_time),
                         np.asarray(current_y, dtype=float).reshape(-1),
                         segment_id=post_segment_id,
-                        segment_key=f"integration:{post_segment_id}",
                         discontinuity_id=discontinuity_id,
                         output_temperatures=outputs_temperature,
                         temperature_K=current_temperature,
@@ -819,12 +802,10 @@ class InterventionScheduleExecutionOwner:
                     outputs_t,
                     outputs_y,
                     output_segment_ids,
-                    output_segment_keys,
                     output_discontinuity_ids,
                     actual_end,
                     np.asarray(current_y, dtype=float).reshape(-1),
                     segment_id=max(0, segment_count - 1),
-                    segment_key=f"integration:{max(0, segment_count - 1)}",
                     discontinuity_id=discontinuity_id,
                     output_temperatures=outputs_temperature,
                     temperature_K=current_temperature,
@@ -839,14 +820,13 @@ class InterventionScheduleExecutionOwner:
                                   else build_time_grid(t0, actual_end, req.grid))
                 except ValueError as exc:
                     raise InterventionScheduleError(str(exc)) from exc
-                boundary_ids, boundary_keys, boundary_discontinuities = _compose_direct_result_sample_identity(
-                    output_segment_ids, output_segment_keys, output_discontinuity_ids,
+                boundary_ids, boundary_discontinuities = _compose_direct_result_sample_identity(
+                    output_segment_ids, output_discontinuity_ids,
                 )
                 final_times = np.union1d(base_times, output_t)
                 final_states = np.empty((current_y.size, final_times.size), dtype=float)
                 final_temperatures = np.empty(final_times.size, dtype=float)
                 final_ids = np.empty(final_times.size, dtype=np.int64)
-                final_keys = np.empty(final_times.size, dtype=object)
                 final_discontinuities = np.empty(final_times.size, dtype=np.int64)
 
                 # Exact executor rows own intervention and termination boundaries.
@@ -854,7 +834,6 @@ class InterventionScheduleExecutionOwner:
                 final_states[:, boundary_rows] = output_y
                 final_temperatures[boundary_rows] = output_temperature
                 final_ids[boundary_rows] = boundary_ids
-                final_keys[boundary_rows] = boundary_keys
                 final_discontinuities[boundary_rows] = boundary_discontinuities
                 needs_sampling = np.ones(final_times.size, dtype=bool)
                 needs_sampling[boundary_rows] = False
@@ -883,7 +862,7 @@ class InterventionScheduleExecutionOwner:
                         chunk_end = min(sample_start + 256, sample_end)
                         rows = sample_rows[sample_start:chunk_end]
                         selected_times = sample_times[sample_start:chunk_end]
-                        selected_temperatures = _selected_temperatures(selected_times, dense_temperature, cancellation_check)
+                        selected_temperatures = dense_temperature.values(selected_times)
                         raw_states = dense(selected_times)
                         _raise_if_cancelled(cancellation_check)
                         raw_states = _apply_holds_to_trajectory(
@@ -897,7 +876,6 @@ class InterventionScheduleExecutionOwner:
                         final_states[:, rows] = projected
                         final_temperatures[rows] = selected_temperatures
                         final_ids[rows] = identity_record.ordinal
-                        final_keys[rows] = identity_record.key
                         final_discontinuities[rows] = discontinuity
                         projected_count += projection.count
                         max_negative_magnitude = max(
@@ -916,7 +894,7 @@ class InterventionScheduleExecutionOwner:
                 _raise_if_cancelled(cancellation_check)
                 output_t, output_y = final_times, final_states
                 output_temperature = final_temperatures
-                output_segment_ids, output_segment_keys, output_discontinuity_ids = [final_ids], [tuple(final_keys)], [final_discontinuities]
+                output_segment_ids, output_discontinuity_ids = [final_ids], [final_discontinuities]
                 dense_segments.clear()
             if output_t.size > 1 and np.any(np.diff(output_t) <= 0.0):
                 raise InterventionScheduleError(
@@ -940,11 +918,9 @@ class InterventionScheduleExecutionOwner:
             provenance["intervention_segments"] = segment_count
             (
                 result_segment_ids,
-                result_segment_keys,
                 result_discontinuity_ids,
             ) = _compose_direct_result_sample_identity(
                 output_segment_ids,
-                output_segment_keys,
                 output_discontinuity_ids,
             )
             _publish_segment_projection_provenance(
@@ -971,7 +947,6 @@ class InterventionScheduleExecutionOwner:
                 intervention_execution=final_contract,
                 presentation_boundaries=tuple(presentation_boundaries),
                 segment_ids=result_segment_ids,
-                segment_keys=result_segment_keys,
                 discontinuity_ids=result_discontinuity_ids,
                 termination=termination,
             )
@@ -1006,9 +981,8 @@ def _raise_if_cancelled(check: Callable[[], bool] | None) -> None:
 
 def _compose_direct_result_sample_identity(
     segment_ids: Sequence[np.ndarray],
-    segment_keys: Sequence[tuple[str, ...]],
     discontinuity_ids: Sequence[np.ndarray],
-) -> tuple[np.ndarray, tuple[str, ...], np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Compose row identity captured at emission time.
 
     Identity is captured while each unique segment/root row is emitted, so no
@@ -1025,11 +999,9 @@ def _compose_direct_result_sample_identity(
         if discontinuity_ids
         else np.empty(0, dtype=np.int64)
     )
-    # Each emitted row appends its id, key and discontinuity together.
-    keys = tuple(key for group in segment_keys for key in group)
     ids.setflags(write=False)
     discontinuities.setflags(write=False)
-    return ids, keys, discontinuities
+    return ids, discontinuities
 
 
 def _record_segment_projection(
@@ -1482,27 +1454,21 @@ def _apply_holds_to_trajectory(
     output = np.asarray(states, dtype=float).copy()
     if not holds:
         return output
-    for column in range(output.shape[1]):
-        output[:, column] = _apply_holds(
-            output[:, column],
-            holds,
-            species_index=species_index,
-            cancellation_check=cancellation_check,
-            time=float(times[column]),
-            temperature_K=float(temperatures[column]),
-            parameter_values=parameter_values,
-        )
+    # A held value is a literal or a param, which changes only with
+    # temperature, so each run of rows at one temperature takes the values
+    # resolved at its first row.
+    if any(hold.value_param is not None for hold in holds):
+        starts = np.flatnonzero(np.diff(temperatures, prepend=np.nan) != 0.0).tolist()
+    else:
+        starts = [0] if len(temperatures) else []
+    for start, end in zip(starts, [*starts[1:], len(temperatures)]):
+        _raise_if_cancelled(cancellation_check)
+        for hold in _resolve_items(
+            holds, float(times[start]), parameter_values,
+            temperature_K=float(temperatures[start]),
+        ):
+            output[species_index[hold.species], start:end] = float(hold.value)
     return output
-
-
-def _selected_temperatures(times, temperature_at, cancellation_check):
-    temperatures = np.empty(len(times), dtype=float)
-    for index, time in enumerate(times):
-        if index % 256 == 0:
-            _raise_if_cancelled(cancellation_check)
-        temperatures[index] = temperature_at(float(time))
-    _raise_if_cancelled(cancellation_check)
-    return temperatures
 
 
 class _InterventionRhs:
@@ -1528,6 +1494,9 @@ class _InterventionRhs:
         self._parameter_values = parameter_values
         self.temperature_at = temperature_at
         self.cancellation_check = cancellation_check
+        # Without holds, flows or a vessel the segment is the mechanism alone;
+        # its right-hand side only reads the solver's state.
+        self._mechanism_only = not self.fluxes and not self._holds and volume.value is None
 
     def _flux_values(self, time, temperature_K):
         sums = {}
@@ -1570,6 +1539,8 @@ class _InterventionRhs:
     def __call__(self, time: float, state: np.ndarray) -> np.ndarray:
         _raise_if_cancelled(self.cancellation_check)
         temperature_K = self.temperature_at(time)
+        if self._mechanism_only:
+            return self._rhs(time, state, T=temperature_K)
         raw_state = np.asarray(state, dtype=float).reshape(-1)
         evaluation_state, sums, _negative = self.base_evaluation_state(raw_state, time, temperature_K)
         # The mechanism's right-hand side returns a fresh array.
@@ -1848,7 +1819,6 @@ def _append_identity_samples(
     output_times: list[np.ndarray],
     output_states: list[np.ndarray],
     output_segment_ids: list[np.ndarray],
-    output_segment_keys: list[tuple[str, ...]],
     output_discontinuity_ids: list[np.ndarray],
     times: np.ndarray,
     states: np.ndarray,
@@ -1856,7 +1826,6 @@ def _append_identity_samples(
     output_temperatures: list[np.ndarray],
     temperatures: np.ndarray,
     segment_id: int,
-    segment_key: str,
     discontinuity_id: int,
 ) -> None:
     emit_times = np.asarray(times, dtype=float).reshape(-1)
@@ -1878,7 +1847,6 @@ def _append_identity_samples(
     output_segment_ids.append(
         np.full(emit_times.size, int(segment_id), dtype=np.int64)
     )
-    output_segment_keys.append(tuple(str(segment_key) for _ in emit_times))
     output_discontinuity_ids.append(
         np.full(emit_times.size, int(discontinuity_id), dtype=np.int64)
     )
@@ -1888,7 +1856,6 @@ def _append_identity_row(
     output_times: list[np.ndarray],
     output_states: list[np.ndarray],
     output_segment_ids: list[np.ndarray],
-    output_segment_keys: list[tuple[str, ...]],
     output_discontinuity_ids: list[np.ndarray],
     time: float,
     state: np.ndarray,
@@ -1896,20 +1863,17 @@ def _append_identity_row(
     output_temperatures: list[np.ndarray],
     temperature_K: float,
     segment_id: int,
-    segment_key: str,
     discontinuity_id: int,
 ) -> None:
     _append_identity_samples(
         output_times,
         output_states,
         output_segment_ids,
-        output_segment_keys,
         output_discontinuity_ids,
         np.array([float(time)], dtype=float),
         np.asarray(state, dtype=float).reshape(-1, 1),
         output_temperatures=output_temperatures,
         temperatures=np.array([temperature_K], dtype=float),
         segment_id=segment_id,
-        segment_key=segment_key,
         discontinuity_id=discontinuity_id,
     )

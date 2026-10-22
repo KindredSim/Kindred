@@ -422,8 +422,12 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
 
     def set_tab_dirty(self, tab_id: str, dirty: bool) -> None:
         index = self._index_for_tab_id(tab_id)
-        text = self._tab_bar.tabText(index).removesuffix(" *")
-        self._tab_bar.setTabText(index, f"{text} *" if dirty else text)
+        current = self._tab_bar.tabText(index)
+        text = current.removesuffix(" *")
+        text = f"{text} *" if dirty else text
+        # Setting even the same text relayouts the whole window.
+        if text != current:
+            self._tab_bar.setTabText(index, text)
 
     def show_rename_error(self, tab_id: str, message: str) -> None:
         index = self._index_for_tab_id(tab_id)

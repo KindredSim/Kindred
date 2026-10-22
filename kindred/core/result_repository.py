@@ -35,7 +35,6 @@ class SimulationResultValue:
     temperature_K: np.ndarray
     series: Mapping[str, np.ndarray]
     segment_ids: np.ndarray
-    segment_keys: tuple[str, ...]
     discontinuity_ids: np.ndarray
     intervention_execution: InterventionExecutionContract
     solver_provenance: Mapping[str, Any]
@@ -134,6 +133,11 @@ class ResultRepository:
     def reference_result(self, set_id: str) -> SimulationResultValue | None:
         entry = self._reference_by_set_id.get(set_id)
         return None if entry is None else entry[2]
+
+    def has_result(self, set_id: str) -> bool:
+        """Whether the set shows a current, Preview or Reference result."""
+
+        return set_id in self._current_by_set_id or set_id in self._reference_by_set_id
 
     def current_request(self, set_id: str) -> SimulationExecutionRequest | None:
         entry = self._current_by_set_id.get(set_id)

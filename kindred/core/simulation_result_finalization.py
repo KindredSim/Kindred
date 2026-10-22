@@ -174,7 +174,8 @@ def finalize_simulation_result(
         # A param read by a let, as its value or failure at a temperature: at
         # each row's own when it changes with temperature, so it fails only at
         # the rows it cannot be calculated at. A failure is kept without its
-        # traceback, which would otherwise grow with every row raising it.
+        # traceback or the exception it was raised while handling, which
+        # would otherwise keep their frames alive for every row raising it.
         resolved: dict[tuple[str, float], float | Exception] = {}
 
         def resolve_symbol(name: str, row: int) -> float | None:
@@ -186,6 +187,7 @@ def finalize_simulation_result(
                 try:
                     resolved[key] = parameter_values_at_temperature(temperature, (name,))[name]
                 except UNCOMPUTABLE_ERRORS as exc:
+                    exc.__context__ = None
                     resolved[key] = exc.with_traceback(None)
             value = resolved[key]
             if isinstance(value, Exception):
@@ -248,7 +250,6 @@ def finalize_simulation_result(
         t=result_time,
         series=MappingProxyType(finalized_series),
         segment_ids=result.segment_ids,
-        segment_keys=result.segment_keys,
         discontinuity_ids=result.discontinuity_ids,
         scalars=MappingProxyType(finalized_algebra_scalars),
         parameters=parameters,

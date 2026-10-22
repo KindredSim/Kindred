@@ -468,10 +468,12 @@ class SimulationJobOwner(QtCore.QObject):
         worker.start()
         if kind == "run" and purpose == "ordinary":
             repository = self._repository(str(tab_id))
+            # A set showing nothing has nothing to clear or redraw.
             changed_request_ids = tuple(
                 target.set_id
                 for target in targets
-                if not self._current_run_matches_target(repository, target)
+                if repository.has_result(target.set_id)
+                and not self._current_run_matches_target(repository, target)
             )
             if changed_request_ids:
                 repository.deauthorize_sets(changed_request_ids)

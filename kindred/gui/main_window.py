@@ -471,7 +471,6 @@ class MainWindow(QtWidgets.QMainWindow):
         slider_binding = TabSliderBinding(
             tab_id=target,
             registry=surface_registry,
-            table=batch_table,
             variable_sliders=editor.variable_sliders_widget(),
             species_sliders=editor.species_sliders_widget(),
             slider_workspace_owner=editor,
@@ -597,6 +596,9 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         sliders.draftStateChanged.connect(self._on_draft_state_changed)
         sliders.dragHeldChanged.connect(self._on_simulation_state_changed)
+        sliders.plotSetsRequested.connect(
+            lambda ids, captured=tab_id: self._plot_sets(captured, ids)
+        )
         sliders.errorRaised.connect(self.set_status_text)
         sliders.targetSetIdsChanged.connect(
             lambda ids, captured=tab_id: self._refresh_slider_target_summary(
@@ -753,9 +755,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._simulation_jobs.state_changed.connect(
             self._on_simulation_state_changed
         )
-        self._simulation_jobs.run_dispatched.connect(
-            self._on_run_dispatched
-        )
+        self._simulation_jobs.run_dispatched.connect(self._plot_sets)
         self._simulation_jobs.results_changed.connect(self._on_results_changed)
         self._simulation_jobs.status_changed.connect(self.set_status_text)
         self._fit_session_owner.window_changed.connect(
@@ -944,6 +944,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._apply_persisted_plot_states(document)
             for tab in document.tabs:
                 self._refresh_tab_controls(tab.tab_id)
+                self._render_results_for_tab(tab.tab_id)
             if project_replaced:
                 # Rendering the replacement text is an undoable editor edit;
                 # clear afterwards so Undo cannot restore the prior project.
@@ -961,7 +962,7 @@ class MainWindow(QtWidgets.QMainWindow):
         *,
         preserve_slider_editor_drafts: bool = True,
     ) -> None:
-        """Refresh one tab's controls, sliders, data views, and results."""
+        """Refresh one tab's controls, sliders and data views."""
 
         target = str(tab_id)
         bundle = self._tab_surfaces[target]
@@ -980,10 +981,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_slider_target_summary(target, bundle.slider_binding.resolve_target_set_ids())
             self._refresh_symbolic_calculator(target)
         finally:
-            try:
-                self._render_results_for_tab(target)
-            finally:
-                self._refresh_project_state()
+            self._refresh_project_state()
 
     def _refresh_application_plot_preferences(self) -> None:
         self._fit_session_owner.refresh_plot_preferences()
@@ -1215,15 +1213,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self._render_results_for_tab(target)
 
     @QtCore.Slot(str, object)
-    def _on_run_dispatched(self, tab_id: str, set_ids: object) -> None:
+    def _plot_sets(self, tab_id: str, set_ids: object) -> None:
+        """Add a Run's or a slider drag's sets to the plot."""
+
         target = str(tab_id)
         bundle = self._tab_surfaces.get(target)
         if bundle is None:
             return
         target_set_ids = tuple(str(set_id) for set_id in set_ids)
+        plotted = set(self._workspace_tab_registry.presentation(target).plot_set_ids)
         if not bundle.initial_actions.union_plot_membership(target_set_ids):
             return
-        self._render_results_for_tab(target)
+        # Only a newly plotted set that already has a result changes the plot;
+        # the others draw when their result arrives.
+        repository = self._repository_for_tab(target)
+        if any(
+            set_id not in plotted and repository.has_result(set_id)
+            for set_id in target_set_ids
+        ):
+            self._render_results_for_tab(target)
         self._refresh_project_state()
 
     def _repository_for_tab(self, tab_id: str) -> ResultRepository:
@@ -1277,6 +1285,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._workspace_tab_registry.tab_runtime(target).selected_run_set_ids = (
             ids[0],
         )
+        self._render_results_for_tab(target)
 
     def _publish_source_proposal(
         self,
@@ -1359,6 +1368,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_workspace_tab_structure()
         self._apply_persisted_plot_state(tab.tab_id)
         self._refresh_tab_controls(tab.tab_id)
+        self._render_results_for_tab(tab.tab_id)
 
     @QtCore.Slot()
     def _finish_focused_tab_input(self) -> None:
@@ -1381,6 +1391,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_workspace_tab_structure()
         self._apply_persisted_plot_state(tab.tab_id)
         self._refresh_tab_controls(tab.tab_id)
+        self._render_results_for_tab(tab.tab_id)
 
     @QtCore.Slot(object)
     def _reorder_tabs(self, tab_ids: tuple[str, ...]) -> None:
@@ -1806,9 +1817,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _discard_slider_draft(self, tab_id: str) -> None:
         """Reset or Discard one tab's Slider drafts and Slider-owned curves."""
 
-        target = str(tab_id)
-        self._tab_surfaces[target].slider_binding.discard_slider_draft()
-        self._render_results_for_tab(target)
+        self._tab_surfaces[str(tab_id)].slider_binding.discard_slider_draft()
 
     def _start_selected_run(self, tab_id: str | None = None) -> bool:
         if not self._mutation_input_admitted("Run"):
@@ -2184,6 +2193,7 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self._slider_apply_refreshing.discard(target)
         self._refresh_tab_controls(target, preserve_slider_editor_drafts=False)
+        self._render_results_for_tab(target)
         self.set_status_text("Slider values applied. The exact preview became the current results.")
         return True
 
@@ -4525,11 +4535,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_project_state()
             return
         target = str(tab_id)
-        if target not in self._tab_surfaces:
+        created = target not in self._tab_surfaces
+        if created:
             self._create_tab_surface(target)
             self._refresh_workspace_tab_structure()
             self._apply_persisted_plot_state(target)
         self._refresh_tab_controls(target)
+        if created:
+            # The origin tab's results redraw when its document is published.
+            self._render_results_for_tab(target)
 
     @QtCore.Slot()
     def _on_simulation_state_changed(self) -> None:
@@ -4633,10 +4647,10 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(int)
     def _resize_result_repositories(self, capacity: int) -> None:
         for tab in self._project_session.document.tabs:
+            # Trimming keeps current and reference results, so nothing redraws.
             self._repository_for_tab(tab.tab_id).resize_cache_capacity(
                 int(capacity)
             )
-            self._render_results_for_tab(tab.tab_id)
 
     def authorize_and_schedule_close(self) -> None:
         self._fence_shell_for_close()

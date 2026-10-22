@@ -3,7 +3,8 @@ Dynamic evaluator for the Algebra DSL.
 
 Current contract
 ----------------
-- Dynamic evaluation per time t.
+- Each statement compiles once into a Python function of the time point,
+  with the arithmetic, checks and refusals of the operations it contains.
 - [A] pulls series at time t; [A]_0 pulls initial concentration.
 - Builtins/helpers and protected symbols: see symbols.py and constants.py.
 - Error taxonomy uses the algebra error classes and codes defined in errors.py.
@@ -172,6 +173,235 @@ def _as_float(x: Any, *, stmt: LetStatement) -> float:
     return xf
 
 
+# ----------------------------- compiled statements ----------------------------
+
+# Compiled code by source; the source names its values as constants, so
+# statements of the same form share one code object.
+_CODE_CACHE: Dict[str, Any] = {}
+_INF = math.inf
+
+
+class _Compiler:
+    """Generate one statement as straight Python: operations in source order,
+    each with its checks and refusals, and only the selected side of a
+    condition calculated."""
+
+    def __init__(self, ev: _Evaluator, stmt: LetStatement, root: ExprNode | None = None,
+                 point: PreparedAlgebraStopEvaluator | None = None) -> None:
+        self.ev = ev
+        self.stmt = stmt
+        self.root = stmt.expr if root is None else root
+        self.point = point
+        self.lines: List[str] = []
+        self.g: Dict[str, Any] = {"math": math, "_INF": _INF}
+        self.n = 0
+
+    def const(self, obj: Any) -> str:
+        name = f"_c{len(self.g)}"
+        self.g[name] = obj
+        return name
+
+    def tmp(self) -> str:
+        self.n += 1
+        return f"v{self.n}"
+
+    def emit(self, line: str, ind: int) -> None:
+        self.lines.append("    " * ind + line)
+
+    def err(self, cls: type, message: str, **extra: Any) -> str:
+        stmt = self.stmt
+        def raise_() -> None:
+            raise cls(message, line=stmt.line, col=stmt.col, line_text=stmt.line_text, **extra)
+        return self.const(raise_)
+
+    def finite(self, v: str, ind: int, message: str = "The result is not a finite number.") -> None:
+        self.emit(f"if not (-_INF < {v} < _INF): {self.err(AlgebraNonFiniteError, message)}()", ind)
+
+    def as_float(self, v: str, kind: str, ind: int) -> str:
+        if kind == "b":
+            self.emit(f"{self.err(AlgebraBoolCastError, 'A true/false result cannot be used as a number.')}()", ind)
+            return v
+        if kind == "f":
+            self.finite(v, ind)
+            return v
+        r = self.tmp()
+        self.emit(f"{r} = {self.const(_as_float)}({v}, stmt={self.const(self.stmt)})", ind)
+        return r
+
+    def expr(self, node: ExprNode, ind: int) -> Tuple[str, str]:
+        point = self.point
+        if point is not None:
+            # A stop reads input-only subtrees as admitted and retained lets
+            # through its own quantities.
+            if id(node) in point.static_values:
+                value = point.static_values[id(node)]
+                r = self.tmp()
+                self.emit(f"{r} = {self.const(point.static_values)}[{self.const(id(node))}]", ind)
+                return r, ("b" if isinstance(value, bool) else "f")
+            if isinstance(node, IdentNode):
+                if node.name in point.statements:
+                    r = self.tmp()
+                    self.emit(f"{r} = q({node.name!r})", ind)
+                    return r, "f"
+                if node.name in point.runtime_names and node.name != "t":
+                    missing = self.err(AlgebraNameError, f"missing runtime symbol {node.name!r}")
+                    self.emit(f"if {node.name!r} not in rs: {missing}()", ind)
+        v, kind = self.unscaled(node, ind)
+        if node.unit_factor == 1.0:
+            return v, kind
+        x = self.as_float(v, kind, ind)
+        r = self.tmp()
+        self.emit(f"{r} = {x} * {node.unit_factor!r}", ind)
+        self.finite(r, ind)
+        return r, "f"
+
+    def unscaled(self, node: ExprNode, ind: int) -> Tuple[str, str]:
+        ev, stmt = self.ev, self.stmt
+        r = self.tmp()
+        if isinstance(node, NumberNode):
+            if ev.literal_reader is None:
+                return repr(float(node.value)), "f"
+            self.emit(f"{r} = {self.const(ev.literal_reader)}({self.const(node)})", ind)
+            return r, "a"
+        if isinstance(node, IdentNode) and self.point is not None:
+            name = node.name
+            if name == "t":
+                self.emit(f"{r} = float(tv)", ind)
+                return r, "f"
+            self.emit(f"if {name!r} in rs: {r} = float(rs[{name!r}])", ind)
+            self.emit(f"else: {r} = lk({name!r}, i, {self.const(stmt)})", ind)
+            return r, "f"
+        if isinstance(node, IdentNode):
+            name = node.name
+            if name in ev.scalars:
+                self.emit(f"{r} = float({self.const(ev.scalars)}[{name!r}])", ind)
+                return r, "f"
+            if name in ev.series:
+                self.emit(f"{r} = float({self.const(ev.series[name])}[i])", ind)
+                undefined = self.err(
+                    AlgebraUndefinedError, f"It depends on {name!r}, which is undefined wherever it is.",
+                    dependency=name)
+                self.emit(f"if {r} != {r}: {undefined}()", ind)
+                return r, "f"
+            if name == "t":
+                self.emit(f"{r} = float({self.const(ev.ctx.t)}[i])", ind)
+                return r, "f"
+            if name in ev.symbol_series:
+                self.emit(f"{r} = float({self.const(ev.symbol_series[name])}[i])", ind)
+                return r, "f"
+            self.emit(f"{r} = {self.const(ev._lookup)}({name!r}, i, {self.const(stmt)})", ind)
+            return r, "f"
+        if isinstance(node, SpeciesRefNode):
+            nm = node.name
+            if node.kind == "now" and self.point is not None:
+                unknown = self.err(AlgebraNameError, f'Unknown species {nm!r}.')
+                if nm not in self.point.species_names:
+                    self.emit(f"{unknown}()", ind)
+                    return "0.0", "f"
+                self.emit(f"if y is None: {unknown}()", ind)
+                self.emit(f"{r} = float(y[{self.point.species_names.index(nm)}])", ind)
+                return r, "f"
+            if node.kind == "now":
+                if nm in ev.ctx.species_series:
+                    self.emit(f"{r} = float({self.const(ev.ctx.species_series[nm])}[i])", ind)
+                    return r, "f"
+                self.emit(f"{self.err(AlgebraNameError, f'Unknown species {nm!r}.')}()", ind)
+                return "0.0", "f"
+            if node.kind == "init":
+                if nm not in ev.ctx.initials:
+                    self.emit(f"{self.err(AlgebraNameError, f'Unknown species {nm!r}.')}()", ind)
+                    return "0.0", "f"
+                self.emit(f"{r} = float({self.const(ev.ctx.initials)}[{nm!r}])", ind)
+                return r, "f"
+        if isinstance(node, UnaryNode):
+            v, kind = self.expr(node.rhs, ind)
+            if node.op == "!":
+                self.emit(f"{r} = not bool({v})", ind)
+                return r, "b"
+            x = self.as_float(v, kind, ind)
+            self.emit(f"{r} = {'+' if node.op == '+' else '-'}{x}", ind)
+            return r, "f"
+        if isinstance(node, BinaryNode):
+            if node.op in ("||", "&&"):
+                lv, _ = self.expr(node.lhs, ind)
+                if node.op == "||":
+                    self.emit(f"if bool({lv}): {r} = True", ind)
+                else:
+                    self.emit(f"if not bool({lv}): {r} = False", ind)
+                self.emit("else:", ind)
+                rv, _ = self.expr(node.rhs, ind + 1)
+                self.emit(f"{r} = bool({rv})", ind + 1)
+                return r, "b"
+            lv = self.as_float(*self.expr(node.lhs, ind), ind)
+            rv = self.as_float(*self.expr(node.rhs, ind), ind)
+            op = node.op
+            if op in ("+", "-", "*"):
+                self.emit(f"{r} = {lv} {op} {rv}", ind)
+                self.finite(r, ind)
+                return r, "f"
+            if op == "/":
+                self.emit(f"if {rv} == 0.0: {self.err(AlgebraZeroDivError, 'Division by zero.')}()", ind)
+                self.emit(f"{r} = {lv} / {rv}", ind)
+                self.finite(r, ind)
+                return r, "f"
+            if op in ("**", "^"):
+                self.emit("try:", ind)
+                self.emit(f"{r} = math.pow({lv}, {rv})", ind + 1)
+                self.emit("except ValueError:", ind)
+                self.emit(f"{self.err(AlgebraDomainError, '^ ' + POWER_DOMAIN)}()", ind + 1)
+                self.emit("except OverflowError:", ind)
+                self.emit(f"{self.err(AlgebraNonFiniteError, 'The result is not a finite number.')}()", ind + 1)
+                self.finite(r, ind)
+                return r, "f"
+            if op in ("==", "!=", "<", "<=", ">", ">="):
+                self.emit(f"{r} = {lv} {op} {rv}", ind)
+                return r, "b"
+        if isinstance(node, CallNode):
+            fn = ev.ctx.symtab.functions().get(node.name)
+            if fn is None:
+                self.emit(f"{self.err(AlgebraNameError, f'Unknown function {node.name!r}.')}()", ind)
+                return "0.0", "f"
+            if node.name == "ifelse":
+                c, _ = self.expr(node.args[0], ind)
+                self.emit(f"if bool({c}):", ind)
+                a = self.as_float(*self.expr(node.args[1], ind + 1), ind + 1)
+                self.emit(f"{r} = {a}", ind + 1)
+                self.emit("else:", ind)
+                b = self.as_float(*self.expr(node.args[2], ind + 1), ind + 1)
+                self.emit(f"{r} = {b}", ind + 1)
+                return r, "f"
+            args = [self.as_float(*self.expr(a, ind), ind) for a in node.args]
+            message = "The function result is not a finite number."
+            self.emit("try:", ind)
+            self.emit(f"{r} = float({self.const(fn)}({', '.join(args)}))", ind + 1)
+            self.emit("except ZeroDivisionError:", ind)
+            self.emit(f"{self.err(AlgebraZeroDivError, 'Division by zero.')}()", ind + 1)
+            self.emit("except OverflowError:", ind)
+            self.emit(f"{self.err(AlgebraNonFiniteError, message)}()", ind + 1)
+            self.emit("except ValueError as e:", ind)
+            self.emit(f"{self.const(self._domain)}(e)", ind + 1)
+            self.finite(r, ind, message)
+            return r, "f"
+        self.emit(f"{self.err(AlgebraError, 'internal evaluator error', code='E150')}()", ind)
+        return "0.0", "f"
+
+    def _domain(self, e: ValueError) -> None:
+        stmt = self.stmt
+        raise AlgebraDomainError(str(e), line=stmt.line, col=stmt.col, line_text=stmt.line_text) from None
+
+    def build(self) -> Callable[[int], float | bool]:
+        v, _ = self.expr(self.root, 1)
+        # A stop's point reads the state, runtime symbols, retained lets, the
+        # time and the remaining names through its arguments.
+        signature = "def row(i, y, rs, q, tv, lk):" if self.point is not None else "def row(i):"
+        source = "\n".join((signature, *self.lines, f"    return {v}\n"))
+        code = _CODE_CACHE.get(source)
+        if code is None:
+            code = _CODE_CACHE[source] = compile(source, "<algebra>", "exec")
+        exec(code, self.g)
+        return self.g["row"]
+
+
 # ----------------------------- evaluator core --------------------------------
 
 
@@ -188,9 +418,13 @@ def bind_scalar_expression_evaluator(
     )
     evaluator = _Evaluator(block, context, literal_reader=literal_reader)
     evaluator.symbol_values = values
+    rows: Dict[int, Callable[[int], float | bool]] = {}
 
     def evaluate(statement: LetStatement) -> float:
-        return _as_float(evaluator._eval_expr(statement.expr, 0, stmt=statement), stmt=statement)
+        row = rows.get(id(statement))
+        if row is None:
+            row = rows[id(statement)] = _Compiler(evaluator, statement).build()
+        return _as_float(row(0), stmt=statement)
 
     return evaluate
 
@@ -262,6 +496,25 @@ class _Evaluator:
             let_dynamic(str(name))
         return {name for name, dynamic in state.items() if not dynamic}
 
+    def _lookup(self, name: str, i: int, stmt: LetStatement) -> float:
+        if name in self.symbol_values:
+            return float(self.symbol_values[name])
+        if self.ctx.symbol_resolver is not None:
+            resolved = self.ctx.symbol_resolver(name, i)
+            if resolved is not None:
+                value = float(resolved)
+                if name not in self.ctx.runtime_symbol_names:
+                    self.symbol_values[name] = value
+                return value
+        if self.ctx.symtab.has(name):
+            return float(self.ctx.symtab.get(name))
+        if name in self.failed:
+            raise AlgebraUndefinedError(
+                f"It depends on {name!r}, which could not be calculated.",
+                dependency=name, line=stmt.line, col=stmt.col, line_text=stmt.line_text,
+            )
+        raise AlgebraNameError(f"Unknown name {name!r}.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+
     # Public entry
     def run(self) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
         scalar_names = self._scalar_let_names()
@@ -275,15 +528,16 @@ class _Evaluator:
             if not is_dyn:
                 # Evaluate scalar lets through the typed evaluator, including
                 # transitive constants and immediate binary/domain failures.
-                val = _as_float(self._eval_expr(stmt.expr, 0, stmt=stmt), stmt=stmt)
+                val = _as_float(_Compiler(self, stmt).build()(0), stmt=stmt)
                 self.scalars[name] = val
             else:
                 # Compute series across t
+                row = _Compiler(self, stmt).build()
                 arr = np.empty(self.N, dtype=float)
                 for i in range(self.N):
                     if i % 256 == 0:
                         self.ctx.check_cancelled()
-                    arr[i] = _as_float(self._eval_expr(stmt.expr, i, stmt=stmt), stmt=stmt)
+                    arr[i] = _as_float(row(i), stmt=stmt)
                 self.series[name] = arr
 
         self.ctx.check_cancelled()
@@ -313,10 +567,11 @@ class _Evaluator:
                     self.timevary.add(name)
 
                 if not is_dyn:
-                    val = _as_float(self._eval_expr(stmt.expr, 0, stmt=stmt), stmt=stmt)
+                    val = _as_float(_Compiler(self, stmt).build()(0), stmt=stmt)
                     self.scalars[name] = val
                     continue
 
+                row = _Compiler(self, stmt).build()
                 arr = np.empty(self.N, dtype=float)
                 # Keyed by whether the point is undefined only through another let.
                 firsts: dict[bool, tuple[int, KindredError]] = {}
@@ -326,7 +581,7 @@ class _Evaluator:
                     if i % 256 == 0:
                         self.ctx.check_cancelled()
                     try:
-                        arr[i] = _as_float(self._eval_expr(stmt.expr, i, stmt=stmt), stmt=stmt)
+                        arr[i] = _as_float(row(i), stmt=stmt)
                     except _UNDEFINED_POINT_ERRORS as exc:
                         arr[i] = np.nan
                         inherited = isinstance(exc, AlgebraUndefinedError)
@@ -364,199 +619,6 @@ class _Evaluator:
         self.ctx.check_cancelled()
         return self.series, self.scalars, errors
 
-    # Eval
-    def _eval_expr(self, node: ExprNode, i: int, *, stmt: LetStatement) -> float | bool:
-        value = self._eval_unscaled_expr(node, i, stmt=stmt)
-        if node.unit_factor == 1.0:
-            return value
-        return _as_float(_as_float(value, stmt=stmt) * node.unit_factor, stmt=stmt)
-
-    def _eval_unscaled_expr(self, node: ExprNode, i: int, *, stmt: LetStatement) -> float | bool:
-        # Number
-        if isinstance(node, NumberNode):
-            return float(node.value) if self.literal_reader is None else self.literal_reader(node)
-
-        # Identifier: may be scalar from symtab or user-defined scalar/series
-        if isinstance(node, IdentNode):
-            name = node.name
-            # user-defined scalar
-            if name in self.scalars:
-                return float(self.scalars[name])
-            # user-defined series
-            if name in self.series:
-                value = float(self.series[name][i])
-                if math.isnan(value):
-                    raise AlgebraUndefinedError(
-                        f"It depends on {name!r}, which is undefined wherever it is.",
-                        dependency=name, line=stmt.line, col=stmt.col, line_text=stmt.line_text,
-                    )
-                return value
-            if name == "t":
-                return float(self.ctx.t[i])
-            # Accepted runtime context takes precedence over the static table,
-            # allowing T, t, coefficients, and changing scalar inputs to vary
-            # independently at each result row.
-            if name in self.symbol_series:
-                return float(self.symbol_series[name][i])
-            if name in self.symbol_values:
-                return float(self.symbol_values[name])
-            if self.ctx.symbol_resolver is not None:
-                # Asked at the point that reads it, so a value undefined at
-                # some points fails only there.
-                resolved = self.ctx.symbol_resolver(name, i)
-                if resolved is not None:
-                    value = float(resolved)
-                    if name not in self.ctx.runtime_symbol_names:
-                        self.symbol_values[name] = value
-                    return value
-            # protected symbol in symtab
-            if self.ctx.symtab.has(name):
-                return float(self.ctx.symtab.get(name))
-            if name in self.failed:
-                # Undefined at every point, so a let reading it is undefined
-                # only where it reads it.
-                raise AlgebraUndefinedError(
-                    f"It depends on {name!r}, which could not be calculated.",
-                    dependency=name, line=stmt.line, col=stmt.col, line_text=stmt.line_text,
-                )
-            # unknown
-            raise AlgebraNameError(f"Unknown name {name!r}.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-
-        # Species references
-        if isinstance(node, SpeciesRefNode):
-            nm = node.name
-            if node.kind == "now":
-                try:
-                    return float(self.ctx.species_series[nm][i])
-                except KeyError:
-                    raise AlgebraNameError(f"Unknown species {nm!r}.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-            if node.kind == "init":
-                if nm not in self.ctx.initials:
-                    raise AlgebraNameError(f"Unknown species {nm!r}.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-                return float(self.ctx.initials[nm])
-        # Unary
-        if isinstance(node, UnaryNode):
-            v = self._eval_expr(node.rhs, i, stmt=stmt)
-            if node.op == "!":
-                return not bool(v)
-            # numeric
-            x = _as_float(v, stmt=stmt)
-            return +x if node.op == "+" else -x
-
-        # Binary
-        if isinstance(node, BinaryNode):
-            # Short-circuit logicals
-            if node.op == "||":
-                lhsb = bool(self._eval_expr(node.lhs, i, stmt=stmt))
-                if lhsb:
-                    return True
-                return bool(self._eval_expr(node.rhs, i, stmt=stmt))
-            if node.op == "&&":
-                lhsb = bool(self._eval_expr(node.lhs, i, stmt=stmt))
-                if not lhsb:
-                    return False
-                return bool(self._eval_expr(node.rhs, i, stmt=stmt))
-
-            # Numeric ops
-            lv = _as_float(self._eval_expr(node.lhs, i, stmt=stmt), stmt=stmt)
-            rv = _as_float(self._eval_expr(node.rhs, i, stmt=stmt), stmt=stmt)
-            op = node.op
-            if op == "+":
-                return _as_float(lv + rv, stmt=stmt)
-            if op == "-":
-                return _as_float(lv - rv, stmt=stmt)
-            if op == "*":
-                return _as_float(lv * rv, stmt=stmt)
-            if op == "/":
-                if rv == 0.0:
-                    raise AlgebraZeroDivError("Division by zero.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-                return _as_float(lv / rv, stmt=stmt)
-            if op in ("**", "^"):
-                try:
-                    return _as_float(math.pow(lv, rv), stmt=stmt)
-                except ValueError:
-                    raise AlgebraDomainError("^ " + POWER_DOMAIN, line=stmt.line, col=stmt.col,
-                                             line_text=stmt.line_text) from None
-                except OverflowError:
-                    raise AlgebraNonFiniteError("The result is not a finite number.", line=stmt.line,
-                                                col=stmt.col, line_text=stmt.line_text) from None
-            if op == "==":
-                return lv == rv
-            if op == "!=":
-                return lv != rv
-            if op == "<":
-                return lv < rv
-            if op == "<=":
-                return lv <= rv
-            if op == ">":
-                return lv > rv
-            if op == ">=":
-                return lv >= rv
-
-        # Call
-        if isinstance(node, CallNode):
-            fn = self.ctx.symtab.functions().get(node.name)
-            if fn is None:
-                raise AlgebraNameError(f"Unknown function {node.name!r}.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-            if node.name == "ifelse":
-                # Only the selected value is calculated, as && and || calculate
-                # only what decides them.
-                selected = node.args[1] if bool(self._eval_expr(node.args[0], i, stmt=stmt)) else node.args[2]
-                return _as_float(self._eval_expr(selected, i, stmt=stmt), stmt=stmt)
-            args: List[Any] = [_as_float(self._eval_expr(a, i, stmt=stmt), stmt=stmt) for a in node.args]
-            try:
-                out = float(fn(*args))
-            except ZeroDivisionError:
-                raise AlgebraZeroDivError("Division by zero.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-            except OverflowError:
-                raise AlgebraNonFiniteError("The function result is not a finite number.", line=stmt.line, col=stmt.col,
-                                            line_text=stmt.line_text) from None
-            except ValueError as e:
-                # e.g., sqrt of negative
-                raise AlgebraDomainError(str(e), line=stmt.line, col=stmt.col, line_text=stmt.line_text) from None
-            if not math.isfinite(out):
-                raise AlgebraNonFiniteError("The function result is not a finite number.", line=stmt.line, col=stmt.col,
-                                            line_text=stmt.line_text)
-            return out
-
-        # Should not reach here
-        raise AlgebraError("internal evaluator error", code="E150", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-
-
-class _PointEvaluator(_Evaluator):
-    """Resolve retained dependencies while sharing the ordinary arithmetic."""
-
-    def __init__(self, prepared: PreparedAlgebraStopEvaluator, ctx: EvaluationContext):
-        super().__init__(prepared.block, ctx)
-        self.prepared = prepared
-
-    def quantity(self, name: str) -> float:
-        if name not in self.scalars:
-            stmt = self.prepared.statements[name]
-            # A refusal is the failing statement's sentence, on its line; the
-            # stopping declaration that watches the quantity names it.
-            self.scalars[name] = _as_float(
-                self._eval_expr(stmt.expr, 0, stmt=stmt), stmt=stmt
-            )
-        return self.scalars[name]
-
-    def _eval_expr(self, node: ExprNode, i: int, *, stmt: LetStatement) -> float | bool:
-        if id(node) in self.prepared.static_values:
-            return self.prepared.static_values[id(node)]
-        if isinstance(node, IdentNode):
-            if node.name in self.prepared.statements:
-                return self.quantity(node.name)
-            if (
-                node.name in self.prepared.runtime_names
-                and node.name != "t"
-                and node.name not in self.symbol_series
-            ):
-                raise AlgebraNameError(
-                    f"missing runtime symbol {node.name!r}",
-                    line=stmt.line, col=stmt.col, line_text=stmt.line_text,
-                )
-        return super()._eval_expr(node, i, stmt=stmt)
-
 
 class PreparedAlgebraStopEvaluator:
     """One run's selected retained LET targets and input-only subtree values.
@@ -589,14 +651,29 @@ class PreparedAlgebraStopEvaluator:
             symtab=SymbolTable(),
             symbol_resolver=symbol_resolver,
         )
-        self._static_evaluator = _PointEvaluator(self, self._context)
+        self._static_evaluator = _Evaluator(block, self._context)
+        self._lookup = _Evaluator(block, EvaluationContext(
+            t=np.array([0.0]), species_series={}, initials=self._context.initials, symtab=self._context.symtab,
+        ))._lookup
+        self._rows: Dict[str, Callable[..., float | bool]] = {}
+
+    def _static_quantity(self, name: str) -> float:
+        scalars = self._static_evaluator.scalars
+        if name not in scalars:
+            stmt = self.statements[name]
+            row = _Compiler(self._static_evaluator, stmt, point=self).build()
+            scalars[name] = _as_float(
+                row(0, None, {}, self._static_quantity, 0.0, self._static_evaluator._lookup), stmt=stmt
+            )
+        return scalars[name]
 
     def admit(self, name: str) -> None:
         """Admit one stop target; its stopping declaration names it in a refusal."""
         stmt = self.statements[name]
+        self._rows.clear()
         self._admit(stmt.expr, stmt, self._static_evaluator)
         if not self._is_dynamic(stmt.expr):
-            self._static_evaluator.quantity(name)
+            self._static_quantity(name)
 
     def _is_dynamic(self, node: ExprNode) -> bool:
         key = id(node)
@@ -620,14 +697,15 @@ class PreparedAlgebraStopEvaluator:
             self._dynamic[key] = dynamic
         return self._dynamic[key]
 
-    def _static_value(self, node: ExprNode, stmt: LetStatement, evaluator: _PointEvaluator) -> float | bool:
+    def _static_value(self, node: ExprNode, stmt: LetStatement, evaluator: _Evaluator) -> float | bool:
         key = id(node)
         if key not in self.static_values:
-            value = evaluator._eval_expr(node, 0, stmt=stmt)
+            row = _Compiler(evaluator, stmt, node, point=self).build()
+            value = row(0, None, {}, self._static_quantity, 0.0, evaluator._lookup)
             self.static_values[key] = value if isinstance(value, bool) else _as_float(value, stmt=stmt)
         return self.static_values[key]
 
-    def _safe_denominator(self, node: ExprNode, stmt: LetStatement, evaluator: _PointEvaluator) -> bool:
+    def _safe_denominator(self, node: ExprNode, stmt: LetStatement, evaluator: _Evaluator) -> bool:
         if not self._is_dynamic(node):
             # A fixed denominator of zero is a value that cannot be calculated,
             # not a form a stop cannot watch.
@@ -644,7 +722,7 @@ class PreparedAlgebraStopEvaluator:
                 return value > 0.0 if node.name == "max" else value < 0.0
         return False
 
-    def _admit(self, node: ExprNode, stmt: LetStatement, evaluator: _PointEvaluator) -> None:
+    def _admit(self, node: ExprNode, stmt: LetStatement, evaluator: _Evaluator) -> None:
         if id(node) in self._admitted:
             return
         if not self._is_dynamic(node):
@@ -701,15 +779,19 @@ class PreparedAlgebraStopEvaluator:
         self, name: str, t: float, y: np.ndarray, runtime_symbols: Mapping[str, float]
     ) -> float:
         """Evaluate one selected quantity without changing caller-owned inputs."""
-        ctx = EvaluationContext(
-            t=np.array([t]),
-            species_series={species: np.array([y[index]]) for index, species in enumerate(self.species_names)},
-            initials=self._context.initials,
-            symtab=self._context.symtab,
-            symbol_series=runtime_symbols,
-        )
+        memo: Dict[str, float] = {}
+
+        def q(target: str) -> float:
+            if target not in memo:
+                row = self._rows.get(target)
+                stmt = self.statements[target]
+                if row is None:
+                    row = self._rows[target] = _Compiler(self._static_evaluator, stmt, point=self).build()
+                memo[target] = _as_float(row(0, y, runtime_symbols, q, t, self._lookup), stmt=stmt)
+            return memo[target]
+
         # The stopping declaration that watches the quantity names it.
-        return _PointEvaluator(self, ctx).quantity(name)
+        return q(name)
 
 
 # ----------------------------- public API ------------------------------------
