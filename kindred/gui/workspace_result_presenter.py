@@ -19,11 +19,13 @@ from kindred.core.quantity_units import (
 import io
 import csv
 import json
+import math
 import unicodedata
 from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
+from itertools import zip_longest
 from types import MappingProxyType
-from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
+from typing import BinaryIO, Callable, Iterable, Iterator, Mapping, Sequence
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import numpy as np
@@ -182,8 +184,8 @@ def _json_safe(value: object) -> object:
     return str(value)
 
 
-def encode_tsv_row(values: Sequence[object]) -> str:
-    """Encode one RFC-style quoted tab-separated row with a final newline."""
+def _encode_tsv_rows(rows: Iterable[Sequence[object]]) -> str:
+    """Encode RFC-style quoted tab-separated rows, each with a final newline."""
 
     output = io.StringIO(newline="")
     writer = csv.writer(
@@ -192,8 +194,32 @@ def encode_tsv_row(values: Sequence[object]) -> str:
         lineterminator="\n",
         quoting=csv.QUOTE_ALL,
     )
-    writer.writerow(tuple("" if value is None else str(value) for value in values))
+    writer.writerows(
+        tuple("" if value is None else str(value) for value in values)
+        for values in rows
+    )
     return output.getvalue()
+
+
+def encode_tsv_row(values: Sequence[object]) -> str:
+    """Encode one RFC-style quoted tab-separated row with a final newline."""
+
+    return _encode_tsv_rows((values,))
+
+
+def _tsv_column_text(values: Sequence[object], kind: str) -> list[str]:
+    """One copied column as cell text; a missing value is blank."""
+
+    items = values.tolist() if isinstance(values, np.ndarray) else values
+    if kind == "float":
+        # An undefined calculated value stays blank.
+        return [
+            "" if value is None or not math.isfinite(value) else repr(float(value))
+            for value in items
+        ]
+    if kind == "int":
+        return ["" if value is None else str(int(value)) for value in items]
+    return ["" if value is None else encode_clipboard_text(str(value)) for value in items]
 
 
 def encode_clipboard_text(value: str) -> str:
@@ -303,7 +329,6 @@ class ResultDataBlock:
     x_axis: AxisSeriesSelection
     result: SimulationResultValue | None
     segment_ids: np.ndarray | None
-    segment_keys: tuple[str, ...] | None
     discontinuity_ids: np.ndarray | None
     source_row: np.ndarray | None
     x_name: str = "t"
@@ -511,7 +536,7 @@ def _result_block(
         presentation_units=result.presentation_units,
         series=series, series_axes=series_axes,
         x_axis=SimulationSeriesAxisSelection("t"), result=result,
-        segment_ids=result.segment_ids, segment_keys=result.segment_keys,
+        segment_ids=result.segment_ids,
         discontinuity_ids=result.discontinuity_ids, source_row=None,
         color_by_series=(
             tuple(
@@ -537,7 +562,7 @@ def _volume_block(block: ResultDataBlock) -> ResultDataBlock | None:
         block, t=result.t[first:], sample_time=result.t[first:],
         series=((name, result.volume.values),),
         series_axes=((name, VesselVolumeAxisSelection()),),
-        segment_ids=result.segment_ids[first:], segment_keys=result.segment_keys[first:], discontinuity_ids=result.discontinuity_ids[first:],
+        segment_ids=result.segment_ids[first:], discontinuity_ids=result.discontinuity_ids[first:],
         first_index=first, color_by_series=((name, VESSEL_VOLUME_COLOR),),
         quantity_units=(("t", SECOND), (name, CUBIC_METRE)),
         presentation_units=((name, dict(result.presentation_units)[name]),),
@@ -633,7 +658,6 @@ def compose_canonical_export_blocks(
                     x_axis=SimulationSeriesAxisSelection("t"),
                     result=None,
                     segment_ids=None,
-                    segment_keys=None,
                     discontinuity_ids=None,
                     source_row=source_rows,
                     series_provenance=(
@@ -673,7 +697,7 @@ def _data_block(
         series=selected,
         series_axes=tuple((name, selection) for name, selection in block.series_axes if name in names),
         x_axis=x_axis, x_name=x_name, first_index=first,
-        segment_ids=block.result.segment_ids[first:], segment_keys=block.result.segment_keys[first:],
+        segment_ids=block.result.segment_ids[first:],
         discontinuity_ids=block.result.discontinuity_ids[first:],
         quantity_units=block.result.quantity_units,
         color_by_series=tuple((name, color) for name, color in block.color_by_series if name in names),
@@ -844,7 +868,7 @@ def _planned_xlsx_worksheet_dimensions(
     dimensions: list[tuple[str, int, int]] = []
     for block in blocks:
         title = _worksheet_title(block.label, used)
-        identity_column_count = int(block.t.size > 0) + (1 if block.kind is ResultLayerKind.EXPERIMENTAL else 3)
+        identity_column_count = int(block.t.size > 0) + (1 if block.kind is ResultLayerKind.EXPERIMENTAL else 2)
         dimensions.append(
             (
                 title,
@@ -1251,7 +1275,6 @@ def compose_result_input(
                 x_axis=x_axis,
                 result=None,
                 segment_ids=None,
-                segment_keys=None,
                 discontinuity_ids=None,
                 source_row=source_rows,
                 x_name=x_name,
@@ -1359,11 +1382,6 @@ def iter_blocks_tsv_chunks(
                         "int",
                     ),
                     (
-                        encode_clipboard_text(f"{block.label} — segment_key"),
-                        block.segment_keys,
-                        "text",
-                    ),
-                    (
                         encode_clipboard_text(f"{block.label} — discontinuity_id"),
                         block.discontinuity_ids,
                         "int",
@@ -1402,29 +1420,13 @@ def iter_blocks_tsv_chunks(
             f"({_MAX_COPY_CHARACTERS // (1024 * 1024)} MiB)."
         )
     yield header
+    texts = [_tsv_column_text(values, kind) for _header, values, kind in columns]
     for start in range(0, row_count, chunk_size):
-        output = io.StringIO()
-        for index in range(start, min(start + chunk_size, row_count)):
-            output.write(
-                encode_tsv_row(
-                    tuple(
-                        (
-                            # An undefined calculated value stays blank.
-                            (repr(float(values[index])) if np.isfinite(values[index]) else "")
-                            if kind == "float"
-                            else (
-                                str(int(values[index]))
-                                if kind == "int"
-                                else encode_clipboard_text(str(values[index]))
-                            )
-                        )
-                        if index < len(values) and values[index] is not None
-                        else ""
-                        for _header, values, kind in columns
-                    )
-                )
-            )
-        chunk = output.getvalue()
+        end = start + chunk_size
+        # A column shorter than the longest leaves its later cells blank.
+        chunk = _encode_tsv_rows(
+            zip_longest(*(text[start:end] for text in texts), fillvalue="")
+        )
         total_characters += len(chunk)
         if total_characters > _MAX_COPY_CHARACTERS:
             raise ValueError(
@@ -1484,7 +1486,6 @@ def write_xlsx(
             else:
                 identity_headers = [
                     "segment_id",
-                    "segment_key",
                     "discontinuity_id",
                 ]
             volume_columns = _boundary_export_columns(block.result)
@@ -1509,7 +1510,6 @@ def write_xlsx(
                 else:
                     identity_values = [
                         int(block.segment_ids[index]),
-                        block.segment_keys[index],
                         int(block.discontinuity_ids[index]),
                     ]
                 _append_xlsx_row(

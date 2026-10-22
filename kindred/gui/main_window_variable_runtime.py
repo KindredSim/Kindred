@@ -39,7 +39,6 @@ from kindred.gui.parameter_enumeration import (
     enumerate_parameter_coordinates,
 )
 from kindred.gui.widgets.batch_initial_conditions_table import (
-    BatchInitialConditionsTableView,
     resolve_live_slider_target_set_ids,
 )
 from kindred.gui.widgets.mechanism_editor import MechanismEditorTabbed
@@ -86,13 +85,13 @@ class TabSliderBinding(QtCore.QObject):
     targetSetIdsChanged = QtCore.Signal(object)
     errorRaised = QtCore.Signal(str)
     dragHeldChanged = QtCore.Signal()
+    plotSetsRequested = QtCore.Signal(object)
 
     def __init__(
         self,
         *,
         tab_id: str,
         registry,
-        table: BatchInitialConditionsTableView,
         variable_sliders,
         species_sliders,
         slider_workspace_owner: MechanismEditorTabbed,
@@ -102,7 +101,7 @@ class TabSliderBinding(QtCore.QObject):
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
-        self._tab_id, self._registry, self._table = tab_id, registry, table
+        self._tab_id, self._registry = tab_id, registry
         self._variable_sliders, self._species_sliders = (
             variable_sliders,
             species_sliders,
@@ -231,11 +230,10 @@ class TabSliderBinding(QtCore.QObject):
 
     def resolve_target_set_ids(self) -> tuple[str, ...]:
         tab = self._registry.tab(self._tab_id)
+        presentation = self._registry.presentation(self._tab_id)
         return resolve_live_slider_target_set_ids(
-            table=self._table,
-            pinned_set_ids=self._registry.presentation(
-                self._tab_id
-            ).pinned_slider_set_ids,
+            current_set_id=presentation.current_set_id,
+            pinned_set_ids=presentation.pinned_slider_set_ids,
             existing_set_ids=(item.set_id for item in tab.initial_condition_sets),
         )
 
@@ -570,6 +568,9 @@ class TabSliderBinding(QtCore.QObject):
     ) -> bool:
         self._stop_preview_timers()
         if interaction is SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
+            # A dragged set is plotted, as Run plots its sets, so its first
+            # drag Preview shows even before any Run.
+            self.plotSetsRequested.emit(targets)
             return self._simulation_jobs.request_interactive_preview(
                 self.capture_interactive_preview(targets, tab=tab)
             )

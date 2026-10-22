@@ -246,8 +246,6 @@ def _execute_scipy(
         if hasattr(event, "direction"):
             _wrapped_event.direction = getattr(event, "direction")  # type: ignore[attr-defined]
         events_list.append(_wrapped_event)
-    if req.cancellation_control is not None:
-        events_list.append(_cancellation_event(req.cancellation_control))
     # SciPy evaluates every event at each accepted step (root searches stay
     # inside that step), so the largest observed time is the last accepted
     # solver time; a failed step returns before events are evaluated.
@@ -513,19 +511,6 @@ def _run_scipy_segment(request: SegmentExecutionRequest) -> SegmentRunResult:
         boundary_terminal_flags=request.boundary_terminal_flags,
         volume=request.volume,
     )
-
-
-def _cancellation_event(
-    control: _SimulationCancellationControl,
-) -> Callable[[float, np.ndarray], float]:
-    """Create the solver-owned event used only for secondary early stop."""
-
-    def event(_time: float, _state: np.ndarray) -> float:
-        return -1.0 if control.cancel_requested() else 1.0
-
-    event.terminal = True  # type: ignore[attr-defined]
-    event.direction = -1.0  # type: ignore[attr-defined]
-    return event
 
 
 def _normal_event_provenance(

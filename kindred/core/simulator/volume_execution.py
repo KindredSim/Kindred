@@ -144,16 +144,19 @@ class VolumeExecution:
         if self.initial_time is None:
             return None
         first = int(np.searchsorted(times, self.initial_time))
-        values = np.empty(len(times) - first)
-        segment_index = 0
-        for index, time in enumerate(times[first:]):
-            if time in self.rows:
-                values[index] = self.rows[time]
-                continue
-            while segment_index < len(self.segments) and self.segments[segment_index][1] < time:
-                segment_index += 1
-            start, end, dense = self.segments[segment_index]
-            if not start <= time <= end:
+        times = times[first:]
+        values = np.empty(len(times))
+        recorded = np.isin(times, tuple(self.rows))
+        for index in np.flatnonzero(recorded):
+            values[index] = self.rows[times[index]]
+        # Every other sample comes from the segment that executed it, all of a
+        # segment's samples in one call.
+        pending = np.flatnonzero(~recorded)
+        owners = np.searchsorted([end for _start, end, _dense in self.segments], times[pending])
+        segments, group_starts = np.unique(owners, return_index=True)
+        for owner, indices in zip(segments, np.split(pending, group_starts[1:])):
+            start, _end, dense = self.segments[owner]
+            if times[indices[0]] < start:
                 raise ValueError("Volume samples must belong to an executed segment.")
-            values[index] = dense(time)[-1]
+            values[indices] = dense(times[indices])[-1]
         return VolumeTrajectory(first, values)

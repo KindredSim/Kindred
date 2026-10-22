@@ -16,7 +16,7 @@ from kindred.core.simulator.solver_types import SimulationCancellationControl
 from kindred.core.units import UnitsModel
 from kindred.io.paths import file_error_text
 from kindred.scan.config import START, END, ScanProgress
-from kindred.scan.json_export import JsonScanWriter, input_record, result_record
+from kindred.scan.json_export import JsonScanWriter, encode_record, input_record, result_record
 from kindred.scan.sampling import PreparedScanDesign
 
 # Windows waits on at most 63 handles at once, and the supervisor waits on one
@@ -70,7 +70,11 @@ def _worker(config, connection, cancel):
                 continue
             connection.send(("started", run.run_id))
             record = execute_input(config, prepared, solver, run, control)
-            connection.send(("result", record))
+            # The worker encodes its record; the supervisor's bookkeeping reads
+            # only the outcome fields.
+            outcome = {key: record[key] for key in ("run_id", "simulation_status", "export_status",
+                                                    "error", "missing_outputs") if key in record}
+            connection.send(("result", (outcome, encode_record(record))))
     except (EOFError, BrokenPipeError):
         return
     finally:
@@ -145,7 +149,7 @@ def run_scan(config, prepared, cancel, progress_callback):
             child.stopping = True
         child.connection.send(child.run)
 
-    def consume(record):
+    def consume(record, encoded=None):
         nonlocal writing
         state = record["simulation_status"]
         setattr(progress, state, getattr(progress, state) + 1)
@@ -158,7 +162,7 @@ def run_scan(config, prepared, cancel, progress_callback):
             progress.latest_failure = f"Run {record['run_id']} — unavailable exported outputs: {', '.join(record['missing_outputs'])}"
         if writing:
             try:
-                writer.write(record)
+                writer.write(encode_record(record) if encoded is None else encoded)
                 progress.saved += 1
             except Exception as exc:
                 writing = False
@@ -218,7 +222,7 @@ def run_scan(config, prepared, cancel, progress_callback):
                             progress.attempted += 1
                             progress.running += 1
                         elif kind == "result":
-                            consume(payload)
+                            consume(*payload)
                             dispatch(child)
                         elif kind == "not_started":
                             dispatch(child)
@@ -274,7 +278,7 @@ def run_scan(config, prepared, cancel, progress_callback):
                                 progress.attempted += 1
                                 progress.running += 1
                             elif kind == "result":
-                                consume(payload)
+                                consume(*payload)
                                 child.run = None
                                 child.started = False
                         except (EOFError, OSError):

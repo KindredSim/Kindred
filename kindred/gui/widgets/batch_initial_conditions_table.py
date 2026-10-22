@@ -627,26 +627,20 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
 
 def resolve_live_slider_target_set_ids(
     *,
-    table: BatchInitialConditionsTableView,
+    current_set_id: str | None,
     pinned_set_ids: Iterable[str],
     existing_set_ids: Iterable[str],
 ) -> tuple[str, ...]:
-    """Resolve the current row followed by stable valid Slider pins.
+    """Resolve the accepted current set followed by stable valid Slider pins.
 
-    The current row remains the deterministic primary target even when pins
-    exist.  Pinned rows are then appended in authored presentation order,
-    with invalid and duplicate identities discarded at this boundary.
+    The current set remains the deterministic primary target even when pins
+    exist, whether or not the table has drawn it yet.  Pinned rows are then
+    appended in authored presentation order, with invalid and duplicate
+    identities discarded at this boundary.
     """
 
     existing = {str(set_id) for set_id in existing_set_ids}
-    current: tuple[str, ...] = ()
-    model = table.model()
-    if isinstance(model, BatchInitialConditionsTableModel):
-        index = table.currentIndex()
-        if index.isValid() and index.model() is model:
-            set_id = model.set_id_for_live_index(index)
-            if set_id in existing:
-                current = (set_id,)
+    current = (current_set_id,) if current_set_id in existing else ()
     pinned = tuple(
         set_id
         for set_id in dict.fromkeys(str(item) for item in pinned_set_ids)

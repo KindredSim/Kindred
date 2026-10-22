@@ -142,7 +142,6 @@ class FinalSimulationOutput:
     """One fully composed execution with direct identity for every row."""
 
     segment_ids: np.ndarray
-    segment_keys: tuple[str, ...]
     discontinuity_ids: np.ndarray
     t: np.ndarray
     Y: np.ndarray
@@ -165,5 +164,4 @@ class FinalSimulationOutput:
         # these rows.  This carrier only freezes the owned buffers.
         for name in ("t", "Y", "temperature_K", "segment_ids", "discontinuity_ids"):
             getattr(self, name).setflags(write=False)
-        object.__setattr__(self, "segment_keys", tuple(self.segment_keys))
         object.__setattr__(self, "presentation_boundaries", tuple(self.presentation_boundaries))

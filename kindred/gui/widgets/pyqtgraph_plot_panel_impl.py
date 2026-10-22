@@ -976,8 +976,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._render_analysis(render_input)
         axis_range = self._axis_range
         self._axis_toolbar.set_manual_ranges(axis_range.x_min, axis_range.x_max, axis_range.y_min, axis_range.y_max)
-        self._apply_plot_presentation(presentation, axis_range=axis_range)
+        # Annotations are items too, so they are placed before auto-range returns.
         self._render_annotations(render_input, presentation)
+        self._apply_plot_presentation(presentation, axis_range=axis_range)
         self._project_completion_warning(render_input)
         self._rendered_point_roster = tuple(rendered_points)
         self._sync_plot_controls()
@@ -1506,18 +1507,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         count = int(block.t.size)
         if count == 1:
             return np.asarray((0,), dtype=int)
-        changes = np.fromiter(
-            (
-                index
-                for index in range(1, count)
-                if (
-                    int(block.segment_ids[index]) != int(block.segment_ids[index - 1])
-                    or block.segment_keys[index] != block.segment_keys[index - 1]
-                    or int(block.discontinuity_ids[index])
-                    != int(block.discontinuity_ids[index - 1])
-                )
-            ),
-            dtype=int,
+        segment_ids, discontinuity_ids = block.segment_ids, block.discontinuity_ids
+        changes = 1 + np.flatnonzero(
+            (segment_ids[1:] != segment_ids[:-1])
+            | (discontinuity_ids[1:] != discontinuity_ids[:-1])
         )
         starts = np.concatenate((np.asarray((0,), dtype=int), changes))
         ends = np.concatenate((changes - 1, np.asarray((count - 1,), dtype=int)))

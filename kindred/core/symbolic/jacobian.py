@@ -449,11 +449,11 @@ def build_symbolic_equations_text(mechanism: Mechanism) -> SymbolicEquationsText
 
 
 def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianStructure:
-    sympy = require_sympy()
     model = _build_symbolic_mechanism_expression_model(
         mechanism,
         exact_stoichiometric_coefficients=False,
     )
+    sympy = require_sympy()
     parameter_sympy_symbols = tuple(
         sympy.Symbol(name)
         for name in model.parameter_symbols

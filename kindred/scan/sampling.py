@@ -9,7 +9,6 @@ import tempfile
 import warnings
 
 import numpy as np
-from scipy.stats import qmc
 
 from kindred.core.algebra.errors import AlgebraError
 
@@ -27,6 +26,9 @@ def unit_samples(count, keys, method, seed, directory, check):
             yield {}
         return
     if method == "sobol":
+        # Only Sobol sampling needs scipy.stats, which is slow to import.
+        from scipy.stats import qmc
+
         engine = qmc.Sobol(d=len(keys), scramble=True, seed=seed)
         remaining = count
         while remaining:

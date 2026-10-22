@@ -50,7 +50,9 @@ def result_record(run, result, outputs):
     for name in outputs:
         if name in result.series:
             # An undefined calculated value is null; JSON has no NaN.
-            data[name] = [value if math.isfinite(value) else None for value in result.series[name].tolist()]
+            values = result.series[name]
+            data[name] = (values.tolist() if np.isfinite(values).all()
+                          else [value if math.isfinite(value) else None for value in values.tolist()])
         elif name in result.scalars:
             scalars[name] = result.scalars[name]
         else:
@@ -59,7 +61,7 @@ def result_record(run, result, outputs):
         "simulation_status": "succeeded", "export_status": "failed" if missing else "succeeded",
         "missing_outputs": missing, "data": data, "scalars": scalars,
         "termination": plain(result.termination), "solver_provenance": plain(result.solver_provenance),
-        "segment_ids": result.segment_ids.tolist(), "segment_keys": list(result.segment_keys),
+        "segment_ids": result.segment_ids.tolist(),
         "discontinuity_ids": result.discontinuity_ids.tolist(),
         "parameters": plain(result.parameters),
         "output_units": {name: unit.symbol if unit is not None else None for name, unit in result.quantity_units if name == "t" or name in outputs},
@@ -73,6 +75,10 @@ def result_record(run, result, outputs):
             "values": result.volume.values.tolist(),
         }
     return record
+
+
+def encode_record(record):
+    return json.dumps(record, allow_nan=False, ensure_ascii=False, separators=(",", ":"))
 
 
 class JsonScanWriter:
@@ -91,17 +97,15 @@ class JsonScanWriter:
                     "scipy": scipy.__version__}
         spec = design.prepared.parameter_algebra_spec_for_execution()
         constraint_units = {s.name: presentation_unit(s.expr.quantity_unit, s.declared_unit) for s in spec.observable_block.lines}
-        header = {"schema_version": 7,
+        header = {"schema_version": 8,
                   "input_units": {item.key: item.unit for item in design.catalog},
                   "constraint_units": {c.observable: constraint_units[c.observable].symbol if constraint_units[c.observable] is not None else None for c in config.constraints}, "created_utc": datetime.now(timezone.utc).isoformat(),
                   "versions": versions, "configuration": asdict(config),
                   "effective_ranges": plain(design.effective_ranges),
                   "sampling_note": "Conditional interval sampling. Constrained physical coordinates are not guaranteed uniform or Latin-hypercube stratified."}
-        encoded = json.dumps(header, allow_nan=False, ensure_ascii=False, separators=(",", ":"))
-        self.stream.write(encoded[:-1] + ',"runs":[\n')
+        self.stream.write(encode_record(header)[:-1] + ',"runs":[\n')
 
-    def write(self, record):
-        encoded = json.dumps(record, allow_nan=False, ensure_ascii=False, separators=(",", ":"))
+    def write(self, encoded):
         self.stream.write(",\n" + encoded if self.count else encoded)
         self.stream.flush()
         self.count += 1

@@ -43,24 +43,30 @@ def physical_curve_chunks(result, x_axis, series_axes, indices):
         return ()
     boundaries = {float(b.time): b for b in result.presentation_boundaries}
     # Exact canonical row identity is owned by the solver, including transitions.
-    boundary_rows = {i for i, time in enumerate(result.t) if float(time) in boundaries}
-    transitions = {i for i in range(1, len(result.t)) if (
-        result.segment_ids[i] != result.segment_ids[i-1]
-        or result.discontinuity_ids[i] != result.discontinuity_ids[i-1]
-    )}
-    indices = sorted(set(map(int, indices)) | boundary_rows | transitions)
-    chunks, rows = [], []
+    boundary_rows = np.flatnonzero(np.isin(result.t, tuple(boundaries)))
+    transitions = 1 + np.flatnonzero(
+        (result.segment_ids[1:] != result.segment_ids[:-1])
+        | (result.discontinuity_ids[1:] != result.discontinuity_ids[:-1])
+    )
+    breaks = np.union1d(boundary_rows, transitions)
+    indices = np.union1d(np.fromiter(indices, dtype=np.int64), breaks)
+
+    def canonical(data):
+        column = np.full(indices.size, np.nan)
+        known = indices >= data[0]
+        column[known] = data[1][indices[known] - data[0]]
+        return column
+
+    matrix = np.column_stack((result.t[indices], canonical(x_data), *(canonical(data) for _, _, data in ys)))
+    chunks = []
 
     def emit(rows, instantaneous=False):
-        if rows:
-            matrix = np.asarray(rows, dtype=float)
+        if len(rows):
+            rows = np.array(rows, dtype=float)
             chunks.append(ProjectedCurveChunk(
-                matrix[:, 0], matrix[:, 1],
-                tuple((name, matrix[:, i+2]) for i, (name, _, _) in enumerate(ys)), instantaneous,
+                rows[:, 0], rows[:, 1],
+                tuple((name, rows[:, i+2]) for i, (name, _, _) in enumerate(ys)), instantaneous,
             ))
-
-    def canonical(data, index):
-        return np.nan if index < data[0] else data[1][index-data[0]]
 
     def endpoint(boundary, state, index):
         concentrations = dict(state.concentrations)
@@ -83,24 +89,21 @@ def physical_curve_chunks(result, x_axis, series_axes, indices):
             return np.nan
         return [boundary.time, value(x_axis), *(value(axis) for _, axis, _ in ys)]
 
-    for index in indices:
-        time = float(result.t[index])
-        boundary = boundaries.get(time)
-        row = [time, canonical(x_data, index), *(canonical(data, index) for _, _, data in ys)]
+    start = 0
+    for position in np.searchsorted(indices, breaks):
+        index = indices[position]
+        boundary = boundaries.get(float(result.t[index]))
         if boundary is not None:
             endpoints = [endpoint(boundary, state, index) for state in boundary.states]
-            if rows:
-                rows.append(endpoints[0])
-                emit(rows)
+            if position > start:
+                emit(np.vstack((matrix[start:position], np.asarray(endpoints[0], dtype=float))))
             emit(endpoints, True)
             # Canonical outputs stay authoritative even when added sides are unknown.
-            rows = [row]
+            start = position
         else:
-            rows.append(row)
-            if index in transitions:
-                emit(rows)
-                rows = [row]
-    emit(rows)
+            emit(matrix[start:position+1])
+            start = position
+    emit(matrix[start:])
     return tuple(chunks)
 
 

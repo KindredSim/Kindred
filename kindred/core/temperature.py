@@ -19,6 +19,8 @@ import math
 from dataclasses import dataclass
 from typing import Sequence
 
+import numpy as np
+
 __all__ = [
     "TemperatureChange",
     "TemperatureSegment",
@@ -51,6 +53,12 @@ class TemperatureSegment:
         return self.target + (self.temperature - self.target) * math.exp(
             -(time - self.start) / self.tau
         )
+
+    def values(self, times: np.ndarray) -> np.ndarray:
+        """The temperature at each of ``times``, each worked out as one call."""
+        if self.tau is None:
+            return np.full(len(times), self.temperature)
+        return np.fromiter(map(self, times.tolist()), float, len(times))
 
     def after(self, change: TemperatureChange) -> TemperatureSegment:
         """The segment that a change executed at its time starts."""
