@@ -45,6 +45,7 @@ from ..mechanism_source import (
     INITIAL_PROVENANCE_PREFIX,
 )
 from ..kinetics import ArrheniusRateModel, ConstantRateModel, EyringRateModel
+from ..quantity_units import DIMENSIONLESS
 from ..units import UnitsModel
 from ..units import (
     admit_arrhenius_prefactor,
@@ -110,6 +111,7 @@ _KEY_ALIASES: Dict[str, str] = {
     "keq": "Keq",
     "kf": "kf",
     "kr": "kr",
+    "factor": "factor",
     # units selector
     "energy": "energy",
 }
@@ -127,7 +129,7 @@ _COMMA_SEMI_SPLIT_RE = re.compile(r"[,;]")
 _SEMI_SPLIT_RE = re.compile(r"[;]")
 
 _REACTION_KNOWN_KEYS = frozenset(
-    {"kappa", "degeneracy", "kf", "k", "kr", "A", "Ea", "Keq", "dG_eq", "dG_act"}
+    {"kappa", "degeneracy", "kf", "k", "kr", "A", "Ea", "Keq", "dG_eq", "dG_act", "factor"}
 )
 # ------------------------------ data models ----------------------------------
 
@@ -234,6 +236,7 @@ class PreparedDslRequestSet:
         "__parameter_algebra_spec",
         "__compiled_ode_topology",
         "__symbolic_jacobian_structure",
+        "__symbolic_jacobian_support",
         "__symbolic_structure_initialized",
         "__symbolic_equations_text",
         "__symbolic_equations_initialized",
@@ -258,6 +261,7 @@ class PreparedDslRequestSet:
         self.__parameter_algebra_spec = parameter_algebra_spec
         self.__compiled_ode_topology = None
         self.__symbolic_jacobian_structure = None
+        self.__symbolic_jacobian_support = None
         self.__symbolic_structure_initialized = False
         self.__symbolic_equations_text = None
         self.__symbolic_equations_initialized = False
@@ -298,29 +302,27 @@ class PreparedDslRequestSet:
                     self.__compiled_ode_topology = topology
         return topology
 
-    def symbolic_jacobian_structure(self) -> object:
-        """Lazily retain one symbolic structure for this accepted mechanism."""
+    def symbolic_jacobian(self) -> tuple[object, object]:
+        """Lazily decide once whether runs of this accepted mechanism can use
+        the analytic Jacobian, and retain its symbolic structure when they can
+        (None otherwise) with that decision."""
 
         if not self.__symbolic_structure_initialized:
             with self.__structure_lock:
                 if not self.__symbolic_structure_initialized:
-                    from kindred.core.symbolic.errors import (
-                        UnsupportedSymbolicExpressionError,
-                    )
                     from kindred.core.symbolic.jacobian import (
                         build_symbolic_jacobian_structure,
+                        classify_runtime_jacobian_support,
                     )
 
-                    try:
-                        structure = build_symbolic_jacobian_structure(
-                            self.__mechanism
-                        )
-                    except UnsupportedSymbolicExpressionError:
-                        structure = None
-                    self.__symbolic_jacobian_structure = structure
+                    support = classify_runtime_jacobian_support(self.__mechanism)
+                    self.__symbolic_jacobian_support = support
+                    self.__symbolic_jacobian_structure = (
+                        build_symbolic_jacobian_structure(self.__mechanism) if support.supported else None
+                    )
                     self.__symbolic_structure_initialized = True
-        # Read after the flag, which is set only once the structure is.
-        return self.__symbolic_jacobian_structure
+        # Read after the flag, which is set only once both are.
+        return self.__symbolic_jacobian_structure, self.__symbolic_jacobian_support
 
     def symbolic_equations_text(self) -> object:
         """Lazily retain the canonical symbolic equations shown for reading;
@@ -1494,6 +1496,10 @@ def _parse_reaction_like_step(
         raise
     except (TypeError, ValueError, OverflowError) as exc:
         raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
+    # Which let it names is checked once the let lines are admitted.
+    factor = params.get("factor")
+    if factor is not None and not _DSL_IDENTIFIER_RE.fullmatch(factor):
+        raise _DSLError("factor= expects the name of a let.", line_number=line_number, line_content=line_content)
 
     return DslBuildStep(
         reactants=tuple((str(name), float(value)) for name, value in react.items()),
@@ -1504,6 +1510,7 @@ def _parse_reaction_like_step(
         standard_conc_M=C0,
         dG_eq_J_per_mol=delta_g,
         Keq_input=explicit_keq,
+        factor=factor,
         line=line_number,
         line_text=line_content,
     )
@@ -1630,6 +1637,7 @@ def prepare_dsl_request_set(
     )
     from kindred.core.algebra.errors import AlgebraError
     from kindred.core.algebra.simulation_series import (
+        observable_parameter_roots,
         reject_unknown_species_references,
     )
 
@@ -1669,6 +1677,29 @@ def prepare_dsl_request_set(
                 f"{statement.name} is a species, so a let line cannot define it.",
                 line_number=statement.line,
                 line_content=statement.line_text,
+            )
+    # A factor multiplies its step's rate, so the rate constant keeps the unit
+    # its orders give only when the factor has none.  Time enters the rates
+    # only through the schedule, whose times are integration boundaries.
+    let_units = dict(parameter_algebra_spec.quantity_units)
+    for step in ir.steps:
+        if step.factor is None:
+            continue
+        if step.factor not in parameter_algebra_spec.observable_names:
+            raise _DSLError(
+                f"factor= expects the name of a let; {step.factor} is not one.",
+                line_number=step.line, line_content=step.line_text,
+            )
+        unit = let_units.get(step.factor)
+        if unit is not None and not unit.compatible(DIMENSIONLESS):
+            raise _DSLError(
+                f"factor= expects a let with no unit; {step.factor} comes out in {unit.symbol}.",
+                line_number=step.line, line_content=step.line_text,
+            )
+        if "t" in observable_parameter_roots(parameter_algebra_spec.observable_block, step.factor):
+            raise _DSLError(
+                f"factor= expects a let that does not read t; {step.factor} reads t.",
+                line_number=step.line, line_content=step.line_text,
             )
     # A schedule whose clock fields read params is compiled per candidate;
     # every other schedule has one timeline and is compiled here.

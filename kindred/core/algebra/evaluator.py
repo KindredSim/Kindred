@@ -61,7 +61,7 @@ __all__ = [
     "AlgebraObservableError",
     "evaluate_block",
     "evaluate_block_partial",
-    "PreparedAlgebraStopEvaluator",
+    "PreparedAlgebraPointEvaluator",
     "bind_scalar_expression_evaluator",
 ]
 
@@ -187,7 +187,7 @@ class _Compiler:
     condition calculated."""
 
     def __init__(self, ev: _Evaluator, stmt: LetStatement, root: ExprNode | None = None,
-                 point: PreparedAlgebraStopEvaluator | None = None) -> None:
+                 point: PreparedAlgebraPointEvaluator | None = None) -> None:
         self.ev = ev
         self.stmt = stmt
         self.root = stmt.expr if root is None else root
@@ -231,21 +231,13 @@ class _Compiler:
     def expr(self, node: ExprNode, ind: int) -> Tuple[str, str]:
         point = self.point
         if point is not None:
-            # A stop reads input-only subtrees as admitted and retained lets
+            # A point reads input-only subtrees as admitted and retained lets
             # through its own quantities.
             if id(node) in point.static_values:
                 value = point.static_values[id(node)]
                 r = self.tmp()
                 self.emit(f"{r} = {self.const(point.static_values)}[{self.const(id(node))}]", ind)
                 return r, ("b" if isinstance(value, bool) else "f")
-            if isinstance(node, IdentNode):
-                if node.name in point.statements:
-                    r = self.tmp()
-                    self.emit(f"{r} = q({node.name!r})", ind)
-                    return r, "f"
-                if node.name in point.runtime_names and node.name != "t":
-                    missing = self.err(AlgebraNameError, f"missing runtime symbol {node.name!r}")
-                    self.emit(f"if {node.name!r} not in rs: {missing}()", ind)
         v, kind = self.unscaled(node, ind)
         if node.unit_factor == 1.0:
             return v, kind
@@ -264,12 +256,15 @@ class _Compiler:
             self.emit(f"{r} = {self.const(ev.literal_reader)}({self.const(node)})", ind)
             return r, "a"
         if isinstance(node, IdentNode) and self.point is not None:
+            # A retained let is read through its own quantity, time from the
+            # point, and every other name only when it is read.
             name = node.name
-            if name == "t":
+            if name in self.point.statements:
+                self.emit(f"{r} = q({name!r})", ind)
+            elif name == "t":
                 self.emit(f"{r} = float(tv)", ind)
-                return r, "f"
-            self.emit(f"if {name!r} in rs: {r} = float(rs[{name!r}])", ind)
-            self.emit(f"else: {r} = lk({name!r}, i, {self.const(stmt)})", ind)
+            else:
+                self.emit(f"{r} = float(lk({name!r}, i, {self.const(stmt)}))", ind)
             return r, "f"
         if isinstance(node, IdentNode):
             name = node.name
@@ -391,9 +386,9 @@ class _Compiler:
 
     def build(self) -> Callable[[int], float | bool]:
         v, _ = self.expr(self.root, 1)
-        # A stop's point reads the state, runtime symbols, retained lets, the
-        # time and the remaining names through its arguments.
-        signature = "def row(i, y, rs, q, tv, lk):" if self.point is not None else "def row(i):"
+        # A point reads the state, retained lets, the time and every other
+        # name through its arguments.
+        signature = "def row(i, y, q, tv, lk):" if self.point is not None else "def row(i):"
         source = "\n".join((signature, *self.lines, f"    return {v}\n"))
         code = _CODE_CACHE.get(source)
         if code is None:
@@ -622,12 +617,14 @@ class _Evaluator:
         return self.series, self.scalars, errors
 
 
-class PreparedAlgebraStopEvaluator:
-    """One run's selected retained LET targets and input-only subtree values.
+class PreparedAlgebraPointEvaluator:
+    """One run's retained LET quantities at a single time and state.
 
-    Eligibility is deliberately separate from ordinary result evaluation. The
-    caller constructs this only for enabled stopping and supplies raw solver
-    state and the correct one-sided runtime symbols at each evaluation.
+    A stop admits each target first, which checks that a stop can watch its
+    form and calculates its input-only subtrees once.  A rate factor is not
+    admitted: any form is allowed.  At each evaluation the caller supplies the
+    state and resolves each name when the quantity reads it, so a name read
+    only in an unselected ``ifelse`` value is never resolved.
     """
 
     def __init__(
@@ -636,7 +633,7 @@ class PreparedAlgebraStopEvaluator:
         *,
         species_names: Tuple[str, ...],
         initials: Mapping[str, float],
-        symbol_resolver: Callable[[str, int], float | None],
+        symbol_resolver: Callable[[str, int], float | None] | None,
         runtime_symbol_names: Set[str],
     ) -> None:
         self.block = block
@@ -665,7 +662,7 @@ class PreparedAlgebraStopEvaluator:
             stmt = self.statements[name]
             row = _Compiler(self._static_evaluator, stmt, point=self).build()
             scalars[name] = _as_float(
-                row(0, None, {}, self._static_quantity, 0.0, self._static_evaluator._lookup), stmt=stmt
+                row(0, None, self._static_quantity, 0.0, self._static_evaluator._lookup), stmt=stmt
             )
         return scalars[name]
 
@@ -703,7 +700,7 @@ class PreparedAlgebraStopEvaluator:
         key = id(node)
         if key not in self.static_values:
             row = _Compiler(evaluator, stmt, node, point=self).build()
-            value = row(0, None, {}, self._static_quantity, 0.0, evaluator._lookup)
+            value = row(0, None, self._static_quantity, 0.0, evaluator._lookup)
             self.static_values[key] = value if isinstance(value, bool) else _as_float(value, stmt=stmt)
         return self.static_values[key]
 
@@ -778,10 +775,16 @@ class PreparedAlgebraStopEvaluator:
         self._admitted.add(id(node))
 
     def evaluate(
-        self, name: str, t: float, y: np.ndarray, runtime_symbols: Mapping[str, float]
+        self, name: str, t: float, y: np.ndarray, resolve: Callable[[str], float | None]
     ) -> float:
-        """Evaluate one selected quantity without changing caller-owned inputs."""
+        """Evaluate one quantity without changing caller-owned inputs;
+        ``resolve`` gives a name's current value when the quantity reads it,
+        or None for a name that is not a scientific parameter."""
         memo: Dict[str, float] = {}
+
+        def lookup(symbol: str, i: int, stmt: LetStatement) -> float:
+            value = resolve(symbol)
+            return self._lookup(symbol, i, stmt) if value is None else value
 
         def q(target: str) -> float:
             if target not in memo:
@@ -789,7 +792,7 @@ class PreparedAlgebraStopEvaluator:
                 stmt = self.statements[target]
                 if row is None:
                     row = self._rows[target] = _Compiler(self._static_evaluator, stmt, point=self).build()
-                memo[target] = _as_float(row(0, y, runtime_symbols, q, t, self._lookup), stmt=stmt)
+                memo[target] = _as_float(row(0, y, q, t, lookup), stmt=stmt)
             return memo[target]
 
         # The stopping declaration that watches the quantity names it.

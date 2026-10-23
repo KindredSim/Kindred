@@ -357,6 +357,7 @@ def fit_global(
         rate_scale_undetermined=rate_scale_undetermined(
             prepared_dsl=prepared_dsl, fit_evaluators=evaluators, datasets=payloads,
             fixed_dataset_params=fixed_dataset_params, layout=layout, vector=vector,
+            dataset_info=result.dataset_info,
         ),
     )
     if hard_cancelled():

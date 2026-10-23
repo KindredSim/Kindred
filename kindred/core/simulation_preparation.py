@@ -271,10 +271,10 @@ def prepare_simulation_run(
     _raise_if_cancelled(cancellation_control)
     prepared_solver_config = execution_request.solver_config
     topology = execution_request.prepared_dsl.compiled_ode_topology()
-    symbolic_structure = (
-        execution_request.prepared_dsl.symbolic_jacobian_structure()
+    symbolic_structure, symbolic_support = (
+        execution_request.prepared_dsl.symbolic_jacobian()
         if prepared_solver_config.use_analytic_jacobian
-        else None
+        else (None, None)
     )
     _raise_if_cancelled(cancellation_control)
 
@@ -344,9 +344,9 @@ def prepare_simulation_run(
     _raise_if_cancelled(cancellation_control)
 
     runtime_symbolic_jacobian = build_runtime_symbolic_jacobian(
-        mechanism=mechanism,
         use_analytic_jacobian=prepared_solver_config.use_analytic_jacobian,
         symbolic_structure=symbolic_structure,
+        symbolic_support=symbolic_support,
         coefficient_evaluator=_coefficient_evaluator,
     )
     _raise_if_cancelled(cancellation_control)
@@ -364,22 +364,15 @@ def prepare_simulation_run(
         targets = tuple(dict.fromkeys(item.condition.name for item in stops))
         if targets:
             from kindred.core.algebra.errors import UNCOMPUTABLE_ERRORS, AlgebraError
-            from kindred.core.algebra.evaluator import PreparedAlgebraStopEvaluator
-            from kindred.core.algebra.simulation_series import let_dependency_facts, observable_parameter_roots
+            from kindred.core.algebra.evaluator import PreparedAlgebraPointEvaluator
+            from kindred.core.algebra.simulation_series import failing_let_facts
             observable_block = parameter_algebra_spec.observable_block
-            # Admission calculates a fixed value when it reads it; the run
-            # supplies only the values that change with time.
-            target_roots = {
-                name: tuple(root for root in observable_parameter_roots(observable_block, name)
-                            if root in parameter_algebra_spec.evaluation_dependencies and root in runtime_names)
-                for name in targets
-            }
             t_start = execution_request.t_span[0]
             start_temperature = starting_temperature_segment(
                 intervention_execution.temperature_changes,
                 _coefficient_evaluator.nominal_temperature_K, t_start,
             )(t_start)
-            evaluator = PreparedAlgebraStopEvaluator(
+            evaluator = PreparedAlgebraPointEvaluator(
                 observable_block,
                 species_names=tuple(species_names), initials=initials_for_algebra,
                 symbol_resolver=lambda name, _row: (
@@ -388,7 +381,6 @@ def prepare_simulation_run(
                 ),
                 runtime_symbol_names=set(runtime_names),
             )
-            lets_by_line = {statement.line: statement.name for statement in observable_block.lines}
             for target in targets:
                 try:
                     evaluator.admit(target)
@@ -400,14 +392,24 @@ def prepare_simulation_run(
                         # A value the watched quantity reads cannot be
                         # calculated for these inputs; it names its inputs as a
                         # let's failure does.
-                        name = lets_by_line[exc.line]
-                        exc.annotate(assignment=name, **let_dependency_facts(parameter_algebra_spec, name))
+                        exc.annotate(**failing_let_facts(parameter_algebra_spec, exc))
                     else:
                         exc.annotate(prefix="A stop condition cannot watch this value: ")
                     raise
 
             def stop_observable_value(name: str, time: float, state: np.ndarray, temperature_K: float) -> float:
-                return evaluator.evaluate(name, time, state, symbols(temperature_K, target_roots[name]))
+                # Admission calculated the fixed values; the run reads a value
+                # that changes with time when the quantity reads it.
+                try:
+                    return evaluator.evaluate(name, time, state, lambda root: (
+                        symbols(temperature_K, (root,))[root]
+                        if root in parameter_algebra_spec.evaluation_dependencies else None
+                    ))
+                except (AlgebraError, ValueDomainError) as exc:
+                    # A param it reads that failed names its own inputs.
+                    if "assignment" not in exc.details:
+                        exc.annotate(**failing_let_facts(parameter_algebra_spec, exc))
+                    raise
 
     request = execution_request
 
