@@ -20,6 +20,7 @@ from kindred.core.algebra.parser import (
 from kindred.core.algebra.symbols import SymbolTable
 
 __all__ = [
+    "failing_let_facts",
     "let_dependency_facts",
     "observable_parameter_roots",
     "reject_unknown_species_references",
@@ -95,6 +96,13 @@ def let_dependency_facts(spec, name: str) -> dict[str, object]:
         "parameter_names": tuple(sorted({*spec.input_dependencies(roots), *(f"[{species}]_0" for species in starting)})),
         "reads_species": bool(observable_species_refs(spec.observable_block, name, "now")),
     }
+
+
+def failing_let_facts(spec, error) -> dict[str, object]:
+    """The let a single-point evaluation failed in, found by the error's line,
+    and what it depends on, as ``let_dependency_facts`` gives them."""
+    name = next(statement.name for statement in spec.observable_block.lines if statement.line == error.line)
+    return {"assignment": name, **let_dependency_facts(spec, name)}
 
 
 def _build_simulation_context(

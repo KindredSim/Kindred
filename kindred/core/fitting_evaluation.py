@@ -27,7 +27,7 @@ from kindred.core.simulation_preparation import (
 )
 from kindred.core.simulation_preparation_stages import PreparedSolverConfig
 from kindred.core.result_repository import SimulationResultValue
-from kindred.core.simulation_result_finalization import finalize_simulation_result
+from kindred.core.simulation_result_finalization import evaluate_lets_at_rows, finalize_simulation_result
 from kindred.core.simulator.solver_types import (
     SimulationCancellationControl,
     SimulationScientificUnavailability,
@@ -251,6 +251,30 @@ class FittingEvaluator:
             float(request.prepared_dsl.analysis.temperature_K), tuple(name for name in names if name not in starting)
         )
         return {name: starting[name] if name in starting else calculated[name] for name in names}
+
+    def factor_values(
+        self,
+        params: Mapping[str, float],
+        simulation: SimulationResultValue,
+        names: tuple[str, ...],
+    ) -> Mapping[str, np.ndarray]:
+        """The named lets at every row of a solved curve with one candidate's
+        values, the curve itself unchanged; NaN where a let cannot be
+        calculated."""
+        request = self._candidate_request(params)
+        prepared_run = prepare_simulation_run(execution_request=request)
+        series, scalars, _errors = evaluate_lets_at_rows(
+            self._spec,
+            t=simulation.t,
+            temperature_K=simulation.temperature_K,
+            species_series={name: simulation.series[name] for name in request.species_names},
+            initials=prepared_run.initials_for_algebra,
+            parameter_values_at_temperature=prepared_run.parameter_values_at_temperature,
+        )
+        return {
+            name: series[name] if name in series else np.full(simulation.t.size, scalars.get(name, np.nan))
+            for name in names
+        }
 
     def _candidate_request(self, params: Mapping[str, float]) -> SimulationExecutionRequest:
         """The dataset's request with a candidate's starting concentrations

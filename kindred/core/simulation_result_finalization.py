@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from kindred.core.simulation_parameters import DerivedParameterValue
 
 __all__ = [
+    "evaluate_lets_at_rows",
     "finalize_simulation_result",
     "result_quantity_units",
 ]
@@ -129,6 +130,53 @@ def _freeze_algebra_series(
     return frozen
 
 
+def evaluate_lets_at_rows(
+    parameter_algebra_spec: object,
+    *,
+    t: np.ndarray,
+    temperature_K: np.ndarray,
+    species_series: Mapping[str, np.ndarray],
+    initials: Mapping[str, float],
+    parameter_values_at_temperature: Callable[[float, tuple[str, ...]], Mapping[str, float]],
+    cancellation_check: Callable[[], bool] | None = None,
+) -> tuple[dict[str, np.ndarray], dict[str, float], list[AlgebraObservableError]]:
+    """Every let at the rows of a solved curve, each failure recorded."""
+
+    runtime_names = runtime_algebra_symbol_names(parameter_algebra_spec)
+    # A param read by a let, as its value or failure at a temperature: at
+    # each row's own when it changes with temperature, so it fails only at
+    # the rows it cannot be calculated at. A failure is kept without its
+    # traceback or the exception it was raised while handling, which
+    # would otherwise keep their frames alive for every row raising it.
+    resolved: dict[tuple[str, float], float | Exception] = {}
+
+    def resolve_symbol(name: str, row: int) -> float | None:
+        if name not in parameter_algebra_spec.evaluation_dependencies:
+            return None
+        temperature = float(temperature_K[row if name in runtime_names else 0])
+        key = (name, temperature)
+        if key not in resolved:
+            try:
+                resolved[key] = parameter_values_at_temperature(temperature, (name,))[name]
+            except UNCOMPUTABLE_ERRORS as exc:
+                exc.__context__ = None
+                resolved[key] = exc.with_traceback(None)
+        value = resolved[key]
+        if isinstance(value, Exception):
+            raise value.with_traceback(None)
+        return value
+
+    return evaluate_algebra_block_for_simulation_partial(
+        parameter_algebra_spec.observable_block,
+        t=t,
+        species_series=species_series,
+        initials=initials,
+        symbol_resolver=resolve_symbol,
+        runtime_symbol_names=runtime_names,
+        cancellation_check=cancellation_check,
+    )
+
+
 def finalize_simulation_result(
     *,
     result: FinalSimulationOutput,
@@ -166,43 +214,14 @@ def finalize_simulation_result(
     finalized_algebra_errors: tuple[FactualCause, ...] = ()
     observable_block = parameter_algebra_spec.observable_block
     if observable_block.lines:
-        species_series = {
-            name: result_y[index, :]
-            for index, name in enumerate(base_species_names)
-        }
-        runtime_names = runtime_algebra_symbol_names(parameter_algebra_spec)
-        # A param read by a let, as its value or failure at a temperature: at
-        # each row's own when it changes with temperature, so it fails only at
-        # the rows it cannot be calculated at. A failure is kept without its
-        # traceback or the exception it was raised while handling, which
-        # would otherwise keep their frames alive for every row raising it.
-        resolved: dict[tuple[str, float], float | Exception] = {}
-
-        def resolve_symbol(name: str, row: int) -> float | None:
-            if name not in parameter_algebra_spec.evaluation_dependencies:
-                return None
-            temperature = float(result.temperature_K[row if name in runtime_names else 0])
-            key = (name, temperature)
-            if key not in resolved:
-                try:
-                    resolved[key] = parameter_values_at_temperature(temperature, (name,))[name]
-                except UNCOMPUTABLE_ERRORS as exc:
-                    exc.__context__ = None
-                    resolved[key] = exc.with_traceback(None)
-            value = resolved[key]
-            if isinstance(value, Exception):
-                raise value.with_traceback(None)
-            return value
-        algebra_series, algebra_scalars, algebra_errors = (
-            evaluate_algebra_block_for_simulation_partial(
-                observable_block,
-                t=result_time,
-                species_series=species_series,
-                initials=initials_for_algebra,
-                symbol_resolver=resolve_symbol,
-                runtime_symbol_names=runtime_names,
-                cancellation_check=None if cancellation_control is None else cancellation_control.cancel_requested,
-            )
+        algebra_series, algebra_scalars, algebra_errors = evaluate_lets_at_rows(
+            parameter_algebra_spec,
+            t=result_time,
+            temperature_K=result.temperature_K,
+            species_series={name: result_y[index, :] for index, name in enumerate(base_species_names)},
+            initials=initials_for_algebra,
+            parameter_values_at_temperature=parameter_values_at_temperature,
+            cancellation_check=None if cancellation_control is None else cancellation_control.cancel_requested,
         )
         finalized_algebra_errors = tuple(
             _algebra_cause(error, parameter_algebra_spec) for error in algebra_errors

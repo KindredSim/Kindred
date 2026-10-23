@@ -5,9 +5,11 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
+from kindred.core.algebra.simulation_series import observable_species_refs
 from kindred.core.mechanism import Mechanism
 from kindred.core.ode_builder import (
     EffectiveRateCoefficientEvaluator,
+    factored_steps,
 )
 from kindred.core.simulator.parameter_namespace import (
     build_namespace_from_mechanism,
@@ -228,6 +230,29 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
     )
 
 
+def factor_species(mechanism: Mechanism, name: str) -> tuple[str, ...]:
+    """The current concentrations a factor's let reads, in species order."""
+    block = mechanism.metadata["parameter_algebra_spec"].observable_block
+    read = observable_species_refs(block, name, "now")
+    return tuple(species for species in mechanism.species_names() if species in read)
+
+
+def classify_runtime_jacobian_support(mechanism: Mechanism) -> SymbolicJacobianSupport:
+    """Whether a run can use the analytic Jacobian: as for the symbolic graph,
+    and no step has a rate factor, whose let only the Algebra evaluator
+    calculates."""
+    support = classify_symbolic_jacobian_support(mechanism)
+    if not support.supported:
+        return support
+    step = next((entry for _position, _name, entry in factored_steps(mechanism)), None)
+    if step is not None:
+        return _unsupported_support(
+            "rate-factor",
+            f"Symbolic Jacobian is not used because line {step['line']} has a rate factor.",
+        )
+    return support
+
+
 def _coefficient_public_parameter_names(
     mechanism: Mechanism,
 ) -> tuple[str, ...]:
@@ -288,6 +313,12 @@ def _build_symbolic_mechanism_expression_model(
     symbol_by_species = dict(zip(species_names, state_symbols))
     rhs = [sympy.Integer(0) for _name in species_names]
     species_index = {name: idx for idx, name in enumerate(species_names)}
+    # Each step's factor stays a function of the current concentrations it
+    # reads, named after its let; the Calculator supplies its formula.
+    factors = {
+        position: sympy.Function(name)(*(symbol_by_species[species] for species in factor_species(mechanism, name)))
+        for position, name, _entry in factored_steps(mechanism)
+    }
 
     for reaction_index, rxn in enumerate(mechanism.reactions):
         coefficient = sympy.Symbol(
@@ -300,7 +331,7 @@ def _build_symbolic_mechanism_expression_model(
             sympy,
             symbol_by_species,
             rxn.rate_orders,
-        )
+        ) * factors.get(reaction_index, sympy.Integer(1))
         for species_name, coeff in rxn.net_stoich.items():
             rhs[species_index[str(species_name)]] += _stoichiometric_coefficient_expr(
                 sympy,
@@ -327,7 +358,7 @@ def _build_symbolic_mechanism_expression_model(
             symbol_by_species,
             eq.stoich_back,
         )
-        rate_expr = forward_expr - reverse_expr
+        rate_expr = (forward_expr - reverse_expr) * factors.get(step_index, sympy.Integer(1))
         for species_name, coeff in eq.net_stoich.items():
             rhs[species_index[str(species_name)]] += _stoichiometric_coefficient_expr(
                 sympy,
@@ -449,6 +480,7 @@ def build_symbolic_equations_text(mechanism: Mechanism) -> SymbolicEquationsText
 
 
 def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianStructure:
+    """The structure of a mechanism ``classify_runtime_jacobian_support`` supports."""
     model = _build_symbolic_mechanism_expression_model(
         mechanism,
         exact_stoichiometric_coefficients=False,

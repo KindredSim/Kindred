@@ -137,6 +137,8 @@ class DslBuildStep:
     dG_eq_J_per_mol: float | None = None
     Keq_input: float | None = None
     source_coordinates: tuple["DslSourceCoordinate", ...] = ()
+    # The let named by the line's factor= field, if any.
+    factor: str | None = None
     # The authored reaction line, which a refusal of its calculated rates shows.
     line: int | None = None
     line_text: str | None = None

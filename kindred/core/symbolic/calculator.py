@@ -241,6 +241,20 @@ def _current_symbols(result) -> set[Any]:
     return set(payload.free_symbols) | set().union(*(c.free_symbols for c in result.conditions))
 
 
+def _expand_factors(expression: Any, lets: Mapping[str, Any]) -> Any:
+    """Each rate factor, a function of the concentrations its let reads, as
+    that let's value; its derivatives are then taken."""
+    if not lets:
+        return expression
+    sp = require_sympy()
+    from sympy.core.function import AppliedUndef
+    expanded = expression.replace(
+        lambda item: isinstance(item, AppliedUndef) and item.func.__name__ in lets,
+        lambda item: lets[item.func.__name__],
+    )
+    return expanded.replace(lambda item: isinstance(item, sp.Derivative), lambda item: item.doit())
+
+
 def _native_substitute(expression: Any, mapping: Mapping[Any, Any], *, equations=True) -> Any:
     """Substitute free coordinates without capturing them in native binders."""
     sp = require_sympy()
@@ -478,19 +492,22 @@ def build_calculator_context(mechanism: Any, *, mechanism_source: str) -> Calcul
     chemistry = build_calculator_chemistry_relations(mechanism, parameter_spec=spec, symbols=symbols)
     closures = {}
 
-    def project(expression, dependencies):
-        """Install completed dependencies before admitting a native projection."""
+    def project(expression, dependencies, factors=()):
+        """Install completed dependencies, and the lets of the rate factors,
+        before admitting a native projection."""
         selected = tuple(name for name in graph if name in dependencies)
-        operands = tuple(values[name] for name in selected)
+        operands = tuple(values[name] for name in (*selected, *factors))
         answers = []
         family = any(isinstance(v, _Alternatives) for v in operands)
         for args in _branches(operands):
             try:
                 conditions = _conditions(additional=(c for item in args for c in item.conditions))
                 unavailable = _unusable(args)
-                mapping = {symbols[name]: item.expression for name, item in zip(selected, args, strict=True)}
+                mapping = {symbols[name]: item.expression for name, item in zip(selected, args)}
                 result = (replace(unavailable, conditions=conditions) if unavailable is not None
-                          else _admit_native(_native_substitute(expression, mapping), conditions))
+                          else _admit_native(_native_substitute(
+                              _expand_factors(expression, dict(zip(factors, (item.expression for item in args[len(selected):])))),
+                              mapping), conditions))
             except _ConditionInapplicable:
                 continue
             except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
@@ -522,7 +539,8 @@ def build_calculator_context(mechanism: Any, *, mechanism_source: str) -> Calcul
     def field(expression):
         expression = expression.xreplace(canonical)
         roots = {name for name in graph if symbols[name] in expression.free_symbols}
-        return project(expression, roots.union(*(closures[name] for name in roots)))
+        factors = tuple(sorted({item.func.__name__ for item in expression.atoms(sp.core.function.AppliedUndef)}))
+        return project(expression, roots.union(*(closures[name] for name in roots)), factors)
     return replace(context, rhs=tuple(_with_quantity(field(x), MOLAR.divide(SECOND)) for x in projection.rhs_expressions),
                    jacobian=_with_quantity(field(sp.ImmutableMatrix(projection.jacobian_expressions)),
                                            tuple(tuple(DIMENSIONLESS.divide(SECOND) for _ in names) for _ in names)))

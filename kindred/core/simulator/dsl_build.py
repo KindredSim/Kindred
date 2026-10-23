@@ -72,6 +72,7 @@ def build_mechanism_from_ir(
                 forward_model=step.forward_model,
                 kr=step.kr,
                 metadata=eq_metadata,
+                factor=step.factor,
             )
         else:
             rxn_index = len(mechanism.reactions)
@@ -79,6 +80,7 @@ def build_mechanism_from_ir(
                 reactants=reactants,
                 products=products,
                 forward_model=step.forward_model,
+                factor=step.factor,
             )
 
         # Record canonical authored step-index mapping for downstream layers (GUI/algebra/fitting).

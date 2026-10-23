@@ -186,12 +186,8 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             science_box,
         )
         self.analytic_jacobian_check.setToolTip(
-            "Uses the symbolic analytic Jacobian when supported. If any "
-            "individual reaction-order or equilibrium concentration exponent "
-            "is non-integral, Kindred uses the numerical Jacobian of the solver "
-            "from the start. Supported intervention schedules retain analytic "
-            "Jacobian handling. If analytic Jacobian evaluation fails after "
-            "execution begins, the execution fails and is not retried."
+            "Uses the symbolic analytic Jacobian when the mechanism supports it, "
+            "otherwise the solver's numerical Jacobian."
         )
         self.scientific_defaults_check = QtWidgets.QCheckBox(
             "Use These Settings as Defaults for New Projects and Tabs",

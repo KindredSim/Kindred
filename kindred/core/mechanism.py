@@ -91,6 +91,8 @@ class Reaction:
     reactants: Mapping[str, float]
     products: Mapping[str, float]
     forward_model: ForwardRateModel
+    # The let the step's rate is multiplied by, if any.
+    factor: str | None = None
     rate_orders: Mapping[str, float] = field(init=False)
     net_stoich: Mapping[str, float] = field(init=False)
 
@@ -118,6 +120,8 @@ class Equilibrium:
     forward_model: ForwardRateModel
     kr: float | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    # The let the step's net rate (forward minus reverse) is multiplied by, if any.
+    factor: str | None = None
     net_stoich: Mapping[str, float] = field(init=False, repr=False, compare=False)
     authority: EquilibriumRateAuthority = field(init=False, repr=False, compare=False)
 
@@ -200,9 +204,10 @@ class Mechanism:
         reactants: Mapping[str, float],
         products: Mapping[str, float],
         forward_model: ForwardRateModel,
+        factor: str | None = None,
     ) -> Reaction:
         """Add a reaction step; its builder declared every species it names."""
-        rxn = Reaction(reactants=reactants, products=products, forward_model=forward_model)
+        rxn = Reaction(reactants=reactants, products=products, forward_model=forward_model, factor=factor)
         self.reactions.append(rxn)
         return rxn
 
@@ -214,12 +219,13 @@ class Mechanism:
         forward_model: ForwardRateModel,
         kr: float | None = None,
         metadata: Optional[Mapping[str, Any]] = None,
+        factor: str | None = None,
     ) -> Equilibrium:
         """Add one admitted forward model and exactly one reverse authority."""
         meta = dict(metadata or {})
         meta.setdefault(EquilibriumMetadataKeys.STANDARD_CONC_M,
                         self.metadata.get(MechanismMetadataKeys.STANDARD_CONC_M, 1.0))
         eq = Equilibrium(stoich_forward=stoich_forward, stoich_back=stoich_back,
-                         forward_model=forward_model, kr=kr, metadata=meta)
+                         forward_model=forward_model, kr=kr, metadata=meta, factor=factor)
         self.equilibria.append(eq)
         return eq

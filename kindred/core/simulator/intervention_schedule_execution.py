@@ -1182,10 +1182,7 @@ def _trigger_value(
     try:
         return float(observable_value(trigger.condition.name, time, state, temperature_K))
     except (AlgebraError, ValueDomainError) as exc:
-        # The watched quantity reads the solved state; a param it reads that
-        # failed names its own inputs.
-        if "assignment" not in exc.details:
-            exc.annotate(reads_species=True)
+        # The value that failed already names its inputs.
         exc.annotate(
             prefix=f"Stopping declaration {trigger.declaration_ordinal + 1}, quantity {trigger.condition.name!r}: ",
             quantity=trigger.condition.name, time=time,

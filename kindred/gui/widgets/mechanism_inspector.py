@@ -166,6 +166,7 @@ def _format_mechanism_step(
             int(entry["equilibrium_index"])
         ]
         forward_model = equilibrium.forward_model
+    factor = (reaction if equilibrium is None else equilibrium).factor
 
     items = [
         _format_coordinate(
@@ -243,6 +244,8 @@ def _format_mechanism_step(
             )
         )
 
+    if factor is not None:
+        items.append(f"factor={html.escape(factor)}")
     return (
         f"{step_index}  {context}    {' · '.join(items)}",
         uses_standard_concentration,
@@ -319,6 +322,12 @@ def _format_steps(
                         step_index,
                     )
                 )
+            step = (mechanism.reactions[int(entry["reaction_index"])] if kind == "reaction"
+                    else mechanism.equilibria[int(entry["equilibrium_index"])])
+            if step.factor is not None:
+                let = next(statement for statement in parameter_spec.observable_block.lines
+                           if statement.name == step.factor)
+                lines.append(f"  Rate multiplied by: {let.name} = {expression_to_source(let.expr)}")
             rate_authority = _rate_authority_for_step(
                 mechanism,
                 entry,

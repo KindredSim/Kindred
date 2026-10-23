@@ -71,9 +71,9 @@ class EffectiveRateCoefficientEvaluator:
 
 def _step_coefficient_names(
     mechanism: Mechanism,
-) -> tuple[tuple[str, Reaction | Equilibrium, str, str | None], ...]:
-    """Each step's kind, the step, and its forward and reverse coefficient
-    names, reactions first, as the topology orders them."""
+) -> tuple[tuple[str, Reaction | Equilibrium, Mapping[str, object], str, str | None], ...]:
+    """Each step's kind, the step, its step-map entry, and its forward and
+    reverse coefficient names, reactions first, as the topology orders them."""
 
     from .simulator.step_indexing import get_step_index_map
 
@@ -82,11 +82,12 @@ def _step_coefficient_names(
     steps = []
     for kind, members in (("reaction", mechanism.reactions), ("equilibrium", mechanism.equilibria)):
         for index, step in enumerate(members):
-            number = entries[kind, index]["step_index"]
+            entry = entries[kind, index]
+            number = entry["step_index"]
             if kind == "reaction":
-                steps.append((kind, step, f"k{number}", None))
+                steps.append((kind, step, entry, f"k{number}", None))
             else:
-                steps.append((kind, step, f"kf{number}", f"kr{number}"))
+                steps.append((kind, step, entry, f"kf{number}", f"kr{number}"))
     return tuple(steps)
 
 
@@ -97,7 +98,7 @@ def rate_authority_snapshot(mechanism: Mechanism) -> tuple[Mapping[str, object],
     # Admission always retains the spec; its absence is a producer error.
     spec = mechanism.metadata["parameter_algebra_spec"]
     snapshots = []
-    for kind, step, forward_name, reverse_name in _step_coefficient_names(mechanism):
+    for kind, step, _entry, forward_name, reverse_name in _step_coefficient_names(mechanism):
         snapshot = {"kind": kind, "forward_model": forward_rate_model_payload(step.forward_model),
                     "binding_name" if kind == "reaction" else "forward_binding_name": forward_name,
                     "value_dependencies": tuple(spec.evaluation_dependencies[forward_name]),
@@ -124,9 +125,9 @@ def _build_effective_rate_coefficient_evaluator(
     steps = _step_coefficient_names(mechanism)
     return EffectiveRateCoefficientEvaluator(
         nominal_temperature_K=float(mech_meta.temperature_K),
-        step_kinds=tuple(kind for kind, _step, _forward, _reverse in steps),
+        step_kinds=tuple(kind for kind, _step, _entry, _forward, _reverse in steps),
         parameter_values=bind_parameter_evaluation(spec, mechanism, initials),
-        _parameter_names=tuple((forward, reverse) for _kind, _step, forward, reverse in steps),
+        _parameter_names=tuple((forward, reverse) for _kind, _step, _entry, forward, reverse in steps),
     )
 
 
@@ -209,13 +210,87 @@ class CompiledOdeTopology:
             self,
             mechanism,
             coefficient_evaluator,
+            bind_rate_factors(mechanism, initials, coefficient_evaluator.parameter_values),
         )
+
+
+def factored_steps(mechanism: Mechanism) -> tuple[tuple[int, str, Mapping[str, object]], ...]:
+    """Each step with a factor: its position in topology order, the let it
+    names and its step-map entry."""
+    return tuple((position, step.factor, entry)
+                 for position, (_kind, step, entry, _forward, _reverse) in enumerate(_step_coefficient_names(mechanism))
+                 if step.factor is not None)
+
+
+def bind_rate_factors(
+    mechanism: Mechanism,
+    initials: Mapping[str, float],
+    parameter_values: Callable[[float, tuple[str, ...]], dict[str, float]],
+) -> tuple[np.ndarray, Callable[[float, np.ndarray, float], np.ndarray]] | None:
+    """One run's rate factors: the topology positions of the factored steps
+    and their values at a time, state and temperature, or None without factors.
+
+    Each factor is its let calculated by the Algebra evaluator on the state
+    with negative concentrations read as zero, as fractional orders are.
+    """
+
+    steps = factored_steps(mechanism)
+    if not steps:
+        return None
+    from .algebra.errors import AlgebraError
+    from .algebra.evaluator import PreparedAlgebraPointEvaluator
+    from .algebra.simulation_series import failing_let_facts, observable_species_refs
+    from .exceptions import ValueDomainError
+
+    spec = mechanism.metadata["parameter_algebra_spec"]
+    block = spec.observable_block
+    species_names = tuple(mechanism.species_names())
+    reads = {
+        name: np.fromiter((index for index, species in enumerate(species_names)
+                           if species in observable_species_refs(block, name, "now")), dtype=np.int64)
+        for _position, name, _entry in steps
+    }
+    evaluator = PreparedAlgebraPointEvaluator(
+        block, species_names=species_names, initials=initials,
+        symbol_resolver=None, runtime_symbol_names=set(),
+    )
+    positions = np.fromiter((position for position, _name, _entry in steps), dtype=np.int64)
+    values = np.empty(len(steps), dtype=float)
+
+    def evaluate(t: float, y: np.ndarray, T: float) -> np.ndarray:
+        state = np.maximum(y, 0.0)
+
+        def resolve(name: str) -> float | None:
+            return parameter_values(T, (name,))[name] if name in spec.evaluation_dependencies else None
+
+        for index, (_position, name, entry) in enumerate(steps):
+            try:
+                values[index] = evaluator.evaluate(name, t, state, resolve)
+            except (AlgebraError, ValueDomainError) as exc:
+                if not np.all(np.isfinite(y[reads[name]])):
+                    # A solver trial with concentrations that are not finite,
+                    # which the solver refuses as it refuses such rates.
+                    values[index] = np.nan
+                    continue
+                # The let that failed names its inputs, and a param it reads
+                # that failed names its own.
+                if "assignment" not in exc.details:
+                    exc.annotate(**failing_let_facts(spec, exc))
+                exc.annotate(
+                    prefix=f"The rate factor {name!r} of line {entry['line']} cannot be calculated at t = {float(t):g} s: ",
+                    factor=name, time=float(t),
+                )
+                raise
+        return values
+
+    return positions, evaluate
 
 
 def _build_bound_ode_rhs(
     topology: CompiledOdeTopology,
     mechanism: Mechanism,
     coefficient_evaluator: EffectiveRateCoefficientEvaluator,
+    rate_factors: tuple[np.ndarray, Callable[[float, np.ndarray, float], np.ndarray]] | None,
 ) -> Callable[..., np.ndarray]:
     """
     Build ODE right-hand side function from a Mechanism.
@@ -238,6 +313,8 @@ def _build_bound_ode_rhs(
     - Reactions contribute: rate = k * ∏[reactants]^stoich
     - Equilibria remain a single reversible step with rate = v_fwd - v_rev
       (stoichiometry is not duplicated into two irreversible columns).
+    - A step with a factor has its net rate multiplied by it, so forward and
+      reverse equally.
     - Stoichiometry determines species changes via a BLAS-free reduction.
     """
     S = topology.stoichiometry
@@ -255,6 +332,7 @@ def _build_bound_ode_rhs(
     # The coefficients are a function of temperature alone, so they are
     # refilled only when it changes; set after a successful evaluation.
     coefficients_T: float | None = None
+    factor_positions, factor_values = rate_factors if rate_factors is not None else (None, None)
 
     def ode_rhs(t: float, y: np.ndarray, *, T: float) -> np.ndarray:
         """ODE right-hand side from stoichiometry and reaction rates."""
@@ -277,6 +355,8 @@ def _build_bound_ode_rhs(
         np.power(bases, exponents, out=terms_buffer, where=mask)
         terms = coefficients * terms_buffer.prod(axis=1)
         rates = terms[:n_steps] - terms[n_steps:] if has_reverse_terms else terms
+        if factor_positions is not None:
+            rates[factor_positions] *= factor_values(t, y, T)
         return _stoichiometric_flux_product(S, rates, workspace=stoich_rate_buffer)
 
     return ode_rhs

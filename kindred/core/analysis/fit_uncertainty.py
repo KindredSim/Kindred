@@ -288,6 +288,10 @@ def undetermined_coordinates(
     return tuple(flagged)
 
 
+class _SpeedUnavailable(Exception):
+    """A rate factor that cannot be calculated at a point of a fitted curve."""
+
+
 def rate_scale_undetermined(
     *,
     prepared_dsl: object,
@@ -296,28 +300,41 @@ def rate_scale_undetermined(
     fixed_dataset_params: Mapping[str, Mapping[str, float]],
     layout: _fit_execution.FitParameterLayout,
     vector: np.ndarray,
+    dataset_info: Sequence[_fit_execution.DatasetFitInfo],
 ) -> bool:
     """Whether the data leave the overall rate scale undetermined.
 
     With nothing tied to the clock (no temperature schedule, and no
     intervention other than a state trigger without a minimum interval), a
-    curve plotted against a measured X is the same when every rate constant is
-    multiplied by one factor; only the time to reach each point changes.  The
+    curve plotted against a measured X is the same when every step's speed is
+    multiplied by one factor; only the time to reach each point changes.  A
+    step's speed is its rate constant, times its rate factor at each
+    point of the dataset's fitted curve when it has one.  The
     scale is undetermined when the fitted values can multiply one measured-X
-    dataset's rate constants by a common factor without changing a time-X
-    dataset's rate constants, any value a target reads, a trigger's inputs or
-    a starting concentration.
+    dataset's speeds by a common factor without changing a time-X dataset's
+    speeds, any value a target reads, a trigger's inputs or a starting
+    concentration.
     A value a target's formula names that cannot be calculated at the fitted
     values lies in an ifelse branch no target took, and is not read.
-    The test is linear, on the relative changes of the rate constants and of
-    those values when each fitted coordinate (log10 under Log Scale) moves by
-    1e-5 of itself (of its range at zero) within its bounds; a value of zero
-    stays zero.  A value that cannot be calculated at a moved point leaves
-    the scale unflagged.
+    The test is linear, on the relative changes of the speeds and of those
+    values when each fitted coordinate (log10 under Log Scale) moves by 1e-5
+    of itself (of its range at zero) within its bounds; a value of zero stays
+    zero.  A value that cannot be calculated at a moved point leaves the
+    scale unflagged.
     """
 
     schedule = (prepared_dsl.parameterized_intervention_schedule_for_binding()
                 or prepared_dsl.intervention_execution_contract().authored)
+    spec = prepared_dsl.parameter_algebra_spec_for_execution()
+    mechanism = prepared_dsl.accepted_mechanism_for_structure()
+    rates, factors = [], {}
+    for name, entry, role in iter_canonical_parameters(mechanism):
+        if role in {"k", "kf", "kr"}:
+            rates.append(name)
+            step = (mechanism.reactions[entry["reaction_index"]] if entry["kind"] == "reaction"
+                    else mechanism.equilibria[entry["equilibrium_index"]])
+            if step.factor is not None:
+                factors[name] = step.factor
     if (
         all(item.x_name == "t" for item in datasets)
         or prepared_dsl.temperature_changes()
@@ -327,11 +344,11 @@ def rate_scale_undetermined(
         )
     ):
         return False
-    rates = tuple(
-        name for name, _entry, role in iter_canonical_parameters(prepared_dsl.accepted_mechanism_for_structure())
-        if role in {"k", "kf", "kr"}
-    )
-    spec = prepared_dsl.parameter_algebra_spec_for_execution()
+    # A factored step's speed is a row per point of the fitted curve.
+    factored = tuple(name for name in rates if name in factors)
+    rates = tuple(name for name in rates if name not in factors)
+    lets = tuple(dict.fromkeys(factors[name] for name in factored))
+    curves = {info.dataset_id: info.simulation_result for info in dataset_info}
     # A trigger's threshold and amounts shape the curve as a target's reads do.
     triggers = {
         name for names in intervention_schedule_parameter_dependencies(schedule.without_stops()).values()
@@ -356,7 +373,10 @@ def rate_scale_undetermined(
         starting = {f"[{name}]_0" for name in prepared_dsl.analysis.species_names}
         reads = tuple(sorted({root for root in roots if root in spec.evaluation_dependencies} | triggers | starting))
 
-        def values(names: tuple[str, ...], index: int | None = None, offset: float = 0.0) -> np.ndarray:
+        evaluator = fit_evaluators[payload.dataset_id]
+
+        def values(names: tuple[str, ...], index: int | None = None, offset: float = 0.0, *,
+                   speeds: bool = True) -> np.ndarray:
             trial = x.copy()
             if index is not None:
                 trial[index] += offset
@@ -365,12 +385,21 @@ def rate_scale_undetermined(
                 shared_values=layout.shared_param_dict_from_vector(trial),
                 fixed_values=fixed_dataset_params[payload.dataset_id],
             ).full_params
-            calculated = fit_evaluators[payload.dataset_id].parameter_values(params, names)
-            return np.asarray([calculated[name] for name in names], dtype=float)
+            calculated = evaluator.parameter_values(params, names)
+            row = np.asarray([calculated[name] for name in names], dtype=float)
+            if not (speeds and factored):
+                return row
+            constants = evaluator.parameter_values(params, factored)
+            curve = evaluator.factor_values(params, curves[payload.dataset_id], lets)
+            speeds = np.concatenate([constants[name] * curve[factors[name]] for name in factored])
+            if not np.all(np.isfinite(speeds)):
+                # A factor that cannot be calculated at a point of the curve.
+                raise _SpeedUnavailable()
+            return np.concatenate([row, speeds])
 
         def calculable(name: str) -> bool:
             try:
-                values((name,))
+                values((name,), speeds=False)
             except UNCOMPUTABLE_ERRORS:
                 return False
             return True
@@ -380,21 +409,24 @@ def rate_scale_undetermined(
         names = rates + tuple(name for name in reads if calculable(name))
         try:
             base = values(names)
-            block = np.empty((len(names), x.size))
+            block = np.empty((base.size, x.size))
             for index, step in enumerate(steps):
                 block[:, index] = (
                     (values(names, index, step) - values(names, index, -step)) / (2.0 * step) if central[index]
                     else (4.0 * values(names, index, step) - 3.0 * base - values(names, index, 2.0 * step)) / (2.0 * step)
                 )
-        except UNCOMPUTABLE_ERRORS:
+        except (*UNCOMPUTABLE_ERRORS, _SpeedUnavailable):
             return False
         # Each change relative to its own value, so rows in any unit compare;
         # a value of zero keeps its change and must stay zero.
         block /= np.where(base != 0.0, np.abs(base), 1.0)[:, None]
-        positive = (np.arange(len(names)) < len(rates)) & (base > 0.0)
+        # A common factor moves each speed by its sign, as its row is
+        # relative to its magnitude; a speed of zero stays zero.
+        rows = np.arange(base.size)
+        direction = np.where((rows < len(rates)) | (rows >= len(names)), np.sign(base), 0.0)
         blocks.append(block)
         # A time-X dataset, or one whose target reads time, sees the scale.
-        scales.append(None if payload.x_name == "t" or "t" in roots else positive)
+        scales.append(None if payload.x_name == "t" or "t" in roots else direction)
     free = [index for index, scale in enumerate(scales) if scale is not None]
     if not free:
         return False

@@ -66,12 +66,12 @@ class SymbolicJacobianExecution:
         )
 
     @classmethod
-    def from_bind_failure(
+    def unsupported(
         cls,
         *,
         classified_status: Mapping[str, Any],
     ) -> "SymbolicJacobianExecution":
-        # Binding fails exactly when the classifier calls the mechanism unsupported.
+        # The accepted mechanism decided once that its runs cannot use it.
         return cls(status=classified_status)
 
     def provenance_fields(self) -> dict[str, Any]:

@@ -40,13 +40,17 @@ def _refuse_energy_offsets(node, stmt, energy_input):
         )
 
 
-def _has_unit_leaf(node) -> bool:
-    """Whether a quantity carrying a unit appears anywhere in a prepared formula."""
+def _has_unit_leaf(node, carrying: set[str]) -> bool:
+    """Whether a quantity carrying a unit appears anywhere in a prepared
+    formula, including through a param or let in ``carrying``, whose own
+    formula has one."""
     if isinstance(node, NumberNode):
         return False
+    if isinstance(node, IdentNode) and node.name in carrying:
+        return True
     if isinstance(node, (IdentNode, SpeciesRefNode)):
         return node.quantity_unit is None or not node.quantity_unit.compatible(DIMENSIONLESS)
-    return any(_has_unit_leaf(child) for child in _children(node))
+    return any(_has_unit_leaf(child, carrying) for child in _children(node))
 
 
 def _unknown_unit_part(node):
@@ -114,6 +118,7 @@ def prepare_spec_units(spec, mechanism):
     prepared = {}
     visiting = set()
     quantities = set(coordinates)
+    carrying: set[str] = set()
 
     def lookup(name):
         name = spec.mechanism_namespace.resolve(name).canonical_name or name
@@ -136,6 +141,9 @@ def prepare_spec_units(spec, mechanism):
         except ValueError as exc:
             raise DSLError(str(exc), line_number=stmt.line, line_content=stmt.line_text) from exc
         _refuse_energy_offsets(expr, stmt, energy_input)
+        has_unit_leaf = _has_unit_leaf(expr, carrying)
+        if has_unit_leaf:
+            carrying.add(name)
         if (stmt.declared_unit is not None and expr.quantity_unit is None
                 and not stmt.declared_unit.compatible(DIMENSIONLESS)):
             raise DSLError(
@@ -151,7 +159,7 @@ def prepare_spec_units(spec, mechanism):
                                                         energy=name in energies),
                                line_number=stmt.line, line_content=stmt.line_text)
         elif (stmt.declared_unit is not None and not stmt.declared_unit.compatible(DIMENSIONLESS)
-              and name not in authored and not _has_unit_leaf(expr)):
+              and name not in authored and not has_unit_leaf):
             declared = stmt.declared_unit
         # A formula reading a reaction parameter (even one whose unit is 1), or a
         # parameter whose own formula reads one, takes its unit from its content.
@@ -184,7 +192,8 @@ def prepare_spec_units(spec, mechanism):
         elif (stmt.declared_unit is not None and name not in inputs and expr.quantity_unit is not None
               and not stmt.declared_unit.compatible(expr.quantity_unit)):
             raise DSLError(
-                f"The formula for {name} {_formula_result(expr.quantity_unit)}, so unit = {stmt.declared_unit.symbol} does not fit it.",
+                f"The formula for {name} {_formula_result(expr.quantity_unit)}, so unit = {stmt.declared_unit.symbol} does not fit it; "
+                f"unit = {stmt.declared_unit.symbol} expects a formula whose result fits it, or one built only from plain numbers.",
                 line_number=stmt.line, line_content=stmt.line_text,
             )
         prepared[name] = replace(stmt, expr=expr)

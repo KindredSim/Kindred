@@ -10,10 +10,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Dict
+from typing import Any
 
 
-from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
 from kindred.core.symbolic.jacobian_execution import (
     SymbolicJacobianExecution,
 )
@@ -43,49 +42,25 @@ class PreparedSolverConfig:
         object.__setattr__(self, "grid", MappingProxyType(dict(self.grid)))
 
 
-def _symbolic_jacobian_status_for_mechanism(mechanism: Any) -> Dict[str, Any]:
-    from kindred.core.symbolic.jacobian import classify_symbolic_jacobian_support
-
-    return dict(classify_symbolic_jacobian_support(mechanism).to_status_payload())
-
-
-def _symbolic_jacobian_for_bind_failure(mechanism: Any) -> SymbolicJacobianExecution:
-    return SymbolicJacobianExecution.from_bind_failure(
-        classified_status=_symbolic_jacobian_status_for_mechanism(mechanism),
-    )
-
-
-def _bind_symbolic_jacobian_for_current_mechanism(
-    *,
-    symbolic_structure: Any = None,
-    coefficient_evaluator: Any,
-) -> SymbolicJacobianExecution:
-    structure = symbolic_structure
-    if structure is None:
-        raise UnsupportedSymbolicExpressionError("symbolic structure is unsupported.")
-    jacobian_func = structure.bind(coefficient_evaluator)
-    return SymbolicJacobianExecution.supported(jacobian_func=jacobian_func)
-
-
 def build_runtime_symbolic_jacobian(
     *,
-    mechanism: Any,
     use_analytic_jacobian: bool,
     symbolic_structure: Any = None,
+    symbolic_support: Any = None,
     coefficient_evaluator: Any,
 ) -> SymbolicJacobianExecution:
-    """Prepare the symbolic Jacobian a Run uses, or why it uses none."""
+    """Prepare the symbolic Jacobian a Run uses, or why it uses none, as the
+    accepted mechanism decided once."""
 
     if not use_analytic_jacobian:
         return SymbolicJacobianExecution.disabled(
             code="policy-disabled",
             reason="Analytic Jacobian preference is disabled.",
         )
-    try:
-        symbolic_jacobian = _bind_symbolic_jacobian_for_current_mechanism(
-            symbolic_structure=symbolic_structure,
-            coefficient_evaluator=coefficient_evaluator,
+    if symbolic_structure is None:
+        return SymbolicJacobianExecution.unsupported(
+            classified_status=dict(symbolic_support.to_status_payload()),
         )
-    except UnsupportedSymbolicExpressionError:
-        symbolic_jacobian = _symbolic_jacobian_for_bind_failure(mechanism)
-    return symbolic_jacobian
+    return SymbolicJacobianExecution.supported(
+        jacobian_func=symbolic_structure.bind(coefficient_evaluator),
+    )
