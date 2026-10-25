@@ -18,6 +18,15 @@ from kindred.gui.ui_helpers import (
 _READS = frozenset({"initializing", "view", "copy", "outputs", "select"})
 
 
+def _step_of(event):
+    """The arrow key whose move Enter, Tab and their Shift forms make, as in Excel."""
+    if event.modifiers() & ~QtCore.Qt.KeypadModifier not in (QtCore.Qt.NoModifier, QtCore.Qt.ShiftModifier):
+        return None
+    if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+        return QtCore.Qt.Key_Up if event.modifiers() & QtCore.Qt.ShiftModifier else QtCore.Qt.Key_Down
+    return {QtCore.Qt.Key_Tab: QtCore.Qt.Key_Right, QtCore.Qt.Key_Backtab: QtCore.Qt.Key_Left}.get(event.key())
+
+
 class SpreadsheetSelectionDialog(QtWidgets.QDialog):
     def __init__(self, records, selected_id, *, parent):
         super().__init__(parent)
@@ -118,6 +127,7 @@ class _SheetModel(QtCore.QAbstractTableModel):
 class _CellDelegate(QtWidgets.QStyledItemDelegate):
     def __init__(self, dialog):
         super().__init__(dialog._table)
+        self.dialog = dialog
         self.active_editor = None
         self._initialized = False
 
@@ -126,7 +136,25 @@ class _CellDelegate(QtWidgets.QStyledItemDelegate):
         editor.setAlignment(QtCore.Qt.AlignCenter)
         self.active_editor = editor
         self._initialized = False
+        for signal in (editor.textEdited, editor.cursorPositionChanged, editor.selectionChanged):
+            signal.connect(lambda *_args: self.dialog._forget_pick(editor))
         return editor
+
+    def eventFilter(self, editor, event):
+        if editor is self.active_editor and event.type() == QtCore.QEvent.KeyPress:
+            step = _step_of(event)
+            if step is not None:
+                self.finish_edit()
+                self.dialog._step(step)
+                return True
+        if (editor is self.active_editor and event.type() == QtCore.QEvent.FocusOut
+                and QtWidgets.QApplication.focusWidget() is self.dialog._formula):
+            # Clicking the formula bar continues the entry there.
+            index = self.dialog._table.currentIndex()
+            self.dialog._hold_entry(index.row() + 1, index.column() + 1, editor.text())
+            self.closeEditor.emit(editor, QtWidgets.QAbstractItemDelegate.NoHint)
+            return False
+        return super().eventFilter(editor, event)
 
     def setEditorData(self, editor, index):
         # Replies update the display cache, not unfinished input.
@@ -342,13 +370,17 @@ class _SheetHeader(QtWidgets.QHeaderView):
                     return False
         control.blockSignals(True)
         self._input = self._edit = None
+        if control.hasFocus():
+            # Hiding a focused control would pass focus on as Tab does.
+            self.dialog._table.setFocus()
         control.hide()
         control.deleteLater()
         return True
 
     def eventFilter(self, watched, event):
         if event.type() == QtCore.QEvent.KeyPress:
-            if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter, QtCore.Qt.Key_Escape):
+            if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter, QtCore.Qt.Key_Escape,
+                               QtCore.Qt.Key_Tab, QtCore.Qt.Key_Backtab):
                 if self.finish_edit(event.key() != QtCore.Qt.Key_Escape):
                     self.dialog._table.setFocus()
                 return True
@@ -432,6 +464,35 @@ class _SheetTable(QtWidgets.QTableView):
         super().__init__(dialog)
         self.dialog = dialog
 
+    def edit(self, index, trigger, event):
+        opened = super().edit(index, trigger, event)
+        editor = self.dialog._delegate.active_editor
+        # As in Excel, F2 puts the cursor at the end and a double-click where it was clicked.
+        if opened and editor is not None and trigger == QtWidgets.QAbstractItemView.EditKeyPressed:
+            editor.end(False)
+        elif opened and editor is not None and trigger == QtWidgets.QAbstractItemView.DoubleClicked and event is not None:
+            # The line edit places centred text when it paints.
+            editor.repaint()
+            editor.setCursorPosition(editor.cursorPositionAt(editor.mapFrom(self.viewport(), event.position().toPoint())))
+        return opened
+
+    def keyboardSearch(self, search):
+        # Excel has no type-to-search; keys typed while a cell cannot be edited are ignored.
+        pass
+
+    def keyPressEvent(self, event):
+        # Tab reaches here too, from Qt's tab navigation.
+        if self.state() != QtWidgets.QAbstractItemView.EditingState:
+            step = _step_of(event)
+            if step is not None:
+                self.dialog._step(step)
+                return
+            if event.key() == QtCore.Qt.Key_Backspace and not event.modifiers():
+                # As in Excel, Backspace clears the active cell.
+                self.dialog._clear_current()
+                return
+        super().keyPressEvent(event)
+
     def paintEvent(self, event):
         super().paintEvent(event)
         painter = QtGui.QPainter(self.viewport())
@@ -475,6 +536,11 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._queue = []
         self._result_area = None
         self._formula_edit = None
+        # The line edit a click inserted a reference into and where it starts, until the entry's
+        # text, cursor or selection changes or the entry ends; a closed cell editor never matches
+        # a new one.
+        self._picked = None
+        self._picking = False
         self._gesture = None
         self._gesture_point = None
         self._projecting = False
@@ -519,7 +585,8 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._formula.setAccessibleName("Cell contents")
         self._formula.setToolTip("A number, or a formula such as =B5*D5 that computes its whole column from cells of the same row.\n"
                                  "Plain numbers in formulas are scientific values (M, s, K, J/mol, m³).\n"
-                                 "Use ln(x) for natural logarithms and log10(x) for base 10.")
+                                 "Use ln(x) for natural logarithms and log10(x) for base 10.\n"
+                                 "While typing a formula, click a cell after =, an operator, ( or , to insert its column on this row.")
         formula_row.addWidget(self._formula)
         layout.addLayout(formula_row)
         self._table = _SheetTable(self)
@@ -538,6 +605,10 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._table.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
         self._table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._context_menu)
+        for header, menu in ((self._header, self._columns_menu), (self._table.verticalHeader(), self._rows_menu)):
+            header.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            header.customContextMenuRequested.connect(
+                lambda point, header=header, menu=menu: self._header_menu(header, menu, point))
         layout.addWidget(self._table, 1)
         self._tabs = QtWidgets.QTabBar(self)
         layout.addWidget(self._tabs)
@@ -551,6 +622,8 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._review = QtWidgets.QPushButton("Review and Create…", self)
         self._cancel.setAutoDefault(False)
         self._review.setAutoDefault(False)
+        # Clicking Review leaves focus where it was; Review finishes active edits itself.
+        self._review.setFocusPolicy(QtCore.Qt.TabFocus)
         footer.addWidget(self._cancel)
         footer.addWidget(self._review)
         layout.addLayout(footer)
@@ -568,12 +641,18 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._table.horizontalHeader().sectionResized.connect(self._schedule_view)
         self._table.selectionModel().currentChanged.connect(self._selection_changed)
         self._table.selectionModel().selectionChanged.connect(lambda *_args: self._table.viewport().update())
+        # Cell clicks focus the table explicitly, so a click can pick a reference without finishing
+        # the entry; clicks on the table's other parts focus it as Qt would.
+        self._table.setFocusPolicy(QtCore.Qt.TabFocus)
         self._table.installEventFilter(self)
-        self._table.viewport().installEventFilter(self)
+        for part in self._table.findChildren(QtWidgets.QWidget):
+            part.installEventFilter(self)
         self._formula.installEventFilter(self)
         self._name.installEventFilter(self)
         self._tabs.currentChanged.connect(self._select_sheet)
         self._formula.textEdited.connect(self._start_formula_edit)
+        for signal in (self._formula.textEdited, self._formula.cursorPositionChanged, self._formula.selectionChanged):
+            signal.connect(lambda *_args: self._forget_pick(self._formula))
         self._formula.editingFinished.connect(lambda: self._finish_formula(True))
         self._name.editingFinished.connect(self._commit_name)
         self._cancel.clicked.connect(self.reject)
@@ -583,6 +662,7 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._worker.failed.connect(self._failure)
         self._worker.finished.connect(self._worker_finished)
         self._availability()
+        self._table.setFocus()
         self._worker.start()
 
     @property
@@ -631,13 +711,12 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         ready = self._editing_available and self._gesture is None
         for action in (*self._toolbar.actions(), *self._rows_menu.actions(), *self._columns_menu.actions()):
             action.setEnabled(ready)
-        self._name.setEnabled(ready)
+        # Entry fields are read-only rather than disabled, as in Excel, so they keep their focus.
+        self._name.setReadOnly(not ready)
         self._tabs.setEnabled(bool(self._sheets) and not self._closing and self._command != "outputs" and self._gesture is None)
-        self._formula.setEnabled(ready)
-        # Read after disabling fields: a focused field's focus loss can queue an edit.
+        self._formula_access()
         pending = self._pending
-        # Focus loss can submit an edit before a mouse click reaches Review.
-        # Keep the button available to record that click while the edit finishes.
+        # Keep Review available while edits finish, so its click runs after them.
         self._review.setEnabled(bool(self._sheets) and not self._closing and "outputs" not in pending)
         history = not self._closing and self._gesture is None
         self._undo.setEnabled(history and (self._can_undo or any(operation not in _READS for operation in pending)))
@@ -748,8 +827,10 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._availability()
         if error and operation == "formula":
             self._feedback.setText(f"{error}{'' if error.endswith('.') else '.'} Press Escape to discard the entry.")
-            self._formula.setReadOnly(False)
             self._formula.setFocus()
+            # The table stays on the refused entry's cell, which later entries capture.
+            _sheet, row, column, _entry = self._formula_edit
+            self._table.setCurrentIndex(self._model.index(row - 1, column - 1))
         while self._queue and not self.busy:
             operation, args, sheet = self._queue.pop(0)
             if operation == "select":
@@ -767,6 +848,8 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._model.info = self._sheets[self._sheet]
         self._model.cells = {}
         self._model.endResetModel()
+        # The scroll range follows the new row count before the current cell is scrolled into view.
+        self._table.updateGeometries()
         self._view_area = None
         self._name.setText(self._model.info["name"])
         if self._model.columnCount():
@@ -804,17 +887,48 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         if self._projecting or not self._sheets or self._formula_edit is not None:
             return
         index = self._table.currentIndex()
+        self._formula_access()
         if not index.isValid():
             self._address.clear()
             self._formula.clear()
-            self._formula.setReadOnly(True)
             return
         row, column = index.row() + 1, index.column() + 1
-        entry = self._model.entry(row, column)
         self._address.setText(f"{ironcalc.column_name_from_number(column)}{row}")
-        # A number is editable here only once its current value has loaded.
-        self._formula.setReadOnly(entry is None)
-        self._formula.setText(entry or "")
+        self._formula.setText(self._model.entry(row, column) or "")
+
+    def _formula_access(self):
+        # Editable once worksheet work is done and, for a number, once its current value has loaded.
+        index = self._table.currentIndex()
+        loaded = self._formula_edit is not None or (
+            index.isValid() and self._model.entry(index.row() + 1, index.column() + 1) is not None)
+        self._formula.setReadOnly(not (self._editing_available and self._gesture is None and loaded))
+
+    def _step(self, key):
+        """Move as the table's own arrow key does, which also resets where Shift selections start."""
+        self._table.setFocus()
+        index = self._table.currentIndex()
+        if key == QtCore.Qt.Key_Down and index.row() == self._model.rowCount() - 1 and "formula" in self._pending:
+            # An entry in the entry row adds the row below once its reply arrives.
+            row, column = index.row() + 2, index.column() + 1
+            self._result_area = "formula", (row, column, row, column)
+        QtWidgets.QApplication.sendEvent(self._table, QtGui.QKeyEvent(QtCore.QEvent.KeyPress, key, QtCore.Qt.NoModifier))
+
+    def _clear_current(self):
+        index = self._table.currentIndex()
+        if index.isValid() and self._clear.isEnabled():
+            row, column = index.row() + 1, index.column() + 1
+            self._request("clear", (row, column, row, column))
+
+    def _header_menu(self, header, menu, point):
+        """Right-clicking a header selects its row or column, unless already selected, and offers its menu."""
+        section = header.logicalIndexAt(point)
+        if section < 0:
+            return
+        horizontal = header.orientation() == QtCore.Qt.Horizontal
+        selection = self._table.selectionModel()
+        if not (selection.isColumnSelected(section) if horizontal else selection.isRowSelected(section)):
+            (self._table.selectColumn if horizontal else self._table.selectRow)(section)
+        menu.exec(header.viewport().mapToGlobal(point))
 
     def _fit_columns(self, previous=None):
         """Fit columns to their headers; given earlier definitions and widths by name, only those that changed."""
@@ -856,11 +970,15 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
             self._view_area = area
             self._send("view", area, self._sheet)
 
-    def _commit_entry(self, row, column, text):
-        """Commit a cell entry through the formula bar, which keeps it if refused."""
+    def _hold_entry(self, row, column, text):
+        """Continue a cell entry in the formula bar."""
         self._formula_edit = self._sheet, row, column, self._model.entry(row, column)
         self._address.setText(f"{ironcalc.column_name_from_number(column)}{row}")
         self._formula.setText(text)
+
+    def _commit_entry(self, row, column, text):
+        """Commit a cell entry through the formula bar, which keeps it if refused."""
+        self._hold_entry(row, column, text)
         return self._finish_formula(True)
 
     def _start_formula_edit(self, *_args):
@@ -869,12 +987,48 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
             row, column = index.row() + 1, index.column() + 1
             self._formula_edit = self._sheet, row, column, self._model.entry(row, column)
 
+    def _forget_pick(self, entry):
+        # Only a change to the entry holding the pick ends it; the formula bar also
+        # redisplays the current cell while a cell editor holds one.
+        if self._picked is not None and self._picked[0] is entry:
+            self._picked = None
+
+    def _repicking(self, entry):
+        """Whether the next click replaces the reference a click just inserted into entry."""
+        return self._picked is not None and self._picked[0] is entry
+
+    def _reference_entry(self):
+        """The unfinished formula a click inserts a reference into: after =, an operator, ( or ,."""
+        entry = self._delegate.active_editor
+        if entry is None and not self._formula.isReadOnly():
+            entry = self._formula
+        if entry is None or not entry.hasFocus() or not entry.text().startswith("="):
+            return None
+        start = entry.selectionStart() if entry.hasSelectedText() else entry.cursorPosition()
+        if self._repicking(entry) or entry.text()[:start].rstrip()[-1:] in tuple("=(,+-*/^<>!"):
+            return entry
+        return None
+
+    def _insert_reference(self, entry, column):
+        if entry is self._formula:
+            # A pick starts a formula-bar entry as typing does.
+            self._start_formula_edit()
+        # Formulas use only their own row, so a click in any row names its column there.
+        row = self._formula_edit[1] if entry is self._formula else self._table.currentIndex().row() + 1
+        if self._repicking(entry):
+            entry.setSelection(self._picked[1], entry.cursorPosition() - self._picked[1])
+        reference = f"{ironcalc.column_name_from_number(column)}{row}"
+        entry.insert(reference)
+        self._picked = entry, entry.cursorPosition() - len(reference)
+
     def _correct_declaration(self):
         index = self._table.currentIndex()
         if index.isValid():
             self._begin_header_edit(index.column(), "unit", correction=True)
 
     def _finish_formula(self, commit):
+        # Every commit attempt and formula-bar discard passes here.
+        self._picked = None
         if self._formula_edit is None or "formula" in self._pending:
             return True
         if commit:
@@ -892,19 +1046,56 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
             self._table.setFocus()
         return True
 
+    def _await_work(self):
+        """Hold the user's input until worksheet work settles, as Excel does, rather than losing keys."""
+        loop = QtCore.QEventLoop()
+        wakes = (self._worker.result, self._worker.failed, self._worker.finished, self._view_timer.timeout)
+        for wake in wakes:
+            wake.connect(loop.quit)
+        # Qt delivers the held input afterwards, in order; Review's mapping dialog is not waited for.
+        while not self._closing and (self.busy or self._view_timer.isActive()) and "outputs" not in self._pending:
+            loop.exec(QtCore.QEventLoop.ExcludeUserInputEvents)
+        for wake in wakes:
+            wake.disconnect(loop.quit)
+
     def eventFilter(self, watched, event):
+        # A user's key reaches a field that cannot take it yet only while work is outstanding.
+        if event.type() == QtCore.QEvent.ShortcutOverride and event.spontaneous() and watched.hasFocus() and (
+                watched is self._table and not self._model.flags(self._table.currentIndex()) & QtCore.Qt.ItemIsEditable
+                or watched in (self._formula, self._name) and watched.isReadOnly()):
+            self._await_work()
         if watched in (self._formula, self._name) and event.type() == QtCore.QEvent.FocusIn:
             if not self._header.finish_edit():
                 return True
             if watched is self._formula and not self._formula.isReadOnly():
                 self._start_formula_edit()
         if watched is self._formula and event.type() == QtCore.QEvent.KeyPress:
-            if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter, QtCore.Qt.Key_Escape):
-                self._finish_formula(event.key() != QtCore.Qt.Key_Escape)
+            if event.key() == QtCore.Qt.Key_Escape:
+                self._finish_formula(False)
+                return True
+            step = _step_of(event)
+            if step is not None:
+                if self._finish_formula(True):
+                    self._step(step)
                 return True
         if watched is self._table.viewport() and event.type() == QtCore.QEvent.Resize:
             self._schedule_view()
+        press = event.type() in (QtCore.QEvent.MouseButtonPress, QtCore.QEvent.MouseButtonDblClick)
         if watched is self._table.viewport():
+            if press:
+                index = self._table.indexAt(event.position().toPoint())
+                entry = self._reference_entry() if event.button() == QtCore.Qt.LeftButton and index.isValid() else None
+                self._picking = entry is not None
+                if self._picking:
+                    self._insert_reference(entry, index.column() + 1)
+                    return True
+                self._table.setFocus(QtCore.Qt.MouseFocusReason)
+                # Any click on the table finishes a header edit, as it finishes a cell entry.
+                self._header.finish_edit()
+            elif self._picking and event.type() in (QtCore.QEvent.MouseMove, QtCore.QEvent.MouseButtonRelease):
+                # The rest of a picking click must not move the table's selection.
+                self._picking = event.type() == QtCore.QEvent.MouseMove
+                return True
             if event.type() == QtCore.QEvent.MouseButtonPress and event.button() == QtCore.Qt.LeftButton:
                 if not self._finish_edits():
                     return True
@@ -923,6 +1114,9 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
                     self._update_gesture(self._table.viewport().mapToGlobal(event.position().toPoint()))
                     self._finish_gesture(True)
                     return True
+        elif press and self._table.isAncestorOf(watched):
+            self._table.setFocus(QtCore.Qt.MouseFocusReason)
+            self._header.finish_edit()
         return super().eventFilter(watched, event)
 
     def event(self, event):
@@ -933,7 +1127,7 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         return super().event(event)
 
     def _commit_name(self):
-        # Clear first: submitting disables the field, and its focus loss commits again.
+        # Clear first, so a later focus loss does not submit the same name again.
         if self._name.isModified():
             self._name.setModified(False)
             if not self._submit_edit("name", (self._name.text(),)):

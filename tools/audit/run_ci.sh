@@ -11,7 +11,7 @@ cd -- "${REPO_ROOT}"
 # Names vulture cannot see being used: Qt, pyqtgraph and QSyntaxHighlighter
 # overrides, sympy printer hooks and signature parameters, pickle hooks,
 # attributes read by openpyxl/decimal/pyqtgraph.
-VULTURE_IGNORE_NAMES="closeEvent,expandingDirections,minimumHeightForWidth,highlightBlock,showAxRect,\
+VULTURE_IGNORE_NAMES="closeEvent,expandingDirections,minimumHeightForWidth,highlightBlock,showAxRect,keyboardSearch,\
 _print_*,bold_name,persistent_id,persistent_load,\
 sheet_state,prec,border"
 
