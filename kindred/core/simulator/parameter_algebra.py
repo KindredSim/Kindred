@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from kindred.core.exceptions import KindredError
+from kindred.core.mechanism_metadata import MechanismMetadataKeys
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
 from kindred.core.algebra.evaluator import bind_scalar_expression_evaluator
@@ -25,17 +26,9 @@ from kindred.core.quantity_units import convert_value
 from kindred.core.units import admit_role_value
 from kindred.core.validation import parse_finite_numeric_text
 
-_PARAMETER_ALGEBRA_SPEC_META_KEY = "parameter_algebra_spec"
-
-
 __all__ = [
     "apply_parameter_algebra_spec_to_mechanism",
-    "parameter_algebra_spec_from_mechanism",
 ]
-
-
-def parameter_algebra_spec_from_mechanism(mechanism: object) -> ParameterAlgebraSpec:
-    return mechanism.metadata[_PARAMETER_ALGEBRA_SPEC_META_KEY]
 
 
 def _sentence(exc: Exception) -> str:
@@ -53,7 +46,7 @@ def apply_parameter_algebra_spec_to_mechanism(
 ) -> None:
     """Seed independent inputs and publish admitted overrides, never derived values."""
     meta = mechanism.metadata
-    scalars = dict(meta.get("scalar_params") or {})
+    scalars = dict(meta.get(MechanismMetadataKeys.SCALAR_PARAMS) or {})
     statements = {statement.name: statement for statement in spec.parameter_block.lines}
     literal = bind_scalar_expression_evaluator(
         spec.parameter_block, {},
@@ -101,5 +94,5 @@ def apply_parameter_algebra_spec_to_mechanism(
                     for name, value in (mechanism_coordinate_overrides or {}).items()},
         parameter_target_map=parameter_target_map, units=input_units,
     )
-    meta[_PARAMETER_ALGEBRA_SPEC_META_KEY] = spec
-    meta["scalar_params"] = scalars
+    meta[MechanismMetadataKeys.PARAMETER_ALGEBRA_SPEC] = spec
+    meta[MechanismMetadataKeys.SCALAR_PARAMS] = scalars

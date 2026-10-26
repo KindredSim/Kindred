@@ -285,6 +285,13 @@ def finalize_simulation_result(
             None if result.species_ctc is None
             else MappingProxyType(dict(zip(base_species_names, map(float, result.species_ctc))))
         ),
+        species_maximum=(
+            None if result.species_maximum is None
+            else MappingProxyType({
+                name: (float(value), float(time))
+                for name, value, time in zip(base_species_names, *result.species_maximum)
+            })
+        ),
         volume=result.volume,
         termination=result.termination,
     )

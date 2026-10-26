@@ -18,13 +18,13 @@ def execute_simulation(
     execution_request: SimulationExecutionRequest,
     *,
     cancellation_control: SimulationCancellationControl | None = None,
-    species_ctc: bool = False,
+    species_statistics: bool = False,
 ) -> SimulationResultValue:
     """Prepare, solve, and finalize without application or GUI ownership.
 
-    ``species_ctc`` asks for each species' cumulative temporal concentration,
-    which a Run with interventions other than temperature changes never
-    carries.
+    ``species_statistics`` asks for each species' maximum and its time, and its
+    cumulative temporal concentration, which a Run with interventions other
+    than temperature changes never carries.
     """
     def check_cancelled() -> None:
         if cancellation_control is not None and cancellation_control.cancel_requested():
@@ -41,7 +41,8 @@ def execute_simulation(
     prepared = prepare_simulation_run(execution_request=execution_request, cancellation_control=cancellation_control)
     solved = solve_ode(build_simulation_request_from_prepared_run(
         prepared,
-        species_ctc=species_ctc and prepared.intervention_execution.is_empty,
+        species_ctc=species_statistics and prepared.intervention_execution.is_empty,
+        species_maximum=species_statistics,
     ))
     check_cancelled()
     derived = derived_parameter_values(

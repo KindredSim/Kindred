@@ -16,6 +16,7 @@ from kindred.core.algebra.parser import (
     UnaryNode,
     _iter_identifiers,
 )
+from kindred.core.mechanism_metadata import MechanismMetadataKeys
 from kindred.core.quantity_units import Unit
 from kindred.core._bounded_rational import ExactWorkLimit, literal_fraction, rational_binary
 from kindred.core.equilibrium_rate_authority import equilibrium_rate_symbolic_relations
@@ -945,7 +946,7 @@ def compose_exact_constraints(
     relations.update(algebra)
     line_of = {
         entry["step_index"]: entry["line_text"].strip()
-        for entry in mechanism.metadata["step_index_map"]
+        for entry in mechanism.metadata[MechanismMetadataKeys.STEP_INDEX_MAP]
     }
     # A step's own param lines belong to the cycle text after its reaction lines.
     param_lines = tuple(

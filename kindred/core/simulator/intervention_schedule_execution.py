@@ -39,6 +39,7 @@ from .solver_types import (
     SimulationRequest,
     SimulationTermination,
 )
+from kindred.core.time_grid import build_time_grid
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +91,8 @@ class SegmentRunResult:
     dense_output: Callable[[np.ndarray], np.ndarray] | None = None
     # Each species' integral of concentration minus this segment's end state.
     species_ctc: np.ndarray | None = None
+    # The solver's accepted step ends, on the absolute clock.
+    step_times: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         # The solver adapter builds aligned rows and projects them nonnegative.
@@ -191,6 +194,10 @@ class InterventionScheduleExecutionOwner:
             # (length, end state, CTC from that end state) of each segment.
             ctc_segments: list[tuple[float, np.ndarray, np.ndarray]] | None = (
                 [] if req.species_ctc else None
+            )
+            # Each species' largest published concentration so far and its time.
+            maximum: tuple[np.ndarray, np.ndarray] | None = (
+                (np.full(len(req.y0), -np.inf), np.zeros(len(req.y0))) if req.species_maximum else None
             )
             integration_segments: list[dict[str, object]] = []
             segment_projections: dict[str, SegmentProjection] = {}
@@ -482,6 +489,13 @@ class InterventionScheduleExecutionOwner:
                     )
                     if has_stops:
                         dense_segments.append((segment_output_identity, segment_result.dense_output, active_holds, discontinuity_id, segment_temperature))
+                    if maximum is not None:
+                        # Executed bounds: SciPy's last step can extend past a root.
+                        _fold_maximum(maximum, _segment_maximum(
+                            segment_result, sub_start, actual_segment_end, active_holds, segment_temperature,
+                            species_index=species_index, parameter_values=req.parameter_values_at_temperature,
+                            cancellation_check=cancellation_check,
+                        ))
                     _record_segment_projection(
                         segment_projections,
                         segment_result,
@@ -814,7 +828,6 @@ class InterventionScheduleExecutionOwner:
                 output_y = np.concatenate(outputs_y, axis=1)
                 output_temperature = np.concatenate(outputs_temperature)
             if has_stops:
-                from kindred.core.time_grid import build_time_grid
                 try:
                     base_times = (np.array([t0], dtype=float) if actual_end == t0
                                   else build_time_grid(t0, actual_end, req.grid))
@@ -936,12 +949,21 @@ class InterventionScheduleExecutionOwner:
                     ctc + length * (end - final_state)
                     for length, end, ctc in ctc_segments
                 )
+            if maximum is not None:
+                # An instantaneous action's states before and after it count too.
+                for boundary in presentation_boundaries:
+                    for state in boundary.states:
+                        values = np.full(len(req.y0), -np.inf)
+                        for name, value in state.concentrations:
+                            values[species_index[name]] = value
+                        _fold_maximum(maximum, (values, np.full(values.size, boundary.time)))
             _raise_if_cancelled(cancellation_check)
             return FinalSimulationOutput(
                 t=output_t,
                 Y=output_y,
                 volume=volume.trajectory(output_t),
                 species_ctc=species_ctc,
+                species_maximum=maximum,
                 temperature_K=output_temperature,
                 provenance=provenance,
                 intervention_execution=final_contract,
@@ -959,6 +981,91 @@ class InterventionScheduleExecutionOwner:
             dense_segments.clear()
             segment_result = None
             dense = None
+
+
+# A golden-section step keeps 1/phi of the bracket, so 12 steps shrink each
+# bracket to about 0.3% of its width.  The maximum's value is then limited by
+# solver tolerances alone, and its time lies well inside the span over which
+# the curve stays within solver tolerance of that value, so finer time steps
+# would not make it more meaningful.
+_INVERSE_GOLDEN = (math.sqrt(5.0) - 1.0) / 2.0
+_GOLDEN_STEPS = 12
+
+
+def _segment_maximum(
+    segment_result: SegmentRunResult,
+    start: float,
+    end: float,
+    holds: tuple[ExecutableHold, ...],
+    temperature: TemperatureSegment,
+    *,
+    species_index: Mapping[str, int],
+    parameter_values: Callable[[float, tuple[str, ...]], Mapping[str, float]],
+    cancellation_check: Callable[[], bool] | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Each species' largest published concentration on one continuous segment
+    and its time.
+
+    The solver's step ends locate each maximum and its step interpolant refines
+    it, so solver tolerances, not output points, control its accuracy.  Holds
+    and the nonnegative projection apply as they do to published rows.
+    """
+
+    def states(times: np.ndarray) -> np.ndarray:
+        held = _apply_holds_to_trajectory(
+            segment_result.dense_output(times), holds, species_index=species_index,
+            cancellation_check=cancellation_check, times=times,
+            temperatures=temperature.values(times), parameter_values=parameter_values,
+        )
+        return project_nonnegative_trajectory(held, context="Maximum")[0]
+
+    steps = segment_result.step_times
+    times = np.unique(np.concatenate(([start, end], steps[(steps > start) & (steps < end)])))
+    values = states(times)
+    index = np.argmax(values, axis=1)
+    best = values[np.arange(values.shape[0]), index]
+    best_times = times[index]
+    # The maximum lies within the steps on either side of the largest step end.
+    low = times[np.maximum(index - 1, 0)]
+    width = times[np.minimum(index + 1, times.size - 1)] - low
+    searched = np.flatnonzero(width > 0.0)
+    if not searched.size:
+        return best, best_times
+    low, width = low[searched], width[searched]
+    columns = np.arange(searched.size)
+
+    def own(offsets: np.ndarray) -> np.ndarray:
+        # Each searched species at its own candidate time.  Offsets from
+        # ``low`` keep a late clock from coarsening the search.
+        return states(low + offsets)[searched, columns]
+
+    # One golden-section search per species, advanced together, so each step
+    # evaluates the interpolant once for every species.
+    a, b = np.zeros(searched.size), width
+    c, d = b - _INVERSE_GOLDEN * b, _INVERSE_GOLDEN * b
+    fc, fd = own(c), own(d)
+    for _ in range(_GOLDEN_STEPS):
+        _raise_if_cancelled(cancellation_check)
+        left = fc > fd
+        a, b = np.where(left, a, c), np.where(left, d, b)
+        c, d = np.where(left, b - _INVERSE_GOLDEN * (b - a), d), np.where(left, c, a + _INVERSE_GOLDEN * (b - a))
+        found = own(np.where(left, c, d))
+        fc, fd = np.where(left, found, fd), np.where(left, fc, found)
+    found = np.maximum(fc, fd)
+    better = found > best[searched]
+    best[searched[better]] = found[better]
+    best_times[searched[better]] = (low + np.where(fc >= fd, c, d))[better]
+    return best, best_times
+
+
+def _fold_maximum(
+    maximum: tuple[np.ndarray, np.ndarray], candidate: tuple[np.ndarray, np.ndarray],
+) -> None:
+    """Keep each species' larger value; a tie keeps the earlier time."""
+
+    larger = candidate[0] > maximum[0]
+    maximum[0][larger] = candidate[0][larger]
+    maximum[1][larger] = candidate[1][larger]
 
 
 def _append_presentation_boundary(

@@ -18,6 +18,7 @@ import numpy as np
 
 from kindred.core.analysis.fit_statistics import FitMetric
 from kindred.core.analysis.global_fit_execution import FitCoordinate, parameter_group_variable_id
+from kindred.core.fitting_evaluation import INITIAL_PREFIX
 from kindred.core.fitting_optimization import fit_bound_position
 from kindred.core.quantity_units import SECOND, format_unit_for_display
 from kindred.core.simulation_failure import FactualCause
@@ -27,7 +28,6 @@ from kindred.gui.fitting.constants import (
     DIFFERENTIAL_EVOLUTION_METHOD,
     FIT_DATASET_WEIGHT_MODE_LABELS,
     FUNCTION_TOLERANCE_LABEL,
-    INITIAL_PREFIX,
     STEP_TOLERANCE_LABEL,
     fit_method_label,
 )
@@ -580,15 +580,18 @@ def _result_text(estimate: float, lower: float | None, upper: float | None, boun
         return f"≥ {_single_number(_round_figures(lower, ROUND_FLOOR, 2))}"
     if lower is None:
         return f"≤ {_single_number(_round_figures(upper, ROUND_CEILING, 2))}"
-    below = _error(estimate - lower)
-    above = _error(upper - estimate)
+    gaps = (estimate - lower, upper - estimate)
+    below, above = (_error(gap) for gap in gaps)
     if max(below, above) == 0:
         return ""
     # The estimate and both errors share the finer error's last place, in the
-    # estimate's own power of ten.
+    # estimate's own power of ten; both errors are rounded up at that place.
     step = Decimal(1).scaleb(min(error.as_tuple().exponent for error in (below, above) if error))
     value = Decimal(repr(estimate)).quantize(step, ROUND_HALF_UP)
-    below, above = below.quantize(step), above.quantize(step)
+    below, above = (Decimal(format(gap, ".12g")).quantize(step, ROUND_CEILING) for gap in gaps)
+    # Errors that differ by less than one unit of that last place are one error.
+    if abs(Decimal(repr(upper - estimate)) - Decimal(repr(estimate - lower))) < step:
+        below = above = max(below, above)
     scale = _power(value if value else max(below, above))
 
     def mantissa(number: Decimal) -> str:

@@ -135,14 +135,6 @@ class TabSliderBinding(QtCore.QObject):
             (species_sliders.interactionRequested, self._on_species_interaction),
         )
 
-    @property
-    def tab_id(self) -> str:
-        return self._tab_id
-
-    @property
-    def active_preview_set_ids(self) -> tuple[str, ...]:
-        return tuple(self._simulation_jobs.preview_set_ids(self._tab_id))
-
     def _stop_preview_timers(self) -> None:
         self._throttle_timer.stop()
 

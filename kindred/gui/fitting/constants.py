@@ -2,7 +2,6 @@
 
 from kindred.core.validation import parse_finite_numeric_text
 
-INITIAL_PREFIX = "init:"
 DIFFERENTIAL_EVOLUTION_METHOD = "differential_evolution"
 # Tolerance labels shared by the Fit window and the Fitting Defaults dialog.
 FUNCTION_TOLERANCE_LABEL = "Objective-improvement tolerance"

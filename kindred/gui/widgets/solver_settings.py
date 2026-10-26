@@ -284,28 +284,12 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         parallel_form.addRow("Simultaneous simulations", self.parallel_automatic_check)
         parallel_form.addRow("Explicit maximum", parallel_row)
         body_layout.addWidget(parallel_box)
-
-        cache_box = QtWidgets.QGroupBox("Result Cache", body)
-        cache_form = QtWidgets.QFormLayout(cache_box)
-        self.cache_capacity_edit = _number_edit(
-            cache_box,
-            "32",
-            "Number of past simulation results kept in memory per mechanism tab. "
-            "Matching results can be restored when enabled for plotting. Larger "
-            "values use more memory. When the cache is full, the least recently "
-            "used results are removed.",
-        )
-        cache_form.addRow(
-            "Explicit-result cache capacity",
-            self.cache_capacity_edit,
-        )
-        body_layout.addWidget(cache_box)
         scroll.setWidget(body)
         layout.addWidget(scroll, 1)
         for control in (self.energy_unit_combo, self._run_default_fields.solver_combo):
             ignore_wheel(control)
 
-        for form in (science_form, run_form, preview_form, parallel_form, cache_form):
+        for form in (science_form, run_form, preview_form, parallel_form):
             for row in range(form.rowCount()):
                 field = form.itemAt(row, QtWidgets.QFormLayout.ItemRole.FieldRole).widget()
                 label = form.labelForField(field)
@@ -438,17 +422,6 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             maximum=self._physical_cores,
         )
 
-    def set_result_cache_capacity(self, value: int) -> None:
-        self.cache_capacity_edit.setText(str(int(value)))
-
-    def result_cache_capacity(self) -> int:
-        return parse_whole_number_text(
-            self.cache_capacity_edit.text(),
-            field="Explicit-result cache capacity",
-            minimum=1,
-            maximum=(1 << 31) - 1,
-        )
-
     @QtCore.Slot()
     def _accept_candidate(self) -> None:
         try:
@@ -456,7 +429,6 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             self.new_tab_run_defaults()
             self.preview_settings()
             self.parallel_maximum()
-            self.result_cache_capacity()
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(
                 self,

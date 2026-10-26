@@ -411,8 +411,6 @@ def _payload_observations(
                 series.source_rows,
                 dtype=np.int64,
             ).reshape(-1),
-            "raw_observation_id": series.raw_observation_id,
-            "raw_column": series.raw_column,
         }
         for name, series in payload.observations.items()
     }
@@ -430,8 +428,6 @@ def _payload_x_observations(payload: FitDatasetSpec) -> Dict[str, object]:
     return {
         "x": np.asarray([by_row[row] for row in rows], dtype=float),
         "source_rows": rows,
-        "raw_observation_id": source.raw_observation_id,
-        "raw_column": source.raw_column,
     }
 
 

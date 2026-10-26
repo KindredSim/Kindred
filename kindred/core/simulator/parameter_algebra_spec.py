@@ -35,6 +35,10 @@ from .dsl_build_input import (
     source_coordinate_name_parts,
     source_coordinate_name_pattern,
 )
+from .parameter_coordinates import build_parameter_target_map, chemistry_parameter_dependencies
+from .exact_constraint_composition import proves_redundant_parameter
+from .parameter_units import prepare_spec_units
+from kindred.core.algebra.evaluator import EvaluationContext, evaluate_block
 
 _PARAM_STMT_RE = re.compile(r"^\s*(?i:param)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$")
 _LET_STMT_RE = re.compile(r"^\s*(?i:let)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$")
@@ -347,11 +351,6 @@ def admit_parameter_evaluation_graph(
 ) -> ParameterAlgebraSpec:
     """Compose authored definitions with typed chemistry before publication."""
     from graphlib import CycleError, TopologicalSorter
-    from .parameter_coordinates import (
-        build_parameter_target_map,
-        chemistry_parameter_dependencies,
-    )
-    from .exact_constraint_composition import proves_redundant_parameter
 
     targets = build_parameter_target_map(mechanism)
     chemistry = chemistry_parameter_dependencies(mechanism, targets)
@@ -372,7 +371,6 @@ def admit_parameter_evaluation_graph(
                 dep for dep in _iter_identifiers(statement.expr) if dep in names
             )
         )
-    from .parameter_units import prepare_spec_units
     spec = prepare_spec_units(spec, mechanism)
     _admit_static_values(spec)
     statements = {statement.name: statement for statement in spec.parameter_block.lines}
@@ -467,8 +465,6 @@ def _admit_static_values(spec: ParameterAlgebraSpec) -> None:
     line is consumed, not against a nominal value.
     """
     import numpy as np
-
-    from kindred.core.algebra.evaluator import EvaluationContext, evaluate_block
 
     constants = set(spec.namespace_model().protected_symbol_names) - {"T"}
     lets = {statement.name: statement for statement in spec.observable_block.lines}

@@ -11,6 +11,7 @@ and are evaluated as net forward minus reverse rates (no reaction duplication).
 from __future__ import annotations
 
 from kindred.core.kinetics import forward_rate_model_payload
+from kindred.core.mechanism_metadata import MechanismMetadataKeys, MechanismMetadataView
 
 from dataclasses import dataclass
 from typing import Callable, Mapping
@@ -21,6 +22,12 @@ from .equilibrium_rate_authority import (
     json_safe_equilibrium_authority_payload,
 )
 from .mechanism import Equilibrium, FrozenDict, Mechanism, Reaction
+from kindred.core.simulator.step_indexing import get_step_index_map
+from kindred.core.simulator.parameter_algebra_eval import bind_parameter_evaluation
+from kindred.core.algebra.errors import AlgebraError
+from kindred.core.algebra.evaluator import PreparedAlgebraPointEvaluator
+from kindred.core.algebra.simulation_series import failing_let_facts, observable_species_refs
+from kindred.core.exceptions import ValueDomainError
 
 __all__ = [
     "CompiledOdeTopology",
@@ -75,8 +82,6 @@ def _step_coefficient_names(
     """Each step's kind, the step, its step-map entry, and its forward and
     reverse coefficient names, reactions first, as the topology orders them."""
 
-    from .simulator.step_indexing import get_step_index_map
-
     entries = {(entry["kind"], int(entry["reaction_index" if entry["kind"] == "reaction" else "equilibrium_index"])): entry
                for entry in get_step_index_map(mechanism)}
     steps = []
@@ -96,7 +101,7 @@ def rate_authority_snapshot(mechanism: Mechanism) -> tuple[Mapping[str, object],
     topology order, without calculating any value."""
 
     # Admission always retains the spec; its absence is a producer error.
-    spec = mechanism.metadata["parameter_algebra_spec"]
+    spec = mechanism.metadata[MechanismMetadataKeys.PARAMETER_ALGEBRA_SPEC]
     snapshots = []
     for kind, step, _entry, forward_name, reverse_name in _step_coefficient_names(mechanism):
         snapshot = {"kind": kind, "forward_model": forward_rate_model_payload(step.forward_model),
@@ -116,12 +121,9 @@ def _build_effective_rate_coefficient_evaluator(
     """Build the sole effective-rate authority consumed by RHS and Jacobian,
     for one run's starting concentrations."""
 
-    from .mechanism_metadata import MechanismMetadataView
-    from .simulator.parameter_algebra_eval import bind_parameter_evaluation
-
     mech_meta = MechanismMetadataView.from_metadata(mechanism.metadata)
     # Admission always retains the spec; its absence is a producer error.
-    spec = mechanism.metadata["parameter_algebra_spec"]
+    spec = mechanism.metadata[MechanismMetadataKeys.PARAMETER_ALGEBRA_SPEC]
     steps = _step_coefficient_names(mechanism)
     return EffectiveRateCoefficientEvaluator(
         nominal_temperature_K=float(mech_meta.temperature_K),
@@ -237,12 +239,8 @@ def bind_rate_factors(
     steps = factored_steps(mechanism)
     if not steps:
         return None
-    from .algebra.errors import AlgebraError
-    from .algebra.evaluator import PreparedAlgebraPointEvaluator
-    from .algebra.simulation_series import failing_let_facts, observable_species_refs
-    from .exceptions import ValueDomainError
 
-    spec = mechanism.metadata["parameter_algebra_spec"]
+    spec = mechanism.metadata[MechanismMetadataKeys.PARAMETER_ALGEBRA_SPEC]
     block = spec.observable_block
     species_names = tuple(mechanism.species_names())
     reads = {

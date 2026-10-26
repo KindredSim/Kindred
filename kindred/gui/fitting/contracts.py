@@ -14,7 +14,6 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class FitParametricSettings:
-    dataset_id: str
     x_name: str
 
 

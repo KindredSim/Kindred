@@ -9,6 +9,7 @@ from numbers import Real
 from typing import Callable, Iterable, Mapping, Sequence
 
 from kindred.core.authored_source_errors import AuthoredSourceError
+from kindred.core.mechanism_metadata import MechanismMetadataKeys
 from kindred.core.datasets import foundation as dataset_foundation
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.fitting_method_policy import LEAST_SQUARES_TOLERANCE, validate_fit_method
@@ -45,6 +46,7 @@ from kindred.core.species import (
     validate_temperature,
     validate_input_time_seconds,
 )
+from kindred.core.datasets.observation_mapping import normalize_observation_mapping
 
 __all__ = [
     "DatasetLink",
@@ -1257,7 +1259,7 @@ def _admitted_correction_targets(
     }
     context = {
         entry["step_index"]: entry["context"]
-        for entry in prepared.accepted_mechanism_for_structure().metadata["step_index_map"]
+        for entry in prepared.accepted_mechanism_for_structure().metadata[MechanismMetadataKeys.STEP_INDEX_MAP]
     }
     targets: list[CorrectionTarget] = []
     for origin in prepared.analysis.origins:
@@ -1430,9 +1432,6 @@ def prepare_tab_scientific_settings(
 
 def validate_project_document(document: ProjectDocument) -> ProjectDocument:
     """Validate every canonical value and cross-reference."""
-    from kindred.core.datasets.observation_mapping import (
-        normalize_observation_mapping,
-    )
 
     # Settings, Fit defaults, imported sources and dataset records arrive
     # admitted by archive decoding, their editors or spreadsheet admission.

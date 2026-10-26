@@ -34,13 +34,13 @@ class _Reader(pickle.Unpickler):
         return self.references[name]
 
 
-def _encode_fit(value, references):
+def encode_fit(value, references):
     stream = io.BytesIO()
     _Writer(stream, references).dump(value)
     return stream.getvalue()
 
 
-def _decode_fit(payload, references):
+def decode_fit(payload, references):
     return _Reader(io.BytesIO(payload), references).load()
 
 

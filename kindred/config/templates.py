@@ -252,6 +252,10 @@ class TemplateManager:
                     indent=2,
                 )
                 handle.write("\n")
+                # The data reaches the disk before the replacement, so a
+                # crash leaves either the prior or the new template.
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(temporary_path, target)
         except BaseException:
             try:

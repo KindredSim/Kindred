@@ -52,6 +52,8 @@ from kindred.gui.dataset_payload_snapshot import ExperimentalLayerInput
 from kindred.gui.plot_config import AxisSelectionCandidate
 
 __all__ = [
+    "MAX_COPY_CELLS",
+    "MAX_COPY_CHARACTERS",
     "ResultDataBlock",
     "ResultLayerKind",
     "ResultRenderInput",
@@ -67,8 +69,8 @@ __all__ = [
     "write_xlsx",
 ]
 
-_MAX_COPY_CELLS = 1_000_000
-_MAX_COPY_CHARACTERS = 64 * 1024 * 1024
+MAX_COPY_CELLS = 1_000_000
+MAX_COPY_CHARACTERS = 64 * 1024 * 1024
 _MAX_XLSX_STRING_LENGTH = 32_767
 _EXCEL_MAX_ROWS = 1_048_576
 _EXCEL_MAX_COLUMNS = 16_384
@@ -1405,19 +1407,19 @@ def iter_blocks_tsv_chunks(
                        for name, values, kind in _boundary_export_columns(block.result))
     row_count = max(len(values) for _header, values, _kind in columns)
     cell_count = (row_count + 1) * len(columns)
-    if cell_count > _MAX_COPY_CELLS:
+    if cell_count > MAX_COPY_CELLS:
         raise ValueError(
             "Copy payload exceeds the bounded full-resolution cell limit "
-            f"({_MAX_COPY_CELLS:,})."
+            f"({MAX_COPY_CELLS:,})."
         )
     chunk_size = int(rows_per_chunk)
     total_characters = 0
     header = encode_tsv_row(tuple(header for header, _values, _kind in columns))
     total_characters += len(header)
-    if total_characters > _MAX_COPY_CHARACTERS:
+    if total_characters > MAX_COPY_CHARACTERS:
         raise ValueError(
             "Copy payload exceeds the bounded output-size limit "
-            f"({_MAX_COPY_CHARACTERS // (1024 * 1024)} MiB)."
+            f"({MAX_COPY_CHARACTERS // (1024 * 1024)} MiB)."
         )
     yield header
     texts = [_tsv_column_text(values, kind) for _header, values, kind in columns]
@@ -1428,10 +1430,10 @@ def iter_blocks_tsv_chunks(
             zip_longest(*(text[start:end] for text in texts), fillvalue="")
         )
         total_characters += len(chunk)
-        if total_characters > _MAX_COPY_CHARACTERS:
+        if total_characters > MAX_COPY_CHARACTERS:
             raise ValueError(
                 "Copy payload exceeds the bounded output-size limit "
-                f"({_MAX_COPY_CHARACTERS // (1024 * 1024)} MiB)."
+                f"({MAX_COPY_CHARACTERS // (1024 * 1024)} MiB)."
             )
         yield chunk
 

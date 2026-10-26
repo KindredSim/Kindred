@@ -33,6 +33,7 @@ from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
+    INITIAL_PREFIX,
     FittingEvaluator,
     prepare_fitting_execution_context,
 )
@@ -47,7 +48,6 @@ from kindred.core.simulation_failure import (
     factual_cause_from_exception,
 )
 from kindred.gui.curve_copy_headers import observable_copy_definitions
-from kindred.gui.fitting.constants import INITIAL_PREFIX
 from kindred.gui.fitting.launch import (
     FitDatasetLocalSettings,
     _FitDispatchCompilation,
@@ -201,8 +201,6 @@ def _series_from_selected(
     """Lower one retained immutable selection into the evaluator payload."""
 
     return FitObservationSeries(
-        raw_observation_id=observation.raw_observation_id,
-        raw_column=observation.raw_column,
         t=np.asarray(observation.t, dtype=float),
         y=np.asarray(observation.y, dtype=float),
         source_rows=observation.source_rows,
@@ -619,7 +617,6 @@ class _FitExecution(_FitControl):
                 # experiment did.
                 use_authored_stops=measured_x and setup.origin.scientific_settings.use_authored_stops,
                 cancellation_control=self._cancellation_control,
-                initial_prefix=INITIAL_PREFIX,
             )
             evaluators[local.dataset_id] = FittingEvaluator(context)
 

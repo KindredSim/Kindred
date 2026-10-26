@@ -551,4 +551,4 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
                     manual_initial_concentrations=manual,
                 )
             )
-        return DatasetMappingBatchProposal(tab_id=self._tab.tab_id, proposals=tuple(proposals))
+        return DatasetMappingBatchProposal(proposals=tuple(proposals))

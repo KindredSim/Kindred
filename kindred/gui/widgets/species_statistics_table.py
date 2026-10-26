@@ -5,7 +5,6 @@ from __future__ import annotations
 
 from typing import Mapping, Optional
 
-import numpy as np
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.quantity_units import (
@@ -16,7 +15,6 @@ from kindred.core.quantity_units import (
     format_unit_for_display,
 )
 from kindred.gui.ui_helpers import SCIENTIFIC_NAME_HTML_ROLE, ScientificNameHeaderView
-from kindred.core.simulator.solver_types import SimulationPresentationBoundary
 
 __all__ = ["SpeciesStatisticsTable"]
 
@@ -40,8 +38,9 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
     - CTC (cumulative temporal concentration) - the signed integral of the
       concentration minus its final value over the simulated span
 
-    The CTC is the result's own value, which results with interventions other
-    than temperature changes do not carry.
+    The maximum, its time and the CTC are the result's own values, located on
+    the solver's steps; results with interventions other than temperature
+    changes do not carry a CTC.
     """
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
@@ -93,11 +92,10 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
 
     def update_results(
         self,
-        canonical_time: np.ndarray,
-        species_data: Mapping[str, np.ndarray],
+        final_concentrations: Mapping[str, float],
         *,
+        species_maximum: Mapping[str, tuple[float, float]],
         species_ctc: Mapping[str, float] | None,
-        presentation_boundaries: tuple[SimulationPresentationBoundary, ...],
         concentration_display_unit: Unit,
         time_display_unit: Unit,
     ) -> None:
@@ -106,17 +104,13 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
 
         Parameters
         ----------
-        canonical_time : np.ndarray
-            Canonical ``SimulationResultValue.t`` array. Display X is invalid
-            at this scientific-statistics boundary.
-        species_data : dict
-            Dictionary of {species_name: concentration_array}
+        final_concentrations : Mapping
+            Each shown species' concentration in M at the last returned sample.
+        species_maximum : Mapping
+            Each species' largest concentration in M and its time in s.
         species_ctc : Mapping, optional
             Each species' cumulative temporal concentration in M·s, absent for
             results with interventions other than temperature changes.
-        presentation_boundaries : tuple, optional
-            Every retained intervention boundary state of the primary result;
-            these contribute to Max and t@Max without becoming table rows.
         """
         ctc_unit = concentration_display_unit.multiply(time_display_unit)
         for column, label, unit in (
@@ -132,20 +126,11 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
                 SCIENTIFIC_NAME_HTML_ROLE,
                 f"{label} ({format_unit_for_display(unit)})",
             )
-        projected_roster = tuple(sorted(species_data))
+        projected_roster = tuple(sorted(final_concentrations))
         calculated: list[tuple[str, ...]] = []
         for species_name in projected_roster:
-            concentrations = species_data[species_name]
-            final_conc = concentrations[-1]
-            max_conc = np.max(concentrations)
-            idx_max = np.argmax(concentrations)
-            max_time = canonical_time[idx_max]
-            for boundary in presentation_boundaries:
-                for state in boundary.states:
-                    boundary_value = dict(state.concentrations).get(species_name)
-                    if boundary_value is not None and boundary_value > max_conc:
-                        max_conc = boundary_value
-                        max_time = boundary.time
+            final_conc = final_concentrations[species_name]
+            max_conc, max_time = species_maximum[species_name]
             final_text = _display_statistic(final_conc, MOLAR, concentration_display_unit)
             maximum_text = _display_statistic(max_conc, MOLAR, concentration_display_unit)
             time_text = _display_statistic(max_time, SECOND, time_display_unit)

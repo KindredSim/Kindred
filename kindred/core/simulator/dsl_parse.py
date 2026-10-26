@@ -65,7 +65,11 @@ from .errors import (
     missing_arrow_error,
     invalid_species_term_error,
 )
-from .parameter_algebra_spec import classify_parameter_algebra_declaration
+from .parameter_algebra_spec import (
+    classify_parameter_algebra_declaration,
+    parse_parameter_algebra_spec_from_dsl_text,
+    admit_parameter_evaluation_graph,
+)
 from .parameter_namespace import (
     build_namespace_from_mechanism,
 )
@@ -73,7 +77,35 @@ from .dsl_build_input import (
     DslBuildStep,
     DslSourceCoordinate,
     canonical_source_coordinate_name,
+    DslMechanismBuildInput,
 )
+from ..temperature_dsl import TemperatureDSLError, parse_temperature_schedule
+from ..intervention_schedule import (
+    _admit_intervention_directives,
+    InterventionStopAction,
+    InterventionScheduleError,
+    ObservableTriggerCondition,
+    admit_intervention_parameter_units,
+    declaration_line,
+    intervention_schedule_clock_parameters,
+    intervention_schedule_parameter_dependencies,
+)
+from ..intervention_schedule_compiler import compile_intervention_schedule
+from .dsl_build import build_mechanism_from_ir
+from ..algebra.errors import AlgebraError
+from ..algebra.simulation_series import observable_parameter_roots, reject_unknown_species_references
+from .parameter_algebra import apply_parameter_algebra_spec_to_mechanism
+from .parameter_coordinates import build_parameter_target_map
+from ..mechanism import Mechanism
+from ..mechanism_metadata import MechanismMetadataView
+from ..exceptions import ValueDomainError
+from ..ode_builder import CompiledOdeTopology
+from ..symbolic.jacobian import (
+    build_symbolic_jacobian_structure,
+    classify_runtime_jacobian_support,
+    build_symbolic_equations_text,
+)
+from ..symbolic.errors import UnsupportedSymbolicExpressionError
 
 if TYPE_CHECKING:
     from ..intervention_schedule import InterventionSchedule
@@ -272,8 +304,6 @@ class PreparedDslRequestSet:
         step lists, sharing the accepted mechanism's immutable steps and
         nested values, which writers replace rather than mutate."""
 
-        from kindred.core.mechanism import Mechanism
-
         shell = Mechanism()
         shell.species = self.__mechanism.species
         shell.metadata = dict(self.__mechanism.metadata)
@@ -294,8 +324,6 @@ class PreparedDslRequestSet:
             with self.__structure_lock:
                 topology = self.__compiled_ode_topology
                 if topology is None:
-                    from kindred.core.ode_builder import CompiledOdeTopology
-
                     topology = CompiledOdeTopology.from_mechanism(
                         self.__mechanism
                     )
@@ -310,11 +338,6 @@ class PreparedDslRequestSet:
         if not self.__symbolic_structure_initialized:
             with self.__structure_lock:
                 if not self.__symbolic_structure_initialized:
-                    from kindred.core.symbolic.jacobian import (
-                        build_symbolic_jacobian_structure,
-                        classify_runtime_jacobian_support,
-                    )
-
                     support = classify_runtime_jacobian_support(self.__mechanism)
                     self.__symbolic_jacobian_support = support
                     self.__symbolic_jacobian_structure = (
@@ -331,13 +354,6 @@ class PreparedDslRequestSet:
         if not self.__symbolic_equations_initialized:
             with self.__structure_lock:
                 if not self.__symbolic_equations_initialized:
-                    from kindred.core.symbolic.errors import (
-                        UnsupportedSymbolicExpressionError,
-                    )
-                    from kindred.core.symbolic.jacobian import (
-                        build_symbolic_equations_text,
-                    )
-
                     try:
                         text = build_symbolic_equations_text(self.__mechanism)
                     except UnsupportedSymbolicExpressionError:
@@ -349,15 +365,12 @@ class PreparedDslRequestSet:
     def temperature_changes(self) -> tuple["TemperatureChange", ...]:
         """Return the accepted mechanism's temperature changes during a Run."""
 
-        from kindred.core.mechanism_metadata import MechanismMetadataView
-
         return MechanismMetadataView.from_metadata(self.__mechanism.metadata).temperature_changes
 
     def parameterized_intervention_schedule_for_binding(self) -> InterventionSchedule | None:
         return self.__intervention_schedule
 
     def authored_stop_declarations(self) -> tuple[str, ...]:
-        from kindred.core.intervention_schedule import InterventionStopAction
         triggers = (
             self.__intervention_schedule.triggers
             if self.__intervention_schedule is not None
@@ -1122,8 +1135,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
     )
 
     # Lower the temperature schedule after resolving the nominal temperature.
-    from ..temperature_dsl import TemperatureDSLError, parse_temperature_schedule
-    from ..intervention_schedule import _admit_intervention_directives
 
     intervention_schedule, intervention_lines = _admit_intervention_directives(text)
 
@@ -1610,8 +1621,6 @@ def _source_origins(
 def _mechanism_build_input(ir: DSLIR):
     """Freeze the private parse accumulator into the sole builder input."""
 
-    from kindred.core.simulator.dsl_build_input import DslMechanismBuildInput
-
     return DslMechanismBuildInput(
         energy_unit=ir.energy_unit,
         temperature_K=ir.temperature_K,
@@ -1628,19 +1637,6 @@ def prepare_dsl_request_set(
 ) -> PreparedDslRequestSet:
     """Admit source once and publish its one immutable typed analysis."""
 
-    from kindred.core.intervention_schedule_compiler import (
-        compile_intervention_schedule,
-    )
-    from kindred.core.simulator.dsl_build import build_mechanism_from_ir
-    from kindred.core.simulator.parameter_algebra_spec import (
-        parse_parameter_algebra_spec_from_dsl_text,
-    )
-    from kindred.core.algebra.errors import AlgebraError
-    from kindred.core.algebra.simulation_series import (
-        observable_parameter_roots,
-        reject_unknown_species_references,
-    )
-
     units = units or UnitsModel()
     ir = _parse_dsl_ir(text, units=units)
     # Directive admission returns a nonempty typed schedule or None.
@@ -1651,10 +1647,7 @@ def prepare_dsl_request_set(
         text,
         mechanism_namespace=mechanism_namespace,
     )
-    from .parameter_algebra_spec import admit_parameter_evaluation_graph
     parameter_algebra_spec = admit_parameter_evaluation_graph(parameter_algebra_spec, mechanism)
-    from .parameter_algebra import apply_parameter_algebra_spec_to_mechanism
-    from .parameter_coordinates import build_parameter_target_map
     apply_parameter_algebra_spec_to_mechanism(
         parameter_algebra_spec, mechanism=mechanism,
         parameter_target_map=build_parameter_target_map(mechanism),
@@ -1705,15 +1698,6 @@ def prepare_dsl_request_set(
     # every other schedule has one timeline and is compiled here.
     parameterized_intervention_schedule = None
     if intervention_schedule is not None:
-        from kindred.core.exceptions import ValueDomainError
-        from kindred.core.intervention_schedule import (
-            InterventionScheduleError,
-            ObservableTriggerCondition,
-            admit_intervention_parameter_units,
-            declaration_line,
-            intervention_schedule_clock_parameters,
-            intervention_schedule_parameter_dependencies,
-        )
         if intervention_schedule_clock_parameters(intervention_schedule):
             parameterized_intervention_schedule = intervention_schedule
         try:

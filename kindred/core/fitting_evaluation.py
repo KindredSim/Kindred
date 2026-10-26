@@ -21,11 +21,11 @@ from kindred.core.analysis.fit_evaluation_outcome import (
 from kindred.core.algebra.errors import UNCOMPUTABLE_ERRORS
 from kindred.core.algebra.simulation_series import observable_closure
 from kindred.core.simulation_preparation import (
+    PreparedSolverConfig,
     SimulationExecutionRequest,
     build_simulation_request_from_prepared_run,
     prepare_simulation_run,
 )
-from kindred.core.simulation_preparation_stages import PreparedSolverConfig
 from kindred.core.result_repository import SimulationResultValue
 from kindred.core.simulation_result_finalization import evaluate_lets_at_rows, finalize_simulation_result
 from kindred.core.simulator.solver_types import (
@@ -44,9 +44,12 @@ __all__ = [
     "FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET",
     "FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED",
     "FittingEvaluator",
+    "INITIAL_PREFIX",
     "prepare_fitting_execution_context",
 ]
 
+# A fitted starting concentration is named by this prefix and its species.
+INITIAL_PREFIX = "init:"
 FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED = "optimizer_shared"
 FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET = "optimizer_dataset"
 FITTING_PARAM_ORIGIN_CONFIGURED_DATASET = "configured_dataset"
@@ -86,7 +89,6 @@ class PreparedFittingExecutionContext:
     requested_sample_times: tuple[float, ...]
     sample_solver_steps: bool
     use_authored_stops: bool
-    initial_prefix: str = "init:"
 
 
 def prepare_fitting_execution_context(
@@ -98,7 +100,6 @@ def prepare_fitting_execution_context(
     prepared_solver_config: PreparedSolverConfig,
     sample_solver_steps: bool,
     use_authored_stops: bool,
-    initial_prefix: str = "init:",
     cancellation_control: SimulationCancellationControl | None = None,
 ) -> PreparedFittingExecutionContext:
     """Prepare structured execution data for one per-dataset evaluator.
@@ -146,7 +147,6 @@ def prepare_fitting_execution_context(
         requested_sample_times=requested_sample_times,
         sample_solver_steps=sample_solver_steps,
         use_authored_stops=use_authored_stops,
-        initial_prefix=initial_prefix,
     )
 
 
@@ -279,7 +279,7 @@ class FittingEvaluator:
     def _candidate_request(self, params: Mapping[str, float]) -> SimulationExecutionRequest:
         """The dataset's request with a candidate's starting concentrations
         and, as overrides, its other values."""
-        prefix = self._context.initial_prefix
+        prefix = INITIAL_PREFIX
         request = self._context.request
         species_index = {name: idx for idx, name in enumerate(request.species_names)}
         y0 = list(request.y0)
@@ -294,7 +294,7 @@ class FittingEvaluator:
     def _candidate_names(self, inputs: Sequence[str]) -> tuple[str, ...]:
         """A failure's inputs as the candidate names them; ``[X]_0`` is X's
         starting concentration."""
-        prefix = self._context.initial_prefix
+        prefix = INITIAL_PREFIX
         return tuple(prefix + name[1:-3] if name.startswith("[") else name for name in inputs)
 
     def _fit_values(self, names: Sequence[str], params: Mapping[str, float]) -> str:

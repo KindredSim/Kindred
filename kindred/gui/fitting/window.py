@@ -636,10 +636,7 @@ class FittingWindow(QtWidgets.QDialog):
         target or the X, and observation mappings stay untouched.
         """
 
-        parametric = FittingWindow._parametric_from_config(
-            current.dataset_id,
-            config,
-        )
+        parametric = FittingWindow._parametric_from_config(config)
         x_name = None if parametric is None else parametric.x_name
         target_species = tuple(
             target for target in current.target_species if target != x_name
@@ -705,16 +702,12 @@ class FittingWindow(QtWidgets.QDialog):
 
     @staticmethod
     def _parametric_from_config(
-        dataset_id: str,
         config: Mapping[str, object],
     ) -> FitParametricSettings | None:
         x_name = config["parametric_x"]
         if x_name == "t":
             return None
-        return FitParametricSettings(
-            dataset_id=dataset_id,
-            x_name=x_name,
-        )
+        return FitParametricSettings(x_name=x_name)
 
     # ------------------------------------------------------------------
     # Current public window behavior

@@ -45,11 +45,11 @@ def main() -> int:
         initial = codec.read_frame(incoming)
         if initial is None:
             return 0
-        source, settings, payload = codec._decode_fit(initial, {})
+        source, settings, payload = codec.decode_fit(initial, {})
         prepared = prepare_dsl_request_set(
             source.reactions_text, units=settings.default_units
         )
-        request = codec._decode_fit(payload, {"prepared": prepared})
+        request = codec.decode_fit(payload, {"prepared": prepared})
         references = {"request": request, "origin": request.setup.origin}
 
         def emit(name, *values):
@@ -59,7 +59,7 @@ def main() -> int:
             if name == "candidate_ready":
                 candidate, = values
                 values = (candidate, tuple(execution.project_fit_candidate_curves(candidate)))
-            encoded = codec._encode_fit((name, values), references)
+            encoded = codec.encode_fit((name, values), references)
             if terminal:
                 runtime.check_scientific_runtime()
             codec.write_frame(output, encoded)
@@ -73,7 +73,7 @@ def main() -> int:
             }
             try:
                 while (frame := codec.read_frame(incoming)) is not None:
-                    actions[codec._decode_fit(frame, {})]()
+                    actions[codec.decode_fit(frame, {})]()
             except BaseException as exc:
                 command_errors.append(exc)
             finally:

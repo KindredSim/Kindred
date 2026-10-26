@@ -6,6 +6,7 @@ from typing import Any, Callable, Mapping
 import numpy as np
 
 from kindred.core.algebra.simulation_series import observable_species_refs
+from kindred.core.mechanism_metadata import MechanismMetadataKeys
 from kindred.core.mechanism import Mechanism
 from kindred.core.ode_builder import (
     EffectiveRateCoefficientEvaluator,
@@ -204,7 +205,7 @@ def _unsupported_support(code: str, reason: str) -> SymbolicJacobianSupport:
 
 def fractional_order_step(mechanism: Mechanism) -> Mapping[str, Any] | None:
     """The first step whose concentration exponents are not whole numbers."""
-    for entry in mechanism.metadata["step_index_map"]:
+    for entry in mechanism.metadata[MechanismMetadataKeys.STEP_INDEX_MAP]:
         if entry["kind"] == "reaction":
             exponents = tuple(mechanism.reactions[entry["reaction_index"]].rate_orders.values())
         else:
@@ -232,7 +233,7 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
 
 def factor_species(mechanism: Mechanism, name: str) -> tuple[str, ...]:
     """The current concentrations a factor's let reads, in species order."""
-    block = mechanism.metadata["parameter_algebra_spec"].observable_block
+    block = mechanism.metadata[MechanismMetadataKeys.PARAMETER_ALGEBRA_SPEC].observable_block
     read = observable_species_refs(block, name, "now")
     return tuple(species for species in mechanism.species_names() if species in read)
 

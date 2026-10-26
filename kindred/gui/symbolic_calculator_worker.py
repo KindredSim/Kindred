@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from multiprocessing import get_context
+from multiprocessing import Pipe, get_context
 from multiprocessing.connection import wait
 import queue
 import threading
@@ -26,12 +26,16 @@ class CalculatorWorker(QtCore.QThread):
         self._inputs = (mechanism, source)
         self._queries = queue.SimpleQueue()
         self._shutdown = threading.Event()
+        # Wakes the supervisor as soon as a query or shutdown arrives.
+        self._wake, self._waker = Pipe(duplex=False)
 
     def submit(self, query: str) -> None:
         self._queries.put(query)
+        self._waker.send_bytes(b"")
 
     def request_shutdown(self) -> None:
         self._shutdown.set()
+        self._waker.send_bytes(b"")
 
     def run(self) -> None:
         process = None
@@ -58,13 +62,12 @@ class CalculatorWorker(QtCore.QThread):
             watchdog = threading.Thread(target=cancel_noncooperative_work, name="Calculator cancellation")
             watchdog.start()
             while not self._shutdown.is_set():
-                try:
-                    query = self._queries.get_nowait()
-                except queue.Empty:
-                    pass
-                else:
-                    parent_pipe.send(query)
-                ready = wait((parent_pipe, process.sentinel), timeout=0.05)
+                ready = wait((parent_pipe, process.sentinel, self._wake))
+                if self._wake in ready:
+                    while self._wake.poll():
+                        self._wake.recv_bytes()
+                    while not self._queries.empty():
+                        parent_pipe.send(self._queries.get())
                 if parent_pipe in ready:
                     query, result_html, context, error, copy_text, reuse_queries = parent_pipe.recv()
                     if not self._shutdown.is_set():

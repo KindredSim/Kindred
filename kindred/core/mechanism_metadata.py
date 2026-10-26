@@ -18,6 +18,9 @@ class MechanismMetadataKeys:
     STANDARD_CONC_M = "standard_conc_M"
     ENERGY_UNIT = "energy_unit"
     TEMPERATURE_CHANGES = "temperature_changes"
+    STEP_INDEX_MAP = "step_index_map"
+    PARAMETER_ALGEBRA_SPEC = "parameter_algebra_spec"
+    SCALAR_PARAMS = "scalar_params"
 
 
 class EquilibriumMetadataKeys:

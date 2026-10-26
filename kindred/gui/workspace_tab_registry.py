@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Callable, Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.project_document import (
@@ -18,6 +18,7 @@ from kindred.core.project_document import (
     prepare_tab_scientific_settings,
 )
 from kindred.core.project_session import ProjectContentToken, ProjectSession
+from kindred.core.result_repository import ResultRepository
 from kindred.core.project_presentation_state import (
     ProjectPresentationState,
     WorkspacePresentationState,
@@ -25,9 +26,6 @@ from kindred.core.project_presentation_state import (
     reconcile_workspace_presentation_state,
     validate_project_presentation_state,
 )
-
-if TYPE_CHECKING:
-    from kindred.core.result_repository import ResultRepository
 
 __all__ = [
     "ScientificDocumentDelta",
@@ -40,7 +38,7 @@ __all__ = [
 class TabRuntimeState:
     """Noncanonical authoring and transient view state for exactly one tab."""
 
-    result_repository: ResultRepository
+    result_repository: ResultRepository = field(default_factory=ResultRepository)
     reactions_draft: MechanismAuthoringSource | None = None
     notes_draft: str | None = None
     # Raw authored concentration text which has not yet crossed the normal
@@ -104,12 +102,10 @@ class WorkspaceTabRegistry:
         *,
         computation_fence: Callable[[ScientificDocumentDelta], None],
         post_document_publication: Callable[[ScientificDocumentDelta], None],
-        runtime_factory: Callable[[str], TabRuntimeState],
     ) -> None:
         self._session = session
         self._computation_fence = computation_fence
         self._post_document_publication = post_document_publication
-        self._runtime_factory = runtime_factory
         self._active_tab_id = ""
         self._presentation_by_tab_id: tuple[
             tuple[str, ProjectPresentationState], ...
@@ -126,7 +122,7 @@ class WorkspaceTabRegistry:
 
         runtimes = []
         for tab_id, state in presentation.presentation_by_tab_id:
-            runtime = self._runtime_factory(tab_id)
+            runtime = TabRuntimeState()
             if state.current_set_id is not None:
                 runtime.selected_run_set_ids = (state.current_set_id,)
             runtimes.append((tab_id, runtime))
@@ -243,7 +239,7 @@ class WorkspaceTabRegistry:
                 tab.tab_id,
                 existing_runtime[tab.tab_id]
                 if tab.tab_id in existing_runtime
-                else self._runtime_factory(tab.tab_id),
+                else TabRuntimeState(),
             )
             for tab in document.tabs
         )
@@ -286,17 +282,7 @@ class WorkspaceTabRegistry:
         for tab_id, affected_ids in delta.affected_targets_by_tab:
             runtime = existing_runtime.get(tab_id)
             if runtime is not None:
-                repository = runtime.result_repository
-                previous_tab = previous_by_tab_id.get(tab_id)
-                replacement_tab = replacement_by_tab_id.get(tab_id)
-                if (
-                    previous_tab is not None
-                    and replacement_tab is not None
-                    and previous_tab.prepared_dsl is not replacement_tab.prepared_dsl
-                ):
-                    repository.purge_sets(affected_ids)
-                else:
-                    repository.deauthorize_sets(affected_ids)
+                runtime.result_repository.deauthorize_sets(affected_ids)
         for tab_id, removed_ids in delta.removed_targets_by_tab:
             runtime = existing_runtime.get(tab_id)
             if runtime is not None:
@@ -309,7 +295,7 @@ class WorkspaceTabRegistry:
                 for set_id in removed:
                     runtime.initial_text_by_set_id.pop(set_id, None)
                     runtime.slider_species_drafts_by_set_id.pop(set_id, None)
-                runtime.result_repository.purge_sets(removed_ids)
+                runtime.result_repository.deauthorize_sets(removed_ids)
 
     def select_tab(
         self,

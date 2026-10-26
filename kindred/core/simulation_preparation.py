@@ -26,6 +26,8 @@ from kindred.core.intervention_schedule import (
     intervention_schedule_clock_parameters,
     intervention_schedule_parameter_dependencies,
     locate_declaration,
+    ObservableTriggerCondition,
+    InterventionStopAction,
 )
 from kindred.core.intervention_schedule_compiler import (
     InterventionExecutionContract,
@@ -42,20 +44,65 @@ from kindred.core.simulator.parameter_coordinates import (
     build_parameter_target_map,
 )
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
-from kindred.core.simulation_preparation_stages import (
-    PreparedSolverConfig as _PreparedSolverConfig,
-    build_runtime_symbolic_jacobian,
-)
 from kindred.core.time_grid import build_time_grid
+from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_spec_to_mechanism
+from kindred.core.simulation_algebra_context import runtime_algebra_symbol_names
+from kindred.core.algebra.errors import UNCOMPUTABLE_ERRORS, AlgebraError
+from kindred.core.algebra.evaluator import PreparedAlgebraPointEvaluator
+from kindred.core.algebra.simulation_series import failing_let_facts
 
 
 __all__ = [
+    "PreparedSolverConfig",
     "SimulationExecutionRequest",
     "PreparedSimulationRun",
     "build_simulation_request_from_prepared_run",
     "build_simulation_execution_request",
     "prepare_simulation_run",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedSolverConfig:
+    """Solver policy consumed by all direct execution paths.
+
+    Its values arrive admitted: Run and Preview from the tab settings and
+    Preview points, Fit from its setup and tab settings, and Scan from its
+    dialog.
+    """
+
+    solver: str
+    rtol: float
+    atol: float
+    grid: Mapping[str, Any]
+    use_analytic_jacobian: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "grid", MappingProxyType(dict(self.grid)))
+
+
+def build_runtime_symbolic_jacobian(
+    *,
+    use_analytic_jacobian: bool,
+    symbolic_structure: Any = None,
+    symbolic_support: Any = None,
+    coefficient_evaluator: Any,
+) -> SymbolicJacobianExecution:
+    """Prepare the symbolic Jacobian a Run uses, or why it uses none, as the
+    accepted mechanism decided once."""
+
+    if not use_analytic_jacobian:
+        return SymbolicJacobianExecution.disabled(
+            code="policy-disabled",
+            reason="Analytic Jacobian preference is disabled.",
+        )
+    if symbolic_structure is None:
+        return SymbolicJacobianExecution.unsupported(
+            classified_status=dict(symbolic_support.to_status_payload()),
+        )
+    return SymbolicJacobianExecution.supported(
+        jacobian_func=symbolic_structure.bind(coefficient_evaluator),
+    )
 
 
 def _raise_if_cancelled(
@@ -101,6 +148,7 @@ def build_simulation_request_from_prepared_run(
     candidate_evaluation: bool = False,
     sample_solver_steps: bool = False,
     species_ctc: bool = False,
+    species_maximum: bool = False,
 ) -> SimulationRequest:
     """Solve exactly what preparation admitted: its starting state, schedule,
     Jacobian and cancellation owner."""
@@ -124,6 +172,7 @@ def build_simulation_request_from_prepared_run(
         candidate_evaluation=candidate_evaluation,
         sample_solver_steps=sample_solver_steps,
         species_ctc=species_ctc,
+        species_maximum=species_maximum,
         stop_observable_value=prepared_run.stop_observable_value,
         parameter_values_at_temperature=prepared_run.parameter_values_at_temperature,
         intervention_lines=request.prepared_dsl.analysis.intervention_lines,
@@ -140,7 +189,7 @@ class SimulationExecutionRequest:
     species_names: tuple[str, ...]
     y0: tuple[float, ...]
     t_span: tuple[float, float]
-    solver_config: _PreparedSolverConfig
+    solver_config: PreparedSolverConfig
     parameter_overrides: Mapping[str, float] | None = None
     use_authored_stops: bool = False
 
@@ -181,7 +230,7 @@ def build_simulation_execution_request(
     prepared_dsl: PreparedDslRequestSet,
     initial_values: Iterable[tuple[str, float]],
     t_span: tuple[float, float],
-    solver_config: _PreparedSolverConfig,
+    solver_config: PreparedSolverConfig,
     parameter_values: Mapping[str, float] | None = None,
     use_authored_stops: bool = False,
 ) -> SimulationExecutionRequest:
@@ -236,9 +285,6 @@ def _apply_parameter_overrides_to_prepared_mechanism(
         for name, value in raw_values.items()
         if name in scalar_parameter_names
     }
-    from kindred.core.simulator.parameter_algebra import (
-        apply_parameter_algebra_spec_to_mechanism,
-    )
 
     try:
         apply_parameter_algebra_spec_to_mechanism(
@@ -351,21 +397,16 @@ def prepare_simulation_run(
     )
     _raise_if_cancelled(cancellation_control)
 
-    from kindred.core.simulation_algebra_context import runtime_algebra_symbol_names
     runtime_names = runtime_algebra_symbol_names(parameter_algebra_spec)
     symbols = _coefficient_evaluator.parameter_values
     stop_observable_value = None
     if intervention_execution is not None:
-        from kindred.core.intervention_schedule import ObservableTriggerCondition, InterventionStopAction
         stops = tuple(
             item for item in intervention_execution.triggers
             if isinstance(item.then, InterventionStopAction) and isinstance(item.condition, ObservableTriggerCondition)
         )
         targets = tuple(dict.fromkeys(item.condition.name for item in stops))
         if targets:
-            from kindred.core.algebra.errors import UNCOMPUTABLE_ERRORS, AlgebraError
-            from kindred.core.algebra.evaluator import PreparedAlgebraPointEvaluator
-            from kindred.core.algebra.simulation_series import failing_let_facts
             observable_block = parameter_algebra_spec.observable_block
             t_start = execution_request.t_span[0]
             start_temperature = starting_temperature_segment(

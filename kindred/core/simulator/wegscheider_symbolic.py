@@ -7,6 +7,8 @@ from functools import reduce
 from math import gcd
 from typing import Sequence
 
+from kindred.core.mechanism_metadata import MechanismMetadataKeys
+
 
 __all__ = [
     "WegscheiderCycle",
@@ -49,7 +51,7 @@ def _canonical_reversible_steps(mechanism: object) -> tuple[tuple[int, int], ...
 
     return tuple(
         (entry["equilibrium_index"], entry["step_index"])
-        for entry in mechanism.metadata["step_index_map"]
+        for entry in mechanism.metadata[MechanismMetadataKeys.STEP_INDEX_MAP]
         if entry["kind"] == "equilibrium"
     )
 
