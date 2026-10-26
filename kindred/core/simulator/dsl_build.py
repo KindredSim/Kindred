@@ -108,7 +108,7 @@ def build_mechanism_from_ir(
         entry["source_coordinates"] = source_coordinates
         step_index_map.append(entry)
 
-    mechanism.metadata["step_index_map"] = step_index_map
+    mechanism.metadata[MechanismMetadataKeys.STEP_INDEX_MAP] = step_index_map
 
     logger.debug(
         "Built mechanism from DSL reactions: %s species, %s reactions, %s equilibria",

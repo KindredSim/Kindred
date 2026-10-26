@@ -5,7 +5,7 @@ from collections.abc import Mapping
 
 from kindred.core.algebra.evaluator import bind_scalar_expression_evaluator
 from kindred.core.exceptions import ErrorContext, KindredError
-from kindred.core.mechanism_metadata import MechanismMetadataView
+from kindred.core.mechanism_metadata import MechanismMetadataKeys, MechanismMetadataView
 from kindred.core.algebra.parser import _iter_identifiers
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
 from kindred.core.simulator.parameter_coordinates import (
@@ -41,7 +41,7 @@ def bind_parameter_evaluation(
         name for name in spec.parameter_dependencies
         if spec.parameter_assignment_kind(name) == "independent scalar"
     }
-    for name, value in metadata["scalar_params"].items():
+    for name, value in metadata[MechanismMetadataKeys.SCALAR_PARAMS].items():
         if name in independent:
             values[name] = float(value)
     values["T"] = float(MechanismMetadataView.from_metadata(metadata).temperature_K)

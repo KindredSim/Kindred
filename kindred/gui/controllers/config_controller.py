@@ -62,11 +62,8 @@ _FIT_SETTINGS_KEYS = {
     "seed": "fitting/seed",
 }
 _PARALLEL_MAXIMUM_KEY = "simulation/parallel_maximum"
-_RESULT_CACHE_CAPACITY_KEY = "results/cache_capacity"
 _PREVIEW_POINTS_KEY = "sliders/preview_points"
 _PREVIEW_DELAY_KEY = "sliders/preview_delay_ms"
-_DEFAULT_RESULT_CACHE_CAPACITY = 32
-_QT_POSITIVE_INT_MAX = (1 << 31) - 1
 _DEFAULT_PREVIEW_POINTS = 50
 _DEFAULT_PREVIEW_DELAY_MS = 150
 
@@ -104,7 +101,6 @@ class ConfigController(QtCore.QObject):
 
     applicationPlotPreferencesChanged = QtCore.Signal()
     recentProjectsChanged = QtCore.Signal()
-    resultCacheCapacityChanged = QtCore.Signal(int)
     previewSettingsChanged = QtCore.Signal()
 
     def __init__(self, settings: QtCore.QSettings):
@@ -173,41 +169,6 @@ class ConfigController(QtCore.QObject):
             success_message=f"Parallel execution maximum set to {accepted}.",
         )
         return accepted
-
-    def result_cache_capacity(self) -> int:
-        """Return the validated per-tab explicit-result cache capacity."""
-
-        parsed = self._parsed_int(
-            self._settings().value(
-                _RESULT_CACHE_CAPACITY_KEY,
-                _DEFAULT_RESULT_CACHE_CAPACITY,
-            )
-        )
-        if parsed is None or not 1 <= parsed <= _QT_POSITIVE_INT_MAX:
-            logger.warning(
-                "Ignoring invalid persisted result cache capacity."
-            )
-            return _DEFAULT_RESULT_CACHE_CAPACITY
-        return parsed
-
-    def set_result_cache_capacity(self, value: int) -> int:
-        """Persist and synchronously publish one positive Qt integer."""
-
-        previous = self.result_cache_capacity()
-        settings = self._settings()
-        snapshot = self._snapshot_settings(settings, (_RESULT_CACHE_CAPACITY_KEY,))
-        settings.setValue(_RESULT_CACHE_CAPACITY_KEY, value)
-        self._sync_or_report(
-            settings,
-            "result cache capacity",
-            snapshot=snapshot,
-            success_message=(
-                f"Result cache capacity set to {value} per mechanism tab."
-            ),
-        )
-        if previous != value:
-            self.resultCacheCapacityChanged.emit(value)
-        return value
 
     def preview_points(self) -> int:
         return self._preview_setting(

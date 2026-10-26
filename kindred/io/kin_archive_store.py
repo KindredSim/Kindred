@@ -1462,6 +1462,9 @@ class KinArchiveStore:
                     for member_name, member_bytes in sorted(members):
                         archive.writestr(member_name, member_bytes)
                 handle.flush()
+                # The data reaches the disk before the replacement, so a
+                # crash leaves either the prior or the new archive.
+                os.fsync(handle.fileno())
             # Inspect the destination entry itself.  In particular, a
             # dangling or live symlink is replaced as an entry by os.replace;
             # following it here would either mutate the target or make a

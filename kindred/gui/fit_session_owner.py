@@ -826,6 +826,11 @@ class FitSessionOwner(QtCore.QObject):
             origin=successor_origin,
         )
         self._registry.replace_document(proposed_document, expected_token=token)
+        # Applied starting concentrations supersede their sets' Initial
+        # Conditions table drafts, as a Slider Apply's do.
+        runtime = self._registry.tab_runtime(origin.tab_id)
+        for set_id, _values in candidate.initial_values_by_set:
+            runtime.initial_text_by_set_id.pop(set_id, None)
         self._candidate_applied_to_project = True
         self._install_setup(rebased_setup)
         self._initial_setup_snapshot = rebased_initial_setup

@@ -48,6 +48,8 @@ from kindred.gui.widgets.parameter_statistics_table import ParameterStatisticsTa
 from kindred.gui.widgets.plot_data_item import PlotDataItem
 from kindred.gui.widgets.species_statistics_table import SpeciesStatisticsTable
 from kindred.gui.workspace_result_presenter import (
+    MAX_COPY_CELLS,
+    MAX_COPY_CHARACTERS,
     ResultDataBlock,
     ResultRenderInput,
     ResultLayerKind,
@@ -1240,10 +1242,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._species_table.setRowCount(0)
             return
         self._species_table.update_results(
-            canonical_time=result.t,
-            species_data={name: result.series[name] for name in render_input.statistics_series_names},
+            {name: result.series[name][-1] for name in render_input.statistics_series_names},
+            species_maximum=result.species_maximum,
             species_ctc=result.species_ctc,
-            presentation_boundaries=result.presentation_boundaries,
             concentration_display_unit=concentration_unit,
             time_display_unit=time_unit,
         )
@@ -1756,8 +1757,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             axis.setTextPen(foreground)
 
 
-_MAX_RENDERED_COPY_CELLS = 1_000_000
-_MAX_RENDERED_COPY_CHARACTERS = 64 * 1024 * 1024
 
 
 def _visible_sample_mask(
@@ -1872,10 +1871,10 @@ def _iter_rendered_point_tsv_chunks(
         planned_rows = max(planned_rows, rows)
         planned_width += width + separator
     planned_cells = (planned_rows + 1) * planned_width
-    if planned_cells > _MAX_RENDERED_COPY_CELLS:
+    if planned_cells > MAX_COPY_CELLS:
         raise ValueError(
             f"{action_name} payload exceeds the bounded cell limit "
-            f"({_MAX_RENDERED_COPY_CELLS:,})."
+            f"({MAX_COPY_CELLS:,})."
         )
 
     combined_headers: list[str] = []
@@ -1936,7 +1935,7 @@ def _iter_rendered_point_tsv_chunks(
         if rows_in_chunk >= rows_per_chunk:
             piece = output.getvalue()
             total_characters += len(piece)
-            if total_characters > _MAX_RENDERED_COPY_CHARACTERS:
+            if total_characters > MAX_COPY_CHARACTERS:
                 raise ValueError(
                     f"{action_name} payload exceeds the bounded output-size limit."
                 )
@@ -1945,7 +1944,7 @@ def _iter_rendered_point_tsv_chunks(
             rows_in_chunk = 0
     piece = output.getvalue()
     total_characters += len(piece)
-    if total_characters > _MAX_RENDERED_COPY_CHARACTERS:
+    if total_characters > MAX_COPY_CHARACTERS:
         raise ValueError(
             f"{action_name} payload exceeds the bounded output-size limit."
         )

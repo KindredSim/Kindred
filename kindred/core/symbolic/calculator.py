@@ -20,7 +20,7 @@ from kindred.core.algebra.parser import BinaryNode, CallNode, IdentNode, NumberN
 from kindred.core.algebra.printer import expression_to_source
 from kindred.core.algebra.symbols import BUILTIN_FUNCTIONS, PROTECTED_NAMES
 from kindred.core.mechanism_metadata import MechanismMetadataView
-from kindred.core.simulator.parameter_algebra import parameter_algebra_spec_from_mechanism
+from kindred.core.mechanism_metadata import MechanismMetadataKeys
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 
 from .backend import require_sympy
@@ -440,7 +440,7 @@ def symbolic_calculator_available(mechanism: Any) -> tuple[bool, str]:
     if step is not None:
         return False, located("Calculator does not support fractional reaction orders.", step["line"], step["line_text"])
     namespace = build_namespace_from_mechanism(mechanism)
-    spec = parameter_algebra_spec_from_mechanism(mechanism)
+    spec = mechanism.metadata[MechanismMetadataKeys.PARAMETER_ALGEBRA_SPEC]
     reserved = set(namespace.canonical_names) | set(spec.param_assignment_names()) | set(spec.observable_names)
     reserved |= set(PROTECTED_NAMES) | set(BUILTIN_FUNCTIONS)
     collisions = [name for name in mechanism.species_names() if name in reserved
@@ -455,7 +455,7 @@ def build_calculator_context(mechanism: Any, *, mechanism_source: str) -> Calcul
     # The owner checked symbolic_calculator_available before starting this child.
     sp = require_sympy()
     namespace = build_namespace_from_mechanism(mechanism)
-    spec = parameter_algebra_spec_from_mechanism(mechanism)
+    spec = mechanism.metadata[MechanismMetadataKeys.PARAMETER_ALGEBRA_SPEC]
     graph = spec.evaluation_dependencies
     statements = {stmt.name: stmt for stmt in spec.parameter_block.lines}
     names = tuple(mechanism.species_names())
@@ -1947,7 +1947,7 @@ def _package_result(context: CalculatorContext, query: str, result) -> SymbolicC
         symbol_legend={"Species": context.species_names, "Parameters": tuple(sorted(context.parameter_namespace.canonical_names | context.parameter_definitions.keys())),
          "Fixed constants": _FIXED_CONSTANTS, "Time and temperature": ("t [s]", "T [K]"),
          "Energy coordinates": ("Ea, dG_act, dG_eq in J/mol",),
-         "Coordinate units": tuple(f"{name} [{unit.symbol}]" for name, unit in dict(parameter_algebra_spec_from_mechanism(context.mechanism).quantity_units).items() if unit is not None and name in context.symbols),
+         "Coordinate units": tuple(f"{name} [{unit.symbol}]" for name, unit in dict(context.mechanism.metadata[MechanismMetadataKeys.PARAMETER_ALGEBRA_SPEC].quantity_units).items() if unit is not None and name in context.symbols),
          "Initial coordinates": tuple(f"initial({name})" for name in context.species_names)},
         mechanism_source=context.mechanism_source,
         reuse_queries=tuple(choices),

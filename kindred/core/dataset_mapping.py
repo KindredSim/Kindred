@@ -69,7 +69,6 @@ class DatasetMappingProposal:
 class DatasetMappingBatchProposal:
     """One immutable, ordered proposal covering every committed dataset."""
 
-    tab_id: str
     proposals: tuple[DatasetMappingProposal, ...]
 
 

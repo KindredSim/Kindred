@@ -7,6 +7,7 @@ from typing import Callable, Mapping
 import numpy as np
 
 from kindred.core.algebra.printer import expression_to_source
+from kindred.core.mechanism_metadata import MechanismMetadataKeys
 from kindred.core.exceptions import KindredError
 from kindred.core.kinetics import ForwardRateModel, forward_rate_family
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
@@ -217,7 +218,7 @@ def enumerate_simulation_parameters(
     physical_names = source_coordinate_names | {
         item[0] for item in physical_candidates
     }
-    scalar_params = dict(metadata["scalar_params"])
+    scalar_params = dict(metadata[MechanismMetadataKeys.SCALAR_PARAMS])
     for raw_name, value in scalar_params.items():
         name = str(raw_name)
         assignment = assignment_kind(name)

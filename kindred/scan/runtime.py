@@ -9,8 +9,7 @@ import time
 
 from kindred.core.exceptions import SimulationCancelled
 from kindred.core.simulation_execution import execute_simulation
-from kindred.core.simulation_preparation import build_simulation_execution_request
-from kindred.core.simulation_preparation_stages import PreparedSolverConfig
+from kindred.core.simulation_preparation import PreparedSolverConfig, build_simulation_execution_request
 from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 from kindred.core.units import UnitsModel

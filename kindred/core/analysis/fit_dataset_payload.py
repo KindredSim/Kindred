@@ -28,8 +28,6 @@ class FitObservationSeries:
     source rows.
     """
 
-    raw_observation_id: str
-    raw_column: str
     t: np.ndarray
     y: np.ndarray
     source_rows: tuple[int, ...]
@@ -54,8 +52,7 @@ class FitDatasetSpec:
     target_weights: Mapping[str, float] = field(default_factory=dict)
     x_name: str = "t"
     # One immutable X capture. Its `y` member stores captured X values; using
-    # the same row-aligned DTO keeps raw identity and dataset row
-    # custody identical for Y and X.
+    # the same row-aligned DTO keeps dataset row custody identical for Y and X.
     x_observations: FitObservationSeries | None = None
 
     def __post_init__(self) -> None:

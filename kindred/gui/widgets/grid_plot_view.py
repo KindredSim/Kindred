@@ -28,6 +28,8 @@ from kindred.gui.theme_manager import plot_background_color, plot_foreground_col
 import pyqtgraph as pg
 from kindred.gui.widgets.plot_data_item import PlotDataItem
 from kindred.gui.workspace_result_presenter import (
+    MAX_COPY_CELLS,
+    MAX_COPY_CHARACTERS,
     VESSEL_VOLUME_COLOR,
     encode_clipboard_text,
     encode_tsv_row,
@@ -37,8 +39,6 @@ __all__ = ["GridPlotView"]
 
 
 ColorResolver = Callable[[str], object]
-_MAX_FIT_COPY_CELLS = 1_000_000
-_MAX_FIT_COPY_CHARACTERS = 64 * 1024 * 1024
 _FIT_COPY_ROWS_PER_CHUNK = 2048
 
 
@@ -533,10 +533,10 @@ class GridPlotView(QtWidgets.QWidget):
             raise ValueError("No Fit curves are available to copy.")
         row_count = max(len(values) for _header, values in columns)
         cell_count = (row_count + 1) * len(columns)
-        if cell_count > _MAX_FIT_COPY_CELLS:
+        if cell_count > MAX_COPY_CELLS:
             raise ValueError(
                 "Fit Copy payload exceeds the bounded full-resolution cell "
-                f"limit ({_MAX_FIT_COPY_CELLS:,})."
+                f"limit ({MAX_COPY_CELLS:,})."
             )
 
         total_characters = 0
@@ -556,20 +556,20 @@ class GridPlotView(QtWidgets.QWidget):
             if rows_in_chunk >= _FIT_COPY_ROWS_PER_CHUNK:
                 chunk = output.getvalue()
                 total_characters += len(chunk)
-                if total_characters > _MAX_FIT_COPY_CHARACTERS:
+                if total_characters > MAX_COPY_CHARACTERS:
                     raise ValueError(
                         "Fit Copy payload exceeds the bounded output-size limit "
-                        f"({_MAX_FIT_COPY_CHARACTERS // (1024 * 1024)} MiB)."
+                        f"({MAX_COPY_CHARACTERS // (1024 * 1024)} MiB)."
                     )
                 yield chunk
                 output = io.StringIO()
                 rows_in_chunk = 0
         chunk = output.getvalue()
         total_characters += len(chunk)
-        if total_characters > _MAX_FIT_COPY_CHARACTERS:
+        if total_characters > MAX_COPY_CHARACTERS:
             raise ValueError(
                 "Fit Copy payload exceeds the bounded output-size limit "
-                f"({_MAX_FIT_COPY_CHARACTERS // (1024 * 1024)} MiB)."
+                f"({MAX_COPY_CHARACTERS // (1024 * 1024)} MiB)."
             )
         if chunk:
             yield chunk

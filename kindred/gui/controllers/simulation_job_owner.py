@@ -16,11 +16,11 @@ from kindred.core.project_document import (
 )
 from kindred.core.result_repository import ResultRepository, SimulationResultValue
 from kindred.core.simulation_preparation import (
+    PreparedSolverConfig,
     SimulationExecutionRequest,
     build_simulation_execution_request,
 )
 from kindred.core.simulation_execution import execute_simulation
-from kindred.core.simulation_preparation_stages import PreparedSolverConfig
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 from kindred.gui.computation_gate import ComputationGate
@@ -190,7 +190,7 @@ class _DirectSimulationWorker(QtCore.QThread):
         try:
             result = execute_simulation(
                 target.execution_request, cancellation_control=self._control,
-                species_ctc=True,
+                species_statistics=True,
             )
         except SimulationCancelled:
             return _TargetTerminalOutcome(target, "cancelled", message="Simulation canceled.")
@@ -258,14 +258,6 @@ class SimulationJobOwner(QtCore.QObject):
         if self._pending_interactive_preview is not None:
             return self._pending_interactive_preview.tab_id
         return next(iter(self._pending_previews), None)
-
-    def has_pending_preview(self, tab_id: str) -> bool:
-        return tab_id in self._pending_previews
-
-    def preview_set_ids(self, tab_id: str) -> tuple[str, ...]:
-        """Return the sets of one tab that show a Preview, drag or exact."""
-
-        return self._repository(tab_id).preview_set_ids()
 
     def owns_preview_capture(self, capture: PreviewCapture) -> bool:
         """Report whether an exact Preview capture still owns live work."""
@@ -416,7 +408,7 @@ class SimulationJobOwner(QtCore.QObject):
         self._retire_unserved_reference_run()
         repository = self._repository(tab_id)
         for set_id in ids:
-            repository.clear_preview(set_id, clear_reference=False)
+            repository.clear_preview(set_id)
             repository.restore_reference_or_current(set_id)
         self.results_changed.emit(str(tab_id))
         if changed:
@@ -663,7 +655,7 @@ class SimulationJobOwner(QtCore.QObject):
     ) -> None:
         """Retire Preview work and Preview results of these sets, or all of the tab's."""
 
-        known = list(self.preview_set_ids(tab_id))
+        known = list(self._repository(tab_id).preview_set_ids())
         operation = self._operation
         if (
             operation is not None
@@ -696,14 +688,6 @@ class SimulationJobOwner(QtCore.QObject):
     def cancel_for_application_close(self) -> None:
         self._close_fenced = True
         self.cancel_current()
-
-    def show_cached(self, tab_id: str, set_id: str, execution_request: SimulationExecutionRequest) -> bool:
-        result = self._repository(tab_id).hydrate_cached(set_id, execution_request)
-        if result is None:
-            # The caller still renders the set from its retained result.
-            return False
-        self.results_changed.emit(str(tab_id))
-        return True
 
     @QtCore.Slot(object)
     def _on_target_terminal(self, outcome: _TargetTerminalOutcome) -> None:
@@ -809,7 +793,7 @@ class SimulationJobOwner(QtCore.QObject):
                         preview_results[target.set_id],
                     )
                 else:
-                    repository.clear_preview(target.set_id, clear_reference=False)
+                    repository.clear_preview(target.set_id)
                     repository.restore_reference_or_current(target.set_id)
             preview_published = True
         reconcile_target_ids: tuple[str, ...] = ()

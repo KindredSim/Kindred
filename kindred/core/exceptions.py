@@ -6,11 +6,11 @@ error codes. Every display shows ``str(exc)``, so the text of an error is its
 user-facing message, located on the authored line it names. Codes and details
 are structured facts for reports and logs and never appear in the text.
 
-Error Categories
-----------------
-- **Validation**: Input validation failures (E200-E299)
-- **Simulation**: Runtime simulation errors (E300-E399)
-- **Fitting**: Parameter estimation errors (E400-E499)
+Error codes
+-----------
+- Reactions validation: E2xx
+- Simulation: E3xx
+- Fitting: E4xx
 """
 
 from __future__ import annotations
@@ -23,15 +23,10 @@ __all__ = [
     "KindredError",
     "ErrorContext",
     "located",
-    # Validation
-    "ValidationError",
-    "ReactionValidationError",
     # Simulation
-    "SimulationError",
     "SolverError",
     "ValueDomainError",
     # Fitting
-    "FittingError",
     "FitSimulationError",
     "FittingCancelled",
 ]
@@ -114,41 +109,17 @@ class KindredError(Exception):
         self.args = (self._build_message(),)
 
 
-# ----------------------------- Validation Errors -------------------------------
-
-
-class ValidationError(KindredError):
-    """Base class for validation errors (E200-E299)."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E200")
-        super().__init__(message, **kwargs)
-
-
-class ReactionValidationError(ValidationError):
-    """Error for invalid reaction specifications."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E203")
-        super().__init__(message, **kwargs)
-
-
 # ---------------------------- Simulation Errors --------------------------------
 
 
-class SimulationError(KindredError):
-    """Base class for simulation runtime errors (E300-E399)."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E300")
-        super().__init__(message, **kwargs)
-
-
-class SolverError(SimulationError):
+class SolverError(KindredError):
     """Error during ODE solver execution."""
     def __init__(self, message: str, **kwargs):
         kwargs.setdefault("code", "E301")
         super().__init__(message, **kwargs)
 
 
-class ValueDomainError(SimulationError, ValueError):
+class ValueDomainError(KindredError, ValueError):
     """A value lies outside its scientific domain: an authored or candidate
     input, or a calculated rate constant, Keq or physical coordinate."""
 
@@ -159,7 +130,7 @@ class ValueDomainError(SimulationError, ValueError):
         self.field = field
 
 
-class SimulationCancelled(SimulationError):
+class SimulationCancelled(KindredError):
     """Raised when a simulation is cancelled by user request."""
     def __init__(self, message: str = "Simulation canceled by user", **kwargs):
         kwargs.setdefault("code", "E305")
@@ -169,14 +140,7 @@ class SimulationCancelled(SimulationError):
 # ------------------------------ Fitting Errors ---------------------------------
 
 
-class FittingError(KindredError):
-    """Base class for parameter fitting errors (E400-E499)."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E400")
-        super().__init__(message, **kwargs)
-
-
-class FitSimulationError(FittingError):
+class FitSimulationError(KindredError):
     """Raised when a simulation fails while evaluating a fitting objective."""
     def __init__(self, message: str, **kwargs):
         kwargs.setdefault("code", "E404")
@@ -184,7 +148,7 @@ class FitSimulationError(FittingError):
         super().__init__(message, details=details, **kwargs)
 
 
-class FittingCancelled(FittingError):
+class FittingCancelled(KindredError):
     """Raised when a fitting run is cancelled by user request."""
 
     def __init__(self, message: str = "Fit canceled by user", **kwargs):

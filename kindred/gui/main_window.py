@@ -206,7 +206,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._dataset_import_progress_dialog: QtWidgets.QProgressDialog | None = None
         self._last_export_directory: str | None = None
         self._slider_apply_refreshing: set[str] = set()
-        self._plot_membership_refreshing: set[str] = set()
         self._current_row_refreshing: set[str] = set()
         self.setObjectName("kindredMainWindow")
         self.setWindowTitle("Kindred")
@@ -242,7 +241,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._project_session,
             computation_fence=self._simulation_jobs.fence_document_delta,
             post_document_publication=self._post_document_publication,
-            runtime_factory=self._new_tab_runtime,
         )
         self._dataset_import_staging = DatasetImportStaging(parent=self)
         self._fit_session_owner = FitSessionOwner(
@@ -343,16 +341,6 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     # Construction
     # ------------------------------------------------------------------
-    def _new_tab_runtime(self, tab_id: str):
-        from kindred.gui.workspace_tab_registry import TabRuntimeState
-
-        return TabRuntimeState(
-            result_repository=ResultRepository(
-                tab_id,
-                cache_capacity=self.config_controller.result_cache_capacity(),
-            )
-        )
-
     def set_theme(self, *, dark_mode: bool) -> None:
         """Forward the application theme to the current physical root."""
 
@@ -789,9 +777,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.config_controller.previewSettingsChanged.connect(
             self._apply_slider_preview_settings
         )
-        self.config_controller.resultCacheCapacityChanged.connect(
-            self._resize_result_repositories
-        )
         self.config_controller.recentProjectsChanged.connect(
             self._populate_recent_menu
         )
@@ -1202,9 +1187,6 @@ class MainWindow(QtWidgets.QMainWindow):
         target = str(tab_id)
         if self._rendering_workspace:
             return
-        if target in self._plot_membership_refreshing:
-            self._render_results_for_tab(target)
-            return
         if (
             target in self._slider_apply_refreshing
             or target in self._current_row_refreshing
@@ -1568,38 +1550,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not changed:
             return
         self._refresh_project_state()
-        if not requested:
-            self._render_results_for_tab(tab_id)
-            return
-        slider_binding = self._tab_surfaces[tab_id].slider_binding
-        slider_targets = slider_binding.resolve_target_set_ids()
-        if set_id in slider_targets:
-            runtime = self._workspace_tab_registry.tab_runtime(tab_id)
-            protected_slider_state = bool(
-                runtime.has_slider_draft
-                or slider_binding.active_preview_set_ids
-                or self._simulation_jobs.has_pending_preview(tab_id)
-                or (
-                    self._simulation_jobs.current_kind == "preview"
-                    and self._simulation_jobs.origin_tab_id == tab_id
-                )
-            )
-            if protected_slider_state:
-                self._render_results_for_tab(tab_id)
-                return
-        tab = self._workspace_tab_registry.tab(tab_id)
-        # An empty mechanism has no parsed form and so no cached results.
-        if tab.prepared_dsl is None:
-            self._render_results_for_tab(tab_id)
-            return
-        target = self._build_explicit_target_for_tab(tab, set_id)
-        self._plot_membership_refreshing.add(tab_id)
-        try:
-            cached = self._simulation_jobs.show_cached(tab_id, set_id, target.execution_request)
-        finally:
-            self._plot_membership_refreshing.discard(tab_id)
-        if not cached:
-            self._render_results_for_tab(tab_id)
+        self._render_results_for_tab(tab_id)
 
     def _on_slider_pin_change_requested(
         self,
@@ -3143,7 +3094,7 @@ class MainWindow(QtWidgets.QMainWindow):
             candidate_tab = apply_dataset_mapping_batch(
                 document=self._project_session.document,
                 tab=tab,
-                batch=DatasetMappingBatchProposal(tab_id=tab.tab_id, proposals=(proposal,)),
+                batch=DatasetMappingBatchProposal(proposals=(proposal,)),
                 model_targets=model_targets,
             )
             result = self._workspace_tab_registry.replace_tab(
@@ -3778,9 +3729,6 @@ class MainWindow(QtWidgets.QMainWindow):
             physical_cores=self.config_controller.physical_cores,
             automatic_workers=self.config_controller.automatic_parallel_workers(),
         )
-        dialog.set_result_cache_capacity(
-            self.config_controller.result_cache_capacity()
-        )
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
         changed = False
@@ -3789,7 +3737,6 @@ class MainWindow(QtWidgets.QMainWindow):
             run_defaults = dialog.new_tab_run_defaults()
             preview_points, preview_delay = dialog.preview_settings()
             parallel_maximum = dialog.parallel_maximum()
-            cache_capacity = dialog.result_cache_capacity()
             persist_scientific_defaults = (
                 dialog.persist_scientific_defaults_requested()
             )
@@ -3810,7 +3757,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.config_controller.set_preview_points(preview_points)
             self.config_controller.set_preview_delay_ms(preview_delay)
             self.config_controller.set_parallel_maximum(parallel_maximum)
-            self.config_controller.set_result_cache_capacity(cache_capacity)
         except ValueError as exc:
             message = str(exc)
             self.set_status_text(message)
@@ -4642,14 +4588,6 @@ class MainWindow(QtWidgets.QMainWindow):
             bundle.slider_binding.set_preview_settings(
                 points=self.config_controller.preview_points(),
                 delay_ms=self.config_controller.preview_delay_ms(),
-            )
-
-    @QtCore.Slot(int)
-    def _resize_result_repositories(self, capacity: int) -> None:
-        for tab in self._project_session.document.tabs:
-            # Trimming keeps current and reference results, so nothing redraws.
-            self._repository_for_tab(tab.tab_id).resize_cache_capacity(
-                int(capacity)
             )
 
     def authorize_and_schedule_close(self) -> None:

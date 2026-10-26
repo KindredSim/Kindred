@@ -82,7 +82,7 @@ class GlobalFitWorker(QtCore.QThread):
             try:
                 codec.write_frame(process.stdin, initial)
                 while (command := self._commands.get()) is not None:
-                    codec.write_frame(process.stdin, codec._encode_fit(command, {}))
+                    codec.write_frame(process.stdin, codec.encode_fit(command, {}))
             except BaseException as exc:
                 fail(exc)
             finally:
@@ -121,8 +121,8 @@ class GlobalFitWorker(QtCore.QThread):
                 terminal = ("cancelled", ())
             else:
                 origin = self._request.setup.origin
-                request = codec._encode_fit(self._request, {"prepared": origin.prepared_dsl})
-                initial = codec._encode_fit((
+                request = codec.encode_fit(self._request, {"prepared": origin.prepared_dsl})
+                initial = codec.encode_fit((
                     origin.mechanism_source, origin.scientific_settings, request,
                 ), {})
                 if not self._cancelled.is_set():
@@ -146,7 +146,7 @@ class GlobalFitWorker(QtCore.QThread):
                         if errors:
                             continue
                         try:
-                            name, args = codec._decode_fit(payload, references)
+                            name, args = codec.decode_fit(payload, references)
                             if terminal is not None:
                                 raise RuntimeError("Fit process sent output after its terminal event.")
                             if name == "candidate_ready":

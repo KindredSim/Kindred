@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import Optional
 
-from kindred.core.exceptions import ErrorContext, ReactionValidationError
+from kindred.core.exceptions import ErrorContext, KindredError
 
 
-class DSLError(ReactionValidationError, ValueError):
+class DSLError(KindredError, ValueError):
     """DSL validation or parsing error, located on its authored line when known."""
 
     def __init__(

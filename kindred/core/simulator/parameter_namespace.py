@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import re
 from typing import Iterator, Sequence
 
+from kindred.core.mechanism_metadata import MechanismMetadataKeys
 from kindred.core.validation import and_join
 
 
@@ -199,7 +200,7 @@ def _mechanism_step_descriptors(mechanism: object) -> list[_NamespaceStepDescrip
             source_index=source_index,
             source_coordinates=tuple(entry["source_coordinates"].items()),
         )
-        for source_index, entry in enumerate(mechanism.metadata["step_index_map"])
+        for source_index, entry in enumerate(mechanism.metadata[MechanismMetadataKeys.STEP_INDEX_MAP])
     ]
 
 
@@ -218,7 +219,7 @@ def canonical_name_for_mechanism_step_parameter(
     index_key = "reaction_index" if kind == "reaction" else "equilibrium_index"
     step_index = next(
         entry["step_index"]
-        for entry in mechanism.metadata["step_index_map"]
+        for entry in mechanism.metadata[MechanismMetadataKeys.STEP_INDEX_MAP]
         if entry["kind"] == kind and entry[index_key] == item_index
     )
     return f"{role}{step_index}"

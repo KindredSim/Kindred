@@ -22,6 +22,7 @@ from kindred.core.analysis.dataset_parameter_overrides import (
     FitSharedVariableParamSpec,
 )
 from kindred.core.analysis.dataset_sampling import compute_sampled_indices
+from kindred.core.fitting_evaluation import INITIAL_PREFIX
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.project_document import (
     FitDefaults,
@@ -32,7 +33,7 @@ from kindred.core.project_document import (
 )
 from kindred.core.species import validate_concentration, validate_input_time_seconds
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
-from kindred.core.simulation_preparation_stages import PreparedSolverConfig
+from kindred.core.simulation_preparation import PreparedSolverConfig
 from kindred.gui.parameter_enumeration import (
     admit_gui_parameter_value,
     enumerate_parameter_coordinates,
@@ -1280,7 +1281,7 @@ def _compile_fit_dispatch(
             coupled_variables.append(
                 FitCoupledVariableParamSpec(
                     variable_id=shared_initial_group_variable_id(group.species, group.origin_dataset_id),
-                    parameter_name=f"init:{group.species}",
+                    parameter_name=f"{INITIAL_PREFIX}{group.species}",
                     dataset_ids=applicable_ids,
                     initial=group.initial,
                     minimum=group.minimum,
@@ -1290,7 +1291,7 @@ def _compile_fit_dispatch(
             )
         else:
             for dataset_id in applicable_ids:
-                fixed_by_dataset[dataset_id][f"init:{group.species}"] = group.initial
+                fixed_by_dataset[dataset_id][f"{INITIAL_PREFIX}{group.species}"] = group.initial
     for initial in setup.initials:
         target_ids = datasets_for_set.get(initial.set_id, ())
         target_ids = tuple(
@@ -1302,7 +1303,7 @@ def _compile_fit_dispatch(
             coupled_variables.append(
                 FitCoupledVariableParamSpec(
                     variable_id=f"initial:{initial.set_id}:{initial.species}",
-                    parameter_name=f"init:{initial.species}",
+                    parameter_name=f"{INITIAL_PREFIX}{initial.species}",
                     dataset_ids=target_ids,
                     initial=initial.initial,
                     minimum=initial.minimum,
@@ -1312,7 +1313,7 @@ def _compile_fit_dispatch(
             )
         else:
             for dataset_id in target_ids:
-                fixed_by_dataset[dataset_id][f"init:{initial.species}"] = initial.initial
+                fixed_by_dataset[dataset_id][f"{INITIAL_PREFIX}{initial.species}"] = initial.initial
 
     overrides = tuple(
         FitDatasetParameterOverrides(

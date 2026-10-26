@@ -48,6 +48,7 @@ from .solver_types import (
     _SimulationScientificUnavailabilitySignal,
     SimulationRequest as _SimulationRequest,
 )
+from kindred.core.intervention_schedule import InterventionStopAction
 
 logger = logging.getLogger(__name__)
 
@@ -223,8 +224,8 @@ def _execute_scipy(
     if volume is not None:
         y0 = np.append(y0, volume.value)
         base_kwargs["atol"] = np.append(np.full(species_count, req.atol), req.atol * volume.initial_value)
-    from kindred.core.intervention_schedule import InterventionStopAction
-    retain_dense = volume is not None or any(isinstance(item.then, InterventionStopAction) for item in req.intervention_execution.triggers)
+    retain_dense = (volume is not None or req.species_maximum
+                    or any(isinstance(item.then, InterventionStopAction) for item in req.intervention_execution.triggers))
     dense_output = retain_dense or req.sample_solver_steps or req.species_ctc
     if dense_output:
         base_kwargs["dense_output"] = True
@@ -473,6 +474,7 @@ def _execute_scipy(
                           else dense if retain_dense else None),
             symbolic_jacobian_used=jac_callable is not None,
             species_ctc=species_ctc,
+            step_times=np.minimum(origin + np.asarray(local_dense.ts, dtype=float), float(t1)) if req.species_maximum else None,
         )
     finally:
         if dense_output:
