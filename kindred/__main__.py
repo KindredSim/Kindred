@@ -10,9 +10,19 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from multiprocessing import freeze_support
 
 from kindred.io.logging import setup_logging
+
+def _load_run_libraries() -> None:
+    """Load what the first Run needs while the user works in the window."""
+    from kindred.core.scipy_integrate import load_scipy_integrate
+    from kindred.core.symbolic.backend import require_sympy
+
+    require_sympy()
+    load_scipy_integrate()
+
 
 def main() -> int:
     """Launch the Kindred GUI and return the Qt event-loop exit code."""
@@ -52,6 +62,9 @@ def main() -> int:
 
     win = MainWindow()
     win.show()
+    # The first Run would otherwise wait for SciPy and SymPy to load; a
+    # daemon thread so closing Kindred never waits for it.
+    threading.Thread(target=_load_run_libraries, name="Kindred library preload", daemon=True).start()
     return app.exec()
 
 
