@@ -34,9 +34,12 @@ from kindred.gui.widgets.observation_mapping_widget import ObservationMappingWid
 __all__ = ["DatasetMappingBatchDialog"]
 
 _COPY_TOOLTIP = (
-    "Copies this dataset's initial-concentration source, each species' Source and typed "
-    "values to every other dataset. Each dataset still reads its own data; column choices "
-    "and Action are not copied. Every dataset can be changed afterwards."
+    "Make every other dataset match this one. Each column that both datasets have maps to the "
+    "same quantity or stays unused. A column that only the other dataset has keeps its choice "
+    "unless a copied column takes its quantity. From a dataset set to Create Set, Initial "
+    "concentrations from, each Source, and typed initial concentrations are copied too. A "
+    "setting that a dataset cannot use leaves its choice unchanged. Every dataset still reads "
+    "its own data and can be changed afterwards. Action is not copied."
 )
 
 
@@ -111,6 +114,7 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
         self._list.setTextElideMode(QtCore.Qt.TextElideMode.ElideMiddle)
         datasets_layout.addWidget(self._list, 1)
         self._copy_btn = QtWidgets.QPushButton("Copy Settings to Other Datasets", datasets)
+        self._copy_btn.setToolTip(_COPY_TOOLTIP)
         datasets_layout.addWidget(self._copy_btn)
 
         settings = QtWidgets.QGroupBox(upper)
@@ -382,18 +386,6 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
             item.setForeground(1, warning if problem else self.palette().color(QtGui.QPalette.ColorRole.Text))
         self._render_sets()
         self._render_header()
-        self._render_copy_button()
-
-    def _render_copy_button(self) -> None:
-        index = self._pages.currentIndex()
-        creating = index >= 0 and (
-            DatasetMappingChoice(self._rows[index].action.currentData()) is DatasetMappingChoice.CREATE_SET
-        )
-        self._copy_btn.setEnabled(creating)
-        self._copy_btn.setToolTip(
-            _COPY_TOOLTIP if creating
-            else "Only a dataset set to Create Set has initial-concentration settings to copy."
-        )
 
     def _render_header(self) -> None:
         index = self._pages.currentIndex()
@@ -484,7 +476,6 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
         self._pages.setCurrentIndex(self._list.indexOfTopLevelItem(current))
         self._render_header()
         self._render_sets()
-        self._render_copy_button()
 
     def _on_set_line_selected(self) -> None:
         selected = self._sets.selectionModel().selectedRows()
@@ -500,12 +491,12 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
 
     def _copy_settings(self) -> None:
         template = self._rows[self._pages.currentIndex()]
-        settings = template.editor.source_settings()
+        settings = template.editor.copied_settings()
         self._refreshing = True
         try:
             for row in self._rows:
                 if row is not template:
-                    row.editor.apply_source_settings(settings)
+                    row.editor.apply_copied_settings(settings)
         finally:
             self._refreshing = False
         self._render()
