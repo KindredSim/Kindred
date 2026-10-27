@@ -117,7 +117,7 @@ class ReactionsAndInitialConditions(PracticeLesson):
                 "move_set_up",
                 "Move a Set Up",
                 "<p>Select only <b>preset_set1</b> and click <b>Move Up</b> to place it above <b>set1</b>. "
-                "If it is already above set1, choose Next.</p>"
+                "If it is already above set1, click <b>Next</b>.</p>"
                 "<p>This changes the row order without changing the concentrations. You can skip these row-management exercises.</p>",
                 lambda: (
                     self._table_target(self.preset_set),
@@ -133,7 +133,7 @@ class ReactionsAndInitialConditions(PracticeLesson):
                 "move_set_down",
                 "Move a Set Down",
                 "<p>Keep only <b>preset_set1</b> selected and click <b>Move Down</b> to place it below <b>set1</b>. "
-                "If it is already below set1, choose Next.</p>",
+                "If it is already below set1, click <b>Next</b>.</p>",
                 lambda: (
                     self._table_target(self.preset_set),
                     self._panel(
@@ -149,7 +149,7 @@ class ReactionsAndInitialConditions(PracticeLesson):
                 "Delete an Unused Set",
                 "<p>Select only the original <b>set1</b> row. Click <b>Delete Set(s)</b> and confirm the deletion.</p>"
                 "<p>Keep <b>preset_set1</b> for the simulation. A tab must retain at least one set. "
-                "If set1 is already absent, choose Next. Use Skip Step if you want to keep it.</p>",
+                "If set1 is already absent, click <b>Next</b>. Use <b>Skip Step</b> if you want to keep it.</p>",
                 self._delete_unused_targets,
                 lambda: self.original_set
                 not in {item.set_id for item in self.tab.initial_condition_sets},
@@ -167,7 +167,7 @@ class ReactionsAndInitialConditions(PracticeLesson):
                 "<p><b>Run</b> checks the draft before calculating new results. Invalid text stays available so you can correct it. "
                 "<b>Save Project</b> also checks pending source edits.</p>"
                 "<p><b>Revert</b> beside Reactions restores the accepted text. For this exercise, keep the draft at 0.5 "
-                "and choose Continue.</p>",
+                "and click <b>Continue</b>.</p>",
                 self._source_target,
                 manual=True,
             ),
@@ -212,7 +212,7 @@ class ReactionsAndInitialConditions(PracticeLesson):
                 "<p>In the <b>Initial Conditions panel</b>, leave <b>Plot</b> checked only for <b>preset_set1</b>.</p>"
                 "<p>Right-click the plot and choose <b>Copy Plotted Data</b>. Paste into an empty spreadsheet.</p>"
                 "<p>Check that the copied results include preset_set1 and exclude Higher A.</p>"
-                "<p>Check Plot for Higher A again, then choose <b>Continue</b>.</p>",
+                "<p>Check Plot for Higher A again, then click <b>Continue</b>.</p>",
                 lambda: (*self._table_column_targets(self.bundle.batch_model.plot_column()), self._plot_target()),
                 manual=True,
             ),

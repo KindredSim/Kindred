@@ -60,8 +60,8 @@ class QuickStart(PracticeLesson):
                 "<li>Copy selected curves with <b>Copy Plotted Data</b>, then compare the output with <b>Copy All</b>.</li>"
                 "<li>Save your work.</li></ul>"
                 "<p><b>Advance Automatically</b> is enabled by default. It moves on after you complete an automatically checked action. "
-                "Uncheck it to choose Next yourself. Steps that are already complete when you reach them wait for Next.</p>"
-                "<p><b>Manual checks</b> ask you to inspect the result and choose Continue.</p>"
+                "Uncheck it to click <b>Next</b> yourself. Steps that are already complete when you reach them wait for <b>Next</b>.</p>"
+                "<p><b>Manual checks</b> ask you to inspect the result and click <b>Continue</b>.</p>"
                 "<ul><li><b>Previous</b> revisits instructions without undoing work.</li>"
                 "<li><b>Skip Step</b> moves on without checking completion.</li>"
                 "<li><b>−</b> minimizes the tutorial. <b>×</b> closes it.</li></ul>",
@@ -151,7 +151,7 @@ class QuickStart(PracticeLesson):
                 "<p><b>Copy All</b> includes all available results for the current mechanism tab, including hidden results, "
                 "with every recorded point in standard units: seconds and M.</p>"
                 "<p>Compare the two outputs. B and total appear in Copy All even though they remain hidden from the plot. "
-                "Then choose <b>Continue</b>.</p>",
+                "Then click <b>Continue</b>.</p>",
                 self._plot_target,
                 manual=True,
             ),
@@ -160,7 +160,7 @@ class QuickStart(PracticeLesson):
                 self._finish_step(),
                 instruction="<p>Your practice tabs stay in the project. You can keep exploring or save your work.</p>"
                 "<p>To resume saved work, choose <b>File → Open Project…</b> and open your saved <b>.kin file</b>.</p>"
-                "<p>Choose <b>Finish</b> to close this lesson. Open <b>Help → Interactive Tutorials…</b> to choose another. "
+                "<p>Click <b>Finish</b> to close this lesson. Open <b>Help → Interactive Tutorials…</b> to choose another. "
                 "Each lesson includes its own setup.</p>",
             ),
         )

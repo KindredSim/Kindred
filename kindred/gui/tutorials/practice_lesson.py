@@ -23,6 +23,10 @@ class PracticeLesson(Lesson):
     _reuse_steps: frozenset[str] = frozenset()
     _result_steps: frozenset[str] = frozenset()
     _extra_steps: frozenset[str] = frozenset()
+    # Whether the lesson uses the preset's set; otherwise it needs only the mechanism.
+    _needs_preset_set = True
+    # Steps whose completion compares results with those before their Run.
+    _run_steps: frozenset[str] = frozenset({"run_first", "run_edited", "run_new_set"})
 
     def __init__(
         self,
@@ -85,8 +89,8 @@ class PracticeLesson(Lesson):
     def _missing(self, message, step):
         return (
             message
-            + " Return to setup, or use Skip Step to continue without this exercise.",
-            "Return to setup",
+            + " Return to Setup, or use Skip Step to continue without this exercise.",
+            "Return to Setup",
             lambda: self.revisitRequested.emit(step),
         )
 
@@ -121,7 +125,7 @@ class PracticeLesson(Lesson):
         if self.registry.active_tab_id != self.tab_id and not creating_reuse:
             return (
                 "The lesson is paused while another mechanism tab is active.",
-                "Return to the lesson tab",
+                "Return to the Lesson Tab",
                 lambda: self.workspace.tabActivated.emit(self.tab_id),
             )
         if name in {"name_tab", "load_preset"}:
@@ -134,7 +138,10 @@ class PracticeLesson(Lesson):
                     "The set used for template reuse was removed.", "create_reuse_tab"
                 )
             return None
-        if self.preset_set is None or self.preset_set not in sets:
+        if not self._needs_preset_set:
+            if not self._mechanism_loaded():
+                return self._missing(f"Load {self._preset_name} to supply the mechanism.", "load_preset")
+        elif self.preset_set is None or self.preset_set not in sets:
             self.preset_set = None
             return self._missing(
                 f"Load {self._preset_name} to supply the mechanism and starting values.", "load_preset"
@@ -203,6 +210,9 @@ class PracticeLesson(Lesson):
             and self._preset_rates_loaded()
         )
 
+    def _mechanism_loaded(self) -> bool:
+        return self.tab.prepared_dsl is not None and self._preset_rates_loaded()
+
     def _preset_rates_loaded(self) -> bool:
         values = {
             item.name: float(item.value)
@@ -222,11 +232,7 @@ class PracticeLesson(Lesson):
             self.changed.emit()
 
     def _run_dispatched(self, tab_id, set_ids) -> None:
-        if tab_id == self.tab_id and self.step.name in {
-            "run_first",
-            "run_edited",
-            "run_new_set",
-        }:
+        if tab_id == self.tab_id and self.step.name in self._run_steps:
             repo = self.registry.tab_runtime(tab_id).result_repository
             self._run_baselines[self.step.name] = {
                 identity: repo.current_result(identity) for identity in set_ids
@@ -409,7 +415,7 @@ class PracticeLesson(Lesson):
                 "Load a Preset",
                 "<p>A preset provides a mechanism and starting values that you can use and modify.</p>"
                 "<p>Open <b>Examples → Preset Mechanisms → M1: A -&gt; B</b>.</p>"
-                "<p>Follow the highlighted menu entries. There is no need to press Next between menus.</p>"
+                "<p>Follow the highlighted menu entries. There is no need to click <b>Next</b> between menus.</p>"
                 "<p>M1 adds <b>preset_set1</b> with starting concentrations "
                 "<b>A = 1</b> and <b>B = 0</b>. A set is a named group of starting values for one simulation.</p>"
                 "<p>The original <b>set1</b> row can stay. Use preset_set1.</p>",
@@ -503,7 +509,7 @@ class PracticeLesson(Lesson):
             "<p>For a new project, choose a filename and destination. "
             "If the project is already saved, this updates that file. "
             "Use <b>Save Project As…</b> when you want a separate copy.</p>"
-            "<p>Check that saving completed. If you canceled the dialog, try again before choosing <b>Continue</b>.</p>",
+            "<p>Check that saving completed. If you canceled the dialog, try again before clicking <b>Continue</b>.</p>",
             self._save_target,
             manual=True,
         )
@@ -515,7 +521,7 @@ class PracticeLesson(Lesson):
             "<p>Your practice tabs stay in the project. You can keep exploring or save your work.</p>"
             "<p>Use <b>File → Open Project…</b> to reopen a saved <b>.kin file</b>. "
             "Open <b>Examples → Template Manager…</b> to reuse a saved mechanism template.</p>"
-            "<p>Choose <b>Finish</b> to close this lesson. Open <b>Help → Interactive Tutorials…</b> to choose another. "
+            "<p>Click <b>Finish</b> to close this lesson. Open <b>Help → Interactive Tutorials…</b> to choose another. "
             "Each lesson includes its own setup.</p>",
             lambda: None,
         )

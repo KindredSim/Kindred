@@ -22,6 +22,11 @@ class Step:
     manual: bool = False
     waiting: str = "Complete the action above to continue."
     link: tuple[str, str] | None = None
+    # A card button's label and handler; handlers never change the project.
+    action: tuple[str, Callable[[], None]] | None = None
+    # Dialogs the step is taught inside. While one is open, the card stays in
+    # it, highlights only the step's targets, and can advance automatically.
+    dialog: type[QtWidgets.QDialog] | tuple[type[QtWidgets.QDialog], ...] | None = None
 
 
 class Lesson(QtCore.QObject):
@@ -74,8 +79,10 @@ class TutorialController(QtCore.QObject):
         self.overlay.card.skipRequested.connect(self.skip)
         self.overlay.card.exitRequested.connect(self.stop)
         self.overlay.card.recoveryRequested.connect(self._recover)
+        self.overlay.card.actionRequested.connect(self._act)
         self.overlay.changed.connect(self.schedule_refresh)
         self._recovery: Callable[[], None] | None = None
+        self._action: Callable[[], None] | None = None
         self._refresh_timer = QtCore.QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.timeout.connect(self.refresh)
@@ -153,7 +160,7 @@ class TutorialController(QtCore.QObject):
         self._geometry_timer.stop()
         self._refresh_timer.stop()
         lesson, self.lesson = self.lesson, None
-        self._recovery = None
+        self._recovery = self._action = None
         if lesson is not None:
             lesson.changed.disconnect(self.schedule_refresh)
             lesson.ended.disconnect(self._ended)
@@ -228,6 +235,11 @@ class TutorialController(QtCore.QObject):
             self._recovery()
             self.schedule_refresh()
 
+    def _act(self) -> None:
+        if self._action is not None:
+            self._action()
+            self.schedule_refresh()
+
     def schedule_refresh(self, *_args) -> None:
         if self.lesson is not None and not self._refresh_timer.isActive():
             self._refresh_timer.start(0)
@@ -243,14 +255,22 @@ class TutorialController(QtCore.QObject):
         if self.lesson is None:  # A closed practice tab ends its lesson.
             return
         step = lesson.step
+        modal = QtWidgets.QApplication.activeModalWidget()
+        taught = (
+            modal
+            if blocked is None and step.dialog is not None and isinstance(modal, step.dialog)
+            else None
+        )
         highlights = ()
-        self._recovery = None
-        recovery_text = ""
+        self._recovery = self._action = None
+        recovery_text = action_text = ""
         complete = False
         observed = False
         if blocked is not None:
             status, recovery_text, self._recovery = blocked
         else:
+            if step.action is not None:
+                action_text, self._action = step.action
             target = step.target()
             highlights = (target,) if isinstance(target, Highlight) else target or ()
             if step.complete is not None:
@@ -314,8 +334,10 @@ class TutorialController(QtCore.QObject):
             skipped=step.name in self._skipped,
             final=self.position == len(lesson.steps) - 1,
             recovery=recovery_text,
+            action=action_text,
             manual=step.manual,
             link=step.link,
+            dialog=taught,
         )
         if (
             self.overlay.card.auto_advance.isChecked()
@@ -327,7 +349,7 @@ class TutorialController(QtCore.QObject):
             and step.name not in self._skipped
             and blocked is None
             and not self.overlay.collapsed
-            and QtWidgets.QApplication.activeModalWidget() is None
+            and modal is taught
             and QtWidgets.QApplication.activePopupWidget() is None
         ):
             self._advance()

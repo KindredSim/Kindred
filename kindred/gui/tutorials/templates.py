@@ -194,7 +194,7 @@ class CreateAndReuseTemplates(PracticeLesson):
                 "added information to help identify it, and loaded it into another tab.</p>"
                 "<p>Use <b>Examples → User-Created Templates</b> to reuse it again. "
                 "Use <b>Template Manager</b> when you want to edit or organize your templates.</p>"
-                "<p>Choose <b>Finish</b> to close this lesson.</p>",
+                "<p>Click <b>Finish</b> to close this lesson.</p>",
                 lambda: None,
             ),
         )

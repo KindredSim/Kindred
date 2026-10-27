@@ -185,7 +185,7 @@ class ExplorePlot(PracticeLesson):
                 "<p>You have explored how to choose what appears on each axis, change display units, zoom and pan, "
                 "adjust axis ranges, and customize the plot appearance.</p>"
                 "<p>These controls let you examine the same simulation results in different ways without running the model again.</p>"
-                "<p>Choose <b>Finish</b> to close this lesson.</p>",
+                "<p>Click <b>Finish</b> to close this lesson.</p>",
                 lambda: None,
             ),
         )
