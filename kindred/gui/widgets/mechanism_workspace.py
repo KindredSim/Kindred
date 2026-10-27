@@ -202,6 +202,7 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
 
         for dock in self._dock_by_identity.values():
             dock.show()
+            dock.titleBarWidget().restore()
         self.reset_visible_dock_layout()
         visible = {
             MECHANISM_DOCK_SPEC.identity_key,
@@ -254,16 +255,17 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         ):
             self.redock_dock(dock)
         dock.show()
+        dock.titleBarWidget().restore()
         dock.raise_()
         if dock.isFloating():
             dock.activateWindow()
         return dock
 
     def is_dock_frontmost(self, identity: str) -> bool:
-        """Return whether a dock is shown and not behind another dock tab."""
+        """Return whether a dock's contents are shown and not behind another dock tab."""
 
         dock = self.dock_for_identity(identity)
-        if not dock.isVisible():
+        if not dock.isVisible() or not dock.widget().isVisible():
             return False
         if dock.isFloating():
             return True
