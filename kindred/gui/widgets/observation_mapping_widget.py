@@ -34,9 +34,11 @@ _SHOWN_VALUE_STYLE = "QLineEdit {{ background: transparent; border: none;{extra}
 
 
 @dataclass(frozen=True)
-class SourceSettings:
-    """One dataset's starting-concentration choices, copied between datasets."""
+class CopiedSettings:
+    """One dataset's shown choices, copied between datasets."""
 
+    # Every column's name -> the target it feeds, or None while unused.
+    columns: dict[str, str | None]
     row_source: InitialConcentrationSource | None
     # Species -> None for From data, or the typed text of a Manual choice.
     manual: dict[str, str | None] = field(default_factory=dict)
@@ -226,22 +228,39 @@ class ObservationMappingWidget(QtWidgets.QWidget):
         self._feedback.setText(text)
         self._feedback.setVisible(bool(text))
 
-    def source_settings(self) -> SourceSettings:
+    def copied_settings(self) -> CopiedSettings:
         """The choices as shown, for copying to other datasets.
 
-        Each species keeps its displayed Source. An untouched forced Manual (no
-        readable column) is not a choice, so it never overrides another
-        dataset's data. The row source is copied only while some species reads
-        data.
+        Every column states its target or that it is unused. Starting values
+        are shown only while creating a set: each species keeps its displayed
+        Source. An untouched forced Manual (no readable column) is not a
+        choice, so it never overrides another dataset's data. The row source
+        is copied only while some species reads data.
         """
-        return SourceSettings(
+        target_by_id = {combo.currentData(): target for target, combo in self._column_combos.items()}
+        columns = {item.column_name: target_by_id.get(item.raw_observation_id) for item in self._record.observations}
+        if not self._create_set:
+            return CopiedSettings(columns, None)
+        return CopiedSettings(
+            columns,
             self._source_combo.currentData() if self._reads_data() else None,
             {start.species: self._manual[start.species] for start in self.starts()
              if start.source == _DATA or self._manual[start.species] is not None},
         )
 
-    def apply_source_settings(self, settings: SourceSettings) -> None:
+    def apply_copied_settings(self, settings: CopiedSettings) -> None:
         """Take another dataset's choices once; they stay editable here."""
+        # Columns come first, since they decide which species can read data.
+        # A column shared by name feeds what it feeds there; a column it
+        # displaces becomes unused, and every other column keeps its choice.
+        shared = {item.raw_observation_id: settings.columns[item.column_name]
+                  for item in self._record.observations if item.column_name in settings.columns}
+        copied = {target: raw_id for raw_id, target in shared.items() if target is not None}
+        for target, combo in self._column_combos.items():
+            current = combo.currentData()
+            chosen = copied.get(target, None if current in shared else current)
+            with QtCore.QSignalBlocker(combo):
+                combo.setCurrentIndex(0 if chosen is None else combo.findData(chosen))
         # A copied choice this dataset cannot use leaves its own choice.
         index = self._source_combo.findData(settings.row_source)
         if settings.row_source is not None and self._source_combo.model().item(index).isEnabled():
