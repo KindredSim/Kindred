@@ -160,6 +160,7 @@ class TutorialCard(QtWidgets.QFrame):
     nextRequested = QtCore.Signal()
     exitRequested = QtCore.Signal()
     recoveryRequested = QtCore.Signal()
+    actionRequested = QtCore.Signal()
     skipRequested = QtCore.Signal()
     sizeEdited = QtCore.Signal()
 
@@ -234,6 +235,9 @@ class TutorialCard(QtWidgets.QFrame):
         self.link.setOpenExternalLinks(True)
         self.link.setWordWrap(True)
         layout.addWidget(self.link)
+        self.action = QtWidgets.QPushButton(self)
+        self.action.clicked.connect(self.actionRequested)
+        layout.addWidget(self.action)
         self.status = QtWidgets.QLabel(self)
         self.status.setWordWrap(True)
         self.status.setTextFormat(QtCore.Qt.TextFormat.PlainText)
@@ -495,6 +499,10 @@ class TutorialOverlay(QtCore.QObject):
             self._dialog = None
         self.card.hide()
         self.card.setParent(self._window, self.card.windowFlags())
+        # A hidden Windows tool window can retain its former modal owner after
+        # Qt reparenting, and dies with that owner. Release its native surface
+        # through Qt first; showing the card again creates a fresh surface.
+        self.card.destroy()
         self._clear_veils()
         self._needs_placement = True
 
@@ -522,10 +530,6 @@ class TutorialOverlay(QtCore.QObject):
         self.card.set_collapsed(False)
         self.card.highlight_checkbox.setChecked(True)
         self.card.auto_advance.setChecked(True)
-        # A hidden Windows tool window can retain its former modal owner after
-        # Qt reparenting. Release its native surface through Qt before that owner
-        # dies; showing the retained card in a new lesson creates a fresh surface.
-        self.card.destroy()
 
     def present(
         self,
@@ -539,9 +543,11 @@ class TutorialOverlay(QtCore.QObject):
         previous: bool,
         final: bool,
         recovery: str = "",
+        action: str = "",
         manual: bool = False,
         skipped: bool = False,
         link: tuple[str, str] | None = None,
+        dialog: QtWidgets.QDialog | None = None,
     ) -> None:
         # Qt can destroy a target window between refreshes. Drop its presentation
         # references here; the lesson resolves a fresh target through its owner.
@@ -553,8 +559,8 @@ class TutorialOverlay(QtCore.QObject):
             return
         # Untaught confirmations remain fully operable. Their ordinary owner
         # decides the result; closing them returns guidance to the lesson.
-        window = highlights[0].widget.window() if highlights else self._window
-        if modal is not None and (
+        window = highlights[0].widget.window() if highlights else dialog or self._window
+        if modal is not None and modal is not dialog and (
             not highlights
             or any(item.widget.window() is not modal for item in highlights)
         ):
@@ -562,7 +568,7 @@ class TutorialOverlay(QtCore.QObject):
             window = modal
             status = "Complete or cancel the open dialog to continue."
             complete = False
-            recovery = ""
+            recovery = action = ""
         popup = app.activePopupWidget()
         card_parent = (
             modal or self._window if isinstance(window, QtWidgets.QMenu) else window
@@ -657,6 +663,8 @@ class TutorialOverlay(QtCore.QObject):
         card.skip_button.setVisible(not final)
         card.recovery.setText(recovery)
         card.recovery.setVisible(bool(recovery))
+        card.action.setText(action)
+        card.action.setVisible(bool(action))
         card.setPalette(card_parent.palette())
         step_changed = self._last_progress != progress
         self._last_progress = progress
@@ -704,6 +712,9 @@ class TutorialOverlay(QtCore.QObject):
             parent.mapToGlobal(QtCore.QPoint()), parent.size()
         ).intersected(screen)
         avoid = target.adjusted(-12, -12, 12, 12)
+        if target.isEmpty() and isinstance(parent, QtWidgets.QDialog):
+            # A dialog step without highlights explains the whole dialog.
+            avoid = bounds.adjusted(-12, -12, 12, 12)
         if popup is not None:
             avoid = avoid.united(
                 QtCore.QRect(popup.mapToGlobal(QtCore.QPoint()), popup.size())

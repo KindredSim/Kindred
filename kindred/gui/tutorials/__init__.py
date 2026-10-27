@@ -3,6 +3,7 @@
 from functools import partial
 
 from kindred.gui.tutorials.controller import TutorialController
+from kindred.gui.tutorials.data_import import ImportAndMapData
 from kindred.gui.tutorials.explore_plot import ExplorePlot
 from kindred.gui.tutorials.interactive_sliders import InteractiveSliders
 from kindred.gui.tutorials.quick_start import QuickStart
@@ -14,6 +15,7 @@ LESSONS = (
     ReactionsAndInitialConditions,
     ExplorePlot,
     InteractiveSliders,
+    ImportAndMapData,
     CreateAndReuseTemplates,
 )
 

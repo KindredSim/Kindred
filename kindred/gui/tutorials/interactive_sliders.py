@@ -244,7 +244,7 @@ class InteractiveSliders(PracticeLesson):
                 "<p>You have tried two parameter changes together, compared Preview with Reference, "
                 "and used sliders with more than one initial-condition set.</p>"
                 "<p>Use <b>Reset</b> to discard a trial or <b>Apply</b> to keep the changes and completed results.</p>"
-                "<p>Choose <b>Finish</b> to close this lesson.</p>",
+                "<p>Click <b>Finish</b> to close this lesson.</p>",
                 lambda: None,
             ),
         )
