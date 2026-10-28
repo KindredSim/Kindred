@@ -519,8 +519,6 @@ class PracticeLesson(Lesson):
             "finish",
             "Lesson Complete",
             "<p>Your practice tabs stay in the project. You can keep exploring or save your work.</p>"
-            "<p>Use <b>File → Open Project…</b> to reopen a saved <b>.kin file</b>. "
-            "Open <b>Examples → Template Manager…</b> to reuse a saved mechanism template.</p>"
             "<p>Click <b>Finish</b> to close this lesson. Open <b>Help → Interactive Tutorials…</b> to choose another. "
             "Each lesson includes its own setup.</p>",
             lambda: None,
