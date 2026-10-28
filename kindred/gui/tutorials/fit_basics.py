@@ -93,10 +93,9 @@ class FittingBasics(PracticeLesson):
         return None
 
     def _reopen_fit(self) -> None:
-        """Closing the Fitting Window discards its datasets, Vary choices, and result, so their
-        steps wait to be done again."""
-        for name in ("run_fit", "vary_rates", "choose_datasets", "open_fit"):
-            self.revisitRequested.emit(name)
+        """Closing the Fitting Window discards its datasets, Vary choices, and result, so its
+        steps wait to be done again from Open the Fitting Window."""
+        self.revisitRequested.emit("open_fit")
 
     def _fit_closed(self, *_args) -> None:
         self._seen_fit = None
