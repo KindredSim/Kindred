@@ -145,7 +145,8 @@ class TutorialController(QtCore.QObject):
     def start(self, lesson: Lesson) -> None:
         self.stop()
         self.lesson = lesson
-        self.position = 0
+        # A lesson can start after steps it finds already done.
+        self.position = lesson.position
         self._visited.clear()
         self._verified.clear()
         self._skipped.clear()
@@ -214,13 +215,17 @@ class TutorialController(QtCore.QObject):
 
     def revisit(self, name: str) -> None:
         if self.lesson is not None:
-            self._verified.discard(name)
-            self._skipped.discard(name)
             self.position = next(
                 index
                 for index, step in enumerate(self.lesson.steps)
                 if step.name == name
             )
+            # Recovery redoes this step and the ones after it, so none keeps an
+            # earlier outcome, and each one redone is a newly completed outcome.
+            for step in self.lesson.steps[self.position:]:
+                self._visited.discard(step.name)
+                self._verified.discard(step.name)
+                self._skipped.discard(step.name)
             self._enter_step()
             self.refresh()
 

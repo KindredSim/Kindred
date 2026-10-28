@@ -2,6 +2,7 @@
 
 from functools import partial
 
+from kindred.gui.tutorials.advanced_fitting import BoundsAndSolvers
 from kindred.gui.tutorials.controller import TutorialController
 from kindred.gui.tutorials.data_import import ImportAndMapData
 from kindred.gui.tutorials.explore_plot import ExplorePlot
@@ -18,6 +19,7 @@ LESSONS = (
     InteractiveSliders,
     ImportAndMapData,
     FittingBasics,
+    BoundsAndSolvers,
     CreateAndReuseTemplates,
 )
 
