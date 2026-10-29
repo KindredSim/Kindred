@@ -313,18 +313,6 @@ class FittingBasics(PracticeLesson):
         """Initial Conditions and both Run buttons, once the Fitting Window is closed."""
         return () if self._fit_window() is not None else (self._initial_target(), *self._run_targets())
 
-    def _fit_page(self, title: str, widget_type, name: str) -> tuple[Highlight, ...]:
-        """A control of the open Fitting Window, or the tab of its page while another page is shown."""
-        window = self._fit_window()
-        if window is None:
-            return ()
-        widget = window.findChild(widget_type, name)
-        if widget is not None and widget.isVisible():
-            return (Highlight(widget),)
-        bar = window.findChild(QtWidgets.QTabBar, "global_fit_top_tabs")
-        index = next(index for index in range(bar.count()) if bar.tabText(index) == title)
-        return (Highlight(bar, lambda: bar.tabRect(index)),)
-
     def _steps(self) -> tuple[Step, ...]:
         create_tab, load_preset = self._setup_steps()
         return (
@@ -458,7 +446,7 @@ class FittingBasics(PracticeLesson):
                 "of that dataset beside the list and its species in the <b>Species Table</b>.</p>"
                 "<p>Check the three workbook datasets. One value of each rate constant then has to explain all "
                 "three runs.</p>",
-                lambda: self._fit_page("Data and Targets", QtWidgets.QListWidget, "global_fit_unified_dataset_list"),
+                lambda: (),
                 lambda: self._fit_applied() or self._included(),
                 "The three workbook datasets are included.",
                 waiting="Check the three workbook datasets in Datasets.",
@@ -484,7 +472,7 @@ class FittingBasics(PracticeLesson):
                 "<b>yield_C = [C] / max([A]_0, concentration_floor)</b> never divides by zero when [A]_0 is 0.</p>"
                 "<p>A fit starts from <b>Initial Guess</b>, the value in Reactions, and searches between "
                 "<b>Minimum</b> and <b>Maximum</b>.</p>",
-                lambda: self._fit_page("Parameters", QtWidgets.QTableWidget, "fit_parameter_roster"),
+                lambda: (),
                 lambda: self._fit_applied() or self._varied(),
                 "kf1, kr1, and k2 vary.",
                 waiting="Check Vary for kf1, kr1, and k2 only.",
