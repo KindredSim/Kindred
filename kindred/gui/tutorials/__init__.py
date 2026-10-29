@@ -2,7 +2,13 @@
 
 from functools import partial
 
-from kindred.gui.tutorials.advanced_fitting import BoundsAndSolvers
+from kindred.gui.tutorials.advanced_fitting import (
+    BoundsAndSolvers,
+    CalculatedQuantitiesAndConstraints,
+    PerDatasetRateConstants,
+    ProfileLikelihood,
+    VaryingInitialConditions,
+)
 from kindred.gui.tutorials.controller import TutorialController
 from kindred.gui.tutorials.data_import import ImportAndMapData
 from kindred.gui.tutorials.explore_plot import ExplorePlot
@@ -20,6 +26,10 @@ LESSONS = (
     ImportAndMapData,
     FittingBasics,
     BoundsAndSolvers,
+    CalculatedQuantitiesAndConstraints,
+    VaryingInitialConditions,
+    PerDatasetRateConstants,
+    ProfileLikelihood,
     CreateAndReuseTemplates,
 )
 
