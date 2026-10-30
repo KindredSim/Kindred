@@ -2,8 +2,6 @@
 
 from dataclasses import replace
 from math import isclose
-from pathlib import Path
-import shutil
 
 from PySide6 import QtWidgets
 
@@ -11,14 +9,11 @@ from kindred.core.datasets.foundation import thaw_json_value
 from kindred.core.project_presentation_state import SimulationSeriesAxisSelection
 from kindred.gui.tutorials.controller import Step
 from kindred.gui.tutorials.overlay import Highlight
-from kindred.gui.tutorials.practice_lesson import PracticeLesson
+from kindred.gui.tutorials.practice_lesson import IMPORT_DIALOGS, PracticeLesson
 from kindred.gui.widgets.dataset_mapping_batch_dialog import DatasetMappingBatchDialog
 from kindred.gui.widgets.import_config_dialog import ImportConfigDialog
 from kindred.gui.widgets.observation_mapping_widget import ObservationMappingWidget
-from kindred.io.paths import file_error_text, resolve_export_start_dir
-from kindred.io.resources import get_resource_path
 
-_FOLDER = "DataImport"
 _FILE = "runs.xlsx"
 _RUNS = ("run1", "run2", "run3")
 _WATER = {"run1": 0.05, "run2": 0.1, "run3": 0.2}
@@ -31,15 +26,6 @@ _UNITS = {
 }
 # run2 names the let total_PB differently from M11.
 _RENAMED = {"PB_total": "total_PB"}
-_IMPORT_DIALOGS = (ImportConfigDialog, DatasetMappingBatchDialog)
-
-
-def _shown(parent, kind, predicate=lambda _widget: True):
-    """The first matching widget the parent shows, or None while it shows none."""
-    return next(
-        (widget for widget in parent.findChildren(kind) if widget.isVisibleTo(parent) and predicate(widget)),
-        None,
-    )
 
 
 class ImportAndMapData(PracticeLesson):
@@ -52,14 +38,14 @@ class ImportAndMapData(PracticeLesson):
     _preset_rates = {"kf1": 1.0, "kr1": 0.01, "k2": 0.01, "k3": 100.0}
     _run_steps = frozenset({"run_data"})
     _needs_preset_set = False
+    _sample_folder = "DataImport"
+    _sample_file = _FILE
     _import_steps = frozenset({"read_units", "set_units", "import_sheets"})
     _review_steps = frozenset({"map_by_hand", "type_starts", "accept_mapping"})
     _data_steps = _review_steps | {"check_dataset", "show_data", "choose_y", "run_data", "export_original"}
 
     def __init__(self, **owners):
         super().__init__(**owners)
-        self._folder: Path | None = None
-        self._chosen_parent: str | None = None
         # Datasets present when the lesson started.
         self._datasets_before = {record.dataset_id for record in self.registry.document.datasets}
 
@@ -91,40 +77,6 @@ class ImportAndMapData(PracticeLesson):
             )
         return None
 
-    # -- the tutorial file -----------------------------------------------------
-    def _save_file(self) -> None:
-        window = self.workspace.window()
-        parent = QtWidgets.QFileDialog.getExistingDirectory(
-            window, "Save Tutorial File", resolve_export_start_dir(self._chosen_parent)
-        )
-        if not parent:
-            return
-        self._chosen_parent = parent
-        target = Path(parent) / _FOLDER
-        if (target / _FILE).exists():
-            answer = QtWidgets.QMessageBox.question(
-                window,
-                "Save Tutorial File",
-                f"{target} already contains {_FILE}. Replace it?",
-                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-                QtWidgets.QMessageBox.StandardButton.No,
-            )
-            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
-                self._folder = target
-                return
-        try:
-            target.mkdir(exist_ok=True)
-            shutil.copyfile(get_resource_path(f"tutorial_files/{_FOLDER}/{_FILE}"), target / _FILE)
-        except OSError as exc:
-            QtWidgets.QMessageBox.critical(
-                window, "Save Tutorial File", file_error_text(exc, exc.filename or target)
-            )
-            return
-        self._folder = target
-
-    def _saved(self) -> bool:
-        return self._folder is not None and (self._folder / _FILE).is_file()
-
     # -- observations ----------------------------------------------------------
     def _run_time_set(self) -> bool:
         defaults = self.tab.run_defaults
@@ -154,20 +106,16 @@ class ImportAndMapData(PracticeLesson):
                     runs[run] = record.dataset_id
         return runs if len(runs) == len(_RUNS) else {}
 
-    def _import_dialog_open(self) -> bool:
-        dialog = self._dialog(ImportConfigDialog)
-        return dialog is not None and dialog.windowTitle() == f"Import: {_FILE}"
-
     def _default_unit(self) -> QtWidgets.QComboBox | None:
         """The Default unit control of the open import dialog."""
         dialog = self._dialog(ImportConfigDialog)
-        label = None if dialog is None else _shown(dialog, QtWidgets.QLabel, lambda label: label.text() == "Default unit")
+        label = None if dialog is None else self._shown(dialog, QtWidgets.QLabel, lambda label: label.text() == "Default unit")
         return None if label is None else label.buddy()
 
     def _run2_units_set(self) -> bool:
         """The import dialog shows run2 with the default unit mM."""
         dialog = self._dialog(ImportConfigDialog)
-        sheets = None if dialog is None else _shown(dialog, QtWidgets.QListWidget)
+        sheets = None if dialog is None else self._shown(dialog, QtWidgets.QListWidget)
         control = self._default_unit()
         return (
             sheets is not None
@@ -269,24 +217,10 @@ class ImportAndMapData(PracticeLesson):
         )
 
     # -- targets ---------------------------------------------------------------
-    def _page_tab(self, page) -> Highlight:
-        """The tab of a Data panel page, for a page that is not shown."""
-        tabs = self.bundle.right_panel.findChild(QtWidgets.QTabWidget)
-        bar = tabs.tabBar()
-        return Highlight(bar, lambda: bar.tabRect(tabs.indexOf(page)), lambda: self.workspace.reveal_dock("data"))
-
-    def _data_page(self) -> Highlight:
-        """The Data page of the Data panel, or its tab while another page is shown."""
-        panel = self.bundle.data_panel
-        return self._panel(panel, "data") if panel.isVisible() else self._page_tab(panel)
-
-    def _open_targets(self) -> tuple[Highlight, ...]:
-        return () if self._dialog(_IMPORT_DIALOGS) is not None else (self._data_page(),)
-
     def _y_target(self) -> tuple[Highlight, ...]:
         """The Y selector above the plot."""
         plot = self.workspace.plot_for_tab(self.tab_id)
-        button = _shown(plot, QtWidgets.QToolButton, lambda button: button.text().startswith("Y:"))
+        button = self._shown(plot, QtWidgets.QToolButton, lambda button: button.text().startswith("Y:"))
         return () if button is None else (Highlight(button),)
 
     def _y_chosen(self) -> bool:
@@ -372,7 +306,7 @@ class ImportAndMapData(PracticeLesson):
                 self._open_targets,
                 lambda: self._import_dialog_open() or bool(self._workbook()),
                 "runs.xlsx is open in the import dialog or already imported.",
-                dialog=_IMPORT_DIALOGS,
+                dialog=IMPORT_DIALOGS,
             ),
             Step(
                 "read_units",
@@ -385,7 +319,7 @@ class ImportAndMapData(PracticeLesson):
                 "in <b>Species Columns</b> each column shows <b>From file (mM)</b>. <b>Conversion</b> shows "
                 "mM → M, so 50 mM of Water becomes 0.05 M.</p>",
                 lambda: (),
-                dialog=_IMPORT_DIALOGS,
+                dialog=IMPORT_DIALOGS,
             ),
             Step(
                 "set_units",
@@ -400,7 +334,7 @@ class ImportAndMapData(PracticeLesson):
                 lambda: self._run2_units_set() or bool(self._workbook()),
                 "run2 is read in s and mM.",
                 waiting="Select run2, then choose mM in Default unit.",
-                dialog=_IMPORT_DIALOGS,
+                dialog=IMPORT_DIALOGS,
             ),
             Step(
                 "import_sheets",
@@ -414,7 +348,7 @@ class ImportAndMapData(PracticeLesson):
                 lambda: (),
                 lambda: bool(self._workbook()),
                 "The workbook is imported.",
-                dialog=_IMPORT_DIALOGS,
+                dialog=IMPORT_DIALOGS,
             ),
             Step(
                 "map_by_hand",

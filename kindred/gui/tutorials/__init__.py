@@ -5,6 +5,7 @@ from functools import partial
 from kindred.gui.tutorials.advanced_fitting import (
     BoundsAndSolvers,
     CalculatedQuantitiesAndConstraints,
+    FittingAgainstMeasuredQuantity,
     PerDatasetRateConstants,
     ProfileLikelihood,
     VaryingInitialConditions,
@@ -17,6 +18,7 @@ from kindred.gui.tutorials.interactive_sliders import InteractiveSliders
 from kindred.gui.tutorials.quick_start import QuickStart
 from kindred.gui.tutorials.reactions_and_initials import ReactionsAndInitialConditions
 from kindred.gui.tutorials.templates import CreateAndReuseTemplates
+from kindred.gui.tutorials.untimed_titration import TitrationsWithoutTime
 
 LESSONS = (
     QuickStart,
@@ -30,6 +32,8 @@ LESSONS = (
     VaryingInitialConditions,
     PerDatasetRateConstants,
     ProfileLikelihood,
+    FittingAgainstMeasuredQuantity,
+    TitrationsWithoutTime,
     CreateAndReuseTemplates,
 )
 

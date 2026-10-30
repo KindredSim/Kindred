@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 from math import isclose
+from pathlib import Path
+import shutil
 
 from PySide6 import QtCore, QtWidgets
 
 from kindred.gui.parameter_enumeration import enumerate_parameter_coordinates
 from kindred.gui.tutorials.controller import Lesson, Step
 from kindred.gui.tutorials.overlay import Highlight, menu_target, scroll_into_view
+from kindred.gui.widgets.dataset_mapping_batch_dialog import DatasetMappingBatchDialog
+from kindred.gui.widgets.import_config_dialog import ImportConfigDialog
+from kindred.io.paths import file_error_text, resolve_export_start_dir
+from kindred.io.resources import get_resource_path
+
+# The dialogs of one data import: its settings and its mapping review.
+IMPORT_DIALOGS = (ImportConfigDialog, DatasetMappingBatchDialog)
 
 
 class PracticeLesson(Lesson):
@@ -27,6 +36,9 @@ class PracticeLesson(Lesson):
     _needs_preset_set = True
     # Steps whose completion compares results with those before their Run.
     _run_steps: frozenset[str] = frozenset({"run_first", "run_edited", "run_new_set"})
+    # The sample file a lesson ships in kindred/data/tutorial_files/<folder>/, if any.
+    _sample_folder = ""
+    _sample_file = ""
 
     def __init__(
         self,
@@ -49,6 +61,9 @@ class PracticeLesson(Lesson):
         self._tabs_before = set()
         self._sets_before = set()
         self._run_baselines = {}
+        # The folder Save Tutorial File… copied the sample file into, and the folder last chosen.
+        self._folder: Path | None = None
+        self._chosen_parent: str | None = None
         # Observations connect only to this lesson's own signal and methods, so
         # Qt ends them when the lesson or the observed object is deleted.
         project_controller.projectStateChanged.connect(self._project_changed)
@@ -381,6 +396,74 @@ class PracticeLesson(Lesson):
     def _dialog(kind):
         dialog = QtWidgets.QApplication.activeModalWidget()
         return dialog if isinstance(dialog, kind) else None
+
+    @staticmethod
+    def _shown(parent, kind, predicate=lambda _widget: True):
+        """The first matching widget the parent shows, or None while it shows none."""
+        return next(
+            (widget for widget in parent.findChildren(kind) if widget.isVisibleTo(parent) and predicate(widget)),
+            None,
+        )
+
+    # -- the sample file -------------------------------------------------------
+    def _save_file(self) -> None:
+        window = self.workspace.window()
+        parent = QtWidgets.QFileDialog.getExistingDirectory(
+            window, "Save Tutorial File", resolve_export_start_dir(self._chosen_parent)
+        )
+        if not parent:
+            return
+        self._chosen_parent = parent
+        target = Path(parent) / self._sample_folder
+        if (target / self._sample_file).exists():
+            answer = QtWidgets.QMessageBox.question(
+                window,
+                "Save Tutorial File",
+                f"{target} already contains {self._sample_file}. Replace it?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                self._folder = target
+                return
+        try:
+            target.mkdir(exist_ok=True)
+            shutil.copyfile(
+                get_resource_path(f"tutorial_files/{self._sample_folder}/{self._sample_file}"),
+                target / self._sample_file,
+            )
+        except OSError as exc:
+            QtWidgets.QMessageBox.critical(
+                window, "Save Tutorial File", file_error_text(exc, exc.filename or target)
+            )
+            return
+        self._folder = target
+
+    def _saved(self) -> bool:
+        return self._folder is not None and (self._folder / self._sample_file).is_file()
+
+    def _import_dialog_open(self) -> bool:
+        dialog = self._dialog(ImportConfigDialog)
+        return dialog is not None and dialog.windowTitle() == f"Import: {self._sample_file}"
+
+    # -- the Data panel --------------------------------------------------------
+    def _page_tab(self, page) -> Highlight:
+        """The tab of a Data panel page, for a page that is not shown."""
+        tabs = self.bundle.right_panel.findChild(QtWidgets.QTabWidget)
+        bar = tabs.tabBar()
+        return Highlight(bar, lambda: bar.tabRect(tabs.indexOf(page)), lambda: self.workspace.reveal_dock("data"))
+
+    def _data_page(self) -> Highlight:
+        """The Data page of the Data panel, or its tab while another page is shown."""
+        panel = self.bundle.data_panel
+        return self._panel(panel, "data") if panel.isVisible() else self._page_tab(panel)
+
+    def _open_targets(self) -> tuple[Highlight, ...]:
+        return () if self._dialog(IMPORT_DIALOGS) is not None else (self._data_page(),)
+
+    def _review_targets(self) -> tuple[Highlight, ...]:
+        """Nothing in the mapping review; the Data page once the review is closed."""
+        return () if self._dialog(DatasetMappingBatchDialog) is not None else (self._data_page(),)
 
     def _slider_target(self) -> Highlight:
         return self._panel(self.bundle.slider_panel, "interactive_sliders")

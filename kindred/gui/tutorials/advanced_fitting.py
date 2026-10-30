@@ -3,8 +3,6 @@
 from dataclasses import dataclass, replace
 from functools import cache
 from math import isclose
-from pathlib import Path
-import shutil
 
 from PySide6 import QtCore, QtWidgets
 
@@ -15,13 +13,11 @@ from kindred.gui.fitting.window import FittingWindow
 from kindred.gui.parameter_enumeration import enumerate_parameter_coordinates
 from kindred.gui.tutorials.controller import Step
 from kindred.gui.tutorials.overlay import Highlight
-from kindred.gui.tutorials.practice_lesson import PracticeLesson
+from kindred.gui.tutorials.practice_lesson import IMPORT_DIALOGS, PracticeLesson
 from kindred.gui.widgets.dataset_mapping_batch_dialog import DatasetMappingBatchDialog
 from kindred.gui.widgets.import_config_dialog import ImportConfigDialog
-from kindred.io.paths import file_error_text, resolve_export_start_dir
-from kindred.io.resources import get_preset_mechanism_source, get_resource_path
+from kindred.io.resources import get_preset_mechanism_source
 
-_FOLDER = "AdvancedFitting"
 _FILE = "advanced_fitting.xlsx"
 _THREE_RUNS = ((0.1, 0.2, 0.2), (0.2, 0.2, 0.2), (0.4, 0.2, 0.2))
 # The starting A, B, and C that the row at time 0 of each sheet records.
@@ -48,7 +44,6 @@ def _columns(sheet: str) -> tuple[str, ...]:
 
 # Every sheet is recorded in seconds and M, without a units row.
 _UNITS = {sheet: ("s", dict.fromkeys(_columns(sheet), "M")) for sheet in _STARTS}
-_IMPORT_DIALOGS = (ImportConfigDialog, DatasetMappingBatchDialog)
 _DE_EVALUATIONS = 3000
 # The species that lessons 2 to 5 compare: every species measured over time.
 _OVER_TIME = frozenset({"A", "B", "C", "Int", "total_PB"})
@@ -71,14 +66,6 @@ def _preset_equations(preset: str):
     return prepare_dsl_request_set(get_preset_mechanism_source(preset).reactions_text).symbolic_equations_text()
 
 
-def _shown(parent, kind, predicate=lambda _widget: True):
-    """The first matching widget the parent shows, or None while it shows none."""
-    return next(
-        (widget for widget in parent.findChildren(kind) if widget.isVisibleTo(parent) and predicate(widget)),
-        None,
-    )
-
-
 class AdvancedFittingLesson(PracticeLesson):
     """A lesson of the series. The first one started runs the shared setup; the others find
     its tab and start after it. A lesson applies its fit only to a tab copy, so the setup
@@ -87,6 +74,8 @@ class AdvancedFittingLesson(PracticeLesson):
     _preset_name = "M11"
     _preset_rates = {"kf1": 1.0, "kr1": 0.01, "k2": 0.01, "k3": 100.0}
     _needs_preset_set = False
+    _sample_folder = "AdvancedFitting"
+    _sample_file = _FILE
     # The values the lesson fits.
     _fitted: tuple[str, ...] = ()
     # The sheets the lesson fits, as the lesson names them, and the species it compares.
@@ -101,8 +90,6 @@ class AdvancedFittingLesson(PracticeLesson):
 
     def __init__(self, **owners):
         super().__init__(**owners)
-        self._folder: Path | None = None
-        self._chosen_parent: str | None = None
         # The Fitting Window last seen, and the tabs present when it opened.
         self._seen_fit: FittingWindow | None = None
         self._tabs_at_open: set[str] = set()
@@ -183,40 +170,6 @@ class AdvancedFittingLesson(PracticeLesson):
         if self.step.name in self._fit_steps and not self._applied:
             self._reopen_fit()
 
-    # -- the tutorial file -----------------------------------------------------
-    def _save_file(self) -> None:
-        window = self.workspace.window()
-        parent = QtWidgets.QFileDialog.getExistingDirectory(
-            window, "Save Tutorial File", resolve_export_start_dir(self._chosen_parent)
-        )
-        if not parent:
-            return
-        self._chosen_parent = parent
-        target = Path(parent) / _FOLDER
-        if (target / _FILE).exists():
-            answer = QtWidgets.QMessageBox.question(
-                window,
-                "Save Tutorial File",
-                f"{target} already contains {_FILE}. Replace it?",
-                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-                QtWidgets.QMessageBox.StandardButton.No,
-            )
-            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
-                self._folder = target
-                return
-        try:
-            target.mkdir(exist_ok=True)
-            shutil.copyfile(get_resource_path(f"tutorial_files/{_FOLDER}/{_FILE}"), target / _FILE)
-        except OSError as exc:
-            QtWidgets.QMessageBox.critical(
-                window, "Save Tutorial File", file_error_text(exc, exc.filename or target)
-            )
-            return
-        self._folder = target
-
-    def _saved(self) -> bool:
-        return self._folder is not None and (self._folder / _FILE).is_file()
-
     # -- observations ----------------------------------------------------------
     def _workbook(self) -> dict[str, str]:
         """Sheet name -> dataset ID of the newest sheets of advanced_fitting.xlsx imported in this
@@ -237,10 +190,6 @@ class AdvancedFittingLesson(PracticeLesson):
                 ) == _UNITS[run]:
                     runs[run] = record.dataset_id
         return runs if len(runs) == len(_UNITS) else {}
-
-    def _import_dialog_open(self) -> bool:
-        dialog = self._dialog(ImportConfigDialog)
-        return dialog is not None and dialog.windowTitle() == f"Import: {_FILE}"
 
     def _expected_mapping(self, dataset_id: str) -> dict[str, str]:
         return {
@@ -414,7 +363,7 @@ class AdvancedFittingLesson(PracticeLesson):
         """The open Fitting Window has a current result to apply. Changing the fit setup makes the
         shown result stale until the fit runs again."""
         window = self._fit_window()
-        apply = None if window is None else _shown(
+        apply = None if window is None else self._shown(
             window, QtWidgets.QPushButton, lambda button: button.text().replace("&", "") == "Apply Fit"
         )
         return apply is not None and apply.isEnabled()
@@ -424,24 +373,6 @@ class AdvancedFittingLesson(PracticeLesson):
         return False
 
     # -- targets ---------------------------------------------------------------
-    def _page_tab(self, page) -> Highlight:
-        """The tab of a Data panel page, for a page that is not shown."""
-        tabs = self.bundle.right_panel.findChild(QtWidgets.QTabWidget)
-        bar = tabs.tabBar()
-        return Highlight(bar, lambda: bar.tabRect(tabs.indexOf(page)), lambda: self.workspace.reveal_dock("data"))
-
-    def _data_page(self) -> Highlight:
-        """The Data page of the Data panel, or its tab while another page is shown."""
-        panel = self.bundle.data_panel
-        return self._panel(panel, "data") if panel.isVisible() else self._page_tab(panel)
-
-    def _open_targets(self) -> tuple[Highlight, ...]:
-        return () if self._dialog(_IMPORT_DIALOGS) is not None else (self._data_page(),)
-
-    def _review_targets(self) -> tuple[Highlight, ...]:
-        """Nothing in the mapping review; the Data page once the review is closed."""
-        return () if self._dialog(DatasetMappingBatchDialog) is not None else (self._data_page(),)
-
     def _parameters_tab(self) -> tuple[Highlight, ...]:
         """The Parameters tab of the open Fitting Window."""
         window = self._fit_window()
@@ -491,7 +422,8 @@ class AdvancedFittingLesson(PracticeLesson):
                 "What Is in the Workbook",
                 "<p>advanced_fitting.xlsx holds 19 runs of M11, one per sheet, in a group for each lesson:</p>"
                 "<ul><li><b>bounds1</b> to <b>bounds3</b>: Bounds and Solvers</li>"
-                "<li><b>base1</b> to <b>base3</b>: Calculated Quantities and Constraints</li>"
+                "<li><b>base1</b> to <b>base3</b>: Calculated Quantities and Constraints, and Fitting Against a "
+                "Measured Quantity</li>"
                 "<li><b>stock1</b> to <b>stock3</b>: Varying Initial Conditions</li>"
                 "<li><b>k2runs1</b> to <b>k2runs3</b>: Per-Dataset Rate Constants</li>"
                 "<li><b>profile1</b> to <b>profile7</b>: Profile Likelihood</li></ul>"
@@ -513,7 +445,7 @@ class AdvancedFittingLesson(PracticeLesson):
                 self._open_targets,
                 lambda: self._import_dialog_open() or bool(self._workbook()),
                 "advanced_fitting.xlsx is open in the import dialog or already imported.",
-                dialog=_IMPORT_DIALOGS,
+                dialog=IMPORT_DIALOGS,
             ),
             Step(
                 "import_sheets",
@@ -523,7 +455,7 @@ class AdvancedFittingLesson(PracticeLesson):
                 lambda: (),
                 lambda: bool(self._workbook()),
                 "The workbook is imported.",
-                dialog=_IMPORT_DIALOGS,
+                dialog=IMPORT_DIALOGS,
             ),
             Step(
                 "accept_mapping",
@@ -662,7 +594,7 @@ class BoundsAndSolvers(AdvancedFittingLesson):
     def _bounds_target(self) -> tuple[Highlight, ...]:
         """Set Bounds for Parameters…, or the Parameters tab while another page is shown."""
         window = self._fit_window()
-        button = None if window is None else _shown(
+        button = None if window is None else self._shown(
             window, QtWidgets.QPushButton, lambda button: button.text() == "Set Bounds for Parameters…"
         )
         if button is not None and button.isVisible():
@@ -945,7 +877,7 @@ class CalculatedQuantitiesAndConstraints(AdvancedFittingLesson):
     def _bounds_target(self) -> tuple[Highlight, ...]:
         """Set Bounds for Parameters…, or the Parameters tab while another page is shown."""
         window = self._fit_window()
-        button = None if window is None else _shown(
+        button = None if window is None else self._shown(
             window, QtWidgets.QPushButton, lambda button: button.text() == "Set Bounds for Parameters…"
         )
         if button is not None and button.isVisible():
@@ -1503,5 +1435,255 @@ class ProfileLikelihood(AdvancedFittingLesson):
                 "<p>Each of profile1 to profile7 was simulated with its own rate constants, each within 5% of "
                 "<b>kf1 = 0.5</b>, <b>kr1 = 0.01</b>, <b>k2 = 0.02</b>, and <b>k3 = 100</b> "
                 "M<sup>−1</sup> s<sup>−1</sup>.</p>"
+            ),
+        )
+
+
+class FittingAgainstMeasuredQuantity(AdvancedFittingLesson):
+    title = "Advanced Fitting 6: Fitting Against a Measured Quantity"
+    description = (
+        "Fit against a measured quantity instead of time: recognize that such data leave the overall rate scale "
+        "undetermined, and fix it by fitting one run against time."
+    )
+    _fitted = ("kf1", "kr1", "k2", "k3")
+    # The values fitted once k3 is held.
+    _held = ("kf1", "kr1", "k2")
+    _sheets = ("base1", "base2", "base3")
+    _named = "base1, base2, and base3"
+    # The species each sheet compares while Int is its X.
+    _targets = frozenset({"A", "B", "C", "PH"})
+    # The Fit against choice of each sheet in the first fit and in the second, where base1 is fitted
+    # against time and compares Int too.
+    _against_int = dict.fromkeys(_sheets, "Int")
+    _against_mixed = {"base1": "t", "base2": "Int", "base3": "Int"}
+    _mixed_targets = {"base1": _targets | {"Int"}, "base2": _targets, "base3": _targets}
+    _first_step = "open_fit"
+    _fit_steps = frozenset({
+        "choose_datasets", "fit_against", "choose_targets", "vary_rates", "run_fit", "read_warning", "times_ten",
+        "read_scale", "time_base1", "hold_k3", "run_mixed", "read_results",
+    })
+    _mapped_steps = _fit_steps | {"open_fit"}
+
+    def __init__(self, **owners):
+        super().__init__(**owners)
+        # The Fit against choice last seen for each dataset the open Fitting Window showed.
+        self._x_seen: dict[str, str] = {}
+        # The rate constants the first fit against Int ended with.
+        self._first_fit: dict[str, float] = {}
+
+    def _observe_fit(self) -> None:
+        """Also record the Fit against choice of the dataset the open Fitting Window shows, and the
+        result of the first fit against Int."""
+        seen = self._seen_fit
+        super()._observe_fit()
+        window = self._fit_window()
+        if window is None or window is not self._seen_fit:
+            return
+        if window is not seen:
+            self._x_seen, self._first_fit = {}, {}
+        datasets = window.findChild(QtWidgets.QListWidget, "global_fit_unified_dataset_list")
+        x = window.findChild(QtWidgets.QComboBox, "global_fit_parametric_x")
+        current = None if datasets is None else datasets.currentItem()
+        if current is not None and x is not None:
+            self._x_seen[current.data(QtCore.Qt.ItemDataRole.UserRole)] = x.currentData()
+        if self.step.name in ("run_fit", "read_warning") and self._against(self._against_int) and self._lesson_fit():
+            self._first_fit = self._results()
+
+    def _results(self) -> dict[str, float]:
+        """The Last Fit Result of each fitted rate constant."""
+        roster = self._roster()
+        try:
+            return {name: float(roster[name]["Last Fit Result"].text()) for name in self._fitted}
+        except (KeyError, AttributeError, ValueError):
+            return {}
+
+    def _scaled_fit(self) -> bool:
+        """The open Fitting Window has a current result against Int whose rate constants are each about
+        ten times those of the first fit."""
+        first, last = self._first_fit, self._results()
+        return (
+            bool(first)
+            and bool(last)
+            and self._against(self._against_int)
+            and self._lesson_fit()
+            and all(isclose(last[name], 10 * value, rel_tol=0.05) for name, value in first.items())
+        )
+
+    def _against(self, choices: dict[str, str]) -> bool:
+        """Each sheet was last seen fitted against its choice, "t" for Time."""
+        found = self._workbook()
+        return bool(found) and all(self._x_seen.get(found[sheet]) == x for sheet, x in choices.items())
+
+    def _compared(self, targets: dict[str, frozenset[str]]) -> bool:
+        """Each sheet was last seen comparing exactly its species."""
+        found = self._workbook()
+        return bool(found) and all(
+            frozenset(species for species, row in self._rows_seen.get(found[sheet], {}).items() if row.included)
+            == wanted
+            for sheet, wanted in targets.items()
+        )
+
+    def _base1_timed(self) -> bool:
+        return self._against(self._against_mixed) and self._compared(self._mixed_targets)
+
+    def _steps(self) -> tuple[Step, ...]:
+        return (
+            *self._setup(),
+            self._open_fit_step(
+                "<p>Some experiments record one measured quantity against another instead of against time, or "
+                "record the time unreliably. Kindred can then fit against a measured quantity: it places each row "
+                "of the data at the point of the simulated curve that best matches that quantity together with the "
+                "other values the fit compares in that row.</p>"
+                "<p>This lesson fits the rate constants of M11 to <b>base1</b>, <b>base2</b>, and <b>base3</b>, "
+                "first against their measured Int and then with base1 against time.</p>"
+            ),
+            self._choose_datasets_step(),
+            Step(
+                "fit_against",
+                "Fit Against Int",
+                "<p>Under <b>Fit Data</b>, <b>Fit against</b> reads <b>Time</b>: each row is compared with the "
+                "simulated curve at its recorded time. Fit against also lists every measured column of the "
+                "dataset.</p>"
+                "<p>Select <b>base1</b> and choose <b>Int</b> in Fit against. Do the same for <b>base2</b> and "
+                "<b>base3</b>. Int becomes the X of each dataset instead of a target, so its <b>Include</b> is "
+                "unchecked and cannot be checked.</p>"
+                "<p>Int rises to a peak and falls again, so most Int values occur twice on a curve. A measured "
+                "quantity does not need to rise steadily to serve as X.</p>",
+                lambda: (),
+                lambda: self._against(self._against_int),
+                "base1, base2, and base3 are fitted against Int.",
+                waiting="Select base1, base2, and base3 in turn and choose Int in Fit against.",
+                dialog=FittingWindow,
+            ),
+            Step(
+                "choose_targets",
+                "Choose the Targets",
+                "<p>The <b>Species Table</b> shows the dataset selected in <b>Datasets</b>. When <b>Include</b> is "
+                "checked in a row, the fit compares that species with its mapped column.</p>"
+                "<p>Water holds a value only at time 0, its starting concentration, so it has no measurements to fit. "
+                "PB never exceeds 3 × 10<sup>−5</sup> M in these sheets, far too little to measure reliably next "
+                "to 0.1 to 0.4 M of the other species, so do not compare it either.</p>"
+                "<p>Select <b>base1</b>, uncheck <b>Include</b> for Water and PB, and click <b>Copy Targets to "
+                "Compatible</b>. It copies these choices to every other dataset that has all the checked species. "
+                "Then select <b>base2</b> and <b>base3</b> to confirm that only A, B, C, and PH are included.</p>",
+                lambda: (),
+                self._targets_chosen,
+                "Only A, B, C, and PH are compared in base1, base2, and base3.",
+                waiting="Uncheck Include for Water and PB in base1, click Copy Targets to Compatible, and select base2 "
+                "and base3 to confirm their targets.",
+                dialog=FittingWindow,
+            ),
+            Step(
+                "vary_rates",
+                "Vary the Rate Constants",
+                "<p>Click <b>Parameters</b> and check <b>Vary</b> for <b>kf1</b>, <b>kr1</b>, <b>k2</b>, and "
+                "<b>k3</b>. Leave <b>concentration_floor</b> unchecked.</p>",
+                lambda: (),
+                self._varied,
+                "kf1, kr1, k2, and k3 vary.",
+                waiting="Check Vary for kf1, kr1, k2, and k3 only.",
+                dialog=FittingWindow,
+            ),
+            Step(
+                "run_fit",
+                "Run the Fit",
+                "<p>Click <b>Run Fit</b> and wait for the fit to finish.</p>",
+                lambda: (),
+                lambda: self._against(self._against_int) and self._lesson_fit(),
+                "The fit is complete.",
+                waiting="Include only base1, base2, and base3, each fitted against Int. Compare A, B, C, and PH. Vary "
+                "kf1, kr1, k2, and k3. Then click Run Fit and wait for the fit to finish.",
+                dialog=FittingWindow,
+            ),
+            Step(
+                "read_warning",
+                "Read the Warning",
+                "<p>Results reads <b>Fit converged</b> and warns: <b>These data do not determine the overall rate "
+                "scale: multiplying every rate constant by one common factor traces the same curve against the "
+                "measured X, only faster or slower.</b></p>"
+                "<p>Against Int, the data show which concentrations occur together, but not how fast the reaction "
+                "reaches them. Multiplying kf1, kr1, k2, and k3 by 10 gives the same curves of A, B, C, and PH "
+                "against Int, reached ten times faster. The next step tries it.</p>",
+                lambda: (),
+                dialog=FittingWindow,
+            ),
+            Step(
+                "times_ten",
+                "Multiply the Guesses by 10",
+                "<p>On <b>Parameters</b>, <b>Initial Guess</b> now holds the result of the fit: about 0.516 for kf1, "
+                "0.0106 for kr1, 0.0204 for k2, and 28.0 for k3. Enter ten times these as Initial Guess: <b>5.16</b> "
+                "for kf1, <b>0.106</b> for kr1, <b>0.204</b> for k2, and <b>280</b> for k3. Then click <b>Run "
+                "Fit</b> and wait for the fit to finish.</p>",
+                lambda: (),
+                self._scaled_fit,
+                "The fit is complete.",
+                waiting="Enter 5.16, 0.106, 0.204, and 280 as the Initial Guess of kf1, kr1, k2, and k3, then click "
+                "Run Fit and wait for the fit to finish.",
+                dialog=FittingWindow,
+            ),
+            Step(
+                "read_scale",
+                "Compare the Two Fits",
+                "<p>Results again reads <b>Fit converged</b> with the same warning, and every rate constant ended "
+                "about ten times larger than in the first fit. Both fits match the data equally well: a fit against "
+                "a measured quantity alone determines the ratios of the rate constants, not their values.</p>",
+                lambda: (),
+                dialog=FittingWindow,
+            ),
+            Step(
+                "time_base1",
+                "Fit base1 Against Time",
+                "<p>One dataset fitted against time sets the rate scale for all of them, while the others stay fitted "
+                "against Int.</p>"
+                "<p>On <b>Data and Targets</b>, select <b>base1</b> and choose <b>Time</b> in <b>Fit against</b>. "
+                "Int can be compared again, but its <b>Include</b> stays unchecked: check it. base1 then compares A, "
+                "B, C, Int, and PH over time.</p>",
+                lambda: (),
+                self._base1_timed,
+                "base1 is fitted against time and compares Int.",
+                waiting="On Data and Targets, select base1, choose Time in Fit against, and check Include for Int. "
+                "Keep base2 and base3 fitted against Int.",
+                dialog=FittingWindow,
+            ),
+            Step(
+                "hold_k3",
+                "Hold k3",
+                "<p>k3 turns PB into PH almost as soon as PB forms, so PH forms as fast as PB does, and only the "
+                "small level of PB shows k3. These fits do not compare PB, so they cannot determine k3: fits from "
+                "different starting points end with very different k3 and fit the data equally well.</p>"
+                "<p>On <b>Parameters</b>, uncheck <b>Vary</b> for k3. k3 then keeps its <b>Initial Guess</b>, the "
+                "previous result.</p>",
+                lambda: (),
+                lambda: self._varied(self._held),
+                "kf1, kr1, and k2 vary, and k3 is held.",
+                waiting="Uncheck Vary for k3.",
+                dialog=FittingWindow,
+            ),
+            Step(
+                "run_mixed",
+                "Run the Fit Again",
+                "<p>Click <b>Run Fit</b> and wait for the fit to finish.</p>",
+                lambda: (),
+                lambda: self._included_only()
+                and self._base1_timed()
+                and self._varied(self._held)
+                and self._fit_result(),
+                "The fit is complete.",
+                waiting="Include only base1, base2, and base3. Fit base1 against Time with Int included, and base2 and "
+                "base3 against Int. Vary kf1, kr1, and k2. Then click Run Fit and wait for the fit to finish.",
+                dialog=FittingWindow,
+            ),
+            Step(
+                "read_results",
+                "Read the Results",
+                "<p>Results reads <b>Fit converged</b> without the warning: base1, fitted against time, sets the "
+                "rate scale, and base2 and base3 add their measurements against Int.</p>",
+                lambda: (),
+                dialog=FittingWindow,
+            ),
+            self._finish(
+                "<p>base1 to base3 were simulated with <b>kf1 = 0.5</b>, <b>kr1 = 0.01</b>, <b>k2 = 0.02</b>, and "
+                "<b>k3 = 100</b> M<sup>−1</sup> s<sup>−1</sup>. These fits cannot determine k3, so compare kf1, "
+                "kr1, and k2 with the fitted values in Results.</p>"
             ),
         )
