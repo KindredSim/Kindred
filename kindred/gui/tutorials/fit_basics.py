@@ -1,8 +1,6 @@
 """Fit the rate constants of M5 to the three runs of an Excel workbook."""
 
 from dataclasses import replace
-from pathlib import Path
-import shutil
 
 from PySide6 import QtCore, QtWidgets
 
@@ -12,13 +10,10 @@ from kindred.gui.fitting.window import FittingWindow
 from kindred.gui.parameter_enumeration import enumerate_parameter_coordinates
 from kindred.gui.tutorials.controller import Step
 from kindred.gui.tutorials.overlay import Highlight
-from kindred.gui.tutorials.practice_lesson import PracticeLesson
+from kindred.gui.tutorials.practice_lesson import IMPORT_DIALOGS, PracticeLesson
 from kindred.gui.widgets.dataset_mapping_batch_dialog import DatasetMappingBatchDialog
 from kindred.gui.widgets.import_config_dialog import ImportConfigDialog
-from kindred.io.paths import file_error_text, resolve_export_start_dir
-from kindred.io.resources import get_resource_path
 
-_FOLDER = "FitBasics"
 _FILE = "fit_runs.xlsx"
 _RUNS = ("run1", "run2", "run3")
 _A0 = {"run1": 0.5, "run2": 1.0, "run3": 2.0}
@@ -27,15 +22,6 @@ _UNITS = ("s", {"A": "M", "B": "M", "C": "M"})
 # The rate constants the lesson fits.
 _RATES = ("kf1", "kr1", "k2")
 _PLOTTED = (SimulationSeriesAxisSelection("B"),)
-_IMPORT_DIALOGS = (ImportConfigDialog, DatasetMappingBatchDialog)
-
-
-def _shown(parent, kind, predicate=lambda _widget: True):
-    """The first matching widget the parent shows, or None while it shows none."""
-    return next(
-        (widget for widget in parent.findChildren(kind) if widget.isVisibleTo(parent) and predicate(widget)),
-        None,
-    )
 
 
 class FittingBasics(PracticeLesson):
@@ -48,6 +34,8 @@ class FittingBasics(PracticeLesson):
     _preset_rates = {"kf1": 1.5, "kr1": 0.25, "k2": 0.1}
     _run_steps = frozenset({"run_data", "run_again"})
     _needs_preset_set = False
+    _sample_folder = "FitBasics"
+    _sample_file = _FILE
     # Steps taught inside the Fitting Window.
     _fit_steps = frozenset({
         "choose_datasets", "choose_species", "vary_rates", "run_fit", "read_results", "apply_copy", "apply_fit",
@@ -56,8 +44,6 @@ class FittingBasics(PracticeLesson):
 
     def __init__(self, **owners):
         super().__init__(**owners)
-        self._folder: Path | None = None
-        self._chosen_parent: str | None = None
         # Datasets present when the lesson started.
         self._datasets_before = {record.dataset_id for record in self.registry.document.datasets}
         # The Fitting Window last seen, with the rate constants and tabs present when it opened.
@@ -101,40 +87,6 @@ class FittingBasics(PracticeLesson):
         self._seen_fit = None
         if self.step.name in self._fit_steps and not self._fit_applied():
             self._reopen_fit()
-
-    # -- the tutorial file -----------------------------------------------------
-    def _save_file(self) -> None:
-        window = self.workspace.window()
-        parent = QtWidgets.QFileDialog.getExistingDirectory(
-            window, "Save Tutorial File", resolve_export_start_dir(self._chosen_parent)
-        )
-        if not parent:
-            return
-        self._chosen_parent = parent
-        target = Path(parent) / _FOLDER
-        if (target / _FILE).exists():
-            answer = QtWidgets.QMessageBox.question(
-                window,
-                "Save Tutorial File",
-                f"{target} already contains {_FILE}. Replace it?",
-                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-                QtWidgets.QMessageBox.StandardButton.No,
-            )
-            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
-                self._folder = target
-                return
-        try:
-            target.mkdir(exist_ok=True)
-            shutil.copyfile(get_resource_path(f"tutorial_files/{_FOLDER}/{_FILE}"), target / _FILE)
-        except OSError as exc:
-            QtWidgets.QMessageBox.critical(
-                window, "Save Tutorial File", file_error_text(exc, exc.filename or target)
-            )
-            return
-        self._folder = target
-
-    def _saved(self) -> bool:
-        return self._folder is not None and (self._folder / _FILE).is_file()
 
     # -- observations ----------------------------------------------------------
     def _rates(self) -> dict[str, float]:
@@ -184,10 +136,6 @@ class FittingBasics(PracticeLesson):
                 ) == _UNITS:
                     runs[run] = record.dataset_id
         return runs if len(runs) == len(_RUNS) else {}
-
-    def _import_dialog_open(self) -> bool:
-        dialog = self._dialog(ImportConfigDialog)
-        return dialog is not None and dialog.windowTitle() == f"Import: {_FILE}"
 
     def _expected_mapping(self, dataset_id: str) -> dict[str, str]:
         return {
@@ -265,7 +213,7 @@ class FittingBasics(PracticeLesson):
     def _fit_result(self) -> bool:
         """The open Fitting Window has a current result to apply."""
         window = self._fit_window()
-        apply = None if window is None else _shown(
+        apply = None if window is None else self._shown(
             window, QtWidgets.QPushButton, lambda button: button.text().replace("&", "") == "Apply Fit"
         )
         return apply is not None and apply.isEnabled()
@@ -278,24 +226,6 @@ class FittingBasics(PracticeLesson):
         ) and self._run_ok(rates, identities)
 
     # -- targets ---------------------------------------------------------------
-    def _page_tab(self, page) -> Highlight:
-        """The tab of a Data panel page, for a page that is not shown."""
-        tabs = self.bundle.right_panel.findChild(QtWidgets.QTabWidget)
-        bar = tabs.tabBar()
-        return Highlight(bar, lambda: bar.tabRect(tabs.indexOf(page)), lambda: self.workspace.reveal_dock("data"))
-
-    def _data_page(self) -> Highlight:
-        """The Data page of the Data panel, or its tab while another page is shown."""
-        panel = self.bundle.data_panel
-        return self._panel(panel, "data") if panel.isVisible() else self._page_tab(panel)
-
-    def _open_targets(self) -> tuple[Highlight, ...]:
-        return () if self._dialog(_IMPORT_DIALOGS) is not None else (self._data_page(),)
-
-    def _review_targets(self) -> tuple[Highlight, ...]:
-        """Nothing in the mapping review; the Data page once the review is closed."""
-        return () if self._dialog(DatasetMappingBatchDialog) is not None else (self._data_page(),)
-
     def _overlay_target(self) -> Highlight:
         """The Plot Overlays list, which stays in view while its datasets are expanded."""
         panel = self.bundle.overlay_panel
@@ -306,7 +236,7 @@ class FittingBasics(PracticeLesson):
     def _y_target(self) -> tuple[Highlight, ...]:
         """The Y selector above the plot."""
         plot = self.workspace.plot_for_tab(self.tab_id)
-        button = _shown(plot, QtWidgets.QToolButton, lambda button: button.text().startswith("Y:"))
+        button = self._shown(plot, QtWidgets.QToolButton, lambda button: button.text().startswith("Y:"))
         return () if button is None else (Highlight(button),)
 
     def _run_targets_now(self) -> tuple[Highlight, ...]:
@@ -360,7 +290,7 @@ class FittingBasics(PracticeLesson):
                 self._open_targets,
                 lambda: self._import_dialog_open() or bool(self._workbook()),
                 "fit_runs.xlsx is open in the import dialog or already imported.",
-                dialog=_IMPORT_DIALOGS,
+                dialog=IMPORT_DIALOGS,
             ),
             Step(
                 "import_sheets",
@@ -371,7 +301,7 @@ class FittingBasics(PracticeLesson):
                 lambda: (),
                 lambda: bool(self._workbook()),
                 "The workbook is imported.",
-                dialog=_IMPORT_DIALOGS,
+                dialog=IMPORT_DIALOGS,
             ),
             Step(
                 "accept_mapping",
