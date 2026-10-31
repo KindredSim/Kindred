@@ -3,13 +3,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from fractions import Fraction
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from types import MappingProxyType
 
 from kindred.core.quantity_units import (
     Unit, UnitScale, ONE_SCALE, DIMENSIONLESS, MOLAR, scientific_unit,
     conversion_scale,
 )
-from .parser import ExprNode, NumberNode, IdentNode, SpeciesRefNode, UnaryNode, BinaryNode, CallNode
+from .parser import BlankNode, ExprNode, NumberNode, IdentNode, SpeciesRefNode, UnaryNode, BinaryNode, CallNode
 from .symbols import BUILTIN_FUNCTIONS
 from kindred.core._bounded_rational import literal_fraction, rational_binary
 
@@ -145,12 +146,18 @@ def _constant(node, constants):
     return None
 
 
-def _finish(node, children, constants):
+def _rule(operation, rules):
+    if operation in rules:
+        return rules[operation]
+    return BUILTIN_FUNCTIONS[operation].unit_rule if operation in BUILTIN_FUNCTIONS else operation
+
+
+def _finish(node, children, constants, rules=MappingProxyType({})):
     operation = node.name if isinstance(node, CallNode) else (
         "unary" if isinstance(node, UnaryNode) and node.op != "!" else node.op)
-    rule = BUILTIN_FUNCTIONS[operation].unit_rule if operation in BUILTIN_FUNCTIONS else operation
+    rule = _rule(operation, rules)
     result = operation_units(
-        operation, tuple(child.quantity_unit for child in children),
+        rules.get(operation, operation), tuple(child.quantity_unit for child in children),
         zeros=tuple(value == 0 for value in constants) if rule in _ZERO_RULES else (),
         exponent=constants[1] if operation in {"^", "**", "pow"} and len(children) == 2 else None,
     )
@@ -165,8 +172,11 @@ def _finish(node, children, constants):
                    unit_scale=result.result, unit_factor=result.result.number())
 
 
-def _prepare(node, lookup, *, constant_needed=False, authored=False):
+def _prepare(node, lookup, *, constant_needed=False, authored=False, rules=MappingProxyType({})):
     """Prepare each subtree once, carrying only locally needed constant facts."""
+    if isinstance(node, BlankNode):
+        # A blank takes the unit of the values it combines with, as an exact zero does.
+        return replace(node, quantity_unit=DIMENSIONLESS), Fraction(0) if constant_needed else None
     if isinstance(node, NumberNode):
         constant = None
         if constant_needed:
@@ -181,15 +191,15 @@ def _prepare(node, lookup, *, constant_needed=False, authored=False):
         return replace(node, quantity_unit=MOLAR), None
     children = _children(node)
     operation = node.name if isinstance(node, CallNode) else node.op
-    rule = BUILTIN_FUNCTIONS[operation].unit_rule if operation in BUILTIN_FUNCTIONS else operation
+    rule = _rule(operation, rules)
     propagate = constant_needed and isinstance(node, (UnaryNode, BinaryNode)) and operation in _RATIONAL_OPERATIONS
     pairs = tuple(_prepare(child, lookup,
                            constant_needed=(propagate or rule in _ZERO_RULES and (rule != "branches" or i > 0)
                                             or operation in {"^", "**", "pow"} and i == 1),
-                           authored=authored)
+                           authored=authored, rules=rules)
                   for i, child in enumerate(children))
     prepared_children, constants = tuple(zip(*pairs)) if pairs else ((), ())
-    prepared = _finish(node, prepared_children, constants)
+    prepared = _finish(node, prepared_children, constants, rules)
     constant = _constant(node, constants) if constant_needed else None
     if authored:
         # Generated arithmetic uses canonical coordinate numbers. Compensate
@@ -209,9 +219,13 @@ def _prepare(node, lookup, *, constant_needed=False, authored=False):
     return prepared, constant
 
 
-def prepare_expression(node: ExprNode, lookup: Callable[[str], Unit | None]) -> ExprNode:
-    """Annotate admitted syntax; numerical execution only applies fixed factors."""
-    return _prepare(node, lookup)[0]
+def prepare_expression(node: ExprNode, lookup: Callable[[str], Unit | None],
+                       rules: Mapping[str, str] = MappingProxyType({})) -> ExprNode:
+    """Annotate admitted syntax; numerical execution only applies fixed factors.
+
+    ``rules`` gives the unit rules of functions a caller admits beyond the builtins.
+    """
+    return _prepare(node, lookup, rules=rules)[0]
 
 
 def authored_projection(node: ExprNode, lookup: Callable[[str], Unit | None]) -> ExprNode:

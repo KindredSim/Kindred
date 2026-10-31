@@ -1,8 +1,9 @@
 """Admit row-wise column patterns and lower prepared Algebra to IronCalc."""
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
+from itertools import count
 import re
 from typing import Any
 
@@ -11,7 +12,7 @@ import ironcalc
 from kindred.core import constants
 from kindred.core.algebra.errors import AlgebraError
 from kindred.core.algebra.parser import (
-    BinaryNode, CallNode, ExprNode, IdentNode, NumberNode, UnaryNode, parse_algebra,
+    BinaryNode, BlankNode, CallNode, ExprNode, IdentNode, NumberNode, UnaryNode, parse_algebra,
 )
 from kindred.core.algebra.unit_preparation import prepare_expression
 from kindred.core.quantity_units import (
@@ -24,7 +25,11 @@ _CONSTANTS = {name: getattr(constants, name) for name in constants.__all__}
 _UNARY_FUNCTIONS = {
     "sqrt", "ln", "log10", "exp", "sin", "cos", "tan", "abs", "erf", "heaviside",
 }
-_FUNCTIONS = _UNARY_FUNCTIONS | {"pow", "ifelse", "clip", "min", "max"}
+_FUNCTIONS = _UNARY_FUNCTIONS | {"pow", "ifelse", "clip", "min", "max", "iferror"}
+# iferror is a spreadsheet function: its value and fallback combine like min and max.
+_UNIT_RULES = {"iferror": "compatible"}
+# The arguments a function gives as its result; it calculates with the others.
+_RESULTS = {"ifelse": (1, 2), "iferror": (0, 1)}
 # IronCalc compares at 15 digits with a tolerance. The sign of the exact
 # difference picks Algebra's 0 or 1 for a negative, zero or positive difference;
 # an overflowed difference keeps its sign and an undefined one is an error.
@@ -75,7 +80,7 @@ def formula_at_row(pattern: str, row: int) -> str:
 
 def _references(node: ExprNode, column_count: int) -> tuple[int, ...]:
     """Admit the supported syntax and retain authored reference order."""
-    if isinstance(node, NumberNode):
+    if isinstance(node, (NumberNode, BlankNode)):
         return ()
     if isinstance(node, IdentNode):
         if node.name in _CONSTANTS:
@@ -98,41 +103,69 @@ def _references(node: ExprNode, column_count: int) -> tuple[int, ...]:
             if node.name.lower() in _FUNCTIONS:
                 raise ValueError(f"Use lowercase function names: {node.name.lower()} instead of {node.name}.")
             raise ValueError(f"Unsupported formula function {node.name!r}.")
+        if node.name == "iferror" and len(node.args) != 2:
+            raise ValueError("iferror takes two arguments.")
         children = node.args
     else:
         raise ValueError("Formula patterns support column references, not species or context references.")
     return tuple(column for child in children for column in _references(child, column_count))
 
 
-def _emit(node: ExprNode, row: str) -> str:
-    if isinstance(node, NumberNode):
+def _operation(node: ExprNode, args: Sequence[str]) -> str:
+    if isinstance(node, UnaryNode):
+        return f"IF({args[0]},0,1)" if node.op == "!" else f"{node.op}{args[0]}"
+    if isinstance(node, BinaryNode):
+        lhs, rhs = args
+        if node.op in _COMPARISONS:
+            return f"CHOOSE(2+SIGN({lhs}-{rhs}),{_COMPARISONS[node.op]})"
+        if node.op in {"^", "**"}:
+            # IronCalc's ^ yields a number that IFERROR, MIN and MAX miss;
+            # POWER's domain failures are errors.
+            return f"POWER({lhs},{rhs})"
+        return f"{lhs}{node.op}{rhs}"
+    if node.name == "pow":
+        return f"POWER({args[0]},{args[1]})"
+    if node.name == "ifelse":
+        # IronCalc's IF calculates only the selected value, as Algebra does.
+        return f"IF({args[0]},{args[1]},{args[2]})"
+    if node.name == "clip":
+        # The median of the value and both bounds is Algebra's clip.
+        return f"MEDIAN({','.join(args)})"
+    if node.name == "heaviside":
+        return f"CHOOSE(2+SIGN({args[0]}),0,0,1)"
+    return f"{node.name.upper()}({','.join(args)})"
+
+
+def _blank_guard(text: str, operands: Mapping[str, str]) -> str:
+    """Name each operand that can be blank once; any blank one makes the result blank."""
+    names = ",".join(f"{name},{operand}" for name, operand in operands.items())
+    tests = ",".join(f"ISTEXT({name})" for name in operands)
+    return f'LET({names},IF(OR({tests}),"",{text}))'
+
+
+def _emit(node: ExprNode, row: str, names: Iterator[str]) -> tuple[str, bool]:
+    """Return the node's IronCalc text and whether it can be blank.
+
+    A blank is a missing value: calculating with one gives a blank, as a missing
+    input does, and ifelse and iferror give a blank result as it is.
+    """
+    blank = isinstance(node, BlankNode)
+    if blank:
+        text = '""'
+    elif isinstance(node, NumberNode):
         text = node.literal if node.literal is not None else repr(node.value)
     elif isinstance(node, IdentNode):
         text = repr(_CONSTANTS[node.name]) if node.name in _CONSTANTS else f"{node.name[:-1]}{row}"
-    elif isinstance(node, UnaryNode):
-        rhs = _emit(node.rhs, row)
-        text = f"IF({rhs},0,1)" if node.op == "!" else f"{node.op}{rhs}"
-    elif isinstance(node, BinaryNode):
-        lhs, rhs = _emit(node.lhs, row), _emit(node.rhs, row)
-        if node.op in _COMPARISONS:
-            text = f"CHOOSE(2+SIGN({lhs}-{rhs}),{_COMPARISONS[node.op]})"
-        else:
-            operator = "^" if node.op == "**" else node.op
-            text = f"{lhs}{operator}{rhs}"
     else:
-        args = tuple(_emit(arg, row) for arg in node.args)
-        if node.name == "pow":
-            text = f"{args[0]}^{args[1]}"
-        elif node.name == "ifelse":
-            # IronCalc's IF calculates only the selected value, as Algebra does.
-            text = f"IF({args[0]},{args[1]},{args[2]})"
-        elif node.name == "clip":
-            # The median of the value and both bounds is Algebra's clip.
-            text = f"MEDIAN({','.join(args)})"
-        elif node.name == "heaviside":
-            text = f"CHOOSE(2+SIGN({args[0]}),0,0,1)"
-        else:
-            text = f"{node.name.upper()}({','.join(args)})"
+        children = (node.rhs,) if isinstance(node, UnaryNode) else (
+            (node.lhs, node.rhs) if isinstance(node, BinaryNode) else node.args)
+        results = _RESULTS.get(node.name, ()) if isinstance(node, CallNode) else ()
+        texts, blanks = zip(*(_emit(child, row, names) for child in children))
+        blank = any(blanks)
+        operands = {index: next(names) for index in range(len(texts)) if blanks[index] and index not in results}
+        text = _operation(node, [operands.get(index, child) for index, child in enumerate(texts)])
+        if operands:
+            text = _blank_guard(text, {name: texts[index] for index, name in operands.items()})
     expression = f"({text})"
     if node.unit_scale != ONE_SCALE:
         # IronCalc keeps formula numbers as 15-digit text. The factor's correctly
@@ -141,8 +174,13 @@ def _emit(node: ExprNode, row: str) -> str:
         head = float(f"{factor:.14g}")
         tail = float(f"{factor - head:.14g}")
         factor_text = repr(head) if not tail else f"{head!r}+({tail!r})"
-        expression = f"(({factor_text})*{expression})"
-    return expression
+        product = f"({factor_text})*"
+        if blank:
+            name = next(names)
+            expression = f"({_blank_guard(product + name, {name: expression})})"
+        else:
+            expression = f"({product}{expression})"
+    return expression, blank
 
 
 @dataclass(frozen=True)
@@ -206,19 +244,21 @@ def _compile_columns(columns: Sequence[Mapping[str, Any]]) -> dict[int, Compiled
     # names the column; the block's own text and positions are never shown, and
     # its internal row-1 names read as column letters.
     try:
-        block = parse_algebra("\n".join(statements) + "\n")
+        block = parse_algebra("\n".join(statements) + "\n", blank=True)
     except AlgebraError as exc:
         message = re.sub(r"\b([A-Z]+)1\b", r"\1", exc.message)
         raise ValueError(f"Column {calculated[exc.line - 1]}: {message}") from exc
     references = {statement.name: _references(statement.expr, len(columns)) for statement in block.lines}
     compiled = {}
+    # Columns whose results can be blank.
+    blanks = set()
     for statement in block.statements_in_evaluation_order():
         column = _reference_column(statement.name)
         preferred = {}
         for reference in references[statement.name]:
             for kind, unit in preferences[reference].items():
                 preferred.setdefault(kind, unit)
-        prepared = prepare_expression(statement.expr, units.get)
+        prepared = prepare_expression(statement.expr, units.get, _UNIT_RULES)
         inferred = prepared.quantity_unit
         preferred = _retained_preferences(inferred, preferred)
         display = None
@@ -235,7 +275,15 @@ def _compile_columns(columns: Sequence[Mapping[str, Any]]) -> dict[int, Compiled
             factor.number()
             prepared = replace(prepared, unit_scale=factor)
         # Emitted once; each row only substitutes its number into the references.
-        compiled[column] = CompiledPattern(display, frozenset(references[statement.name]), "=" + _emit(prepared, _ROW))
+        template, blank = _emit(prepared, _ROW, (f"_{index}" for index in count()))
+        referenced = [reference for reference in dict.fromkeys(references[statement.name]) if reference in blanks]
+        if referenced:
+            # A blank referenced value is missing, as a missing input is.
+            tests = ",".join(f"ISTEXT({ironcalc.column_name_from_number(reference)}{_ROW})" for reference in referenced)
+            template = f'IF(OR({tests}),"",{template})'
+        if blank or referenced:
+            blanks.add(column)
+        compiled[column] = CompiledPattern(display, frozenset(references[statement.name]), "=" + template)
         units[statement.name] = display
         preferences[column] = preferred
     return compiled

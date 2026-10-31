@@ -586,6 +586,7 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._formula.setToolTip("A number, or a formula such as =B5*D5 that computes its whole column from cells of the same row.\n"
                                  "Plain numbers in formulas are scientific values (M, s, K, J/mol, m³).\n"
                                  "Use ln(x) for natural logarithms and log10(x) for base 10.\n"
+                                 "Use \"\" for a blank, as in =iferror(B5/C5,\"\").\n"
                                  "While typing a formula, click a cell after =, an operator, ( or , to insert its column on this row.")
         formula_row.addWidget(self._formula)
         layout.addLayout(formula_row)

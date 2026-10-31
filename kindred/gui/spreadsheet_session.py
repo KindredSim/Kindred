@@ -31,6 +31,12 @@ def _number(text):
     return value
 
 
+def _value(raw, sheet, row, column):
+    """A cell's typed value; a formula's blank result is missing, as a blank cell is."""
+    value = raw.get_cell_value(sheet, row, column)
+    return None if value == "" else value
+
+
 # IronCalc's worksheet grid; operations beyond it are refused before any change.
 _MAX_ROWS, _MAX_COLUMNS = 1_048_576, 16_384
 
@@ -247,7 +253,7 @@ class SpreadsheetSession:
                     raw = self._raw()
                     values = []
                     for result_row in range(1, rows + 1):
-                        value = raw.get_cell_value(sheet, result_row, column)
+                        value = _value(raw, sheet, result_row, column)
                         if value is not None and (type(value) not in (int, float) or not math.isfinite(value)):
                             raise ValueError(f"Column {letter} has an error in row {result_row}. "
                                              "Fix the error before removing the formula.")
@@ -433,7 +439,7 @@ class SpreadsheetSession:
                     raise ValueError(f"{info['sheet']}: choose a unit for {spec['name']}.")
                 values = []
                 for row in range(1, info["rows"] + 1):
-                    value = raw.get_cell_value(sheet, row, column)
+                    value = _value(raw, sheet, row, column)
                     if value is not None and (type(value) not in (int, float) or not math.isfinite(value)):
                         cell = f"{ironcalc.column_name_from_number(column)}{row}"
                         raise ValueError(f"{info['sheet']}!{cell}: a finite number or blank is required ({value!r}).")
