@@ -13,7 +13,8 @@ Scope of this module
   mechanism DSL algebra declarations are normalized into this format before
   reaching this parser.
 - Build a typed AST with nodes:
-    Number, Ident, Unary, Binary, Call, SpeciesRef(kind="now"|"init")
+    Number, Ident, Unary, Binary, Call, SpeciesRef(kind="now"|"init"), and Blank
+    where the caller admits it
 - Enforce precedence and right-associative power (** and ^).
 - Admit builtin argument counts from the builtin table; numeric and type
   checks belong to the evaluator.
@@ -72,7 +73,7 @@ _TOKEN_RE = re.compile(
 )
 
 
-def _lex(src: str) -> List[Token]:
+def _lex(src: str, blank: bool = False) -> List[Token]:
     tokens: List[Token] = []
     line = 1
     bol = 0  # beginning-of-line index
@@ -87,8 +88,10 @@ def _lex(src: str) -> List[Token]:
         text = m.group(0)
         if kind_name == "SKIP":
             pass
-        elif kind_name == "MISMATCH":
-            raise AlgebraSyntaxError(f"Unexpected character {text!r}.", line=line, col=(i - bol + 1), line_text=_line_of(src, line))
+        elif kind_name == "MISMATCH" or kind_name == "BLANK" and not blank:
+            message = ('Expected "" for a blank; a formula holds no other text.' if blank and text == '"'
+                       else f"Unexpected character {text[0]!r}.")
+            raise AlgebraSyntaxError(message, line=line, col=(i - bol + 1), line_text=_line_of(src, line))
         else:
             tk = TokenKind[kind_name]
             # Apply keyword recognition: if IDENT matches a keyword, use that TokenKind instead
@@ -170,6 +173,11 @@ class CallNode(ExprNode):
 
     def has_species_ref(self, kind: str | None = None) -> bool:
         return any(a.has_species_ref(kind) for a in self.args)
+
+@dataclass(frozen=True)
+class BlankNode(ExprNode):
+    """The missing value "", which only spreadsheet formulas admit."""
+
 
 @dataclass(frozen=True)
 class SpeciesRefNode(ExprNode):
@@ -543,6 +551,9 @@ class Parser:
             else:
                 return IdentNode(ident)
 
+        if self._match(TokenKind.BLANK):
+            return BlankNode()
+
         # Parenthesized
         if self._match(TokenKind.LPAREN):
             node = self._parse_expr()
@@ -559,13 +570,13 @@ class Parser:
 
 # ------------------------------ Public API -----------------------------------
 
-def parse_algebra(src: str) -> AlgebraBlock:
+def parse_algebra(src: str, *, blank: bool = False) -> AlgebraBlock:
     """
     Parse an internal synthetic algebra source string and return its
-    AlgebraBlock.
+    AlgebraBlock; ``blank`` admits the missing value "".
 
     Raises Algebra* errors carrying their line and column.
     """
-    tokens = _lex(src)
+    tokens = _lex(src, blank)
     parser = Parser(tokens)
     return parser.parse_block()

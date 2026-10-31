@@ -16,10 +16,11 @@ EBNF (power is right-associative):
     factor         := unary { ("*"|"/") unary }
     power          := primary [ ("**"|"^") unary ]    # right associative
     unary          := ("+"|"-"|"!") unary | power
-    primary        := NUMBER | IDENT | func_call | species_ref | "(" expr ")"
+    primary        := NUMBER | IDENT | func_call | species_ref | "(" expr ")" | BLANK
     func_call      := IDENT "(" [ arg_list ] ")"
     arg_list       := expr { "," expr }
     species_ref    := "[" IDENT "]" | "[" IDENT "]_0"
+    BLANK          := '""'    # a missing value, only where the caller admits blanks
 
 Built-in functions:
     sqrt, ln, log10, log1p, exp, expm1, sin, cos, tan, abs, min, max, pow, erf
@@ -46,6 +47,7 @@ class TokenKind(str, Enum):
     # Literals and identifiers
     NUMBER = "NUMBER"
     IDENT = "IDENT"
+    BLANK = "BLANK"          # ""
 
     # Keywords
     LET = "LET"
@@ -106,6 +108,7 @@ TOKEN_SPEC: List[Tuple[TokenKind, str]] = [
     (TokenKind.LBRACK, r"\["),
     (TokenKind.RBRACK, r"\]"),
     (TokenKind.COMMA, r","),
+    (TokenKind.BLANK, r'""'),
     (TokenKind.EQUALS, r"="),
     # Literals
     # NUMBER: decimal or integer with optional exponent (e or E), no leading +
