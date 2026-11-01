@@ -440,19 +440,6 @@ class FitSessionOwner(QtCore.QObject):
         self._set_status("Current-project Fit defaults updated.")
         return True
 
-    def close_idle_for_application_close(self) -> bool:
-        """Synchronously discard and destroy an idle Fit dialog for Close."""
-
-        if self._worker is not None:
-            return False
-        self._closing = True
-        self._discard_local()
-        if self._window is None:
-            self._closing = False
-            self._notify_application_close_settled()
-            return True
-        return self._destroy_window_after_cleanup()
-
     def cancel_for_application_close(self) -> None:
         """Dispose Fit state and close through the existing owner lifecycle."""
 
@@ -485,28 +472,15 @@ class FitSessionOwner(QtCore.QObject):
         self._discard_local()
         return True
 
-    def _destroy_window_after_cleanup(self) -> bool:
-        """Use the owner-held deferred-delete path and verify destruction."""
+    def _destroy_window_after_cleanup(self) -> None:
+        """Close the window through its owner-authorized path and delete it now."""
 
         window = self._window
-        if window is None:
-            self._notify_application_close_settled()
-            return True
         window.force_close_after_cleanup()
         QtCore.QCoreApplication.sendPostedEvents(
             window,
             QtCore.QEvent.Type.DeferredDelete,
         )
-        if self._window is not None:
-            window.deleteLater()
-            QtCore.QCoreApplication.sendPostedEvents(
-                window,
-                QtCore.QEvent.Type.DeferredDelete,
-            )
-        destroyed = self._window is None
-        if destroyed:
-            self._notify_application_close_settled()
-        return destroyed
 
     def _discard_local(self) -> None:
         self._invalidate_candidate_custody()
@@ -527,8 +501,7 @@ class FitSessionOwner(QtCore.QObject):
         self._last_fit_setup_snapshot = None
         self._undo_setups.clear()
         self._redo_setups.clear()
-        worker = self._worker
-        self._closing = worker is not None
+        self._closing = False
         self.window_changed.emit(False)
         self._notify_application_close_settled()
         self._set_status("Fit closed. All temporary fit state was discarded.")
