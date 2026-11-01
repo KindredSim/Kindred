@@ -74,7 +74,7 @@ class DataTab(QtWidgets.QWidget):
 
         self._build_ui()
 
-    def select_dataset(self, dataset_id: str, display_name: str | None = None) -> None:
+    def select_dataset(self, dataset_id: str, display_name: str | None) -> None:
         if display_name is not None:
             self._display_names[dataset_id] = display_name
         self._current_dataset_id = dataset_id
@@ -319,7 +319,7 @@ class DataTab(QtWidgets.QWidget):
         limit = self._available_observation_limit(dataset_id, config)
         self._maximum_edit.setText(self._invalid_raw.get(
             (dataset_id, "maximum_observations_per_target"),
-            str(limit if maximum is None else min(int(maximum), limit)),
+            str(limit if maximum is None else min(maximum, limit)),
         ))
         self._maximum_total.setText(f"/ {limit}")
         # Sampling keeps at least two observations per target.
@@ -371,7 +371,7 @@ class DataTab(QtWidgets.QWidget):
                 self._invalid_raw.pop((dataset_id, field), None)
                 config[field] = value
         if "parametric_x" in changed:
-            config["parametric_x"] = str(self._x_combo.currentData() or "t")
+            config["parametric_x"] = self._x_combo.currentData()
         if _POINTS in changed:
             # The available count depends on the other settings just read.
             key = (dataset_id, _POINTS)
@@ -400,13 +400,13 @@ class DataTab(QtWidgets.QWidget):
             config.get("data_range_min"),
             config.get("data_range_max"),
             config.get("maximum_observations_per_target"),
-            config.get("parametric_x", "t"),
+            config["parametric_x"],
             config.get("simulation_end"),
         )
 
     def _validation_error(self, dataset_id: str, config: Mapping[str, object]) -> str | None:
         accepted = self._settings_getter(dataset_id)
-        is_time = str(config.get("parametric_x", "t") or "t") == "t"
+        is_time = config["parametric_x"] == "t"
         active_fields = ("t_start", "simulation_end")
         if is_time:
             active_fields += ("data_range_min", "data_range_max")
@@ -435,10 +435,8 @@ class DataTab(QtWidgets.QWidget):
                 "Simulation start and end must cover the selected data times, "
                 f"{six_digit_text(min(times))} to {six_digit_text(max(times))}."
             )
-        selected_x = str(config.get("parametric_x", "t") or "t")
-        if selected_x != "t" and selected_x not in tuple(
-            str(item) for item in accepted.get("eligible_parametric_x", ())
-        ):
+        selected_x = config["parametric_x"]
+        if selected_x != "t" and selected_x not in accepted["eligible_parametric_x"]:
             return "Fit against must be a measured series of this dataset."
         return None
 
@@ -487,7 +485,7 @@ class DataTab(QtWidgets.QWidget):
                 raw_points, self._available_observation_limit(dataset_id, config)
             )
         inactive = {}
-        if str(config.get("parametric_x") or "t") != "t":
+        if config["parametric_x"] != "t":
             # Typed range text, readable or not, waits for Time while the setup
             # keeps its accepted range; Data Reset clears what was typed first.
             accepted = self._owned_settings(self._settings_getter(dataset_id))
@@ -527,7 +525,7 @@ class DataTab(QtWidgets.QWidget):
             return
         dataset_id = self._current_dataset_id
         defaults = self._owned_settings(self._default_settings_getter(dataset_id))
-        defaults["parametric_x"] = str(self._x_combo.currentData() or "t")
+        defaults["parametric_x"] = self._x_combo.currentData()
         self._discard_held(dataset_id)
         self._apply_or_hold(dataset_id, defaults)
         if dataset_id in self._held:

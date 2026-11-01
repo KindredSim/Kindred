@@ -235,9 +235,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "with the cursor attached to the handle. Also use smaller arrow-key "
             "and Page Up/Down steps."
         )
-        self._fine_btn.toggled.connect(
-            lambda v: self._variable_sliders.set_fine_mode(v)
-        )
+        self._fine_btn.toggled.connect(self._variable_sliders.set_fine_mode)
         self._fine_btn.toggled.connect(self._species_sliders.set_fine_mode)
         slider_actions_layout.addWidget(self._fine_btn, 0, 1, alignment=QtCore.Qt.AlignLeft)
 
@@ -826,7 +824,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             self._emit_native_history_availability
         )
         self._notes_text.textChanged.connect(
-            lambda: self.notesEdited.emit(str(self._notes_text.toPlainText()))
+            lambda: self.notesEdited.emit(self._notes_text.toPlainText())
         )
         QtWidgets.QApplication.instance().focusChanged.connect(
             self._emit_native_history_availability
@@ -845,7 +843,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         return self._species_sliders
 
     def set_slider_edit_targets_summary(self, text: str) -> None:
-        summary = str(text or "Initial-condition sets: none")
+        summary = text
         base_tooltip = (
             "Concentration sliders affect the current set and any pinned sets."
         )
@@ -868,7 +866,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
     def _sync_slider_workspace_state(self) -> None:
         has_variable_entries = self._variable_sliders.has_slider_entries()
         has_species_entries = self._species_sliders.has_slider_rows()
-        has_available_entries = bool(has_variable_entries or has_species_entries)
+        has_available_entries = has_variable_entries or has_species_entries
 
         visible_variable_entries = self._variable_sliders.visible_slider_count()
         visible_species_entries = self._species_sliders.visible_row_count()
@@ -950,11 +948,11 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             self._species_sliders.slider_picker_entries()
         )
         mechanism_projection = {
-            name: not bool(visible)
+            name: not visible
             for name, _label, _markup, visible in mechanism_entries
         }
         species_projection = {
-            name: not bool(visible)
+            name: not visible
             for name, _label, _markup, visible in species_entries
         }
         self._variable_sliders.apply_visibility_projection(
@@ -1001,10 +999,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self,
         item: QtWidgets.QListWidgetItem,
     ) -> None:
-        identity = item.data(QtCore.Qt.ItemDataRole.UserRole)
-        if not identity:
-            return
-        entry_kind, item_name = identity
+        # Header rows are not checkable, so only entries change.
+        entry_kind, item_name = item.data(QtCore.Qt.ItemDataRole.UserRole)
         self._set_slider_entry_visible(
             entry_kind,
             item_name,
@@ -1026,11 +1022,11 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         super().changeEvent(event)
         if event.type() in (QtCore.QEvent.PaletteChange, QtCore.QEvent.ApplicationPaletteChange):
             self._refresh_sliders_icon()
-            if hasattr(self, "_reactions_highlighter"):
-                with QtCore.QSignalBlocker(self._reactions_text):
-                    self._reactions_highlighter.set_theme(
-                        dark_mode=self.palette().color(QtGui.QPalette.Text).lightness() > 128
-                    )
+            # Palette changes arrive only after construction.
+            with QtCore.QSignalBlocker(self._reactions_text):
+                self._reactions_highlighter.set_theme(
+                    dark_mode=self.palette().color(QtGui.QPalette.Text).lightness() > 128
+                )
 
     def _refresh_sliders_icon(self) -> None:
         color = self.palette().color(QtGui.QPalette.ColorRole.ButtonText)
@@ -1056,7 +1052,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         Parameters
         ----------
         state : str
-            One of: "idle", "draft", "valid", "invalid"
+            One of: "idle", "draft", "valid"
         message : str
             Status message to display
         """
@@ -1076,10 +1072,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             self._set_validation_label_text("")
             self._validation_label.setStyleSheet("QLabel { padding: 4px; }")
         elif state == "draft":
-            self._set_validation_label_text(
-                message
-                or "Visible Reactions have changed. Scientific actions will validate them."
-            )
+            self._set_validation_label_text(message)
             self._validation_label.setStyleSheet(
                 "QLabel { padding: 4px; border-radius: 3px; }"
             )
@@ -1090,14 +1083,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
                 "QLabel { padding: 4px; border-radius: 3px; }"
             )
 
-        elif state == "invalid":
-            self._set_validation_label_text(message)
-            self._validation_label.setStyleSheet(
-                "QLabel { font-weight: bold; padding: 4px; border-radius: 3px; }"
-            )
-
     def _set_validation_label_text(self, text: str) -> None:
-        full_text = str(text or "")
+        full_text = text
         self._validation_label.setMaximumWidth(520)
         self._validation_label.setMaximumHeight(96)
         self._validation_label.setWordWrap(True)
@@ -1107,22 +1094,21 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         )
         self._validation_label.setVisible(bool(full_text))
         self._validation_label.setText(full_text)
-        self._validation_label.setToolTip(full_text if full_text else "")
+        self._validation_label.setToolTip(full_text)
 
     @property
     def run_btn(self) -> QtWidgets.QPushButton:
         return self._run_btn
 
     def set_run_enabled(self, enabled: bool) -> None:
-        self._run_btn.setEnabled(bool(enabled))
+        self._run_btn.setEnabled(enabled)
 
     def set_slider_draft_actions_enabled(
         self,
         dirty: bool,
         reset_enabled: bool,
     ) -> None:
-        enabled = bool(dirty)
-        self._commit_runtime_parameters_btn.setEnabled(enabled)
+        self._commit_runtime_parameters_btn.setEnabled(dirty)
         self._reset_runtime_parameters_btn.setEnabled(reset_enabled)
         self._commit_runtime_parameters_btn.setText(
             "Apply \N{BULLET}" if dirty else "Apply"
@@ -1136,28 +1122,26 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
     ) -> None:
         """Render explicit draft/accepted truth supplied by the binding."""
 
-        draft = bool(has_draft)
-        self._revert_reactions_btn.setEnabled(draft)
-        if draft:
+        self._revert_reactions_btn.setEnabled(has_draft)
+        if has_draft:
             self._set_validation_state(
                 "draft",
                 "Visible Reactions are Draft. Current work and results use "
                 "Accepted Reactions.",
             )
-        elif bool(has_accepted_reactions):
+        elif has_accepted_reactions:
             self._set_validation_state("valid", "Accepted Reactions.")
         else:
             self._set_validation_state("idle")
 
     def reactions_text(self) -> str:
         """Return the current Reaction DSL text."""
-        return str(self._reactions_text.toPlainText())
+        return self._reactions_text.toPlainText()
 
     def set_reactions_text(self, text: str) -> None:
         """Replace the Reaction DSL text."""
-        replacement = str(text)
-        if self._reactions_text.toPlainText() != replacement:
-            self._reactions_text.setPlainText(replacement)
+        if self._reactions_text.toPlainText() != text:
+            self._reactions_text.setPlainText(text)
 
     def apply_accepted_reactions_rewrite(
         self,
@@ -1167,12 +1151,11 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
     ) -> bool:
         """Install parser-authored provenance as one undoable native edit."""
 
-        if self.reactions_text() != str(expected_visible_text):
+        if self.reactions_text() != expected_visible_text:
             return False
-        replacement = str(accepted_text)
-        if replacement == self.reactions_text():
+        if accepted_text == self.reactions_text():
             return False
-        self._replace_text_undoably(self._reactions_text, replacement)
+        self._replace_text_undoably(self._reactions_text, accepted_text)
         return True
 
     @staticmethod
@@ -1199,7 +1182,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         reactions_blocker = QtCore.QSignalBlocker(self._reactions_text)
         notes_blocker = QtCore.QSignalBlocker(self._notes_text)
         try:
-            notes_text = str(notes)
+            notes_text = notes
             if not self._authoring_rendered:
                 self.set_reactions_text(source.reactions_text)
                 if self._notes_text.toPlainText() != notes_text:
@@ -1293,7 +1276,6 @@ class MechanismEditorBinding(QtCore.QObject):
         self._tab_id = tab_id
         self._editor = editor
         self._registry = registry
-        self._rendering = False
         editor.sourceDraftEdited.connect(self._on_source_draft)
         editor.reactionsRevertRequested.connect(self.revert_reactions_draft)
         editor.notesEdited.connect(self._on_notes_edited)
@@ -1305,23 +1287,18 @@ class MechanismEditorBinding(QtCore.QObject):
     def render(self) -> None:
         tab = self._registry.tab(self._tab_id)
         runtime = self._registry.tab_runtime(self._tab_id)
-        self._rendering = True
-        try:
-            self._editor.render_authoring_snapshot(
-                source=runtime.reactions_draft or tab.mechanism_source,
-                notes=tab.notes if runtime.notes_draft is None else runtime.notes_draft,
-            )
-            self._editor.render_reactions_acceptance_status(
-                has_draft=runtime.reactions_draft is not None,
-                has_accepted_reactions=tab.prepared_dsl is not None,
-            )
-        finally:
-            self._rendering = False
+        # The editor blocks its own draft signals while it renders.
+        self._editor.render_authoring_snapshot(
+            source=runtime.reactions_draft or tab.mechanism_source,
+            notes=tab.notes if runtime.notes_draft is None else runtime.notes_draft,
+        )
+        self._editor.render_reactions_acceptance_status(
+            has_draft=runtime.reactions_draft is not None,
+            has_accepted_reactions=tab.prepared_dsl is not None,
+        )
 
     @QtCore.Slot(object)
     def _on_source_draft(self, source: object) -> None:
-        if self._rendering:
-            return
         tab = self._registry.tab(self._tab_id)
         runtime = self._registry.tab_runtime(self._tab_id)
         runtime.reactions_draft = None if source == tab.mechanism_source else source
@@ -1333,14 +1310,9 @@ class MechanismEditorBinding(QtCore.QObject):
 
     @QtCore.Slot(str)
     def _on_notes_edited(self, notes: str) -> None:
-        if self._rendering:
-            return
         tab = self._registry.tab(self._tab_id)
         runtime = self._registry.tab_runtime(self._tab_id)
-        visible_notes = str(notes)
-        runtime.notes_draft = (
-            None if visible_notes == tab.notes else visible_notes
-        )
+        runtime.notes_draft = None if notes == tab.notes else notes
         self.draftStateChanged.emit(tab.tab_id)
 
     @QtCore.Slot()

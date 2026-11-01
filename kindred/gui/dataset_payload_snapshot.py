@@ -50,28 +50,18 @@ class ExperimentalLayerInput:
     y: tuple[float, ...]
     source_rows: tuple[int, ...]
     set_id: str | None = None
+    set_name: str | None = None
 
 
 def build_data_manager_snapshot(
     *,
     document: ProjectDocument,
-    active_tab: MechanismTabDocument | None,
-    presentation: ProjectPresentationState | None,
+    active_tab: MechanismTabDocument,
+    presentation: ProjectPresentationState,
 ) -> DataManagerSnapshot:
     """Compose the Data dock's complete immutable render input."""
-    if active_tab is None:
-        return DataManagerSnapshot(
-            datasets=document.datasets,
-            active_tab_id=None,
-            active_links=(),
-            available_sets=(),
-        )
     canonical_links = dict(active_tab.dataset_links)
-    overlays = dict(
-        ()
-        if presentation is None
-        else presentation.overlay_raw_observation_ids_by_dataset
-    )
+    overlays = dict(presentation.overlay_raw_observation_ids_by_dataset)
     sets_by_id = {
         item.set_id: item.name for item in active_tab.initial_condition_sets
     }
@@ -114,13 +104,17 @@ def experimental_axis_label(
     document: ProjectDocument,
     selection: ExperimentalAxisSelection,
 ) -> str:
-    """Name a retained experimental axis whose overlay may be hidden."""
-    for record in document.datasets:
-        if record.dataset_id == selection.dataset_id:
-            for series in record.observations:
-                if series.raw_observation_id == selection.raw_observation_id:
-                    return f"{record.display_name}: {series.column_name}"
-    return "Removed data column"
+    """Name a retained experimental axis whose overlay may be hidden.
+
+    Observations never change, and deleting a dataset resets a selected X
+    that used it.
+    """
+    record = document.dataset(selection.dataset_id)
+    series = next(
+        item for item in record.observations
+        if item.raw_observation_id == selection.raw_observation_id
+    )
+    return f"{record.display_name}: {series.column_name}"
 
 
 def build_experimental_layer_inputs(
@@ -134,6 +128,9 @@ def build_experimental_layer_inputs(
         presentation.overlay_raw_observation_ids_by_dataset
     )
     links = dict(active_tab.dataset_links)
+    set_names = {
+        item.set_id: item.name for item in active_tab.initial_condition_sets
+    }
     layers: list[ExperimentalLayerInput] = []
     for record in document.datasets:
         selected = set(overlays.get(record.dataset_id, ()))
@@ -141,8 +138,9 @@ def build_experimental_layer_inputs(
             continue
         link = links.get(record.dataset_id)
         mapping = dict(link.observation_mapping) if link is not None else {}
+        set_id = link.set_id if link is not None else None
         for series in record.observations:
-            raw_column = str(series.column_name)
+            raw_column = series.column_name
             raw_observation_id = series.raw_observation_id
             if raw_observation_id not in selected:
                 continue
@@ -157,7 +155,8 @@ def build_experimental_layer_inputs(
                     unit=series.unit,
                     time_column_name=record.time_column_name,
                     model_target=mapping.get(raw_observation_id),
-                    set_id=(link.set_id if link is not None else None),
+                    set_id=set_id,
+                    set_name=None if set_id is None else set_names[set_id],
                     t=series.t,
                     y=series.y,
                     source_rows=series.source_rows,

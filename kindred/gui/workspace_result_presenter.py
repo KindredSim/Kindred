@@ -94,15 +94,14 @@ class _XlsxDestination:
         self,
         destination: BinaryIO,
         *,
-        cancellation_check: Callable[[], None] | None,
+        cancellation_check: Callable[[], None],
     ) -> None:
         self._destination = destination
         self._cancellation_check = cancellation_check
         self._maximum_size = 0
 
     def write(self, data: object) -> int:
-        if self._cancellation_check is not None:
-            self._cancellation_check()
+        self._cancellation_check()
         payload = bytes(data)
         written = int(self._destination.write(payload))
         if written != len(payload):
@@ -132,7 +131,7 @@ def _cleanup_write_only_workbook(workbook: Workbook) -> list[BaseException]:
 
     failures: list[BaseException] = []
     for sheet in workbook.worksheets:
-        rows = getattr(sheet, "_rows", None)
+        rows = sheet._rows
         if rows is not None:
             try:
                 rows.close()
@@ -140,7 +139,7 @@ def _cleanup_write_only_workbook(workbook: Workbook) -> list[BaseException]:
                 pass
             except BaseException as exc:
                 failures.append(exc)
-        writer = getattr(sheet, "_writer", None)
+        writer = sheet._writer
         if writer is None:
             continue
         try:
@@ -342,11 +341,15 @@ class ResultDataBlock:
     x_provenance: Mapping[str, object] = MappingProxyType({})
     color_by_series: tuple[tuple[str, str], ...] = ()
     visible: bool = True
-    dashed: bool = False
+    # The block's set's position among the plotted sets, which picks its line
+    # style and its measurements' marker; None for a measurement whose linked
+    # set is not plotted, and for blocks that are never drawn.
+    set_position: int | None = None
+    # Legend text when it differs from "label: series" (measurements).
+    legend_label: str | None = None
     opacity: float = 1.0
     markers: bool = False
     point_size: float = 6.0
-    point_shape: str = "o"
     presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
     first_index: int = 0
 
@@ -368,16 +371,8 @@ class ResultDataBlock:
             name = self.time_column_name
         return f"{name} [{unit.symbol}]" if unit is not None else name
 
-    def __post_init__(self) -> None:
-        # Blocks are built only by this module's composers; freeze them.
-        object.__setattr__(self, "series", tuple(self.series))
-        object.__setattr__(self, "series_axes", tuple(self.series_axes))
-        object.__setattr__(self, "series_provenance", tuple(
-            (name, MappingProxyType(dict(payload))) for name, payload in self.series_provenance
-        ))
-        object.__setattr__(self, "x_provenance", MappingProxyType(dict(self.x_provenance)))
-        object.__setattr__(self, "color_by_series", tuple(self.color_by_series))
-        object.__setattr__(self, "presentation_boundaries", tuple(self.presentation_boundaries))
+    # Blocks are built only by this module's composers, which pass tuples and
+    # read-only mappings.
 
 def _select_analysis_block(
     blocks: Sequence[ResultDataBlock],
@@ -409,36 +404,24 @@ class ResultRenderInput:
     tab_id: str
     current_set_id: str
     blocks: tuple[ResultDataBlock, ...]
-    statistics_series_names: tuple[str, ...] = ()
-    selected_x_series: AxisSeriesSelection = SimulationSeriesAxisSelection("t")
-    selected_y_series: tuple[AxisSeriesSelection, ...] = ()
-    mapped_overlay_locks: tuple[tuple[ExperimentalAxisSelection, str], ...] = ()
-    selected_y_uses_default_all: bool = True
-    x_label: str = "Time (s)"
-    y_label: str = "Value"
-    x_unit: Unit | None = None
-    y_unit: Unit | None = None
-    x_unit_options: tuple[Unit, ...] = ()
-    y_unit_options: tuple[Unit, ...] = ()
-    axis_candidates: tuple[AxisSelectionCandidate, ...] = ()
-    reference_lines_visible: bool = True
-    intervention_annotations: tuple[_DisplayAnnotation, ...] = ()
-    intervention_annotations_visible: bool = True
-    intervention_labels_visible: bool = True
-    unavailable_x_diagnostic: str | None = None
-    completion_warning_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
-
-    def __post_init__(self) -> None:
-        # Built only by this module's composers; freeze the collections.
-        object.__setattr__(self, "blocks", tuple(self.blocks))
-        object.__setattr__(self, "statistics_series_names", tuple(self.statistics_series_names))
-        object.__setattr__(self, "selected_y_series", tuple(self.selected_y_series))
-        object.__setattr__(self, "mapped_overlay_locks", tuple(self.mapped_overlay_locks))
-        object.__setattr__(self, "axis_candidates", tuple(self.axis_candidates))
-        object.__setattr__(self, "intervention_annotations", tuple(self.intervention_annotations))
-        object.__setattr__(self, "completion_warning_details", tuple(
-            (label, tuple(details)) for label, details in self.completion_warning_details
-        ))
+    statistics_series_names: tuple[str, ...]
+    selected_x_series: AxisSeriesSelection
+    selected_y_series: tuple[AxisSeriesSelection, ...]
+    mapped_overlay_locks: tuple[tuple[ExperimentalAxisSelection, str], ...]
+    selected_y_uses_default_all: bool
+    x_label: str
+    y_label: str
+    x_unit: Unit | None
+    y_unit: Unit | None
+    x_unit_options: tuple[Unit, ...]
+    y_unit_options: tuple[Unit, ...]
+    axis_candidates: tuple[AxisSelectionCandidate, ...]
+    reference_lines_visible: bool
+    intervention_annotations: tuple[_DisplayAnnotation, ...]
+    intervention_annotations_visible: bool
+    intervention_labels_visible: bool
+    unavailable_x_diagnostic: str | None
+    completion_warning_details: tuple[tuple[str, tuple[str, ...]], ...]
 
     @property
     def statistics_result(self) -> SimulationResultValue | None:
@@ -518,6 +501,7 @@ def _result_block(
     kind: ResultLayerKind,
     color_by_axis_selection: Mapping[AxisSeriesSelection, str] | None = None,
     visible: bool = True,
+    set_position: int | None = None,
 ) -> ResultDataBlock:
     display_label = (
         f"{label} [Preview]"
@@ -547,7 +531,7 @@ def _result_block(
                 if isinstance(selection, SimulationSeriesAxisSelection)
             ) if color_by_axis_selection is not None else ()
         ),
-        visible=visible, dashed=kind is ResultLayerKind.REFERENCE,
+        visible=visible, set_position=set_position,
         opacity=0.42 if kind is ResultLayerKind.REFERENCE else 1.0,
         presentation_boundaries=result.presentation_boundaries,
     )
@@ -1055,40 +1039,40 @@ def _owned_annotations(
 def compose_result_input(
     *,
     tab_id: str,
-    current_set_id: str | None,
+    current_set_id: str,
     visible_sets: Sequence[VisibleResultSet],
     repository: ResultRepository,
     reference_lines_visible: bool,
     intervention_annotations_visible: bool,
     intervention_labels_visible: bool,
-    active_overlay_layers: Sequence[ExperimentalLayerInput] = (),
-    color_by_axis_selection: Mapping[AxisSeriesSelection, str] = MappingProxyType({}),
-    experimental_point_shape: str = "o",
-    experimental_point_size: float = 6.0,
-    experimental_point_opacity: float = 0.85,
-    selected_x_series: AxisSeriesSelection = SimulationSeriesAxisSelection("t"),
-    selected_x_label: str = "",
-    selected_y_series: Sequence[AxisSeriesSelection] = (),
-    selected_y_uses_default_all: bool = True,
+    active_overlay_layers: tuple[ExperimentalLayerInput, ...],
+    color_by_axis_selection: dict[AxisSeriesSelection, str],
+    experimental_point_size: float,
+    experimental_point_opacity: float,
+    selected_x_series: AxisSeriesSelection,
+    selected_x_label: str,
+    selected_y_series: tuple[AxisSeriesSelection, ...],
+    selected_y_uses_default_all: bool,
 ) -> ResultRenderInput:
-    current_id = str(current_set_id or "")
+    # Reconciliation always picks a current set.
+    current_id = current_set_id
     preview_ids = set(repository.preview_set_ids())
-    colors = dict(color_by_axis_selection)
+    colors = color_by_axis_selection
     selected_x = selected_x_series
-    selected_y = tuple(selected_y_series)
-    point_size = float(experimental_point_size)
-    point_opacity = float(experimental_point_opacity)
-    active = tuple(active_overlay_layers)
+    selected_y = selected_y_series
+    point_size = experimental_point_size
+    point_opacity = experimental_point_opacity
+    active = active_overlay_layers
     experimental_by_axis = {item.axis: item for item in active}
     selected_model_y = {
         item.series_name for item in selected_y
         if isinstance(item, SimulationSeriesAxisSelection)
     }
     mapped_overlay_locks = tuple(
-        (item.axis, str(item.model_target))
+        (item.axis, item.model_target)
         for item in active
         if item.model_target is not None
-        and (bool(selected_y_uses_default_all) or item.model_target in selected_model_y)
+        and (selected_y_uses_default_all or item.model_target in selected_model_y)
         and item.axis not in selected_y
     )
     effective_y = tuple(
@@ -1099,7 +1083,7 @@ def compose_result_input(
             )
         )
     )
-    wanted_y = None if bool(selected_y_uses_default_all) else set(effective_y)
+    wanted_y = None if selected_y_uses_default_all else set(effective_y)
     selected_x_source: ExperimentalLayerInput | None = None
     if isinstance(selected_x, ExperimentalAxisSelection):
         selected_x_source = experimental_by_axis.get(selected_x)
@@ -1138,7 +1122,10 @@ def compose_result_input(
             warning_ids.add(id(result))
             warning_facts.append((label, tuple(_result_warning_details(result))))
 
-    for visible in visible_sets:
+    set_positions = {
+        visible.set_id: position for position, visible in enumerate(visible_sets)
+    }
+    for position, visible in enumerate(visible_sets):
         foreground = repository.current_result(visible.set_id)
         foreground_kind = ResultLayerKind.PREVIEW if visible.set_id in preview_ids else ResultLayerKind.EXPLICIT
         semantic: ResultDataBlock | None = None
@@ -1148,6 +1135,7 @@ def compose_result_input(
                 set_id=visible.set_id, label=visible.label, result=foreground,
                 prepared_dsl=repository.current_request(visible.set_id).prepared_dsl,
                 kind=foreground_kind, color_by_axis_selection=colors,
+                set_position=position,
             )
             for name, selection in semantic.series_axes:
                 add_candidate(selection, name)
@@ -1178,7 +1166,8 @@ def compose_result_input(
                 set_id=visible.set_id, label=visible.label, result=reference,
                 prepared_dsl=repository.reference_request(visible.set_id).prepared_dsl,
                 kind=ResultLayerKind.REFERENCE,
-                color_by_axis_selection=colors, visible=bool(reference_lines_visible),
+                color_by_axis_selection=colors, visible=reference_lines_visible,
+                set_position=position,
             )
             for name, selection in reference_semantic.series_axes:
                 add_candidate(selection, name)
@@ -1286,8 +1275,13 @@ def compose_result_input(
                 ),
                 x_provenance=x_provenance,
                 color_by_series=((experimental.raw_column, colors[y_axis]),),
+                set_position=set_positions.get(experimental.set_id),
+                legend_label=(
+                    f"{label} ({experimental.set_name})"
+                    if experimental.set_name is not None
+                    else f"{label} (no set)"
+                ),
                 opacity=point_opacity,
-                point_shape=experimental_point_shape,
                 markers=True,
                 point_size=point_size,
             )
@@ -1323,13 +1317,13 @@ def compose_result_input(
         statistics_series_names=statistics_names,
         selected_x_series=selected_x, selected_y_series=selected_y,
         mapped_overlay_locks=mapped_overlay_locks,
-        selected_y_uses_default_all=bool(selected_y_uses_default_all),
+        selected_y_uses_default_all=selected_y_uses_default_all,
         x_label="Time (s)" if _is_time_selection(selected_x) else selected_candidate.label,
         y_label="Concentration" if y_unit is not None and y_unit.compatible(MOLAR) else "Value",
         x_unit=x_unit, y_unit=y_unit,
         x_unit_options=x_options, y_unit_options=y_options,
         axis_candidates=tuple(candidates),
-        reference_lines_visible=bool(reference_lines_visible),
+        reference_lines_visible=reference_lines_visible,
         intervention_annotations=owned_annotations,
         intervention_annotations_visible=intervention_annotations_visible,
         intervention_labels_visible=intervention_labels_visible,
@@ -1461,7 +1455,7 @@ def write_xlsx(
     blocks: Sequence[ResultDataBlock],
     destination: BinaryIO,
     *,
-    cancellation_check: Callable[[], None] | None = None,
+    cancellation_check: Callable[[], None],
 ) -> XlsxExportCompletion:
     """Write full-resolution worksheets directly to the destination."""
 
@@ -1479,8 +1473,7 @@ def write_xlsx(
     original_failure: BaseException | None = None
     try:
         for block in block_values:
-            if cancellation_check is not None:
-                cancellation_check()
+            cancellation_check()
             title = _worksheet_title(block.label, used)
             sheet = workbook.create_sheet(title=title)
             if block.kind is ResultLayerKind.EXPERIMENTAL:
@@ -1503,7 +1496,7 @@ def write_xlsx(
             )
             row_count = max((block.series[0][1].size, *(len(values) for _, values, _ in volume_columns)))
             for index in range(row_count):
-                if cancellation_check is not None and index % 256 == 0:
+                if index % 256 == 0:
                     cancellation_check()
                 if index >= block.series[0][1].size:
                     identity_values = [None] * len(identity_headers)
@@ -1534,8 +1527,7 @@ def write_xlsx(
                 if provenance
             )
         if lineage_rows:
-            if cancellation_check is not None:
-                cancellation_check()
+            cancellation_check()
             lineage_sheet = workbook.create_sheet(
                     title=_worksheet_title(
                     "_Kindred Lineage",
@@ -1556,8 +1548,7 @@ def write_xlsx(
                 ),
             )
             for title, name, provenance in lineage_rows:
-                if cancellation_check is not None:
-                    cancellation_check()
+                cancellation_check()
                 _append_xlsx_row(
                     lineage_sheet,
                     (
@@ -1573,8 +1564,7 @@ def write_xlsx(
                 )
             lineage_sheet.sheet_state = "hidden"
         if metadata_rows:
-            if cancellation_check is not None:
-                cancellation_check()
+            cancellation_check()
             metadata_sheet = workbook.create_sheet(
                     title=_worksheet_title(
                     "_Kindred Result Metadata",
@@ -1586,15 +1576,13 @@ def write_xlsx(
                 ("worksheet", "part", "repository_entry"),
             )
             for row in metadata_rows:
-                if cancellation_check is not None:
-                    cancellation_check()
+                cancellation_check()
                 _append_xlsx_row(
                     metadata_sheet,
                     row,
                 )
             metadata_sheet.sheet_state = "hidden"
-        if cancellation_check is not None:
-            cancellation_check()
+        cancellation_check()
         archive = ZipFile(
             output,
             "w",

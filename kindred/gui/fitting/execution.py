@@ -151,7 +151,7 @@ class FitCandidate:
 def _observed_curve_parts(
     observations: tuple[FitObservationSnapshot, ...],
     *,
-    x_observations: FitObservationSeries | None = None,
+    x_observations: FitObservationSeries | None,
 ) -> tuple[
     tuple[tuple[str, tuple[float, ...]], ...],
     tuple[tuple[str, tuple[float, ...]], ...],
@@ -183,10 +183,7 @@ def _observed_curve_parts(
                 item.model_target,
                 tuple(
                     float(value)
-                    for value in axes.get(
-                        item.model_target,
-                        np.asarray(item.t, dtype=float),
-                    )
+                    for value in axes[item.model_target]
                 ),
             )
             for item in observations
@@ -848,10 +845,10 @@ class _FitExecution(_FitControl):
             datasets=datasets,
             weights=weights,
             method=defaults.method,
-            max_nfev=int(defaults.max_nfev),
+            max_nfev=defaults.max_nfev,
             ftol=float(defaults.ftol),
             xtol=float(defaults.xtol),
-            seed=int(defaults.seed) if defaults.use_seed else None,
+            seed=defaults.seed if defaults.use_seed else None,
             progress_callback=progress,
             search_evaluations_callback=search_evaluations_reported,
             extension_progress_callback=extension_progress,

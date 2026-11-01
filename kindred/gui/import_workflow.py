@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 import os
 from pathlib import Path
-from types import MappingProxyType
 from typing import Mapping, Optional, Sequence, Tuple
 import uuid
 
@@ -114,15 +113,6 @@ class ResolvedSheetPlan:
     time_unit: Unit
     observation_units: Mapping[str, Unit]
 
-    def __post_init__(self) -> None:
-        # The worker retains this plan after GUI admission.  Copy caller
-        # mappings once, then expose read-only views so later caller edits
-        # cannot change worker normalization.
-        object.__setattr__(
-            self,
-            "observation_units",
-            MappingProxyType(dict(self.observation_units)),
-        )
 
 
 @dataclass(frozen=True)

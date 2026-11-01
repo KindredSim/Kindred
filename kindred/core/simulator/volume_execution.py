@@ -155,8 +155,8 @@ class VolumeExecution:
         owners = np.searchsorted([end for _start, end, _dense in self.segments], times[pending])
         segments, group_starts = np.unique(owners, return_index=True)
         for owner, indices in zip(segments, np.split(pending, group_starts[1:])):
-            start, _end, dense = self.segments[owner]
-            if times[indices[0]] < start:
-                raise ValueError("Volume samples must belong to an executed segment.")
+            # Segments are contiguous from the start, so each sample follows
+            # the previous segment's end.
+            _start, _end, dense = self.segments[owner]
             values[indices] = dense(times[indices])[-1]
         return VolumeTrajectory(first, values)

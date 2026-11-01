@@ -33,11 +33,7 @@ class SimulationSeriesAxisSelection:
     series_name: str
 
     def __post_init__(self) -> None:
-        if (
-            not isinstance(self.series_name, str)
-            or not self.series_name
-            or self.series_name != self.series_name.strip()
-        ):
+        if not self.series_name or self.series_name != self.series_name.strip():
             raise ValueError(
                 "Simulation axis series must be a nonblank edge-normalized "
                 "name."
@@ -57,11 +53,7 @@ class ExperimentalAxisSelection:
     raw_observation_id: str
 
     def __post_init__(self) -> None:
-        if (
-            not isinstance(self.dataset_id, str)
-            or not self.dataset_id
-            or self.dataset_id != self.dataset_id.strip()
-        ):
+        if not self.dataset_id or self.dataset_id != self.dataset_id.strip():
             raise ValueError(
                 "Experimental axis dataset ID must be a nonblank "
                 "edge-normalized string."
@@ -219,9 +211,10 @@ def default_project_presentation_state(
     tab: MechanismTabDocument,
 ) -> ProjectPresentationState:
     default_set_id = tab.initial_condition_sets[0].set_id
+    # Nothing is plotted until a Run, Preview or Plot tick adds a set, so an
+    # unrun set never takes a plotted set's line style.
     return ProjectPresentationState(
         current_set_id=default_set_id,
-        plot_set_ids=(default_set_id,),
         selected_x_series=SimulationSeriesAxisSelection("t"),
         reference_lines_visible=True,
         intervention_annotations_visible=True,
@@ -232,17 +225,14 @@ def default_project_presentation_state(
 def default_workspace_presentation_state(
     document: ProjectDocument,
 ) -> WorkspacePresentationState:
-    return validate_workspace_presentation_state(
-        document,
-        WorkspacePresentationState(
-            active_tab_id=document.tabs[0].tab_id,
-            presentation_by_tab_id=tuple(
-                (
-                    tab.tab_id,
-                    default_project_presentation_state(tab),
-                )
-                for tab in document.tabs
-            ),
+    return WorkspacePresentationState(
+        active_tab_id=document.tabs[0].tab_id,
+        presentation_by_tab_id=tuple(
+            (
+                tab.tab_id,
+                default_project_presentation_state(tab),
+            )
+            for tab in document.tabs
         ),
     )
 
@@ -284,9 +274,8 @@ def _validate_axis_selection(
     *,
     simulation_series: frozenset[SimulationSeriesAxisSelection],
     experimental_series: frozenset[ExperimentalAxisSelection],
-    allow_unavailable: bool = False,
 ) -> None:
-    if allow_unavailable or _axis_selection_is_current(
+    if _axis_selection_is_current(
         value,
         simulation_series=simulation_series,
         experimental_series=experimental_series,
@@ -381,13 +370,7 @@ def validate_project_presentation_state(
         in state.overlay_raw_observation_ids_by_dataset
         for raw_observation_id in raw_observation_ids
     )
-    _validate_axis_selection(
-        state.selected_x_series,
-        "selected_x_series",
-        simulation_series=simulation_series,
-        experimental_series=experimental_series,
-        allow_unavailable=True,
-    )
+    # A selected X that is currently unavailable is retained as intent.
     if len(state.selected_y_series) != len(set(state.selected_y_series)):
         raise ValueError("Selected Y series must be unique.")
     for index, selection in enumerate(state.selected_y_series):

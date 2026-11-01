@@ -220,8 +220,8 @@ class ParameterAlgebraSpec:
     param_statements: Tuple[ParameterAssignment, ...]
     observable_names: Set[str]
     mechanism_namespace: MechanismParameterNamespace
-    parameter_block: AlgebraBlock | None = None
-    observable_block: AlgebraBlock | None = None
+    parameter_block: AlgebraBlock
+    observable_block: AlgebraBlock
     # Authored-assignment projection for symbolic/source consumers. Numerical
     # ordering and classification use evaluation_dependencies, which also
     # includes chemistry readouts and their canonical source coordinates.
@@ -1061,11 +1061,6 @@ def parse_parameter_algebra_spec_from_dsl_text(
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )
-    initial_spec = ParameterAlgebraSpec(
-        param_statements=list(assignments),
-        observable_names=set(observables),
-        mechanism_namespace=mechanism_namespace,
-    )
     full_block, descriptors = _compile_retained_algebra_program(lines)
     parameter_indices = [
         index for index, (kind, _line_number, _line_content) in enumerate(descriptors)
@@ -1077,6 +1072,16 @@ def parse_parameter_algebra_spec_from_dsl_text(
     ]
     parameter_raw_block = AlgebraBlock(
         lines=tuple(full_block.lines[index] for index in parameter_indices),
+    )
+    observable_block = AlgebraBlock(
+        lines=tuple(full_block.lines[index] for index in observable_indices),
+    )
+    initial_spec = ParameterAlgebraSpec(
+        param_statements=list(assignments),
+        observable_names=set(observables),
+        mechanism_namespace=mechanism_namespace,
+        parameter_block=parameter_raw_block,
+        observable_block=observable_block,
     )
     if assignments:
         block = _compile_retained_parameter_block(
@@ -1097,9 +1102,6 @@ def parse_parameter_algebra_spec_from_dsl_text(
         retained_assignments = []
         parameter_dependencies = {}
 
-    observable_block = AlgebraBlock(
-        lines=tuple(full_block.lines[index] for index in observable_indices),
-    )
     _validate_retained_observable_program(initial_spec, block=observable_block)
     return replace(
         initial_spec,

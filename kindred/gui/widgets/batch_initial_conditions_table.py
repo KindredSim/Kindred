@@ -45,7 +45,7 @@ def is_valid_initial_text(raw: object) -> bool:
     """Whether visible Initial Conditions text is an admissible concentration."""
 
     try:
-        concentration_from_text(str(raw))
+        concentration_from_text(raw)
     except ValueError:
         return False
     return True
@@ -68,7 +68,7 @@ class _ProjectedRow:
             return raw[species]
         # The item text is the exact accepted binary64 value, so editing never
         # becomes a scientific write; the delegate paints six digits.
-        return repr(float(dict(self.canonical_values).get(species, 0.0)))
+        return repr(dict(self.canonical_values).get(species, 0.0))
 
 
 class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
@@ -92,20 +92,15 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         tab: MechanismTabDocument,
         presentation: ProjectPresentationState,
         *,
-        invalid_raw_by_set: dict[str, dict[str, str]] | None = None,
-        species_names: Sequence[str] | None = None,
+        invalid_raw_by_set: dict[str, dict[str, str]],
+        species_names: Sequence[str],
     ) -> None:
-        if species_names is None:
-            species = canonical_species_names(tab)
-        else:
-            species = tuple(
-                dict.fromkeys(str(item) for item in species_names if str(item))
-            )
+        species = species_names
         admitted_sets = tab.initial_condition_sets
         override_ids = {
             set_id for set_id, _settings in tab.run_overrides_by_set_id
         }
-        invalid = invalid_raw_by_set or {}
+        invalid = invalid_raw_by_set
         plot_ids = set(presentation.plot_set_ids)
         pinned_ids = set(presentation.pinned_slider_set_ids)
         rows = tuple(
@@ -114,12 +109,12 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
                 name=initial_set.name,
                 canonical_values=initial_set.values,
                 raw_values=tuple(
-                    (str(species_name), str(raw))
+                    (species_name, raw)
                     for species_name, raw
                     in invalid.get(initial_set.set_id, {}).items()
                 ),
                 invalid_raw_values=tuple(
-                    (str(species_name), str(raw))
+                    (species_name, raw)
                     for species_name, raw
                     in invalid.get(initial_set.set_id, {}).items()
                     if not is_valid_initial_text(raw)
@@ -132,7 +127,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         )
         if rows == self._rows and species == self._species:
             return
-        structure_changed = bool(
+        structure_changed = (
             species != self._species
             or tuple(row.set_id for row in rows)
             != tuple(row.set_id for row in self._rows)
@@ -192,9 +187,8 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         return tuple(row.set_id for row in self._rows)
 
     def set_id_for_row(self, row: int) -> str | None:
-        row_i = int(row)
-        if 0 <= row_i < len(self._rows):
-            return self._rows[row_i].set_id
+        if 0 <= row < len(self._rows):
+            return self._rows[row].set_id
         return None
 
     def set_id_for_live_index(self, index: QtCore.QModelIndex) -> str | None:
@@ -214,7 +208,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
     ) -> QtCore.QModelIndex:  # noqa: N802
         if parent.isValid() or not self.hasIndex(row, column, parent):
             return QtCore.QModelIndex()
-        return self.createIndex(int(row), int(column), self._binding_generation)
+        return self.createIndex(row, column, self._binding_generation)
 
     def parent(self, _index: QtCore.QModelIndex) -> QtCore.QModelIndex:  # noqa: N802
         return QtCore.QModelIndex()
@@ -238,11 +232,11 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         return len(self._species) + 4
 
     def is_numeric_column(self, column: int) -> bool:
-        return 1 <= int(column) <= len(self._species)
+        return 1 <= column <= len(self._species)
 
     def species_for_column(self, column: int) -> str | None:
         return (
-            self._species[int(column) - 1]
+            self._species[column - 1]
             if self.is_numeric_column(column)
             else None
         )
@@ -400,10 +394,8 @@ class _InitialConditionsItemDelegate(QtWidgets.QStyledItemDelegate):
             or index.data(QtCore.Qt.ItemDataRole.BackgroundRole) is not None
         ):
             return
-        try:
-            option.text = six_digit_text(float(option.text))
-        except ValueError:
-            pass
+        # Shown text is a valid draft or the repr of an admitted float.
+        option.text = six_digit_text(float(option.text))
 
     def createEditor(  # noqa: N802 - Qt override
         self,
@@ -434,7 +426,6 @@ class _InitialConditionsItemDelegate(QtWidgets.QStyledItemDelegate):
             model = index.model()
             if (
                 index.isValid()
-                and isinstance(model, BatchInitialConditionsTableModel)
                 and model.is_numeric_column(index.column())
                 and not is_valid_initial_text(editor.text())
             ):
@@ -489,18 +480,13 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
     def setModel(
         self, model: QtCore.QAbstractItemModel | None
     ) -> None:  # noqa: N802
-        old_model = self.model()
-        if isinstance(old_model, BatchInitialConditionsTableModel):
-            old_model.modelReset.disconnect(self._apply_column_presentation)
+        # The simulation panel sets the one table model once.
         super().setModel(model)
-        if isinstance(model, BatchInitialConditionsTableModel):
-            model.modelReset.connect(self._apply_column_presentation)
+        model.modelReset.connect(self._apply_column_presentation)
         self._apply_column_presentation()
 
     def _apply_column_presentation(self) -> None:
         model = self.model()
-        if not isinstance(model, BatchInitialConditionsTableModel):
-            return
         header = self.horizontalHeader()
         desired_order = [
             0,
@@ -513,10 +499,10 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
         movable_before = header.sectionsMovable()
         header.setSectionsMovable(True)
         for visual_index, logical_index in enumerate(desired_order):
-            current_visual = header.visualIndex(int(logical_index))
+            current_visual = header.visualIndex(logical_index)
             if current_visual != visual_index:
                 header.moveSection(current_visual, visual_index)
-        header.setSectionsMovable(bool(movable_before))
+        header.setSectionsMovable(movable_before)
 
         for column in range(model.columnCount()):
             header.setSectionResizeMode(
@@ -538,8 +524,6 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
 
     def _auto_fit_columns(self) -> None:
         model = self.model()
-        if not isinstance(model, BatchInitialConditionsTableModel):
-            return
         header = self.horizontalHeader()
         header.setMaximumSectionSize(_MAX_SET_COLUMN_WIDTH)
         header_text = model.headerData(
@@ -548,7 +532,7 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
             QtCore.Qt.ItemDataRole.DisplayRole,
         )
         header_minimum = header.fontMetrics().horizontalAdvance(
-            f" {str(header_text or '')} "
+            f" {header_text} "
         ) + 20
         for column in range(len(model.species_names()) + 1):
             self.resizeColumnToContents(column)
@@ -564,8 +548,6 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
 
     def selected_set_ids(self) -> tuple[str, ...]:
         model = self.model()
-        if not isinstance(model, BatchInitialConditionsTableModel):
-            return ()
         rows = sorted({index.row() for index in self.selectionModel().selectedRows()})
         return tuple(
             set_id
@@ -586,8 +568,7 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
         if event.key() in (QtCore.Qt.Key_Space, QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
             model = self.model()
-            if (isinstance(model, BatchInitialConditionsTableModel)
-                    and model.request_run_settings_for_index(self.currentIndex())):
+            if model.request_run_settings_for_index(self.currentIndex()):
                 event.accept()
                 return
         if event.matches(QtGui.QKeySequence.StandardKey.Copy):
@@ -597,16 +578,12 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
         if event.matches(QtGui.QKeySequence.StandardKey.Paste):
             model = self.model()
             index = self.currentIndex()
-            if (
-                isinstance(model, BatchInitialConditionsTableModel)
-                and index.isValid()
-                and model.is_numeric_column(index.column())
-            ):
+            if index.isValid() and model.is_numeric_column(index.column()):
                 clipboard = QtWidgets.QApplication.clipboard()
                 self.pasteRequested.emit(
-                    int(index.row()),
-                    int(index.column()),
-                    str(clipboard.text()),
+                    index.row(),
+                    index.column(),
+                    clipboard.text(),
                 )
                 event.accept()
                 return
@@ -617,7 +594,6 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
         model = self.model()
         if (
             event.button() == QtCore.Qt.MouseButton.LeftButton
-            and isinstance(model, BatchInitialConditionsTableModel)
             and model.request_run_settings_for_index(index)
         ):
             event.accept()
@@ -628,25 +604,18 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
 def resolve_live_slider_target_set_ids(
     *,
     current_set_id: str | None,
-    pinned_set_ids: Iterable[str],
-    existing_set_ids: Iterable[str],
+    pinned_set_ids: tuple[str, ...],
 ) -> tuple[str, ...]:
-    """Resolve the accepted current set followed by stable valid Slider pins.
+    """Resolve the accepted current set followed by its Slider pins.
 
     The current set remains the deterministic primary target even when pins
-    exist, whether or not the table has drawn it yet.  Pinned rows are then
-    appended in authored presentation order, with invalid and duplicate
-    identities discarded at this boundary.
+    exist, whether or not the table has drawn it yet.  Pinned rows follow in
+    authored presentation order; presentation admission keeps them unique and
+    existing.
     """
 
-    existing = {str(set_id) for set_id in existing_set_ids}
-    current = (current_set_id,) if current_set_id in existing else ()
-    pinned = tuple(
-        set_id
-        for set_id in dict.fromkeys(str(item) for item in pinned_set_ids)
-        if set_id in existing
-    )
-    return tuple(dict.fromkeys((*current, *pinned)))
+    current = () if current_set_id is None else (current_set_id,)
+    return tuple(dict.fromkeys((*current, *pinned_set_ids)))
 
 class InitialConditionsTableActions(QtCore.QObject):
     """Own IC intents for one immutable mechanism-tab identity."""
@@ -699,16 +668,13 @@ class InitialConditionsTableActions(QtCore.QObject):
             self._model.render_snapshot(
                 tab,
                 presentation,
-                invalid_raw_by_set={
-                    str(set_id): {str(species): str(raw) for species, raw in values.items()}
-                    for set_id, values in runtime.initial_text_by_set_id.items()
-                },
+                invalid_raw_by_set=runtime.initial_text_by_set_id,
                 species_names=tuple(canonical_species_names(tab)),
             )
-            selected_ordered = tuple(runtime.selected_run_set_ids)
+            selected_ordered = runtime.selected_run_set_ids
             selected = set(selected_ordered)
             current_set_id = presentation.current_set_id
-            if tuple(self._table.selected_set_ids()) != selected_ordered:
+            if self._table.selected_set_ids() != selected_ordered:
                 selection.clearSelection()
                 for row, set_id in enumerate(self._model.set_ids()):
                     if set_id not in selected:
@@ -744,7 +710,7 @@ class InitialConditionsTableActions(QtCore.QObject):
             return
         center = editor.mapTo(self._table.viewport(), editor.rect().center())
         index = self._table.indexAt(center)
-        if not index.isValid() or index.model() is not self._model:
+        if not index.isValid():
             return
         species = self._model.species_for_column(index.column())
         set_id = self._model.set_id_for_live_index(index)
@@ -776,16 +742,14 @@ class InitialConditionsTableActions(QtCore.QObject):
         self._table.settle_active_editor()
 
     def selected_run_set_ids(self) -> tuple[str, ...]:
-        return tuple(
-            self._registry.tab_runtime(self._tab_id).selected_run_set_ids
-        )
+        return self._registry.tab_runtime(self._tab_id).selected_run_set_ids
 
     def invalid_cells(
         self,
         set_ids: Iterable[str] | None = None,
     ) -> tuple[tuple[str, str, str], ...]:
         runtime = self._registry.tab_runtime(self._tab_id)
-        allowed = None if set_ids is None else {str(item) for item in set_ids}
+        allowed = None if set_ids is None else set(set_ids)
         return tuple(
             (set_id, species, raw)
             for set_id, values in runtime.initial_text_by_set_id.items()
@@ -803,7 +767,7 @@ class InitialConditionsTableActions(QtCore.QObject):
         initial_set = tab.initial_condition_set(set_id)
         try:
             value = concentration_from_text(
-                str(raw_text),
+                raw_text,
                 field=f"initial concentration for {species}",
             )
         except ValueError:
@@ -812,18 +776,18 @@ class InitialConditionsTableActions(QtCore.QObject):
             self._tab_id
         ).initial_text_by_set_id
         if value is None:
-            if invalid.get(set_id, {}).get(species) == str(raw_text):
+            if invalid.get(set_id, {}).get(species) == raw_text:
                 return False
-            invalid.setdefault(set_id, {})[species] = str(raw_text)
+            invalid.setdefault(set_id, {})[species] = raw_text
             self.render()
             self.draftStateChanged.emit(self._tab_id)
             return False
 
         values = dict(initial_set.values)
-        canonical = float(values.get(str(species), 0.0))
+        canonical = values.get(species, 0.0)
         changed = value != canonical
         if changed:
-            values[str(species)] = value
+            values[species] = value
             candidate = initial_set.with_values(values)
             self._registry.replace_initial_condition_set(
                 self._tab_id,
@@ -840,17 +804,16 @@ class InitialConditionsTableActions(QtCore.QObject):
 
     @QtCore.Slot(int, int, str)
     def accept_paste(self, start_row: int, start_column: int, text: str) -> bool:
-        rows = str(text).splitlines()
+        rows = text.splitlines()
         if not rows:
             return False
         cells = [row.split("\t") for row in rows]
-        width = max((len(row) for row in cells), default=0)
-        if width <= 0 or any(len(row) != width for row in cells):
+        width = max(len(row) for row in cells)
+        if any(len(row) != width for row in cells):
             return self._reject("Paste must be a rectangular table.")
+        # The view pastes only from a valid concentration cell.
         if (
-            start_row < 0
-            or start_column < 1
-            or start_row + len(cells) > self._model.rowCount()
+            start_row + len(cells) > self._model.rowCount()
             or start_column + width - 1 > len(self._model.species_names())
         ):
             return self._reject(
@@ -883,7 +846,7 @@ class InitialConditionsTableActions(QtCore.QObject):
             for column_offset, value in enumerate(values_to_paste):
                 species = species_names[start_column + column_offset - 1]
                 cleared_cells.append((initial_set.set_id, species))
-                if float(values.get(species, 0.0)) != value:
+                if values.get(species, 0.0) != value:
                     values[species] = value
                     row_changed = True
             if row_changed:
@@ -910,7 +873,7 @@ class InitialConditionsTableActions(QtCore.QObject):
 
     @QtCore.Slot(str, str)
     def accept_name_edit(self, set_id: str, name: str) -> bool:
-        normalized = str(name).strip()
+        normalized = name.strip()
         tab = self._registry.tab(self._tab_id)
         if not normalized:
             return self._reject("Initial-condition set names must be nonblank.")
@@ -934,13 +897,13 @@ class InitialConditionsTableActions(QtCore.QObject):
             self.setNameChanged.emit(self._tab_id)
         return True
 
-    def add_set(self) -> InitialConditionSet | None:
+    def add_set(self) -> None:
         tab = self._registry.tab(self._tab_id)
         created = InitialConditionSet(
             set_id=new_set_id(),
             name=next_set_name(item.name for item in tab.initial_condition_sets),
             values=tuple(
-                (str(species), 0.0) for species in canonical_species_names(tab)
+                (species, 0.0) for species in canonical_species_names(tab)
             ),
         )
         self._registry.mutate_tab(
@@ -949,41 +912,35 @@ class InitialConditionsTableActions(QtCore.QObject):
             expected_token=self._registry.capture_content_token(),
         )
         self.render()
-        return created
 
-    def move_selected(self, delta: int) -> tuple[str, ...]:
+    def move_selected(self, delta: int) -> None:
+        """Move the selected sets one row up (-1) or down (+1)."""
         self.settle_active_editor()
         selected = self.selected_run_set_ids()
-        if not selected or int(delta) == 0:
-            return selected
+        if not selected:
+            return
         tab = self._registry.tab(self._tab_id)
         ordered = list(tab.initial_condition_sets)
         active = {
             index for index, item in enumerate(ordered) if item.set_id in set(selected)
         }
-        direction = -1 if int(delta) < 0 else 1
-        for _ in range(abs(int(delta))):
-            traversal = (
-                sorted(active) if direction < 0 else sorted(active, reverse=True)
-            )
-            for row in traversal:
-                destination = row + direction
-                if (
-                    destination < 0
-                    or destination >= len(ordered)
-                    or destination in active
-                ):
-                    continue
-                ordered[row], ordered[destination] = ordered[destination], ordered[row]
-                active.remove(row)
-                active.add(destination)
+        for row in sorted(active, reverse=delta > 0):
+            destination = row + delta
+            if (
+                destination < 0
+                or destination >= len(ordered)
+                or destination in active
+            ):
+                continue
+            ordered[row], ordered[destination] = ordered[destination], ordered[row]
+            active.remove(row)
+            active.add(destination)
         self._registry.mutate_tab(
             self._tab_id,
             lambda current: current.with_initial_condition_sets(tuple(ordered)),
             expected_token=self._registry.capture_content_token(),
         )
         self.render()
-        return tuple(ordered[row].set_id for row in sorted(active))
 
     def delete_selected(self) -> bool:
         self.settle_active_editor()
@@ -1017,7 +974,7 @@ class InitialConditionsTableActions(QtCore.QObject):
 
     @QtCore.Slot(object)
     def union_plot_membership(self, set_ids: Iterable[str]) -> bool:
-        admitted = tuple(str(set_id) for set_id in set_ids)
+        admitted = tuple(set_ids)
         state = self._registry.presentation(self._tab_id)
         next_ids = tuple(dict.fromkeys((*state.plot_set_ids, *admitted)))
         if next_ids == state.plot_set_ids:
@@ -1132,12 +1089,9 @@ class InitialConditionsTableActions(QtCore.QObject):
     def _capture_run_selection(self, *_args) -> None:
         if self._rendering:
             return
-        valid = set(self._model.set_ids())
-        selected = tuple(
-            set_id for set_id in self._table.selected_set_ids() if set_id in valid
-        )
+        selected = self._table.selected_set_ids()
         runtime = self._registry.tab_runtime(self._tab_id)
-        if tuple(runtime.selected_run_set_ids) == selected:
+        if runtime.selected_run_set_ids == selected:
             return
         runtime.selected_run_set_ids = selected
         self.selectedRunSetIdsChanged.emit(selected)
@@ -1169,5 +1123,5 @@ class InitialConditionsTableActions(QtCore.QObject):
         return True
 
     def _reject(self, message: str) -> bool:
-        self.errorRaised.emit(str(message))
+        self.errorRaised.emit(message)
         return False

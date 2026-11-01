@@ -57,15 +57,14 @@ class FittingWindow(QtWidgets.QDialog):
         setup: FitSetupSnapshot,
         *,
         close_handler: Callable[[], bool],
-        observation_style: tuple[str, float, float],
-        color_resolver: Callable[[str], object] | None = None,
+        observation_style: tuple[float, float],
+        color_resolver: Callable[[str], object],
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._projected_setup = setup
         self._close_handler = close_handler
         self._color_resolver = color_resolver
-        self._observation_style = observation_style
         self._closing = False
         self._closing_after_cleanup = False
         self._paused = False
@@ -82,14 +81,14 @@ class FittingWindow(QtWidgets.QDialog):
             self.windowFlags()
             | QtCore.Qt.WindowType.WindowMinMaxButtonsHint
         )
-        self._build_ui()
+        self._build_ui(observation_style)
         clamp_initial_size(self, 1280, 720)
 
     # ------------------------------------------------------------------
     # Top-level presentation
     # ------------------------------------------------------------------
 
-    def _build_ui(self) -> None:
+    def _build_ui(self, observation_style: tuple[float, float]) -> None:
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(8)
@@ -117,7 +116,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_results_tab = RunResultsTab(
             parent=self,
             color_resolver=self._color_resolver,
-            observation_style=self._observation_style,
+            observation_style=observation_style,
         )
         self._run_results_tab.set_dark_mode(self._current_results_dark_mode())
 
@@ -371,7 +370,7 @@ class FittingWindow(QtWidgets.QDialog):
     def _refresh_setup_buttons(self) -> None:
         self._reset_button.setEnabled(not self._executing and not self._closing)
 
-    def clear_pending_setup_edits(self, *, data: bool = True, parameters: bool = True) -> None:
+    def clear_pending_setup_edits(self, *, data: bool, parameters: bool) -> None:
         """Discard held invalid text in the tabs being replaced and refresh."""
 
         if parameters:
@@ -494,10 +493,7 @@ class FittingWindow(QtWidgets.QDialog):
             }
             for dataset in snapshot.datasets
         ]
-        self._data_targets_tab.unified_list.populate(
-            entries,
-            emit_selection=False,
-        )
+        self._data_targets_tab.unified_list.populate(entries)
 
     # ------------------------------------------------------------------
     # Fit data and setup presentation adapters
@@ -524,23 +520,17 @@ class FittingWindow(QtWidgets.QDialog):
         )
 
     def _mapped_dataset(self, dataset_id: str):
+        # The setup holds exactly one dataset per mapped dataset, and the
+        # lists and panels ask only about those.
         return next(
-            (
-                item
-                for item in self._origin.mapped_datasets
-                if item.dataset_id == str(dataset_id)
-            ),
-            None,
+            item
+            for item in self._origin.mapped_datasets
+            if item.dataset_id == dataset_id
         )
 
     def _fit_settings_for_dataset(self, dataset_id: str) -> dict[str, object]:
         setup = self._projected_setup
-        dataset = next(
-            (item for item in setup.datasets if item.dataset_id == dataset_id),
-            None,
-        )
-        if dataset is None:
-            return self._fit_default_settings_for_dataset(dataset_id)
+        dataset = next(item for item in setup.datasets if item.dataset_id == dataset_id)
         return {
             "t_start": dataset.t_start,
             "simulation_end": dataset.simulation_end,
@@ -556,8 +546,6 @@ class FittingWindow(QtWidgets.QDialog):
     def _eligible_parametric_x(self, dataset_id: str) -> tuple[str, ...]:
         setup = self._projected_setup
         mapped = self._mapped_dataset(dataset_id)
-        if mapped is None:
-            return ()
         dataset = next(
             item for item in setup.datasets if item.dataset_id == dataset_id
         )
@@ -586,16 +574,6 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _fit_default_settings_for_dataset(self, dataset_id: str) -> dict[str, object]:
         mapped = self._mapped_dataset(dataset_id)
-        if mapped is None:
-            return {
-                "t_start": None,
-                "simulation_end": None,
-                "data_range_min": 0.0,
-                "data_range_max": 0.0,
-                "maximum_observations_per_target": None,
-                "parametric_x": "t",
-                "eligible_parametric_x": (),
-            }
         start, end, low, high = fit_dataset_time_defaults(mapped)
         return {
             "t_start": start,
@@ -614,8 +592,6 @@ class FittingWindow(QtWidgets.QDialog):
     ) -> tuple[object, ...]:
         setup = self._projected_setup
         mapped = self._mapped_dataset(dataset_id)
-        if mapped is None:
-            return ()
         current = next(
             item for item in setup.datasets if item.dataset_id == dataset_id
         )
@@ -659,22 +635,15 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _on_dataset_include_changed(
         self,
-        _row: int,
         dataset_id: str,
         included: bool,
     ) -> None:
         setup = self._projected_setup
-        current = next(
-            (item for item in setup.datasets if item.dataset_id == dataset_id),
-            None,
-        )
-        if current is None:
-            return
         self._on_leaf_snapshot(
             replace(
                 setup,
                 datasets=tuple(
-                    replace(item, included=bool(included))
+                    replace(item, included=included)
                     if item.dataset_id == dataset_id else item
                     for item in setup.datasets
                 ),
@@ -683,12 +652,7 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _on_data_settings_applied(self, dataset_id: str, config: dict) -> None:
         setup = self._projected_setup
-        current = next(
-            (item for item in setup.datasets if item.dataset_id == dataset_id),
-            None,
-        )
-        if current is None:
-            return
+        current = next(item for item in setup.datasets if item.dataset_id == dataset_id)
         edited = self._project_dataset_settings(current, config)
         self._on_leaf_snapshot(
             replace(
@@ -717,8 +681,8 @@ class FittingWindow(QtWidgets.QDialog):
         return bool(self._executing)
 
     def _request_execute(self) -> None:
-        if self._closing:
-            return
+        # Stopping disables Run, and a closed idle window is deleted before a
+        # delayed mnemonic click could arrive.
         # Mnemonics do not move focus like a mouse click does. Let the focused
         # editor settle through its normal signals before checking admission.
         focused = self.focusWidget()
@@ -775,7 +739,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._pause_button.setText("&Pause")
         self._pause_button.setEnabled(self._executing)
         self._species_table.set_running_state(self._executing)
-        self._params_ics_tab.set_running_state(self._executing)
         self._params_ics_tab.setEnabled(not self._executing)
         self._data_targets_tab.unified_list.set_running_state(self._executing)
         self._data_tab.setEnabled(not self._executing)
@@ -783,9 +746,8 @@ class FittingWindow(QtWidgets.QDialog):
         self._refresh_setup_validity()
         self._layout_footer()
 
-    def set_observation_style(self, shape: str, size: float, opacity: float) -> None:
-        self._observation_style = (shape, size, opacity)
-        self._run_results_tab.set_observation_style(shape, size, opacity)
+    def set_observation_style(self, size: float, opacity: float) -> None:
+        self._run_results_tab.set_observation_style(size, opacity)
 
     def set_progress(self, done: int, total: int) -> None:
         """Show ``done`` of ``total``; a total of 0 is a busy bar with no known end."""
@@ -805,10 +767,10 @@ class FittingWindow(QtWidgets.QDialog):
         if self._closing and not self._closing_after_cleanup:
             self.set_execution_status("Closing", "Stopping Fit before closing…")
             return
-        text = fit_identity_text(str(text), self._origin)
-        self._status.setText(str(text))
-        self._status.setAccessibleName(str(text))
-        self._status.setToolTip(str(text))
+        text = fit_identity_text(text, self._origin)
+        self._status.setText(text)
+        self._status.setAccessibleName(text)
+        self._status.setToolTip(text)
         self._status.setVisible(bool(text))
         self._layout_footer()
 
@@ -839,23 +801,19 @@ class FittingWindow(QtWidgets.QDialog):
 
     def set_terminal_presentation(
         self,
-        candidate: FitCandidate | None,
+        candidate: FitCandidate,
         *,
-        curves: tuple[FitCurveDataset, ...] = (),
-    ) -> bool:
+        curves: tuple[FitCurveDataset, ...],
+    ) -> None:
         """Consume one call-local typed candidate presentation."""
 
         self._status.clear()
         self._status.hide()
         self._layout_footer()
-        rendered = self._run_results_tab.set_terminal_presentation(
-            candidate,
-            curves=curves,
-        )
-        self._results_summary_button.setEnabled(candidate is not None)
+        self._run_results_tab.set_terminal_presentation(candidate, curves=curves)
+        self._results_summary_button.setEnabled(True)
         self._layout_footer()
         self._tabs.setCurrentIndex(2)
-        return bool(rendered)
 
     def set_apply_available(
         self, available: bool, reason: str, *,
@@ -928,15 +886,9 @@ class FittingWindow(QtWidgets.QDialog):
         )
 
     def _current_results_dark_mode(self) -> bool:
-        for candidate in (self.parentWidget(), self.parent()):
-            if candidate is not None:
-                window_color = candidate.palette().color(
-                    QtGui.QPalette.ColorRole.Window
-                )
-                return int(window_color.lightness()) < 128
-        app = QtWidgets.QApplication.instance()
-        window_color = app.palette().color(QtGui.QPalette.ColorRole.Window)
-        return int(window_color.lightness()) < 128
+        # The Fit window's parent is always the main window.
+        window_color = self.parentWidget().palette().color(QtGui.QPalette.ColorRole.Window)
+        return window_color.lightness() < 128
 
     def changeEvent(self, event: QtCore.QEvent) -> None:  # noqa: N802
         super().changeEvent(event)
@@ -964,8 +916,6 @@ class FittingWindow(QtWidgets.QDialog):
     def enter_stopping(self) -> None:
         """Make the presentation inert until owner-authorized cleanup closes it."""
 
-        if self._closing_after_cleanup:
-            return
         self._closing = True
         self._refresh_copy_allowed()
         self.set_execution_status("Closing", "Stopping Fit before closing…")

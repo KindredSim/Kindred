@@ -89,10 +89,10 @@ def fit_parameters_with_fixed(
     fixed_parameters: Dict[object, float],
     bounds: Dict[object, Tuple[float, float]],
     method: str,
-    max_nfev: int = 1000,
+    max_nfev: int,
     ftol: float,
     xtol: float,
-    cancellation_check: Callable[[], bool] | None = None,
+    cancellation_check: Callable[[], bool],
 ) -> FitResult:
     """Optimize one canonical objective while holding named coordinates fixed.
 
@@ -116,7 +116,7 @@ def fit_parameters_with_fixed(
         )
 
     if not free:
-        if cancellation_check is not None and cancellation_check():
+        if cancellation_check():
             raise FittingCancelled()
         return FitResult(
             success=True,
@@ -173,13 +173,13 @@ def fit_parameters(
     objective_func: BatchObjective,
     initial_params: Dict[object, float],
     bounds: Dict[object, Tuple[float, float]],
-    max_nfev: int = 1000,
+    max_nfev: int,
     seed: Optional[int] = None,
     *,
     ftol: float,
     xtol: float,
     method: str,
-    cancellation_check: Callable[[], bool] | None = None,
+    cancellation_check: Callable[[], bool],
     search_evaluations_callback: Callable[[int], None] | None = None,
 ) -> FitResult:
     """Fit parameters by least squares, or by Differential Evolution polished
@@ -204,7 +204,7 @@ def fit_parameters(
     identifiability_warning: Optional[str] = None
 
     def evaluate(points: Sequence[np.ndarray]) -> Sequence[np.ndarray]:
-        if cancellation_check is not None and cancellation_check():
+        if cancellation_check():
             raise FittingCancelled()
         return objective_func(points)
 
@@ -229,7 +229,6 @@ def fit_parameters(
             max_nfev=max_nfev,
             method=least_squares_method,
             bounds=scipy_bounds,
-            verbose=0,
             workers=finite_difference_points,
         )
         with warnings.catch_warnings():
@@ -260,8 +259,9 @@ def fit_parameters(
             # SciPy keeps the polish only when it succeeds, scores lower and
             # stays inside the bounds. Its score is the sum of squares, twice
             # the least-squares cost.
-            if search_evaluations_callback is not None:
-                search_evaluations_callback(0)
+            # Only the Fit itself runs Differential Evolution, and it always
+            # passes this callback.
+            search_evaluations_callback(0)
             polished = run_least_squares(np.asarray(start, dtype=float), "trf")
             polished.fun = 2.0 * polished.cost
             polishes.append(polished)
@@ -272,8 +272,7 @@ def fit_parameters(
         # evaluations, (maxiter + 1) * popsize * len(x0) at most.
         popsize = 15
         maxiter = max(0, max_nfev // (popsize * len(x0)) - 1)
-        if search_evaluations_callback is not None:
-            search_evaluations_callback((maxiter + 1) * popsize * len(x0))
+        search_evaluations_callback((maxiter + 1) * popsize * len(x0))
         # SciPy rescales x0 to [0, 1] and refuses a start that rounds
         # just outside, as a start on its bound can; such a start moves
         # inside by a negligible fraction of the range.

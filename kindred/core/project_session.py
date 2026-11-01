@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 from kindred.core.project_document import ProjectDocument
@@ -26,9 +25,8 @@ class SavedArchiveBaseline:
 
 @dataclass(frozen=True, slots=True)
 class ProjectContentToken:
-    """Opaque session-local identity for one canonical content revision."""
+    """Opaque identity for one canonical content revision of the one session."""
 
-    _owner: object
     revision: int
 
 
@@ -47,7 +45,6 @@ class ProjectSession:
             presentation=initial_presentation,
         )
         self._content_revision = 0
-        self._content_token_owner = object()
 
     @property
     def document(self) -> ProjectDocument:
@@ -64,18 +61,12 @@ class ProjectSession:
     def capture_content_token(self) -> ProjectContentToken:
         """Capture the exact current revision for conditional publication."""
 
-        return ProjectContentToken(
-            self._content_token_owner,
-            self._content_revision,
-        )
+        return ProjectContentToken(self._content_revision)
 
     def is_content_token_current(self, token: ProjectContentToken) -> bool:
         """Return whether ``token`` belongs to this session's current content."""
 
-        return bool(
-            token._owner is self._content_token_owner
-            and token.revision == self._content_revision
-        )
+        return token.revision == self._content_revision
 
     def _advance_content_revision(self) -> ProjectContentToken:
         self._content_revision += 1
@@ -124,21 +115,17 @@ class ProjectSession:
         document: ProjectDocument,
         presentation: WorkspacePresentationState,
         *,
-        path: str | os.PathLike[str] | None,
+        path: str | None,
         baseline_document: ProjectDocument,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
-        """Publish one admitted project identity and its saved baseline."""
+    ) -> ProjectContentToken:
+        """Publish one admitted project identity and its saved baseline.
 
-        if not self.is_content_token_current(expected_token):
-            return None
-        normalized_path = (
-            None
-            if path is None
-            else os.path.abspath(os.fsdecode(os.fspath(path)))
-        )
+        The registry checked the caller's token immediately before; ``path``
+        is already absolute.
+        """
+
         self._document = document
-        self._current_path = normalized_path
+        self._current_path = path
         self._saved_baseline = SavedArchiveBaseline(
             document=baseline_document,
             presentation=presentation,
@@ -147,7 +134,7 @@ class ProjectSession:
 
     def mark_saved(
         self,
-        path: str | os.PathLike[str],
+        path: str,
         presentation: WorkspacePresentationState,
         *,
         expected_token: ProjectContentToken,
@@ -156,8 +143,7 @@ class ProjectSession:
 
         if not self.is_content_token_current(expected_token):
             return False
-        normalized_path = os.path.abspath(os.fsdecode(os.fspath(path)))
-        self._current_path = normalized_path
+        self._current_path = path
         self._saved_baseline = SavedArchiveBaseline(
             document=self.document,
             presentation=presentation,

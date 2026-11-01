@@ -14,7 +14,7 @@ class UnifiedDatasetList(QtWidgets.QWidget):
     """Checkable dataset list for unified dataset navigation."""
 
     currentDatasetChanged = Signal(str)
-    datasetIncludeChanged = Signal(int, str, bool)
+    datasetIncludeChanged = Signal(str, bool)
 
     def __init__(self, *, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -40,7 +40,6 @@ class UnifiedDatasetList(QtWidgets.QWidget):
 
         # Track previous check states to detect toggle vs. other itemChanged triggers.
         self._check_states: dict[int, Qt.CheckState] = {}
-        self._running = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -49,8 +48,6 @@ class UnifiedDatasetList(QtWidgets.QWidget):
     def populate(
         self,
         dataset_entries: list,
-        *,
-        emit_selection: bool = True,
     ) -> None:
         old_id = self.selected_dataset_id()
         normalized: list[tuple[str, str, str, bool]] = []
@@ -59,10 +56,10 @@ class UnifiedDatasetList(QtWidgets.QWidget):
             compact = compact_dataset_label(entry["label"], max_chars=DATASET_LIST_LABEL_MAX_CHARS)
             normalized.append((ds_id, compact.display, compact.full, entry["include"]))
 
+        # Every item carries its nonblank dataset ID.
         existing_ids = tuple(
-            str(self._list.item(index).data(Qt.UserRole) or "").strip()
+            self._list.item(index).data(Qt.UserRole)
             for index in range(self._list.count())
-            if self._list.item(index) is not None
         )
         incoming_ids = tuple(item[0] for item in normalized)
         self._list.blockSignals(True)
@@ -87,8 +84,6 @@ class UnifiedDatasetList(QtWidgets.QWidget):
                 # only update the affected item in place.
                 for row, (_ds_id, display, full, include) in enumerate(normalized):
                     item = self._list.item(row)
-                    if item is None:
-                        continue
                     item.setText(display)
                     item.setToolTip(literal_tooltip(full))
                     item.setData(Qt.UserRole + 1, full)
@@ -104,16 +99,11 @@ class UnifiedDatasetList(QtWidgets.QWidget):
         finally:
             self._list.blockSignals(False)
 
-        new_id = self.selected_dataset_id()
-        if emit_selection and new_id != old_id:
-            self.currentDatasetChanged.emit(new_id or "")
-
     def selected_dataset_id(self) -> Optional[str]:
         item = self._list.currentItem()
         if item is None:
             return None
-        ds_id = str(item.data(Qt.UserRole) or "").strip()
-        return ds_id if ds_id else None
+        return item.data(Qt.UserRole)
 
     def set_data_edit_issues(self, issues: dict[str, str]) -> None:
         """Mark rows whose Fit Data settings are in error, without changing identity or inclusion."""
@@ -129,18 +119,13 @@ class UnifiedDatasetList(QtWidgets.QWidget):
             item.setData(Qt.AccessibleTextRole, detail)
             item.setToolTip(literal_tooltip(detail))
 
-    def dataset_display_name(self, dataset_id: str | None = None) -> str | None:
+    def dataset_display_name(self, dataset_id: str) -> str | None:
         """Return the full bounded-row source label, never the stable ID role."""
 
-        requested = str(dataset_id or self.selected_dataset_id() or "").strip()
-        if not requested:
-            return None
         for index in range(self._list.count()):
             item = self._list.item(index)
-            if item is None:
-                continue
-            if str(item.data(Qt.UserRole) or "").strip() == requested:
-                return str(item.data(Qt.UserRole + 1))
+            if item.data(Qt.UserRole) == dataset_id:
+                return item.data(Qt.UserRole + 1)
         return None
 
     def content_width(self) -> int:
@@ -155,8 +140,7 @@ class UnifiedDatasetList(QtWidgets.QWidget):
     def set_running_state(self, running: bool) -> None:
         """Preserve the historical disabled/locked running-state visual."""
 
-        self._running = bool(running)
-        self._list.setEnabled(not self._running)
+        self._list.setEnabled(not running)
 
     # ------------------------------------------------------------------
     # Internal handlers
@@ -167,29 +151,20 @@ class UnifiedDatasetList(QtWidgets.QWidget):
         current: QtWidgets.QListWidgetItem | None,
         _previous: QtWidgets.QListWidgetItem | None,
     ) -> None:
-        if current is None:
-            return
-        ds_id = str(current.data(Qt.UserRole) or "").strip()
-        if ds_id:
-            self.currentDatasetChanged.emit(ds_id)
+        # The only clear runs with signals blocked.
+        self.currentDatasetChanged.emit(current.data(Qt.UserRole))
 
     def _on_item_changed(self, item: QtWidgets.QListWidgetItem) -> None:
         row = self._list.row(item)
         new_state = item.checkState()
-        old_state = self._check_states.get(row)
-        if old_state is not None and new_state == old_state:
+        if new_state == self._check_states[row]:
             return
         self._check_states[row] = new_state
-        ds_id = str(item.data(Qt.UserRole) or "").strip()
-        self.datasetIncludeChanged.emit(row, ds_id, new_state == Qt.Checked)
+        self.datasetIncludeChanged.emit(item.data(Qt.UserRole), new_state == Qt.Checked)
 
     def _select_by_id(self, dataset_id: str | None) -> bool:
-        if not dataset_id:
-            return False
-        ds_id = str(dataset_id).strip()
         for i in range(self._list.count()):
-            item = self._list.item(i)
-            if item is not None and str(item.data(Qt.UserRole) or "").strip() == ds_id:
+            if self._list.item(i).data(Qt.UserRole) == dataset_id:
                 self._list.setCurrentRow(i)
                 return True
         return False

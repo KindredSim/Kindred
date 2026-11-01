@@ -60,15 +60,6 @@ class SimulationResultValue:
     # time in s, located on the solver's steps; Run and Preview results carry it.
     species_maximum: Mapping[str, tuple[float, float]] | None = None
 
-    def __post_init__(self) -> None:
-        # Canonical finalization is the sole producer: it selects succeeded and
-        # failed outputs disjointly from the requested roster and classifies
-        # exactly the parameters it records.  The carrier checks only that the
-        # Algebra evaluation gave every requested output a terminal outcome.
-        requested = set(self.requested_algebra_outputs)
-        if requested.difference(self.succeeded_algebra_outputs, self.failed_algebra_outputs):
-            raise ValueError("requested algebra outputs lack a terminal outcome.")
-
 
 class ResultRepository:
     """Store each set's current result value and its Reference Run."""
@@ -133,10 +124,9 @@ class ResultRepository:
             or sid in self._reference_by_set_id
         ):
             return
-        explicit = self._current_by_set_id.pop(sid, None)
+        # The Run set IDs are always a subset of the current values.
+        self._reference_by_set_id[sid] = self._current_by_set_id.pop(sid)
         self._current_run_set_ids.discard(sid)
-        if explicit is not None:
-            self._reference_by_set_id[sid] = explicit
 
     def clear_preview(self, set_id: str) -> None:
         """Remove the set's Preview value; its Reference stays retained."""

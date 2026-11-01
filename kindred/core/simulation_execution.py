@@ -17,7 +17,7 @@ from kindred.core.simulator.solvers import solve_ode
 def execute_simulation(
     execution_request: SimulationExecutionRequest,
     *,
-    cancellation_control: SimulationCancellationControl | None = None,
+    cancellation_control: SimulationCancellationControl,
     species_statistics: bool = False,
 ) -> SimulationResultValue:
     """Prepare, solve, and finalize without application or GUI ownership.
@@ -27,7 +27,7 @@ def execute_simulation(
     than temperature changes never carries.
     """
     def check_cancelled() -> None:
-        if cancellation_control is not None and cancellation_control.cancel_requested():
+        if cancellation_control.cancel_requested():
             raise SimulationCancelled()
 
     check_cancelled()
@@ -41,6 +41,7 @@ def execute_simulation(
     prepared = prepare_simulation_run(execution_request=execution_request, cancellation_control=cancellation_control)
     solved = solve_ode(build_simulation_request_from_prepared_run(
         prepared,
+        cancellation_control=cancellation_control,
         species_ctc=species_statistics and prepared.intervention_execution.is_empty,
         species_maximum=species_statistics,
     ))

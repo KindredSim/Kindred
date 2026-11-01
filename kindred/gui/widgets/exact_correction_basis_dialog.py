@@ -53,16 +53,7 @@ class ExactCorrectionBasisDialog(QtWidgets.QDialog):
         for target in assessment.targets:
             item = QtWidgets.QListWidgetItem(f"{target.name} — {reaction_text(target.context)}")
             item.setData(Qt.ItemDataRole.UserRole, target.name)
-            item.setFlags(
-                Qt.ItemFlag.ItemIsUserCheckable
-                | Qt.ItemFlag.ItemIsSelectable
-                | Qt.ItemFlag.ItemIsEnabled
-            )
-            item.setCheckState(
-                Qt.CheckState.Checked
-                if target.name in self._selected
-                else Qt.CheckState.Unchecked
-            )
+            # _refresh_state sets each item's flags and check state.
             self.target_list.addItem(item)
         layout.addWidget(self.target_list)
 
@@ -70,7 +61,7 @@ class ExactCorrectionBasisDialog(QtWidgets.QDialog):
         self.equations = QtWidgets.QPlainTextEdit(self)
         self.equations.setObjectName("exact_correction_generated_equations")
         self.equations.setReadOnly(True)
-        self.equations.setMaximumBlockCount(max(1, required))
+        self.equations.setMaximumBlockCount(required)
         layout.addWidget(self.equations)
 
         self.buttons = QtWidgets.QDialogButtonBox(self)
@@ -168,21 +159,6 @@ class ExactCorrectionBasisDialog(QtWidgets.QDialog):
             selected.add(name)
         else:
             selected.discard(name)
-        ordered = tuple(
-            target.name
-            for target in self._assessment.targets
-            if target.name in selected
-        )
-        if not self._planner.partial_selection_can_complete(ordered):
-            self.target_list.blockSignals(True)
-            try:
-                item.setCheckState(
-                    Qt.CheckState.Checked
-                    if name in self._selected
-                    else Qt.CheckState.Unchecked
-                )
-            finally:
-                self.target_list.blockSignals(False)
-            return
+        # Only completable additions are enabled, and removals stay completable.
         self._selected = selected
         self._refresh_state()

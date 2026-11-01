@@ -127,13 +127,12 @@ def allocate_initial_condition_set_name(
     existing_names: Iterable[str],
 ) -> str:
     """Allocate a display-derived set name with extension-aware suffixes."""
-    raw_name = str(display_name).strip()
-    if not raw_name:
-        raise DatasetMappingError("Create Set requires a nonblank dataset display name.")
+    # Dataset display names and set names are admitted nonblank.
+    raw_name = display_name.strip()
     stem, dot, suffix = raw_name.rpartition(".")
     base = stem if dot and stem else raw_name
     extension = f".{suffix}" if dot and stem else ""
-    occupied = {str(name).strip().casefold() for name in existing_names}
+    occupied = {name.strip().casefold() for name in existing_names}
     candidate = raw_name
     counter = 1
     while candidate.casefold() in occupied:
@@ -230,9 +229,8 @@ def apply_dataset_mapping_batch(
                 observation_mapping=normalized_mapping,
             )
             continue
+        # Both mapping screens require a target set before Map Existing.
         target = item.target_set_id
-        if target is None:
-            raise DatasetMappingError("Map Existing requires a target set.")
         target_set = next(current_set for current_set in sets if current_set.set_id == target)
         occupant = next(
             (dataset_id for dataset_id, link in current.items()
@@ -324,14 +322,14 @@ def validate_unique_dataset_name(
     excluding_dataset_id: str | None = None,
 ) -> str:
     """Return a stripped globally unique name or raise without mutation."""
-    clean = str(candidate).strip()
+    clean = candidate.strip()
     if not clean:
         raise DatasetMappingError("Dataset display name cannot be blank.")
     folded = clean.casefold()
     for dataset_id, display_name in existing:
-        if excluding_dataset_id is not None and str(dataset_id) == str(excluding_dataset_id):
+        if dataset_id == excluding_dataset_id:
             continue
-        if str(display_name).strip().casefold() == folded:
+        if display_name.strip().casefold() == folded:
             raise DatasetMappingError(f"A dataset named '{clean}' already exists.")
     return clean
 
@@ -348,18 +346,15 @@ def plan_global_dataset_delete(
     actual atomic cleanup. This value carries only the fact its real caller
     uses; it does not duplicate the replacement document or presentation.
     """
-    target = str(dataset_id).strip()
-    if not target:
-        raise DatasetMappingError("Dataset deletion requires a stable dataset ID.")
-    tab_ids = tuple(dict.fromkeys((*links_by_tab.keys(), *overlays_by_tab.keys())))
+    # Both mappings cover the same tabs.
+    target = dataset_id
     referenced = False
-    for raw_tab_id in tab_ids:
-        links = links_by_tab.get(raw_tab_id, ())
+    for raw_tab_id, links in links_by_tab.items():
         if any(current_dataset_id == target for current_dataset_id, _link in links):
             referenced = True
         if any(
-            str(raw_dataset_id) == target
-            for raw_dataset_id, _raw_columns in overlays_by_tab.get(raw_tab_id, ())
+            raw_dataset_id == target
+            for raw_dataset_id, _raw_columns in overlays_by_tab[raw_tab_id]
         ):
             referenced = True
     return GlobalDatasetDeletePlan(referenced=referenced)

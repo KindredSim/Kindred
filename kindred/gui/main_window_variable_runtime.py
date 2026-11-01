@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-import math
 from typing import Iterable
 
 from PySide6 import QtCore
@@ -116,7 +115,6 @@ class TabSliderBinding(QtCore.QObject):
         self._projection_dsl = None
         self._last_targets = ()
         self._exact_preview_capture: PreviewCapture | None = None
-        self._disposed = False
         # Stop on a Preview holds until the next slider gesture.
         self._preview_stopped = False
         self.set_preview_settings(points=preview_points, delay_ms=preview_delay_ms)
@@ -168,7 +166,7 @@ class TabSliderBinding(QtCore.QObject):
     def _handle_interaction(
         self, kind: str, name: str, value: float, interaction: SliderInteractionKind
     ) -> None:
-        identity = (str(kind), str(name))
+        identity = (kind, name)
         if interaction is SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
             if self._active_drag != identity:
                 self._active_drag, self._latest_admissible_pending = identity, None
@@ -184,13 +182,8 @@ class TabSliderBinding(QtCore.QObject):
         self._accept_and_submit(kind, name, float(value), interaction=interaction)
 
     def _record_raw_gesture(self, kind: str, name: str, value: float) -> None:
-        if not math.isfinite(value) or (kind == "species" and value < 0):
-            return
-        pending = _PendingGesture(
-            str(kind),
-            str(name),
-            float(value),
-        )
+        # Drag samples come from clamped slider positions.
+        pending = _PendingGesture(kind, name, value)
         if pending == self._latest_admissible_pending:
             return
         self._latest_admissible_pending = pending
@@ -221,12 +214,10 @@ class TabSliderBinding(QtCore.QObject):
             self.render()
 
     def resolve_target_set_ids(self) -> tuple[str, ...]:
-        tab = self._registry.tab(self._tab_id)
         presentation = self._registry.presentation(self._tab_id)
         return resolve_live_slider_target_set_ids(
             current_set_id=presentation.current_set_id,
             pinned_set_ids=presentation.pinned_slider_set_ids,
-            existing_set_ids=(item.set_id for item in tab.initial_condition_sets),
         )
 
     def publish_slider_draft_state(self) -> None:
@@ -253,13 +244,13 @@ class TabSliderBinding(QtCore.QObject):
         if self._active_drag and self._active_drag[0] == "parameter":
             live = self._variable_sliders.get_variables().get(self._active_drag[1])
             if live is not None:
-                parameters[self._active_drag[1]] = float(live)
+                parameters[self._active_drag[1]] = live
         targets = self.resolve_target_set_ids()
         species, mixed = self._project_species_targets(tab, targets)
         if self._active_drag and self._active_drag[0] == "species":
             live = self._species_sliders.get_current_values().get(self._active_drag[1])
             if live is not None:
-                species[self._active_drag[1]] = float(live)
+                species[self._active_drag[1]] = live
         vb, sb = (
             QtCore.QSignalBlocker(self._variable_sliders),
             QtCore.QSignalBlocker(self._species_sliders),
@@ -347,9 +338,10 @@ class TabSliderBinding(QtCore.QObject):
             rows.append(values)
         projected, mixed = {}, set()
         for name in names:
-            first = float(rows[0].get(name, 0.0))
+            # canonical_initial_values gives every species as a float.
+            first = rows[0][name]
             projected[name] = first
-            if any(float(row.get(name, 0.0)) != first for row in rows[1:]):
+            if any(row[name] != first for row in rows[1:]):
                 mixed.add(name)
         return projected, frozenset(mixed)
 
@@ -378,7 +370,7 @@ class TabSliderBinding(QtCore.QObject):
         prepared = self._preflight_preview_action(targets)
         if prepared is None:
             return False
-        coordinate = prepared.projection.coordinate(str(name))
+        coordinate = prepared.projection.coordinate(name)
         if coordinate is None:
             return self._reject(f"Parameter {name!r} is not editable.")
         try:
@@ -400,10 +392,10 @@ class TabSliderBinding(QtCore.QObject):
             return self._reject(str(exc))
         runtime = self._registry.tab_runtime(self._tab_id)
         before = dict(runtime.slider_parameter_draft)
-        if value_f == prepared.projection.values_dict().get(str(name)):
-            runtime.slider_parameter_draft.pop(str(name), None)
+        if value_f == prepared.projection.values_dict().get(name):
+            runtime.slider_parameter_draft.pop(name, None)
         else:
-            runtime.slider_parameter_draft[str(name)] = value_f
+            runtime.slider_parameter_draft[name] = value_f
         draft_unchanged = before == runtime.slider_parameter_draft
         if draft_unchanged:
             if interaction is SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
@@ -437,7 +429,7 @@ class TabSliderBinding(QtCore.QObject):
             return self._reject(str(exc))
         targets = self.resolve_target_set_ids()
         prepared = self._preflight_preview_action(targets)
-        if prepared is None or str(species) not in canonical_species_names(
+        if prepared is None or species not in canonical_species_names(
             prepared.tab
         ):
             return self._reject(
@@ -450,15 +442,15 @@ class TabSliderBinding(QtCore.QObject):
             canonical = float(
                 prepared.tab.initial_condition_set(set_id)
                 .values_dict()
-                .get(str(species), 0.0)
+                .get(species, 0.0)
             )
             if value_f == canonical:
                 item = drafts.get(set_id)
                 if item is not None:
-                    item.pop(str(species), None)
+                    item.pop(species, None)
                     (drafts.pop(set_id, None) if not item else None)
             else:
-                drafts.setdefault(set_id, {})[str(species)] = value_f
+                drafts.setdefault(set_id, {})[species] = value_f
         draft_unchanged = before == {
             item: dict(drafts.get(item, {})) for item in targets
         }
@@ -731,9 +723,7 @@ class TabSliderBinding(QtCore.QObject):
         return True
 
     def dispose(self) -> None:
-        if self._disposed:
-            return
-        self._disposed = True
+        # Called once, when its tab's surface is dropped.
         for signal, slot in self._disposable_connections:
             signal.disconnect(slot)
         self._clear_gesture_state()
@@ -744,5 +734,5 @@ class TabSliderBinding(QtCore.QObject):
         self.publish_slider_draft_state()
 
     def _reject(self, message: str) -> bool:
-        self.errorRaised.emit(str(message))
+        self.errorRaised.emit(message)
         return False

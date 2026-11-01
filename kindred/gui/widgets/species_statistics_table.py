@@ -150,8 +150,7 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
 
         names = tuple(row[0] for row in rows)
         current_names = tuple(
-            self.item(row, 0).text() if self.item(row, 0) is not None else ""
-            for row in range(self.rowCount())
+            self.item(row, 0).text() for row in range(self.rowCount())
         )
         if current_names != names:
             self.setRowCount(len(rows))

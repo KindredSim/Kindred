@@ -29,6 +29,7 @@ from kindred.core.validation import parse_whole_number_text
 from kindred.core.project_presentation_state import (
     ProjectPresentationState,
     SimulationSeriesAxisSelection,
+    VesselVolumeAxisSelection,
 )
 from kindred.gui.curve_copy_headers import copy_column_header, copy_series_label
 from kindred.gui.display_name_policy import literal_tooltip
@@ -129,6 +130,38 @@ _EPSILON = 1e-9
 _DisplayAnnotation = tuple[str, str, Mapping[str, object], float]
 _AnnotationKey = tuple[str, str, tuple[tuple[str, str], ...]]
 _ANNOTATION_ACCENTS = ("#4E79A7", "#F28E2B", "#59A14F", "#E15759", "#B07AA1", "#76B7B2")
+# Colour names the quantity; a set's position among the plotted sets picks
+# its line style and its measurements' marker, repeating past the fifth set.
+_SET_LINE_STYLES = (
+    QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenStyle.DashLine,
+    QtCore.Qt.PenStyle.DotLine, QtCore.Qt.PenStyle.DashDotLine,
+    QtCore.Qt.PenStyle.DashDotDotLine,
+)
+_SET_MARKER_SHAPES = ("o", "s", "t", "d", "+")
+# A measurement not linked to a plotted set has no curve to match.
+_UNLINKED_MARKER_SHAPE = "x"
+_LEGEND_KIND_ORDER = {
+    ResultLayerKind.EXPLICIT: 0, ResultLayerKind.PREVIEW: 0,
+    ResultLayerKind.REFERENCE: 1, ResultLayerKind.EXPERIMENTAL: 2,
+}
+
+
+def _line_pen(color: str, block: ResultDataBlock) -> QtGui.QPen:
+    # The Reference fade is in the pen, so its legend sample shows it too.
+    pen_color = QtGui.QColor(color)
+    pen_color.setAlphaF(block.opacity)
+    style = _SET_LINE_STYLES[block.set_position % len(_SET_LINE_STYLES)]
+    pen = pg.mkPen(color=pen_color, width=2, style=style)
+    if style != QtCore.Qt.PenStyle.SolidLine:
+        # Flat ends keep the pattern's gaps at full length.
+        pen.setCapStyle(QtCore.Qt.PenCapStyle.FlatCap)
+    return pen
+
+
+def _marker_shape(block: ResultDataBlock) -> str:
+    if block.set_position is None:
+        return _UNLINKED_MARKER_SHAPE
+    return _SET_MARKER_SHAPES[block.set_position % len(_SET_MARKER_SHAPES)]
 
 
 def _undefined_edges(*arrays: np.ndarray) -> np.ndarray:
@@ -142,11 +175,11 @@ def _undefined_edges(*arrays: np.ndarray) -> np.ndarray:
     return np.concatenate((changes, changes + 1))
 
 
-def _authored_volume_axis(source: Unit | None, render_input: ResultRenderInput | None) -> bool:
+def _authored_volume_axis(source: Unit | None, render_input: ResultRenderInput) -> bool:
     """Whether an axis shows a volume while the mechanism authors a volume unit."""
     return (
         source is not None and source.compatible(CUBIC_METRE)
-        and render_input is not None and render_input.authored_volume_unit is not None
+        and render_input.authored_volume_unit is not None
     )
 
 
@@ -808,7 +841,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         )
 
     def _selected_volume_unit(self) -> Unit:
-        authored = self._render_input.authored_volume_unit if self._render_input is not None else None
+        # Reached only while drawing a retained input.
+        authored = self._render_input.authored_volume_unit
         return self._volume_display_unit or authored or presentation_unit(CUBIC_METRE)
 
     def _volume_unit_choices(self) -> tuple[Unit, ...]:
@@ -843,7 +877,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         if source is None:
             return None, 1.0
         render_input = self._render_input
-        common = None if render_input is None else render_input.x_unit if axis == "x" else render_input.y_unit
+        common = render_input.x_unit if axis == "x" else render_input.y_unit
         if common is not None:
             shown = self._selected_display_unit(axis, common)
         elif _authored_volume_axis(source, render_input):
@@ -935,6 +969,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._plot_widget.setLabel("left", y_label)
         rendered_items: dict[tuple[object, ...], object] = {}
         rendered_points: list[_RenderedPointBlock] = []
+        legend_rows: list[tuple[tuple[object, ...], object, str]] = []
         for block in render_input.blocks:
             if not block.visible:
                 continue
@@ -944,11 +979,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 existing_items=existing_items,
                 rendered_items=rendered_items,
                 rendered_points=rendered_points,
+                legend_rows=legend_rows,
             )
         for item_key, item in existing_items.items():
             if item_key not in rendered_items:
-                self._remove_plot_item(item)
+                self._plot_widget.getPlotItem().removeItem(item)
         self._plot_items_by_key = rendered_items
+        self._rebuild_legend(legend_rows)
         self._axis_toolbar.set_x_candidates(
             render_input.axis_candidates,
             selected=render_input.selected_x_series,
@@ -985,29 +1022,22 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._rendered_point_roster = tuple(rendered_points)
         self._sync_plot_controls()
 
-    def _update_plot_item_legend(self, item: object, name: str | None) -> None:
-        # PyQtGraph 0.13.7 exposes PlotDataItem.name() as an opts-backed
-        # getter without a corresponding name mutator.
-        item.opts["name"] = name
-        if self._legend is None:
+    def _rebuild_legend(
+        self, rows: list[tuple[tuple[object, ...], object, str]],
+    ) -> None:
+        # Rows follow plot order whatever order items were first drawn in:
+        # each plotted set's curves, then its Reference, then its
+        # measurements; measurements not linked to a plotted set come last.
+        ordered = [(item, name) for _key, item, name in sorted(rows, key=lambda row: row[0])]
+        if [(sample.item, label.text) for sample, label in self._legend.items] == ordered:
+            # Unchanged rows, as on every drag frame, only repaint: a sample
+            # reads its curve's pen when painted and is not told of changes.
+            for sample, _label in self._legend.items:
+                sample.update()
             return
-        if name is None:
-            # A reused item may have been the first chunk in an earlier
-            # topology. Remove that stale row when it becomes a later chunk,
-            # a connector, or a ghost curve.
-            if self._legend.getLabel(item) is not None:
-                self._legend.removeItem(item)
-            return
-        label = self._legend.getLabel(item)
-        if label is None:
+        self._legend.clear()
+        for item, name in ordered:
             self._legend.addItem(item, name=name)
-        else:
-            label.setText(name)
-
-    def _remove_plot_item(self, item: object) -> None:
-        if self._legend is not None:
-            self._legend.removeItem(item)
-        self._plot_widget.getPlotItem().removeItem(item)
 
     def _rendered_block_for_static(
         self,
@@ -1109,9 +1139,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         block: ResultDataBlock,
         *,
         sampling_limit: int | None,
-        existing_items: Mapping[tuple[object, ...], object] | None = None,
-        rendered_items: dict[tuple[object, ...], object] | None = None,
-        rendered_points: list[_RenderedPointBlock] | None = None,
+        existing_items: Mapping[tuple[object, ...], object],
+        rendered_items: dict[tuple[object, ...], object],
+        rendered_points: list[_RenderedPointBlock],
+        legend_rows: list[tuple[tuple[object, ...], object, str]],
     ) -> None:
         rendered_block, rendered_chunks = self._rendered_block_for_static(
             block,
@@ -1120,8 +1151,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         transformed_blocks = self._transformed_blocks(rendered_block)
         transform = self._presentation.plot_transform
         colors = dict(block.color_by_series)
-        item_store = rendered_items if rendered_items is not None else {}
-        existing_store = existing_items if existing_items is not None else {}
         # Items are keyed by lane, so a set's Run, drag and exact Preview reuse
         # its foreground items and only the Reference has its own.
         lane = (
@@ -1153,56 +1182,70 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     continue
                 marker = block.markers
                 item_key = (role, dict(block.series_axes)[series_name], chunk_index, "marker" if marker else "line")
-                item = existing_store.get(item_key)
-                name = f"{block.label}: {series_name}"
-                unit = block.unit_for(series_name)
-                if self._render_input.y_unit is None and unit is not None:
-                    name += f" [{format_unit_for_display(dict(transformed.y_units)[series_name])}]"
-                legend_name = name if legend_pending else None
-                legend_pending = False
+                item = existing_items.get(item_key)
                 if item is None:
                     if marker:
                         item = self._add_plot_data(
-                            x, y, pen=None, symbol=block.point_shape,
+                            x, y, pen=None, symbol=_marker_shape(block),
                             symbolSize=block.point_size,
                             symbolBrush=pg.mkBrush(color), symbolPen=pg.mkPen(color),
-                            name=legend_name, connect="finite",
+                            connect="finite",
                         )
                     else:
                         item = self._add_plot_data(
-                            x, y,
-                            pen=pg.mkPen(color=color, width=2, style=(QtCore.Qt.PenStyle.DashLine if block.dashed else QtCore.Qt.PenStyle.SolidLine)),
-                            name=legend_name, connect="finite", connectors=instantaneous,
+                            x, y, pen=_line_pen(color, block),
+                            connect="finite", connectors=instantaneous,
                         )
                 elif marker:
                     item.setData(x, y, connect="finite", connectors=instantaneous)
                     item.setSymbolBrush(pg.mkBrush(color))
                     item.setSymbolPen(pg.mkPen(color))
-                    item.setSymbol(block.point_shape)
+                    item.setSymbol(_marker_shape(block))
                     item.setSymbolSize(block.point_size)
                 else:
                     # The pen goes with the data, so the item is built once.
                     item.setData(
                         x, y, connect="finite", connectors=instantaneous,
-                        pen=pg.mkPen(color=color, width=2, style=(QtCore.Qt.PenStyle.DashLine if block.dashed else QtCore.Qt.PenStyle.SolidLine)),
+                        pen=_line_pen(color, block),
                     )
-                self._update_plot_item_legend(item, legend_name)
+                if legend_pending:
+                    name = block.legend_label or f"{block.label}: {series_name}"
+                    unit = block.unit_for(series_name)
+                    if self._render_input.y_unit is None and unit is not None:
+                        name += f" [{format_unit_for_display(dict(transformed.y_units)[series_name])}]"
+                    position = block.set_position
+                    legend_rows.append((
+                        (
+                            position is None, position or 0,
+                            _LEGEND_KIND_ORDER[block.kind],
+                            isinstance(dict(block.series_axes)[series_name], VesselVolumeAxisSelection),
+                            len(legend_rows),
+                        ),
+                        item, name,
+                    ))
+                legend_pending = False
                 item.setVisible(True)
-                self._style_simulation_item(item, block.kind is not ResultLayerKind.EXPERIMENTAL, color, block.opacity)
-                item_store[item_key] = item
-        if rendered_points is not None and any(
+                self._style_item(item, block, color)
+                rendered_items[item_key] = item
+        if any(
             chunk.x.size for chunk in rendered_block.chunks
         ):
             rendered_points.extend(transformed_blocks)
-    def _style_simulation_item(self, item: object, simulation: bool, color: object, opacity: float) -> None:
-        if simulation:
-            item.setSymbol("o" if self._presentation.simulation_markers else None)
-            if self._presentation.simulation_markers:
-                item.setSymbolSize(5)
-                item.setSymbolBrush(pg.mkBrush(color))
-                item.setSymbolPen(pg.mkPen(color))
-            opacity *= self._presentation.simulation_opacity
-        item.setOpacity(opacity)
+    def _style_item(self, item: object, block: ResultDataBlock, color: str) -> None:
+        if block.kind is ResultLayerKind.EXPERIMENTAL:
+            item.setOpacity(block.opacity)
+            return
+        item.setSymbol("o" if self._presentation.simulation_markers else None)
+        if self._presentation.simulation_markers:
+            # Simulation markers fade with their curve's pen.
+            marker_color = QtGui.QColor(color)
+            marker_color.setAlphaF(block.opacity)
+            item.setSymbolSize(5)
+            item.setSymbolBrush(pg.mkBrush(marker_color))
+            item.setSymbolPen(pg.mkPen(marker_color))
+        # The Reference fade is already in the pen; the item carries only the
+        # tab's Simulation Opacity.
+        item.setOpacity(self._presentation.simulation_opacity)
 
     def _sample_static_block(
         self,
@@ -1286,8 +1329,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             return raw
         if raw <= 0.0:
             return None
-        mapped = float(np.log10(raw))
-        return mapped if np.isfinite(mapped) else None
+        return float(np.log10(raw))
 
     @staticmethod
     def _view_to_raw_coordinate(
@@ -1361,8 +1403,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     continue
                 entries.append((self._annotation_signature(owned), owned, start, end))
                 continue
-            if "time" not in annotation:
-                continue
+            # Instants and triggers carry a time; intervals returned above.
             time = self._raw_to_view_coordinate(
                 float(annotation["time"]) * x_scale,
                 log_enabled=presentation.log_x,
@@ -1544,20 +1585,16 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._apply_volume_unit_change(unit)
             return
         options = self._display_unit_choices(render_input, axis)
-        chosen = next((item for item in options if item.symbol == unit), None)
-        if chosen is None:
-            return
-        if self._selected_display_unit(axis, source).symbol == chosen.symbol:
-            return
+        # The combo lists exactly these choices and signals only real changes.
+        chosen = next(item for item in options if item.symbol == unit)
         self._axis_range = self._capture_view_range()
         old_x_scale, old_y_scale = self._coordinate_scales(render_input)
         self._axis_display_units[axis, chosen.dimensions] = chosen
         self._refresh_display_units(old_x_scale, old_y_scale)
 
     def _apply_volume_unit_change(self, symbol: str) -> None:
+        # The volume unit menu is enabled only with an authored volume unit.
         render_input = self._render_input
-        if render_input is None or render_input.authored_volume_unit is None:
-            return
         chosen = None if symbol == "Authored" else next(unit for unit in self._volume_unit_choices() if unit.symbol == symbol)
         current = self._volume_display_unit.symbol if self._volume_display_unit is not None else "Authored"
         if symbol == current:
@@ -1737,8 +1774,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         item.invertY(state.y_inverted)
         item.showGrid(x=state.grid_x, y=state.grid_y, alpha=state.grid_opacity)
         self._sync_plot_controls()
-        if self._legend is not None:
-            self._legend.setVisible(state.legend_visible)
+        self._legend.setVisible(state.legend_visible)
         if axis_range is not None:
             self._apply_axis_range_state(axis_range, state)
 
@@ -1746,11 +1782,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         dark = bool(dark_mode)
         self._plot_widget.setBackground(plot_background_color(dark))
         foreground = plot_foreground_color(dark)
-        if self._legend is not None:
-            self._legend.setLabelTextColor(foreground)
-            # A label takes the new colour when its text is set again.
-            for _sample, label in self._legend.items:
-                label.setText(label.text)
+        self._legend.setLabelTextColor(foreground)
+        # A label takes the new colour when its text is set again.
+        for _sample, label in self._legend.items:
+            label.setText(label.text)
         for axis_name in ("left", "bottom"):
             axis = self._plot_widget.getPlotItem().getAxis(axis_name)
             axis.setPen(foreground)
@@ -1834,8 +1869,7 @@ def _iter_rendered_point_tsv_chunks(
         for block in values
         if any(chunk.x.size for chunk in block.chunks)
     )
-    if not nonempty:
-        raise ValueError("No plotted data is available to copy.")
+    # Copy Plotted is enabled only with samples; Copy Visible returns first.
     # Per block: its column parts, the rows kept after de-duplication, and the row count.
     _BlockPlan = tuple[tuple[tuple[np.ndarray, ...], ...], np.ndarray | None, int]
     block_specs: list[tuple[_RenderedPointBlock, tuple[str, ...], _BlockPlan, int, bool]] = []

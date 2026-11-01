@@ -30,14 +30,14 @@ class ExcelWorkbookPair:
     """
 
     def __init__(self, source_bytes: bytes, *, source_label: str) -> None:
-        self._source_bytes = bytes(source_bytes)
-        self._source_label = str(source_label).strip() or "<workbook>"
+        # Every caller opens a fresh pair in one ``with`` block and reads it
+        # there; the label is the admitted original file name.
+        self._source_bytes = source_bytes
+        self._source_label = source_label
         self._workbook = None
         self._authored_workbook = None
 
     def __enter__(self) -> "ExcelWorkbookPair":
-        if self._workbook is not None:
-            raise RuntimeError("Excel workbook pair is already open.")
         try:
             self._workbook = _open_workbook_bytes(
                 self._source_bytes,
@@ -66,8 +66,6 @@ class ExcelWorkbookPair:
                 item.close()
 
     def _require_open(self):  # noqa: ANN202
-        if self._workbook is None or self._authored_workbook is None:
-            raise RuntimeError("Excel workbook pair is closed.")
         return self._workbook, self._authored_workbook
 
     @property

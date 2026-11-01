@@ -102,7 +102,7 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
 
     def __init__(
         self,
-        documents: tuple[str, str] = ("", ""),
+        documents: tuple[str, str],
         *,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
@@ -437,8 +437,8 @@ class RunResultsTab(QtWidgets.QWidget):
         self,
         parent: QtWidgets.QWidget | None = None,
         *,
-        color_resolver: ColorResolver | None = None,
-        observation_style: tuple[str, float, float],
+        color_resolver: ColorResolver,
+        observation_style: tuple[float, float],
     ) -> None:
         super().__init__(parent)
         self._observation_style = observation_style
@@ -485,26 +485,20 @@ class RunResultsTab(QtWidgets.QWidget):
 
     def set_live_curves(self, curves: Sequence[FitCurveDataset]) -> None:
         self._install_plot_projection(curves)
-        self._refresh_summary()
 
     def set_terminal_presentation(
         self,
-        candidate: FitCandidate | None,
+        candidate: FitCandidate,
         *,
-        curves: Sequence[FitCurveDataset] = (),
-    ) -> bool:
+        curves: Sequence[FitCurveDataset],
+    ) -> None:
         """Consume one call-local typed terminal presentation."""
-        if candidate is None:
-            self._summary_body = self._summary_provenance = ""
-            self._tracker_panel.clear()
-        else:
-            overview, self._summary_body, self._summary_provenance, entries, warnings = (
-                fit_candidate_presentation(candidate)
-            )
-            self._tracker_panel.set_summary(overview, entries, warnings)
+        overview, self._summary_body, self._summary_provenance, entries, warnings = (
+            fit_candidate_presentation(candidate)
+        )
+        self._tracker_panel.set_summary(overview, entries, warnings)
         self._install_plot_projection(curves)
         self._refresh_summary()
-        return self.copy_eligible()
 
     def set_progress(self, done: int, total: int) -> None:
         self._progress = (done, total)
@@ -619,20 +613,18 @@ class RunResultsTab(QtWidgets.QWidget):
     def copy_dataset_to_clipboard(self, dataset_id: str, all_simulated: bool) -> None:
         """Copy the one dataset represented by a clicked Fit plot."""
 
-        identity = str(dataset_id or "").strip()
         curves = tuple(
-            curve for curve in self._curves if curve.dataset_id == identity
+            curve for curve in self._curves if curve.dataset_id == dataset_id
         )
         view = self._subtab_stack.currentWidget()
         view.copy_projection_to_clipboard(curves, all_simulated=all_simulated)
 
-    def set_observation_style(self, shape: str, size: float, opacity: float) -> None:
-        self._observation_style = (shape, size, opacity)
+    def set_observation_style(self, size: float, opacity: float) -> None:
+        self._observation_style = (size, opacity)
         for plot_view in self._dataset_plot_views.values():
-            plot_view.set_observation_style(shape, size, opacity)
+            plot_view.set_observation_style(size, opacity)
         if self._all_datasets_plot_view is not None:
-            self._all_datasets_plot_view.set_observation_style(shape, size, opacity)
-        self._refresh_summary()
+            self._all_datasets_plot_view.set_observation_style(size, opacity)
 
     def set_waiting(self, request: FitExecutionRequest) -> None:
         self.clear_candidate()
@@ -664,7 +656,6 @@ class RunResultsTab(QtWidgets.QWidget):
             plot_view.set_dark_mode(self._dark_mode)
         if self._all_datasets_plot_view is not None:
             self._all_datasets_plot_view.set_dark_mode(self._dark_mode)
-        self._refresh_summary()
 
     def prepare(self, request: FitExecutionRequest) -> None:
         self._ensure_subtabs(request)
@@ -786,7 +777,6 @@ class RunResultsTab(QtWidgets.QWidget):
 
     def _on_subtab_changed(self, index: int) -> None:
         self._refresh_active_plot_view()
-        self._refresh_summary()
         self.copyAvailableChanged.emit(self.copy_eligible())
 
     def _remove_plot_view(self, view: GridPlotView) -> None:

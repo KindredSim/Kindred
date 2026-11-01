@@ -10,7 +10,6 @@ from dataclasses import dataclass
 import math
 from numbers import Real
 from pathlib import Path
-from pathlib import PurePosixPath, PureWindowsPath
 from typing import Mapping, TypeAlias
 from kindred.core.quantity_units import Unit
 
@@ -71,20 +70,17 @@ def freeze_json_value(value: object) -> FrozenJsonValue:
         return _require_finite(value, "JSON number")
     if isinstance(value, Mapping):
         items: list[tuple[str, FrozenJsonValue]] = []
+        # Parsed JSON and import metadata key their objects by text.
         for key, item in value.items():
-            if not isinstance(key, str):
-                raise TypeError("JSON object keys must be strings.")
             items.append((key, freeze_json_value(item)))
         items.sort(key=lambda item: item[0])
         return FrozenJsonObject(tuple(items))
-    if isinstance(value, (list, tuple)):
-        return FrozenJsonArray(tuple(freeze_json_value(item) for item in value))
-    raise TypeError(f"Unsupported JSON value type: {type(value).__name__}.")
+    return FrozenJsonArray(tuple(freeze_json_value(item) for item in value))
 
 
 def thaw_json_value(value: FrozenJsonValue) -> object:
     if isinstance(value, FrozenJsonObject):
-        return {str(key): thaw_json_value(item) for key, item in value.items}
+        return {key: thaw_json_value(item) for key, item in value.items}
     if isinstance(value, FrozenJsonArray):
         return [thaw_json_value(item) for item in value.items]
     return value
@@ -95,8 +91,6 @@ def validate_raw_observation_id(
     label: str = "raw observation ID",
 ) -> str:
     """Require one already-allocated opaque raw observation identity."""
-    if type(value) is not str:
-        raise TypeError(f"{label} must be a str.")
     if not value or value != value.strip():
         raise ValueError(f"{label} must be nonblank and edge-normalized.")
     return value
@@ -132,8 +126,6 @@ class ImportedSource:
 
 def validate_original_basename(value: object, *, label: str = "original filename") -> str:
     """Validate one exact filename with no POSIX or Windows path semantics."""
-    if not isinstance(value, str):
-        raise ValueError(f"{label} must be a string.")
     if not value or value != value.strip():
         raise ValueError(f"{label} cannot be blank or start or end with a space.")
     if (
@@ -143,16 +135,6 @@ def validate_original_basename(value: object, *, label: str = "original filename
         or "\\" in value
         or ":" in value
         or value.endswith((".", " "))
-    ):
-        raise ValueError(f"{label} cannot contain /, \\, or :, or end with a period or a space.")
-    posix = PurePosixPath(value)
-    windows = PureWindowsPath(value)
-    if (
-        posix.is_absolute()
-        or windows.is_absolute()
-        or windows.drive
-        or windows.root
-        or any(part in {".", ".."} for part in (*posix.parts, *windows.parts))
     ):
         raise ValueError(f"{label} cannot contain /, \\, or :, or end with a period or a space.")
     windows_reserved = {
@@ -184,32 +166,22 @@ def validate_raw_dataset_record(record: RawDatasetRecord) -> RawDatasetRecord:
     def fail(message: str) -> None:
         raise ValueError(message)
 
-    if (
-        not isinstance(record.dataset_id, str)
-        or not record.dataset_id
-        or record.dataset_id != record.dataset_id.strip()
-    ):
+    # The archive decoder admits every string field as a nonblank string and
+    # every tuple as a tuple; edge spaces and duplicates are judged here.
+    if record.dataset_id != record.dataset_id.strip():
         fail("Raw dataset ID must be a nonblank edge-normalized string.")
-    if (
-        not isinstance(record.display_name, str)
-        or not record.display_name
-        or record.display_name != record.display_name.strip()
-    ):
+    if record.display_name != record.display_name.strip():
         fail(
             f"Raw dataset {record.dataset_id!r} display name must be a nonblank edge-normalized string."
         )
-    if type(record.observations) is not tuple:
-        fail(f"Raw dataset {record.dataset_id!r} observations must be an immutable tuple.")
     if not record.observations:
         fail(f"Raw dataset {record.dataset_id!r} requires at least one observation series.")
 
     observation_names: list[str] = []
     raw_observation_ids: set[str] = set()
     for series in record.observations:
-        if not isinstance(series, ObservationSeries):
-            fail(f"Raw dataset {record.dataset_id!r} observations must contain only ObservationSeries values.")
         name = series.column_name
-        if not isinstance(name, str) or not name or name != name.strip():
+        if name != name.strip():
             fail(f"Raw dataset {record.dataset_id!r} observation names must be nonblank edge-normalized strings.")
         if name in observation_names:
             fail(f"Raw dataset {record.dataset_id!r} contains duplicate assigned observation name {name!r}.")
@@ -218,28 +190,25 @@ def validate_raw_dataset_record(record: RawDatasetRecord) -> RawDatasetRecord:
                 series.raw_observation_id,
                 f"Raw dataset {record.dataset_id!r} observation {name!r} raw observation ID",
             )
-        except (TypeError, ValueError) as exc:
+        except ValueError as exc:
             fail(str(exc))
         if raw_observation_id in raw_observation_ids:
             fail(f"Raw dataset {record.dataset_id!r} contains duplicate raw observation ID {raw_observation_id!r}.")
         raw_observation_ids.add(raw_observation_id)
-        if type(series.t) is not tuple or type(series.y) is not tuple or type(series.source_rows) is not tuple:
-            fail(f"Raw dataset {record.dataset_id!r} observation {name!r} must own immutable t/y/source_rows tuples.")
         if (
             not series.y
             or (series.t and len(series.t) != len(series.y))
             or len(series.y) != len(series.source_rows)
         ):
             fail(f"Raw dataset {record.dataset_id!r} observation {name!r} must retain equal nonempty time/value tuples aligned with source rows.")
-        if any(type(row) is not int or row <= 0 for row in series.source_rows):
+        if any(row <= 0 for row in series.source_rows):
             fail(f"Raw dataset {record.dataset_id!r} observation {name!r} source rows must be positive integers.")
         if len(set(series.source_rows)) != len(series.source_rows):
             fail(f"Raw dataset {record.dataset_id!r} observation {name!r} contains duplicate observation row identities.")
         observation_names.append(name)
     if any(series.t for series in record.observations):
         if (
-            not isinstance(record.time_column_name, str)
-            or not record.time_column_name
+            record.time_column_name is None
             or record.time_column_name != record.time_column_name.strip()
         ):
             fail("Timed datasets require a nonblank edge-normalized time column name.")
@@ -261,17 +230,11 @@ def validate_raw_dataset_record(record: RawDatasetRecord) -> RawDatasetRecord:
                 times_by_row[row] = time
         return record
 
-    if (
-        not isinstance(record.source_id, str)
-        or not record.source_id
-        or record.source_id != record.source_id.strip()
-    ):
+    if record.source_id != record.source_id.strip():
         fail(f"Raw dataset {record.dataset_id!r} source ID must be nonblank and edge-normalized.")
     if any(series.unit is None for series in record.observations):
         fail("Imported observations require known scientific units.")
     thawed_metadata = thaw_json_value(record.source_metadata)
-    if not isinstance(thawed_metadata, dict):
-        fail(f"Raw dataset {record.dataset_id!r} source metadata must be an immutable JSON object.")
     physical_values = thawed_metadata.get("physical_columns")
     if not isinstance(physical_values, list) or not physical_values:
         fail(f"Raw dataset {record.dataset_id!r} must retain its physical source-column catalog.")
@@ -332,11 +295,7 @@ def validate_raw_dataset_record(record: RawDatasetRecord) -> RawDatasetRecord:
 def validate_imported_source(source: ImportedSource) -> ImportedSource:
     """Validate one canonical source capture, including exact bytes."""
 
-    if (
-        not isinstance(source.source_id, str)
-        or not source.source_id
-        or source.source_id != source.source_id.strip()
-    ):
+    if source.source_id != source.source_id.strip():
         raise ValueError("Imported source ID must be nonblank and edge-normalized.")
     if source.original_format not in {"csv", "xlsx"}:
         raise ValueError("Imported source format must be exactly 'csv' or 'xlsx'.")

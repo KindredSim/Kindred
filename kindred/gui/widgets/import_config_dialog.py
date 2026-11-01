@@ -338,8 +338,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
             self._update_import_enabled()
 
     def _on_current_sheet_changed(self, row: int) -> None:
-        if row < 0:
-            return
+        # The sheet list is filled once and never cleared.
         self._current_sheet = self._sheets[row]
         sheet = self._shown_sheet()
         name = sheet.name if sheet.name is not None else self._source.original_filename
@@ -397,14 +396,12 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 index = combo.findData(UnitSource.FILE)
             if index >= 0:
                 combo.setCurrentIndex(index)
-            elif custom:
+            else:
+                # Only a column's custom expression is not a listed choice.
                 combo.setCurrentIndex(combo.count() - 1)
                 combo.setEditable(True)
                 combo.setCompleter(None)
                 combo.setEditText(choice)
-            else:
-                combo.addItem(choice, choice)
-                combo.setCurrentIndex(combo.count() - 1)
 
     @staticmethod
     def _unit_choice(combo) -> str | UnitSource:
@@ -556,8 +553,6 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._update_import_enabled()
 
     def _on_column_unit_selected(self, column, combo, index: int) -> None:
-        if index < 0:
-            return
         if combo.itemData(index) is None:
             sheet = self._current_sheet
             try:
@@ -590,8 +585,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._update_import_enabled()
 
     def _on_species_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
-        if item.column() != 0:
-            return
+        # Only the Use checkboxes are user-editable.
         sheet = self._current_sheet
         column = next(
             col
@@ -682,13 +676,8 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._btn_invert_sheets.setEnabled(bool(self._sheets))
 
     def _on_import(self) -> None:
-        try:
-            plans = self._resolved_plans()
-            if not plans:
-                raise ValueError("Select at least one sheet to import.")
-        except ValueError as exc:
-            QtWidgets.QMessageBox.critical(self, "Import Configuration", str(exc))
-            return
+        # Import is enabled only while these plans resolve.
+        plans = self._resolved_plans()
         template = self._template_sheet
         shared = None if template is None else template.settings
         self._result = ImportDialogResult(ImportConfig(self._source, plans, shared), "import")
@@ -715,8 +704,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
             ("_preview_error_label", "error"),
             ("_readiness_label", "warning"),
         ):
-            label = getattr(self, name, None)
-            if label is not None:
-                palette = label.palette()
-                palette.setColor(QtGui.QPalette.WindowText, semantic_color(role, dark))
-                label.setPalette(palette)
+            label = getattr(self, name)
+            palette = label.palette()
+            palette.setColor(QtGui.QPalette.WindowText, semantic_color(role, dark))
+            label.setPalette(palette)

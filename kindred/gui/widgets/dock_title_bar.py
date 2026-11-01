@@ -79,11 +79,9 @@ class DockTitleBar(QtWidgets.QWidget):
         self._minimize_btn.setText(_MINIMIZE_GLYPH)
         self._minimize_btn.setToolTip("Minimize panel.")
         self._minimize_btn.setAccessibleName("Minimize panel")
-        content = self._dock.widget()
-        if content is not None:
-            content.setVisible(True)
-        if self._dock_minimum_width_before_minimize is not None:
-            self._dock.setMinimumWidth(int(self._dock_minimum_width_before_minimize))
+        # Every dock gets its content when built; minimizing saved the width.
+        self._dock.widget().setVisible(True)
+        self._dock.setMinimumWidth(self._dock_minimum_width_before_minimize)
         self._dock_minimum_width_before_minimize = None
         self.updateGeometry()
 
@@ -102,9 +100,7 @@ class DockTitleBar(QtWidgets.QWidget):
                     int(self.minimumSizeHint().width()),
                 )
             )
-            content = self._dock.widget()
-            if content is not None:
-                content.setVisible(False)
+            self._dock.widget().setVisible(False)
             self.updateGeometry()
 
     def _close_dock(self) -> None:
@@ -116,8 +112,8 @@ class DockTitleBar(QtWidgets.QWidget):
 
     def minimumSizeHint(self) -> QtCore.QSize:
         layout = self.layout()
-        margins = layout.contentsMargins() if isinstance(layout, QtWidgets.QLayout) else QtCore.QMargins()
-        spacing = int(layout.spacing()) if isinstance(layout, QtWidgets.QLayout) else 0
+        margins = layout.contentsMargins()
+        spacing = layout.spacing()
         label_hint = self._title_label.minimumSizeHint()
         button_width = self._minimize_btn.sizeHint().width() + self._close_btn.sizeHint().width()
         width = margins.left() + self.fontMetrics().averageCharWidth() * 6 + button_width + margins.right() + (spacing * 2)

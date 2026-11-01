@@ -46,7 +46,6 @@ _TEMPLATE_STRING_FIELDS = frozenset(
         "modified_at",
     }
 )
-_UNSET = object()
 
 
 def _template_name(value: object) -> str:
@@ -187,11 +186,6 @@ class TemplateManager:
 
         return self._write_disabled_reason
 
-    def _require_writable_collection(self) -> None:
-        reason = self._write_disabled_reason
-        if reason is not None:
-            raise RuntimeError(reason)
-
     def _record_storage_failure(self, action: str, exc: Exception) -> None:
         detail = file_error_text(exc, self._templates_dir).strip()
         self._write_disabled_reason = (
@@ -234,7 +228,6 @@ class TemplateManager:
                 raise ValueError(f"Template name already exists: {name!r}.")
 
     def _write_template(self, template: Template) -> None:
-        self._require_writable_collection()
         payload = template.to_dict()
         target = self._template_path(payload["id"], create_root=True)
         descriptor, temporary_path = tempfile.mkstemp(
@@ -308,9 +301,7 @@ class TemplateManager:
         logger.info("Loaded %d template(s)", len(staged))
 
     def delete_template(self, template_id: str) -> None:
-        self._require_writable_collection()
-        if template_id not in self._templates:
-            raise KeyError(f"Unknown template ID: {template_id!r}.")
+        # Template IDs come from the current selection; the dialogs are modal.
         template_file = self._template_path(template_id)
         if template_file.exists():
             template_file.unlink()
@@ -327,7 +318,7 @@ class TemplateManager:
         return sorted({template.category for template in self._templates.values()})
 
     def search_templates(self, query: str) -> List[Template]:
-        query_lower = str(query).casefold()
+        query_lower = query.casefold()
         return [
             template
             for template in self._templates.values()
@@ -342,14 +333,13 @@ class TemplateManager:
         self,
         name: str,
         source: MechanismAuthoringSource,
-        description: str = "",
-        category: str = "General",
-        tags: Optional[List[str]] = None,
-        author: Optional[str] = None,
+        description: str,
+        category: str,
+        tags: List[str],
+        author: Optional[str],
     ) -> Template:
         """Create a new template; never select or overwrite an existing one."""
 
-        self._require_writable_collection()
         normalized_name = _template_name(name)
         self._assert_available_name(normalized_name)
         template = Template(
@@ -357,7 +347,7 @@ class TemplateManager:
             name=normalized_name,
             description=description,
             category=category,
-            tags=[] if tags is None else list(tags),
+            tags=list(tags),
             reactions_text=source.reactions_text,
             created_at=datetime.now().isoformat(),
             modified_at=datetime.now().isoformat(),
@@ -372,33 +362,26 @@ class TemplateManager:
         self,
         template_id: str,
         *,
-        name: object = _UNSET,
-        source: object = _UNSET,
-        description: object = _UNSET,
-        category: object = _UNSET,
-        tags: object = _UNSET,
-        author: object = _UNSET,
+        name: str,
+        source: MechanismAuthoringSource,
+        description: str,
+        category: str,
+        tags: List[str],
+        author: Optional[str],
     ) -> Template:
         """Update fields of one existing template while preserving its ID."""
 
-        self._require_writable_collection()
-        current = self._templates.get(template_id)
-        if current is None:
-            raise KeyError(f"Unknown template ID: {template_id!r}.")
+        current = self._templates[template_id]
         candidate = Template(
             id=current.id,
-            name=current.name if name is _UNSET else name,
-            description=current.description if description is _UNSET else description,
-            category=current.category if category is _UNSET else category,
-            tags=current.tags if tags is _UNSET else tags,
-            reactions_text=(
-                current.reactions_text
-                if source is _UNSET
-                else source.reactions_text
-            ),
+            name=name,
+            description=description,
+            category=category,
+            tags=tags,
+            reactions_text=source.reactions_text,
             created_at=current.created_at,
             modified_at=datetime.now().isoformat(),
-            author=current.author if author is _UNSET else author,
+            author=author,
         )
         self._assert_available_name(candidate.name, except_template_id=current.id)
         self._write_template(candidate)
@@ -406,15 +389,11 @@ class TemplateManager:
         logger.info("Updated template: %s", candidate.id)
         return candidate
 
-    def replace_template(self, template_id: str, template: Template) -> Template:
+    def replace_template(self, template: Template) -> Template:
         """Replace one existing template with a complete same-ID value."""
 
-        self._require_writable_collection()
-        if template_id not in self._templates:
-            raise KeyError(f"Unknown template ID: {template_id!r}.")
+        template_id = template.id
         candidate = template
-        if candidate.id != template_id:
-            raise ValueError("Replacement template must retain the target stable ID.")
         self._assert_available_name(candidate.name, except_template_id=template_id)
         self._write_template(candidate)
         self._templates[template_id] = candidate

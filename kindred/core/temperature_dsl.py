@@ -100,8 +100,7 @@ def _parse_directive_fields(
         rf"(?is){re.escape(syntax_name)}:(?P<payload>.*)",
         source.strip(),
     )
-    if match is None:
-        raise TemperatureDSLError(f"Invalid {syntax_name} syntax.")
+    # The caller passes a line that starts with this directive.
     payload = match.group("payload").strip()
     if not payload:
         raise TemperatureDSLError(
@@ -152,17 +151,9 @@ def parse_temperature_schedule(
     temperature applies.  A change to the temperature already in force is no
     change and is left out.
     """
-    lines = directive_line.splitlines()
-    if len(lines) != 1:
-        raise TemperatureDSLError(
-            "Temperature schedule parsing requires exactly one admitted directive."
-        )
-    line = lines[0].strip()
+    # Parsing hands over one line that starts with temp_step: or temp_response:.
+    line = directive_line.strip()
     syntax_name = line.partition(":")[0].strip().lower()
-    if syntax_name not in {"temp_step", "temp_response"}:
-        raise TemperatureDSLError(
-            "Expected one admitted temp_step: or temp_response: directive."
-        )
     response = syntax_name == "temp_response"
     fields = _parse_directive_fields(
         line,

@@ -48,12 +48,8 @@ class NumericValueEdit(QtWidgets.QLineEdit):
 class FineDragSlider(QtWidgets.QSlider):
     """Keep native slider signals while attenuating Fine pointer movement."""
 
-    def __init__(
-        self,
-        orientation: QtCore.Qt.Orientation,
-        parent: QtWidgets.QWidget | None = None,
-    ) -> None:
-        super().__init__(orientation, parent)
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(QtCore.Qt.Orientation.Horizontal, parent)
         # Observe a missing release when the pointer returns without a button.
         self.setMouseTracking(True)
         self._fine_mode = False
@@ -101,10 +97,7 @@ class FineDragSlider(QtWidgets.QSlider):
         event.ignore()
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        if (
-            event.button() == QtCore.Qt.MouseButton.LeftButton
-            and self.orientation() == QtCore.Qt.Orientation.Horizontal
-        ):
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
             option, groove, handle, span = self._slider_geometry()
             if not handle.contains(event.position().toPoint()):
                 position = int(

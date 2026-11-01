@@ -82,7 +82,7 @@ def _step_coefficient_names(
     """Each step's kind, the step, its step-map entry, and its forward and
     reverse coefficient names, reactions first, as the topology orders them."""
 
-    entries = {(entry["kind"], int(entry["reaction_index" if entry["kind"] == "reaction" else "equilibrium_index"])): entry
+    entries = {(entry["kind"], entry["reaction_index" if entry["kind"] == "reaction" else "equilibrium_index"]): entry
                for entry in get_step_index_map(mechanism)}
     steps = []
     for kind, members in (("reaction", mechanism.reactions), ("equilibrium", mechanism.equilibria)):

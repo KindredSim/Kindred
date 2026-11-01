@@ -82,25 +82,18 @@ class InterventionScheduleError(AuthoredSourceError):
         details: Mapping[str, Any] | None = None,
     ) -> None:
         """Retain producer-owned location facts."""
-        normalized_field_identities = tuple(
-            (int(declaration), None if nested is None else int(nested), str(path))
-            for declaration, nested, path in field_identities
-        )
-        object.__setattr__(self, "operation", None if operation is None else str(operation))
-        object.__setattr__(
-            self,
-            "declaration_ordinal",
-            None if declaration_ordinal is None else int(declaration_ordinal),
-        )
-        object.__setattr__(self, "field", None if field is None else str(field))
-        object.__setattr__(self, "domain", None if domain is None else str(domain))
-        object.__setattr__(self, "field_identities", normalized_field_identities)
+        # Every raise site passes typed facts.
+        object.__setattr__(self, "operation", operation)
+        object.__setattr__(self, "declaration_ordinal", declaration_ordinal)
+        object.__setattr__(self, "field", field)
+        object.__setattr__(self, "domain", domain)
+        object.__setattr__(self, "field_identities", tuple(field_identities))
         object.__setattr__(
             self,
             "_extra_details",
             _freeze_schedule_value(details or {}),
         )
-        super().__init__(str(message))
+        super().__init__(message)
 
     @property
     def details(self) -> Mapping[str, Any]:
@@ -200,7 +193,7 @@ def _finite(value: object, *, field: str) -> float:
 def _nonnegative(value: object, *, field: str) -> float:
     try:
         return validate_input_time_seconds(value, field=field)
-    except (TypeError, ValueError) as exc:
+    except ValueError as exc:
         raise InterventionScheduleError(str(exc)) from exc
 
 
@@ -214,7 +207,7 @@ def _positive(value: object, *, field: str) -> float:
 def _concentration(value: object, *, field: str) -> float:
     try:
         return validate_concentration(value, field=field)
-    except (TypeError, ValueError) as exc:
+    except ValueError as exc:
         raise InterventionScheduleError(str(exc)) from exc
 
 
@@ -319,7 +312,7 @@ def _put_pair(
     parameter: str | None,
 ) -> None:
     if parameter is None:
-        payload[field] = float(value if value is not None else 0.0)
+        payload[field] = float(value)
     else:
         payload[f"{field}_param"] = parameter
 
@@ -445,7 +438,7 @@ class InterventionPhysical:
     def clock_fields(self) -> tuple[str, ...]:
         return ("start_time", "end_time") if self.op == "flux" else ("time",)
 
-    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> InterventionPhysical:
+    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str]) -> InterventionPhysical:
         updates = {}
         for field in self.clock_fields:
             updates[field] = _resolved(getattr(self, field), getattr(self, field + "_param"), values, field=field, domain="nonnegative")
@@ -481,11 +474,6 @@ class InterventionSet:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "species", _name(self.species, field="species"))
-        object.__setattr__(
-            self,
-            "declaration_ordinal",
-            self.declaration_ordinal,
-        )
         time, time_param = _pair(
             self.time, self.time_param, field="time", domain="nonnegative"
         )
@@ -501,7 +489,7 @@ class InterventionSet:
     def op(self) -> str:
         return "set"
 
-    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> "InterventionSet":
+    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str]) -> "InterventionSet":
         return InterventionSet(
             species=self.species,
             time=_resolved(
@@ -535,11 +523,6 @@ class InterventionJump:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "species", _name(self.species, field="species"))
-        object.__setattr__(
-            self,
-            "declaration_ordinal",
-            self.declaration_ordinal,
-        )
         time, time_param = _pair(
             self.time, self.time_param, field="time", domain="nonnegative"
         )
@@ -555,7 +538,7 @@ class InterventionJump:
     def op(self) -> str:
         return "jump"
 
-    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> "InterventionJump":
+    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str]) -> "InterventionJump":
         return InterventionJump(
             species=self.species,
             time=_resolved(
@@ -591,11 +574,6 @@ class InterventionFlux:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "species", _name(self.species, field="species"))
-        object.__setattr__(
-            self,
-            "declaration_ordinal",
-            self.declaration_ordinal,
-        )
         for field, domain in (
             ("start_time", "nonnegative"),
             ("end_time", "nonnegative"),
@@ -622,7 +600,7 @@ class InterventionFlux:
     def op(self) -> str:
         return "flux"
 
-    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> "InterventionFlux":
+    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str]) -> "InterventionFlux":
         start_time = _resolved(
             self.start_time,
             self.start_time_param,
@@ -681,11 +659,6 @@ class InterventionHold:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "species", _name(self.species, field="species"))
-        object.__setattr__(
-            self,
-            "declaration_ordinal",
-            self.declaration_ordinal,
-        )
         for field in ("start_time", "end_time", "value"):
             value, parameter = _pair(
                 getattr(self, field),
@@ -708,7 +681,7 @@ class InterventionHold:
     def op(self) -> str:
         return "hold"
 
-    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> "InterventionHold":
+    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str]) -> "InterventionHold":
         start_time = _resolved(
             self.start_time,
             self.start_time_param,
@@ -798,7 +771,7 @@ class InterventionProtocolOperation:
             object.__setattr__(self, f"{field}_param", parameter)
 
     def resolve_parameters(
-        self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()
+        self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str]
     ) -> "InterventionProtocolOperation":
         if self.physical is not None:
             return self
@@ -854,11 +827,6 @@ class InterventionProtocol:
         object.__setattr__(self, "start_time_param", start_time_param)
         object.__setattr__(self, "every", _positive(self.every, field="every"))
         object.__setattr__(self, "count", _positive_int(self.count, field="count"))
-        object.__setattr__(
-            self,
-            "declaration_ordinal",
-            self.declaration_ordinal,
-        )
         for phase in ("before", "during", "after"):
             object.__setattr__(self, phase, tuple(getattr(self, phase)))
         if not self.before and not self.during and not self.after:
@@ -883,7 +851,7 @@ class InterventionProtocol:
     def kind(self) -> str:
         return "repeat"
 
-    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> "InterventionProtocol":
+    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str]) -> "InterventionProtocol":
         resolved_phases: dict[str, tuple[InterventionProtocolOperation, ...]] = {}
         for phase in ("before", "during", "after"):
             resolved_phases[phase] = tuple(
@@ -957,7 +925,7 @@ class InterventionTriggerAction:
         object.__setattr__(self, f"{selected}_param", parameter)
 
     def resolve_parameters(
-        self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()
+        self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str]
     ) -> "InterventionTriggerAction":
         if self.physical is not None:
             return self
@@ -1011,7 +979,7 @@ class InterventionStopAction:
     def op(self) -> str:
         return "stop"
 
-    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> InterventionStopAction:
+    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str]) -> InterventionStopAction:
         return self
 
     def to_payload(self) -> dict[str, str]:
@@ -1051,7 +1019,7 @@ class InterventionTrigger:
     def op(self) -> str:
         return "trigger"
 
-    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> InterventionTrigger:
+    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str]) -> InterventionTrigger:
         then = self.then.resolve_parameters(values, runtime_parameters=runtime_parameters)
         return replace(
             self, then=then,
@@ -1136,11 +1104,11 @@ class InterventionSchedule:
 
     def resolve_parameters(
         self,
-        parameter_values: Mapping[str, Any] | None,
+        parameter_values: Mapping[str, Any],
         *,
-        runtime_parameters: frozenset[str] = frozenset(),
+        runtime_parameters: frozenset[str],
     ) -> "InterventionSchedule":
-        values = dict(parameter_values or {})
+        values = dict(parameter_values)
         resolved: list[InterventionOperation] = []
         for item in self.operations:
             try:
@@ -1788,12 +1756,12 @@ def intervention_schedule_parameter_dependencies(
             "jump": ("time", "delta"),
             "flux": ("start_time", "end_time", "flux_rate"),
             "hold": ("start_time", "end_time", "value"),
-        }.get(operation.op, ()):
+        }[operation.op]:
             add(
                 declaration,
                 None,
                 field,
-                getattr(operation, f"{field}_param", None),
+                getattr(operation, f"{field}_param"),
             )
     return MappingProxyType(dict(dependencies))
 

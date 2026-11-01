@@ -46,17 +46,17 @@ def fit_global(
     *,
     fit_evaluators: Mapping[str, object],
     datasets: Sequence[FitDatasetSpec],
-    dataset_overrides: Sequence[FitDatasetParameterOverrides] = (),
+    dataset_overrides: Sequence[FitDatasetParameterOverrides],
     weights: Optional[Mapping[str, float]] = None,
     method: str,
-    max_nfev: int = 1000,
+    max_nfev: int,
     ftol: float,
     xtol: float,
     seed: Optional[int] = None,
     progress_callback: Callable[[_fit_execution.FitProgress], None],
     search_evaluations_callback: Callable[[int], None],
-    cancellation_check: Optional[Callable[[], bool]] = None,
-    cancellation_control: SimulationCancellationControl | None = None,
+    cancellation_check: Callable[[], bool],
+    cancellation_control: SimulationCancellationControl,
     stop_check: Callable[[], bool],
     starting_facts: tuple[_fit_execution.DatasetFitInfo, ...],
     profile_likelihood: ProfileLikelihoodConfig | None = None,
@@ -98,19 +98,13 @@ def fit_global(
     penalty_value = 1e6
 
     def hard_cancelled() -> bool:
-        return bool(
-            (cancellation_check is not None and cancellation_check())
-            or (cancellation_control is not None and cancellation_control.cancel_requested())
-        )
+        return cancellation_check() or cancellation_control.cancel_requested()
 
     def active_cancelled() -> bool:
         return hard_cancelled() or stop_check()
 
     active_control = SimulationCancellationControl(
-        lambda: bool(
-            (cancellation_control is not None and cancellation_control.cancel_requested())
-            or stop_check()
-        )
+        lambda: cancellation_control.cancel_requested() or stop_check()
     )
     def new_objective(
         progress: Optional[Callable[[_fit_execution.FitProgress], None]] = None,

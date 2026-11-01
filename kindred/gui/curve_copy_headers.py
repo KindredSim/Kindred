@@ -10,10 +10,9 @@ def observable_copy_definitions(
     """Project direct authored expressions from the result's admitted model."""
 
     spec = prepared_dsl.parameter_algebra_spec_for_execution()
-    block = spec.observable_block
-    return () if block is None else tuple(
+    return tuple(
         (statement.name, expression_to_source(statement.expr))
-        for statement in block.lines
+        for statement in spec.observable_block.lines
     )
 
 

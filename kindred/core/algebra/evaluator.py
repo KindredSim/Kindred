@@ -85,12 +85,6 @@ class EvaluationContext:
     symtab : SymbolTable
         Protected symbols. `T` is read-only and may be updated by the
         application, not by user algebra.
-    symbol_series : mapping, optional
-        Row-aligned runtime symbols.  These values are resolved before the
-        static symbol table and are intended for step-local ``T``, mechanism
-        coefficients, and changing scalar inputs; ``t`` is read from ``t``.  A scalar value
-        is broadcast to the supplied grid; an array must have exactly the
-        same length as ``t``.
     symbol_values : mapping, optional
         Already evaluated static symbols. Missing scientific symbols can be
         resolved on first use inside the consuming observable's error boundary.
@@ -107,7 +101,6 @@ class EvaluationContext:
     species_series: Mapping[str, np.ndarray]
     initials: Mapping[str, float]
     symtab: SymbolTable
-    symbol_series: Mapping[str, np.ndarray] = field(default_factory=dict)
     symbol_values: Mapping[str, float] = field(default_factory=dict)
     symbol_resolver: Callable[[str, int], float | None] | None = None
     runtime_symbol_names: frozenset[str] = frozenset()
@@ -281,19 +274,13 @@ class _Compiler:
             if name == "t":
                 self.emit(f"{r} = float({self.const(ev.ctx.t)}[i])", ind)
                 return r, "f"
-            if name in ev.symbol_series:
-                self.emit(f"{r} = float({self.const(ev.symbol_series[name])}[i])", ind)
-                return r, "f"
             self.emit(f"{r} = {self.const(ev._lookup)}({name!r}, i, {self.const(stmt)})", ind)
             return r, "f"
         if isinstance(node, SpeciesRefNode):
             nm = node.name
             if node.kind == "now" and self.point is not None:
-                unknown = self.err(AlgebraNameError, f'Unknown species {nm!r}.')
-                if nm not in self.point.species_names:
-                    self.emit(f"{unknown}()", ind)
-                    return "0.0", "f"
-                self.emit(f"if y is None: {unknown}()", ind)
+                # Admission refused unknown species, and a current
+                # concentration always makes its row dynamic, so y is given.
                 self.emit(f"{r} = float(y[{self.point.species_names.index(nm)}])", ind)
                 return r, "f"
             if node.kind == "now":
@@ -352,10 +339,8 @@ class _Compiler:
                 self.emit(f"{r} = {lv} {op} {rv}", ind)
                 return r, "b"
         if isinstance(node, CallNode):
-            fn = ev.ctx.symtab.functions().get(node.name)
-            if fn is None:
-                self.emit(f"{self.err(AlgebraNameError, f'Unknown function {node.name!r}.')}()", ind)
-                return "0.0", "f"
+            # Admission refused unknown functions.
+            fn = ev.ctx.symtab.functions()[node.name]
             if node.name == "ifelse":
                 c, _ = self.expr(node.args[0], ind)
                 self.emit(f"if bool({c}):", ind)
@@ -377,8 +362,6 @@ class _Compiler:
             self.emit(f"{self.const(self._domain)}(e)", ind + 1)
             self.finite(r, ind, message)
             return r, "f"
-        self.emit(f"{self.err(AlgebraError, 'internal evaluator error', code='E150')}()", ind)
-        return "0.0", "f"
 
     def _domain(self, e: ValueError) -> None:
         stmt = self.stmt
@@ -433,15 +416,9 @@ class _Evaluator:
         self.ctx = ctx
         self.literal_reader = literal_reader
         self.N = int(ctx.t.size)
-        self.symbol_series: Dict[str, np.ndarray] = {}
-        for name, values in (ctx.symbol_series or {}).items():
-            arr = np.asarray(values, dtype=float)
-            if arr.ndim == 0:
-                arr = np.full(self.N, float(arr), dtype=float)
-            self.symbol_series[str(name)] = arr.reshape(-1)
         self.symbol_values: Dict[str, float] = {
             str(name): float(value)
-            for name, value in (ctx.symbol_values or {}).items()
+            for name, value in ctx.symbol_values.items()
         }
         # results
         self.series: Dict[str, np.ndarray] = {}
@@ -451,7 +428,7 @@ class _Evaluator:
         # dependency classification for user-defined symbols
         # Runtime row-aligned symbols are dynamic roots even when their values
         # happen to be constant over one particular grid.
-        self.timevary: Set[str] = {"t"} | set(self.symbol_series) | set(ctx.runtime_symbol_names)
+        self.timevary: Set[str] = {"t"} | set(ctx.runtime_symbol_names)
 
     def _scalar_let_names(self) -> Set[str]:
         """Classify the complete retained let DAG by row dependence.

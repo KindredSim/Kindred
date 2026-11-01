@@ -59,8 +59,9 @@ class _DatasetSelector(QtWidgets.QComboBox):
         self.setMaxVisibleItems(12)
 
     def showPopup(self):
-        text_width = max((self.fontMetrics().horizontalAdvance(self.itemText(i))
-                          for i in range(self.count())), default=0)
+        # The selector is hidden while there are no datasets.
+        text_width = max(self.fontMetrics().horizontalAdvance(self.itemText(i))
+                         for i in range(self.count()))
         self.view().setMinimumWidth(min(
             max(self.width(), text_width + 40),
             self.screen().availableGeometry().width() - 24,
@@ -130,6 +131,8 @@ class _MappingField(QtWidgets.QWidget):
 class _DatasetName(QtWidgets.QLabel):
     """Show a compact name while keeping its full text available."""
 
+    _name = ""
+
     def set_name(self, name: str) -> None:
         self._name = name
         self.setTextFormat(Qt.PlainText)
@@ -139,7 +142,7 @@ class _DatasetName(QtWidgets.QLabel):
 
     def _elide(self) -> None:
         self.setText(self.fontMetrics().elidedText(
-            getattr(self, "_name", ""), Qt.ElideRight, self.contentsRect().width()
+            self._name, Qt.ElideRight, self.contentsRect().width()
         ))
 
     def resizeEvent(self, event):
@@ -202,7 +205,7 @@ class _SourceDialog(QtWidgets.QDialog):
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
-        units = metadata.get("original_concentration_units", {}) if metadata is not None else {}
+        units = metadata["original_concentration_units"] if source is not None else {}
         table.setItemDelegateForColumn(table.columnCount() - 1, ScientificNameDelegate(table))
         for row, series in enumerate(record.observations):
             converted, markup = data_unit_labels(series.unit)
@@ -420,7 +423,6 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._visible_records_by_id: Dict[str, RawDatasetRecord] = {}
         self._mechanism_name = ""
         self._mapping_available = False
-        self._import_busy = False
         self._update_mapping_area()
 
     def set_creation_busy(self, busy: bool) -> None:
@@ -432,9 +434,8 @@ class DataManagerPanel(QtWidgets.QWidget):
             button.setEnabled(self.import_action.isEnabled())
 
     def _show_source(self) -> None:
-        record = self._visible_records_by_id.get(self._selected_dataset_id())
-        if record is None:
-            return
+        # Its button is enabled only with a selected dataset.
+        record = self._visible_records_by_id[self._selected_dataset_id()]
         selector = self._dataset_selector
         dialog = _SourceDialog(record, selector.currentData(Qt.UserRole + 2), self)
         try:
@@ -446,14 +447,14 @@ class DataManagerPanel(QtWidgets.QWidget):
         self,
         icon: QtWidgets.QMessageBox.Icon,
         title: str,
-        message: object,
+        message: str,
     ) -> None:
         """Show one literal message, including messages containing markup."""
         box = QtWidgets.QMessageBox(self)
         box.setIcon(icon)
-        box.setWindowTitle(str(title))
+        box.setWindowTitle(title)
         box.setTextFormat(QtCore.Qt.TextFormat.PlainText)
-        box.setText(str(message))
+        box.setText(message)
         box.exec()
 
     # ------------------------------------------------------------------
@@ -468,9 +469,10 @@ class DataManagerPanel(QtWidgets.QWidget):
         selected_id = self._selected_dataset_id()
         previous_row = self._dataset_selector.currentIndex()
         self._snapshot = snapshot
-        tab = document.tab(snapshot.active_tab_id) if snapshot.active_tab_id is not None else None
-        self._mechanism_name = tab.name if tab is not None else ""
-        self._mapping_available = tab is not None and bool(canonical_observation_target_names(tab))
+        # Rendered snapshots always name the panel's tab.
+        tab = document.tab(snapshot.active_tab_id)
+        self._mechanism_name = tab.name
+        self._mapping_available = bool(canonical_observation_target_names(tab))
         self._visible_records_by_id = {record.dataset_id: record for record in snapshot.datasets}
         blocker = QtCore.QSignalBlocker(self._dataset_selector)
         self._dataset_selector.clear()
@@ -493,8 +495,7 @@ class DataManagerPanel(QtWidgets.QWidget):
 
     def _load_dataset(self):
         """Load dataset(s) using per-file import configuration."""
-        if self._import_busy:
-            return
+        # The import action is disabled while an import runs.
         filenames, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self,
             "Load Dataset(s)",
@@ -511,7 +512,7 @@ class DataManagerPanel(QtWidgets.QWidget):
                 sources.append(capture_import_source(filepath))
             except (OSError, ValueError) as exc:
                 # The rejection list names the file.
-                rejected_sources.append((str(filepath), file_error_text(exc, None)))
+                rejected_sources.append((filepath, file_error_text(exc, None)))
 
         if rejected_sources:
             rejection_details = "\n\n".join(
@@ -539,9 +540,7 @@ class DataManagerPanel(QtWidgets.QWidget):
             if result.action == "skip":
                 index += 1
                 continue
-            if result.config is None:
-                index += 1
-                continue
+            # An "import" result always carries its config.
             configs.append(result.config)
             source_settings = result.config.remaining_file_template
             if source_settings is not None:
@@ -606,7 +605,7 @@ class DataManagerPanel(QtWidgets.QWidget):
         source: ImportedSource,
         source_settings: ImportSettings,
         *,
-        source_sheet_names: Tuple[str, ...] = (),
+        source_sheet_names: Tuple[str, ...],
     ) -> ImportConfig:
         """Resolve shared choices against each remaining source's first row."""
         plans = []
@@ -646,8 +645,7 @@ class DataManagerPanel(QtWidgets.QWidget):
 
     def set_import_busy(self, busy: bool) -> None:
         """Project application-global import custody onto every import entry."""
-        self._import_busy = bool(busy)
-        self.import_action.setEnabled(not self._import_busy)
+        self.import_action.setEnabled(not busy)
 
     def _remove_dataset(self):
         """Emit one global-delete intent; confirmation belongs to integration."""
@@ -665,17 +663,15 @@ class DataManagerPanel(QtWidgets.QWidget):
 
     def _rename_dataset(self) -> None:
         dataset_id = self._selected_dataset_id()
-        record = self._visible_records_by_id.get(dataset_id)
-        if record is None:
-            return
+        record = self._visible_records_by_id[dataset_id]
         value, accepted = QtWidgets.QInputDialog.getText(
             self,
             "Rename Dataset",
             "Dataset name:",
-            text=str(record.display_name),
+            text=record.display_name,
         )
         if accepted:
-            self.datasetRenameRequested.emit(dataset_id, str(value))
+            self.datasetRenameRequested.emit(dataset_id, value)
 
     def _on_dataset_selected(self, index):
         record = self._visible_records_by_id.get(self._selected_dataset_id())
@@ -695,7 +691,7 @@ class DataManagerPanel(QtWidgets.QWidget):
         return self._dataset_selector.currentData() or ""
 
     def _active_link(self, dataset_id: str) -> ActiveDatasetLinkSnapshot | None:
-        return self._snapshot.link_by_dataset_id().get(str(dataset_id))
+        return self._snapshot.link_by_dataset_id().get(dataset_id)
 
     def _update_mapping_area(self) -> None:
         dataset_id = self._selected_dataset_id()
@@ -715,11 +711,9 @@ class DataManagerPanel(QtWidgets.QWidget):
         total = len(record.observations) if record else 0
         assigned = sum(series.raw_observation_id in mapped_ids for series in record.observations) if record else 0
         self._observation_value.setText(f"{assigned} of {total} mapped")
-        self._tab_name.set_name(self._mechanism_name or "No active mechanism")
+        self._tab_name.set_name(self._mechanism_name)
         self._mapping_status.setVisible(not self._mapping_available)
-        if not self._mechanism_name:
-            self._mapping_status.setText("No active mechanism. Datasets remain available. Select a mechanism to assign data.")
-        elif not self._mapping_available:
+        if not self._mapping_available:
             self._mapping_status.setText("Apply a valid mechanism with observation targets to assign data.")
         else:
             self._mapping_status.clear()
@@ -736,7 +730,7 @@ class DataManagerPanel(QtWidgets.QWidget):
             return
         self.datasetMappingRequested.emit(
             dataset_id,
-            str(action),
+            action,
             set_id,
             occupied_choice,
         )

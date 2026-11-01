@@ -114,8 +114,6 @@ class AdvancedFittingLesson(PracticeLesson):
         everything = {record.dataset_id for record in document.datasets}
         active = self.registry.active_tab_id
         for identity in sorted((tab.tab_id for tab in document.tabs), key=lambda identity: identity != active):
-            if identity not in self.surfaces:
-                continue
             # A candidate is read as the practice tab, with the datasets mapped to it as the ones
             # the setup imported.
             self.practice = identity
@@ -214,18 +212,15 @@ class AdvancedFittingLesson(PracticeLesson):
         found = self._workbook()
         tab = self.tab if tab is None else tab
         sets = {item.set_id: item for item in tab.initial_condition_sets}
-        used = set()
         for run, dataset_id in found.items():
             link = tab.dataset_link(dataset_id)
             if (
                 link is None
                 or link.set_id not in sets
-                or link.set_id in used
                 or dict(link.observation_mapping) != self._expected_mapping(dataset_id)
                 or not self._starts_from(dict(sets[link.set_id].values), run)
             ):
                 return False
-            used.add(link.set_id)
         return bool(found)
 
     def _fit_window(self) -> FittingWindow | None:
@@ -266,15 +261,16 @@ class AdvancedFittingLesson(PracticeLesson):
 
     def _datasets(self) -> set[str]:
         """The datasets of the sheets the lesson fits."""
+        # Mapped and fit steps require the workbook.
         found = self._workbook()
-        return {found[sheet] for sheet in self._sheets} if found else set()
+        return {found[sheet] for sheet in self._sheets}
 
     def _included_only(self) -> bool:
         """The open Fitting Window includes exactly the datasets the lesson fits."""
-        window = self._fit_window()
-        datasets = None if window is None else window.findChild(QtWidgets.QListWidget, "global_fit_unified_dataset_list")
+        # Fit-step checks run only while the window is open (or after Apply short-circuits them).
+        datasets = self._fit_window().findChild(QtWidgets.QListWidget, "global_fit_unified_dataset_list")
         wanted = self._datasets()
-        if datasets is None or not wanted:
+        if not wanted:
             return False
         checked = {
             item.data(QtCore.Qt.ItemDataRole.UserRole)
@@ -289,8 +285,8 @@ class AdvancedFittingLesson(PracticeLesson):
         at a time, and only that one can be changed or copied to the others."""
         datasets = window.findChild(QtWidgets.QListWidget, "global_fit_unified_dataset_list")
         table = window.findChild(QtWidgets.QTableWidget, "global_fit_unified_species_table")
-        current = None if datasets is None else datasets.currentItem()
-        if current is None or table is None:
+        current = datasets.currentItem()
+        if current is None:
             return None
         headers = [table.horizontalHeaderItem(column).text() for column in range(table.columnCount())]
         include, species, vary, lower, shared = (
@@ -300,21 +296,20 @@ class AdvancedFittingLesson(PracticeLesson):
         def checked(row: int, column: int) -> bool:
             item = table.item(row, column)
             return (
-                item is not None
-                and bool(item.flags() & QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                bool(item.flags() & QtCore.Qt.ItemFlag.ItemIsUserCheckable)
                 and item.checkState() == QtCore.Qt.CheckState.Checked
             )
 
         rows = {}
         for row in range(table.rowCount()):
+            # Every species row has all its cells and a Vary IC combo.
             name, choice, bound = table.item(row, species), table.cellWidget(row, vary), table.item(row, lower)
-            if name is not None:
-                rows[name.text()] = _Row(
-                    checked(row, include),
-                    choice.currentData() if isinstance(choice, QtWidgets.QComboBox) else None,
-                    "" if bound is None else bound.text(),
-                    checked(row, shared),
-                )
+            rows[name.text()] = _Row(
+                checked(row, include),
+                choice.currentData(),
+                bound.text(),
+                checked(row, shared),
+            )
         return current.data(QtCore.Qt.ItemDataRole.UserRole), rows
 
     def _targets_chosen(self) -> bool:
@@ -326,22 +321,19 @@ class AdvancedFittingLesson(PracticeLesson):
             for dataset in datasets
         )
 
-    def _roster_table(self) -> QtWidgets.QTableWidget | None:
-        window = self._fit_window()
-        return None if window is None else window.findChild(QtWidgets.QTableWidget, "fit_parameter_roster")
+    def _roster_table(self) -> QtWidgets.QTableWidget:
+        return self._fit_window().findChild(QtWidgets.QTableWidget, "fit_parameter_roster")
 
     def _roster(self) -> dict[str, dict[str, QtWidgets.QTableWidgetItem]]:
         """Parameter -> its row of the open Fitting Window's parameter table, by column title."""
         roster = self._roster_table()
-        if roster is None:
-            return {}
         headers = [roster.horizontalHeaderItem(column).text() for column in range(roster.columnCount())]
         rows = {}
         for row in range(roster.rowCount()):
             cells = {header: roster.item(row, column) for column, header in enumerate(headers)}
             name = cells["Parameter"]
             # Rows of single datasets follow their parameter row.
-            if name is not None and name.data(QtCore.Qt.ItemDataRole.UserRole + 1) is None:
+            if name.data(QtCore.Qt.ItemDataRole.UserRole + 1) is None:
                 rows[name.data(QtCore.Qt.ItemDataRole.UserRole)] = cells
         return rows
 
@@ -350,7 +342,7 @@ class AdvancedFittingLesson(PracticeLesson):
         roster = self._roster()
         varied = {
             name for name, cells in roster.items()
-            if cells["Vary"] is not None and cells["Vary"].checkState() == QtCore.Qt.CheckState.Checked
+            if cells["Vary"].checkState() == QtCore.Qt.CheckState.Checked
         }
         return bool(roster) and varied == set(self._fitted if names is None else names)
 
@@ -362,11 +354,10 @@ class AdvancedFittingLesson(PracticeLesson):
     def _fit_result(self) -> bool:
         """The open Fitting Window has a current result to apply. Changing the fit setup makes the
         shown result stale until the fit runs again."""
-        window = self._fit_window()
-        apply = None if window is None else self._shown(
-            window, QtWidgets.QPushButton, lambda button: button.text().replace("&", "") == "Apply Fit"
+        apply = self._shown(
+            self._fit_window(), QtWidgets.QPushButton, lambda button: button.text().replace("&", "") == "Apply Fit"
         )
-        return apply is not None and apply.isEnabled()
+        return apply.isEnabled()
 
     def _final_setup(self) -> bool:
         """The open Fitting Window holds the setup whose result the lesson applies to a tab copy."""
@@ -559,7 +550,7 @@ class BoundsAndSolvers(AdvancedFittingLesson):
         def widened(cells) -> bool:
             try:
                 minimum, maximum = float(cells["Minimum"].text()), float(cells["Maximum"].text())
-            except (AttributeError, ValueError):
+            except ValueError:
                 return False
             return (
                 isclose(minimum, 1e-4)
@@ -572,14 +563,14 @@ class BoundsAndSolvers(AdvancedFittingLesson):
     def _de_chosen(self) -> bool:
         """The open Fitting Window uses Differential Evolution with at least the lesson's evaluations."""
         window = self._fit_window()
-        method = None if window is None else window.findChild(QtWidgets.QComboBox, "global_fit_method")
+        method = window.findChild(QtWidgets.QComboBox, "global_fit_method")
         # The label stays found while another page of the window is shown.
-        label = None if window is None else next(
-            (label for label in window.findChildren(QtWidgets.QLabel) if label.text() == "Maximum evaluations:"), None
+        label = next(
+            label for label in window.findChildren(QtWidgets.QLabel) if label.text() == "Maximum evaluations:"
         )
         try:
             evaluations = int(label.buddy().text())
-        except (AttributeError, ValueError):
+        except ValueError:
             return False
         # A typed number applies on Enter or focus loss; until then the box is modified.
         return (
@@ -597,7 +588,7 @@ class BoundsAndSolvers(AdvancedFittingLesson):
         button = None if window is None else self._shown(
             window, QtWidgets.QPushButton, lambda button: button.text() == "Set Bounds for Parameters…"
         )
-        if button is not None and button.isVisible():
+        if button is not None:
             return (Highlight(button),)
         return self._parameters_tab()
 
@@ -769,7 +760,6 @@ class CalculatedQuantitiesAndConstraints(AdvancedFittingLesson):
         identity = self.registry.active_tab_id
         if self.reuse is None and (
             identity in self._tabs_before
-            or identity not in self.surfaces
             or self.registry.tab(identity).mechanism_source.reactions_text != self.tab.mechanism_source.reactions_text
             or not self._mapped(self.registry.tab(identity))
         ):
@@ -782,7 +772,7 @@ class CalculatedQuantitiesAndConstraints(AdvancedFittingLesson):
         prepared = self.tab.prepared_dsl
         if prepared is None or prepared.symbolic_equations_text() != _preset_equations(self._preset_name):
             return False
-        values = {item.name: float(item.value) for item in enumerate_parameter_coordinates(prepared)}
+        values = {item.name: item.value for item in enumerate_parameter_coordinates(prepared)}
         dependencies = prepared.parameter_algebra_spec_for_execution().evaluation_dependencies
         return (
             "k2" not in values
@@ -840,7 +830,7 @@ class CalculatedQuantitiesAndConstraints(AdvancedFittingLesson):
         cells = self._roster().get("a")
         try:
             minimum, maximum = float(cells["Minimum"].text()), float(cells["Maximum"].text())
-        except (TypeError, AttributeError, ValueError):
+        except (TypeError, ValueError):
             return False
         return (
             isclose(minimum, 1e-4)
@@ -857,7 +847,7 @@ class CalculatedQuantitiesAndConstraints(AdvancedFittingLesson):
             cells = roster.get(name)
             try:
                 value, result = float(cells["Mechanism Tab Value"].text()), float(cells["Last Fit Result"].text())
-            except (TypeError, AttributeError, ValueError):
+            except (TypeError, ValueError):
                 return False
             return isclose(value, result, rel_tol=1e-5)
 
@@ -880,7 +870,7 @@ class CalculatedQuantitiesAndConstraints(AdvancedFittingLesson):
         button = None if window is None else self._shown(
             window, QtWidgets.QPushButton, lambda button: button.text() == "Set Bounds for Parameters…"
         )
-        if button is not None and button.isVisible():
+        if button is not None:
             return (Highlight(button),)
         return self._parameters_tab()
 
@@ -1057,7 +1047,7 @@ class VaryingInitialConditions(AdvancedFittingLesson):
     def _c_rows(self) -> dict[str, _Row | None]:
         """The C row last seen in each sheet."""
         found = self._workbook()
-        return {sheet: self._rows_seen.get(found.get(sheet), {}).get("C") for sheet in self._sheets}
+        return {sheet: self._rows_seen.get(found[sheet], {}).get("C") for sheet in self._sheets}
 
     def _c_varied(self) -> bool:
         """stock1 and stock3 were last seen varying C by 20% either side of its Starting IC."""
@@ -1169,20 +1159,17 @@ class PerDatasetRateConstants(AdvancedFittingLesson):
     def _k2_rows(self) -> tuple[QtWidgets.QComboBox | None, dict[str, QtWidgets.QTableWidgetItem]]:
         """The Across Datasets choice of k2, and the Across Datasets cell of each dataset row of k2."""
         roster = self._roster_table()
-        if roster is None:
-            return None, {}
         headers = [roster.horizontalHeaderItem(column).text() for column in range(roster.columnCount())]
         parameter, scope = headers.index("Parameter"), headers.index("Across Datasets")
         choice, cells = None, {}
         for row in range(roster.rowCount()):
             name = roster.item(row, parameter)
-            if name is None or name.data(QtCore.Qt.ItemDataRole.UserRole) != "k2":
+            if name.data(QtCore.Qt.ItemDataRole.UserRole) != "k2":
                 continue
             dataset = name.data(QtCore.Qt.ItemDataRole.UserRole + 1)
             if dataset is None:
-                widget = roster.cellWidget(row, scope)
-                choice = widget if isinstance(widget, QtWidgets.QComboBox) else None
-            elif roster.item(row, scope) is not None:
+                choice = roster.cellWidget(row, scope)
+            else:
                 cells[dataset] = roster.item(row, scope)
         return choice, cells
 
@@ -1194,7 +1181,7 @@ class PerDatasetRateConstants(AdvancedFittingLesson):
         """k2runs1 and k2runs2 share one group of k2, and k2runs3 has its own k2."""
         _choice, cells = self._k2_rows()
         found = self._workbook()
-        first, second, third = (cells.get(found.get(sheet)) for sheet in self._sheets)
+        first, second, third = (cells.get(found[sheet]) for sheet in self._sheets)
         if None in (first, second, third):
             return False
 
@@ -1312,15 +1299,13 @@ class ProfileLikelihood(AdvancedFittingLesson):
 
     def _profiled(self, names: tuple[str, ...]) -> bool:
         """Profile Likelihood is on and profiles these values."""
-        window = self._fit_window()
-        check = None if window is None else next(
-            (check for check in window.findChildren(QtWidgets.QCheckBox) if check.text() == "Profile Likelihood"),
-            None,
+        check = next(
+            check for check in self._fit_window().findChildren(QtWidgets.QCheckBox)
+            if check.text() == "Profile Likelihood"
         )
         roster = self._roster()
-        return check is not None and check.isChecked() and all(
+        return check.isChecked() and all(
             name in roster
-            and roster[name]["Profile"] is not None
             and roster[name]["Profile"].checkState() == QtCore.Qt.CheckState.Checked
             for name in names
         )
@@ -1483,8 +1468,8 @@ class FittingAgainstMeasuredQuantity(AdvancedFittingLesson):
             self._x_seen, self._first_fit = {}, {}
         datasets = window.findChild(QtWidgets.QListWidget, "global_fit_unified_dataset_list")
         x = window.findChild(QtWidgets.QComboBox, "global_fit_parametric_x")
-        current = None if datasets is None else datasets.currentItem()
-        if current is not None and x is not None:
+        current = datasets.currentItem()
+        if current is not None:
             self._x_seen[current.data(QtCore.Qt.ItemDataRole.UserRole)] = x.currentData()
         if self.step.name in ("run_fit", "read_warning") and self._against(self._against_int) and self._lesson_fit():
             self._first_fit = self._results()
@@ -1494,7 +1479,7 @@ class FittingAgainstMeasuredQuantity(AdvancedFittingLesson):
         roster = self._roster()
         try:
             return {name: float(roster[name]["Last Fit Result"].text()) for name in self._fitted}
-        except (KeyError, AttributeError, ValueError):
+        except (KeyError, ValueError):
             return {}
 
     def _scaled_fit(self) -> bool:
@@ -1517,7 +1502,7 @@ class FittingAgainstMeasuredQuantity(AdvancedFittingLesson):
     def _compared(self, targets: dict[str, frozenset[str]]) -> bool:
         """Each sheet was last seen comparing exactly its species."""
         found = self._workbook()
-        return bool(found) and all(
+        return all(
             frozenset(species for species, row in self._rows_seen.get(found[sheet], {}).items() if row.included)
             == wanted
             for sheet, wanted in targets.items()

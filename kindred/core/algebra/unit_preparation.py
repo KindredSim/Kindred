@@ -120,9 +120,7 @@ def _children(node):
         return (node.rhs,)
     if isinstance(node, BinaryNode):
         return node.lhs, node.rhs
-    if isinstance(node, CallNode):
-        return node.args
-    raise TypeError(f"Unsupported admitted expression node: {type(node).__name__}")
+    return node.args
 
 
 def _with_children(node, children):
@@ -181,7 +179,7 @@ def _prepare(node, lookup, *, constant_needed=False, authored=False, rules=Mappi
         constant = None
         if constant_needed:
             try:
-                constant = literal_fraction(node.literal if node.literal is not None else str(node.value))
+                constant = literal_fraction(node.literal)
             except ValueError:
                 pass
         return replace(node, quantity_unit=DIMENSIONLESS), constant

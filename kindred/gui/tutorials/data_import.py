@@ -221,7 +221,7 @@ class ImportAndMapData(PracticeLesson):
         """The Y selector above the plot."""
         plot = self.workspace.plot_for_tab(self.tab_id)
         button = self._shown(plot, QtWidgets.QToolButton, lambda button: button.text().startswith("Y:"))
-        return () if button is None else (Highlight(button),)
+        return (Highlight(button),)
 
     def _y_chosen(self) -> bool:
         return self.registry.presentation(self.tab_id).selected_y_series == (

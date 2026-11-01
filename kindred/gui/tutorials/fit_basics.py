@@ -90,7 +90,7 @@ class FittingBasics(PracticeLesson):
 
     # -- observations ----------------------------------------------------------
     def _rates(self) -> dict[str, float]:
-        values = {item.name: float(item.value) for item in enumerate_parameter_coordinates(self.tab.prepared_dsl)}
+        values = {item.name: item.value for item in enumerate_parameter_coordinates(self.tab.prepared_dsl)}
         return {name: values[name] for name in _RATES if name in values}
 
     def _observe_fit(self) -> None:
@@ -148,18 +148,15 @@ class FittingBasics(PracticeLesson):
         found = self._workbook()
         tab = self.tab
         sets = {item.set_id: item for item in tab.initial_condition_sets}
-        used = set()
         for run, dataset_id in found.items():
             link = tab.dataset_link(dataset_id)
             if (
                 link is None
                 or link.set_id not in sets
-                or link.set_id in used
                 or dict(link.observation_mapping) != self._expected_mapping(dataset_id)
                 or dict(sets[link.set_id].values) != {"A": _A0[run], "B": 0.0, "C": 0.0}
             ):
                 return False
-            used.add(link.set_id)
         return bool(found)
 
     def _overlays_shown(self) -> bool:
@@ -183,10 +180,8 @@ class FittingBasics(PracticeLesson):
 
     def _included(self) -> bool:
         """The open Fitting Window includes the three workbook datasets."""
-        window = self._fit_window()
-        datasets = None if window is None else window.findChild(QtWidgets.QListWidget, "global_fit_unified_dataset_list")
-        if datasets is None:
-            return False
+        # Fit steps run their checks only while the window is open.
+        datasets = self._fit_window().findChild(QtWidgets.QListWidget, "global_fit_unified_dataset_list")
         checked = {
             item.data(QtCore.Qt.ItemDataRole.UserRole)
             for item in (datasets.item(row) for row in range(datasets.count()))
@@ -196,27 +191,23 @@ class FittingBasics(PracticeLesson):
 
     def _varied(self) -> bool:
         """The open Fitting Window varies kf1, kr1, and k2, and leaves concentration_floor fixed."""
-        window = self._fit_window()
-        roster = None if window is None else window.findChild(QtWidgets.QTableWidget, "fit_parameter_roster")
-        if roster is None:
-            return False
+        roster = self._fit_window().findChild(QtWidgets.QTableWidget, "fit_parameter_roster")
         headers = [roster.horizontalHeaderItem(column).text() for column in range(roster.columnCount())]
         name_column, vary_column = headers.index("Parameter"), headers.index("Vary")
         varied = {}
         for row in range(roster.rowCount()):
             name, vary = roster.item(row, name_column), roster.item(row, vary_column)
             # Rows of single datasets follow their parameter row.
-            if name is not None and vary is not None and name.data(QtCore.Qt.ItemDataRole.UserRole + 1) is None:
+            if name.data(QtCore.Qt.ItemDataRole.UserRole + 1) is None:
                 varied[name.data(QtCore.Qt.ItemDataRole.UserRole)] = vary.checkState() == QtCore.Qt.CheckState.Checked
         return all(varied.get(name) for name in _RATES) and not varied.get("concentration_floor", False)
 
     def _fit_result(self) -> bool:
         """The open Fitting Window has a current result to apply."""
-        window = self._fit_window()
-        apply = None if window is None else self._shown(
-            window, QtWidgets.QPushButton, lambda button: button.text().replace("&", "") == "Apply Fit"
+        apply = self._shown(
+            self._fit_window(), QtWidgets.QPushButton, lambda button: button.text().replace("&", "") == "Apply Fit"
         )
-        return apply is not None and apply.isEnabled()
+        return apply.isEnabled()
 
     def _ran(self, rates: dict[str, float]) -> bool:
         identities = self._workbook_sets()
@@ -237,7 +228,7 @@ class FittingBasics(PracticeLesson):
         """The Y selector above the plot."""
         plot = self.workspace.plot_for_tab(self.tab_id)
         button = self._shown(plot, QtWidgets.QToolButton, lambda button: button.text().startswith("Y:"))
-        return () if button is None else (Highlight(button),)
+        return (Highlight(button),)
 
     def _run_targets_now(self) -> tuple[Highlight, ...]:
         """Initial Conditions and both Run buttons, once the Fitting Window is closed."""

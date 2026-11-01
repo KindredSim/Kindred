@@ -28,7 +28,7 @@ def validate_tabular_source_bytes(
 ) -> None:
     """Admit exact nonempty bytes for one current CSV or XLSX source."""
 
-    label = str(source_label).strip() or "<dataset>"
+    label = source_label
     if not source_bytes:
         raise ValueError(f"Dataset source {label!r} is empty.")
     signature = source_bytes[:8]
@@ -39,8 +39,7 @@ def validate_tabular_source_bytes(
                 "workbook."
             )
         return
-    if source_format != "csv":
-        raise ValueError(f"Unsupported exact dataset source format {source_format!r}.")
+    # The only caller admits csv or xlsx.
     if signature.startswith(_ZIP_SIGNATURES) or signature.startswith(
         _OLE_SIGNATURE
     ):
@@ -74,10 +73,8 @@ def identify_physical_columns(
 ) -> tuple[PhysicalColumn, ...]:
     """Allocate exact-case collision-safe names by physical source position."""
 
-    authored = tuple(
-        "" if value is None else str(value).strip()
-        for value in headers
-    )
+    # CSV headers are text, and Excel headers are turned into text first.
+    authored = tuple(value.strip() for value in headers)
     # Blank physical positions have no import identity.  Keep their original
     # positions out of the retained catalog; callers still use each retained
     # column's source_index to read the physical row.

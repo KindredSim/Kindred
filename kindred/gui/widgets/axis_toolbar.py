@@ -22,7 +22,7 @@ unitChanged(axis: str, unit: str)
 Public API
 ----------
 set_x_candidates(candidates, *, selected)
-set_y_candidates(candidates, *, locked_checked=None)
+set_y_candidates(candidates, *, locked_checked)
 selected_y() -> tuple[AxisSeriesSelection, ...]
 current_x() -> AxisSeriesSelection
 set_manual_range_controls(*, auto_x: bool, auto_y: bool) -> None
@@ -249,7 +249,7 @@ class AxisToolbar(QtWidgets.QWidget):
         self,
         candidates: Sequence[tuple[AxisSelectionCandidate, bool]],
         *,
-        locked_checked: Mapping[AxisSeriesSelection, str] | None = None,
+        locked_checked: Mapping[AxisSeriesSelection, str],
     ) -> None:
         """
         Populate Y list.
@@ -263,7 +263,7 @@ class AxisToolbar(QtWidgets.QWidget):
             authored Y selection, mapped to their model-series identity.
         """
         values = tuple(candidates)
-        locked_checked_by_identity = dict(locked_checked or {})
+        locked_checked_by_identity = dict(locked_checked)
         self._locked_checked_y = frozenset(locked_checked_by_identity)
 
         self._y_list.blockSignals(True)
@@ -526,8 +526,8 @@ class AxisToolbar(QtWidgets.QWidget):
     # ----------------------- internal wiring -----------------------
 
     def _on_x_changed(self, _index: int) -> None:
-        if self._x_combo.count():
-            self.xChanged.emit(self.current_x())
+        # The combo is cleared only with signals blocked; it always holds t.
+        self.xChanged.emit(self.current_x())
 
     def _on_y_item_changed(self, item: QtWidgets.QListWidgetItem) -> None:
         selection = item.data(Qt.ItemDataRole.UserRole)

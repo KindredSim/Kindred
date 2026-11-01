@@ -41,7 +41,6 @@ class TemplateEditorDialog(QtWidgets.QDialog):
         parent: Optional[QtWidgets.QWidget] = None,
         template: Optional[Template] = None,
         mechanism_source: Optional[MechanismAuthoringSource] = None,
-        operation: str = "create",
     ):
         """
         Initialize template editor dialog.
@@ -57,7 +56,6 @@ class TemplateEditorDialog(QtWidgets.QDialog):
         """
         super().__init__(parent)
         self._is_edit_mode = template is not None
-        self._operation = operation
         self._template_id = template.id if template is not None else None
 
         self.setWindowTitle(
@@ -148,10 +146,9 @@ class TemplateEditorDialog(QtWidgets.QDialog):
         )
         save_button = button_box.button(QtWidgets.QDialogButtonBox.Save)
         self._save_button = save_button
-        if save_button is not None:
-            save_button.setText(
-                "Update" if self._operation == "update" else "Create"
-            )
+        save_button.setText(
+            "Update" if self._is_edit_mode else "Create"
+        )
         button_box.accepted.connect(self._validate_and_request_save)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
@@ -177,13 +174,11 @@ class TemplateEditorDialog(QtWidgets.QDialog):
             self._mechanism_edit.setFocus()
             return
 
-        if self._save_button is not None:
-            self._save_button.setEnabled(False)
+        self._save_button.setEnabled(False)
         try:
             self.saveRequested.emit()
         finally:
-            if self._save_button is not None:
-                self._save_button.setEnabled(True)
+            self._save_button.setEnabled(True)
 
     def get_template_data(self) -> Dict[str, Any]:
         """
@@ -542,13 +537,10 @@ class TemplateManagerDialog(QtWidgets.QDialog):
             self._update_action_availability()
             return
 
+        # The modal manager lists only templates its manager holds.
         template_id = current.data(QtCore.Qt.UserRole)
         self._current_template = self._template_manager.get_template(template_id)
-
-        if self._current_template:
-            self._show_preview(self._current_template)
-        else:
-            self._clear_preview()
+        self._show_preview(self._current_template)
         self._update_action_availability()
 
     def _show_preview(self, template: Template):
@@ -584,7 +576,6 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         dialog = TemplateEditorDialog(
             parent=self,
             mechanism_source=self._current_mechanism_source,
-            operation="create",
         )
 
         dialog.saveRequested.connect(self._save_template_editor)
@@ -592,13 +583,9 @@ class TemplateManagerDialog(QtWidgets.QDialog):
 
     def _on_update_clicked(self):
         """Update one selected template from an admitted source candidate."""
-        if not self._current_template:
-            return
-
         dialog = TemplateEditorDialog(
             parent=self,
             template=self._current_template,
-            operation="update",
         )
 
         dialog.saveRequested.connect(self._save_template_editor)
@@ -608,7 +595,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
     def _save_template_editor(self):
         """Finish an editor only after its admitted draft has been persisted."""
         dialog = cast(TemplateEditorDialog, self.sender())
-        operation = dialog._operation
+        operation = "update" if dialog._is_edit_mode else "create"
         try:
             data = dialog.get_template_data()
             source = self._source_preflight(data["source"])
@@ -638,8 +625,6 @@ class TemplateManagerDialog(QtWidgets.QDialog):
     def _on_replace_clicked(self):
         """Explicitly replace one selected template from the source tab."""
         current = self._current_template
-        if current is None:
-            return
         reply = QtWidgets.QMessageBox.question(
             self,
             "Replace Template",
@@ -661,10 +646,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
                 reactions_text=admitted_source.reactions_text,
                 modified_at=datetime.now().isoformat(),
             )
-            template = self._template_manager.replace_template(
-                current.id,
-                candidate,
-            )
+            template = self._template_manager.replace_template(candidate)
             self._render_collection_state(
                 selected_template_id=template.id
             )
@@ -684,8 +666,6 @@ class TemplateManagerDialog(QtWidgets.QDialog):
 
     def _on_delete_clicked(self):
         """Handle Delete button clicked."""
-        if not self._current_template:
-            return
 
         reply = QtWidgets.QMessageBox.question(
             self,
@@ -720,8 +700,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
 
     def _on_apply_clicked(self, *_args: object) -> None:
         """Apply the selected source through the destination-tab owner."""
-        if not self._current_template:
-            return
+        # Apply is enabled, and an item can be double-clicked, only with a selection.
         if self._destination_apply(self._current_template.source):
             self.accept()
 

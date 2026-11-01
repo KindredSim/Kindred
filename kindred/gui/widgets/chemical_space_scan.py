@@ -29,7 +29,7 @@ def _whole_number(box: QtWidgets.QLineEdit, label: str) -> int:
 
 
 class ChemicalSpaceScanDialog(QtWidgets.QDialog):
-    def __init__(self, tab, owner, parent=None, *, selected_set_id=None):
+    def __init__(self, tab, owner, parent=None, *, selected_set_id):
         super().__init__(parent)
         self.tab, self.owner = tab, owner
         self.setWindowTitle("Chemical Space Scan")
@@ -168,8 +168,9 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         self.solver = QtWidgets.QComboBox()
         self.solver.addItems(SUPPORTED_SOLVERS)
         self.solver.setToolTip(SOLVER_TOOLTIP)
-        self.points = entry(100)
-        self.rtol, self.atol = entry(1e-6), entry(1e-12)
+        # _load fills the solver settings from the baseline set.
+        self.points = QtWidgets.QLineEdit()
+        self.rtol, self.atol = QtWidgets.QLineEdit(), QtWidgets.QLineEdit()
         self.jacobian = QtWidgets.QCheckBox("Use Analytic Jacobian")
         self.stops = QtWidgets.QCheckBox("Use Authored Stopping Interventions")
         show = QtWidgets.QPushButton("Show Authored Stopping Declarations")
@@ -267,9 +268,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
 
     def _baseline_changed(self):
         """Refresh only the values the baseline set supplies; keep the setup."""
-        if not self.rows:
-            self._load()
-            return
+        # __init__ fills the rows with _load before the user can change the baseline.
         self.base = self._baseline_config()
         self.catalog = input_catalog(self.tab.prepared_dsl, self.base)
         for item in self.catalog:
@@ -379,7 +378,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
                 selection = self.ranges[key]
                 ranges[key] = selection if self.boundaries.isChecked() else replace(selection, endpoints=())
             else:
-                numeric = parse_finite_numeric_text(value.text().strip(), field=input_label(key))
+                numeric = parse_finite_numeric_text(value.text(), field=input_label(key))
                 if key.startswith("initial:"):
                     initials[key.removeprefix("initial:")] = numeric
                 elif key.startswith("parameter:"):
@@ -393,10 +392,10 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
             raise ValueError("Choose a destination JSON file.")
         grouped, boundary = self.group.currentData(), self.boundaries.isChecked()
         rtol = validate_scipy_rtol(
-            parse_finite_numeric_text(self.rtol.text().strip(), field="Relative tolerance"),
+            parse_finite_numeric_text(self.rtol.text(), field="Relative tolerance"),
             field="Relative tolerance",
         )
-        atol = parse_finite_numeric_text(self.atol.text().strip(), field="Absolute tolerance")
+        atol = parse_finite_numeric_text(self.atol.text(), field="Absolute tolerance")
         if atol <= 0.0:
             raise ValueError("Absolute tolerance must be finite and positive.")
         return replace(base, initials=initials, parameters=parameters, ranges=ranges, outputs=selected,
@@ -447,7 +446,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
     def _completed(self, result):
         if isinstance(result, str):
             self.status.setPlainText(result)
-        elif result is not None:
+        else:
             self._progress(result)
             state = "canceled" if result.state == "cancelled" else result.state
             self.status.appendPlainText(f"Scan {state}. Not started: {result.requested-result.attempted}.")

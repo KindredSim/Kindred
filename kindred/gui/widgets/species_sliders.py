@@ -23,7 +23,7 @@ __all__ = ["BatchSpeciesSliders"]
 
 
 def format_slider_value(value: float) -> str:
-    value_f = float(value)
+    value_f = value
     if value_f == 0.0:
         return "0"
     magnitude = abs(value_f)
@@ -78,7 +78,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
 
     def set_fine_mode(self, enabled: bool) -> None:
         """Adjust keyboard steps and mouse sensitivity without changing values."""
-        self._fine_mode = bool(enabled)
+        self._fine_mode = enabled
         for row in self._rows.values():
             row.slider.setSingleStep(1 if self._fine_mode else 50)
             row.slider.setPageStep(50 if self._fine_mode else 1000)
@@ -89,25 +89,16 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         values: Mapping[str, float],
         *,
         target_set_ids: Sequence[str],
-        mixed_species: Sequence[str] = (),
-        preserve_editor_drafts: bool = True,
+        mixed_species: frozenset[str],
+        preserve_editor_drafts: bool,
     ) -> None:
-        normalized: dict[str, float] = {}
         # The Slider runtime admitted these names and concentrations.
-        for name, value in values.items():
-            normalized[name] = float(value)
+        normalized = dict(values)
         self._reconcile_visibility_scope(set(normalized))
-        self._target_set_ids = tuple(str(item) for item in target_set_ids)
+        self._target_set_ids = tuple(target_set_ids)
         self._values = normalized
-        mixed = {str(name) for name in mixed_species}
-        same_rows = (
-            tuple(normalized) == tuple(self._rows)
-            and all(
-                species in self._rows
-                for species in normalized
-            )
-        )
-        if same_rows:
+        mixed = mixed_species
+        if tuple(normalized) == tuple(self._rows):
             for species, value in normalized.items():
                 self._update_row_projection(
                     species,
@@ -117,12 +108,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         else:
             self._clear_rows()
             for species, value in normalized.items():
-                self._add_row(
-                    species,
-                    value,
-                    display_name=species,
-                    mixed=species in mixed,
-                )
+                self._add_row(species, value, mixed=species in mixed)
         if not preserve_editor_drafts:
             for species, value in normalized.items():
                 text = "Multiple values" if species in mixed else format_slider_value(value)
@@ -180,9 +166,9 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         species: str,
         value: float,
         *,
-        display_name: str,
         mixed: bool,
     ) -> None:
+        display_name = species
         container = QtWidgets.QWidget(self._content)
         layout = QtWidgets.QGridLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -198,7 +184,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         configure_compact_numeric_edit(value_editor, characters=15)
         value_editor.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
         value_editor.editStarted.connect(
-            lambda item=species: self._on_editor_started(item)
+            lambda item=species: self.remember_editor_state(item)
         )
         value_editor.editEscape.connect(
             lambda item=species: self._on_editor_escape(item)
@@ -209,17 +195,14 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         value_editor.editingFinished.connect(
             lambda item=species: self._commit_editor(item)
         )
-        slider = FineDragSlider(
-            QtCore.Qt.Orientation.Horizontal,
-            container,
-        )
+        slider = FineDragSlider(container)
         slider.setAccessibleName(f"{display_name} initial concentration slider")
         slider.setRange(0, 10_000)
         slider.setSingleStep(1 if self._fine_mode else 50)
         slider.setPageStep(50 if self._fine_mode else 1000)
         slider.set_fine_mode(self._fine_mode)
+        # The maximum is always at least 1.
         maximum = compute_slider_max_option_c(v=value)
-        maximum = max(float(maximum), 1e-12)
         slider.setValue(self._value_to_position(value, maximum))
         slider.setEnabled(bool(self._target_set_ids))
         slider.sliderPressed.connect(
@@ -252,12 +235,11 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         )
 
     def _on_value_changed(self, species: str, position: int) -> None:
-        row = self._rows.get(species)
-        if row is None or not self._target_set_ids:
+        if not self._target_set_ids:
             return
-        value = float(position) / 10_000.0 * row.maximum
-        press = self._active_presses.get(str(species))
-        if press is not None and int(position) != press.start_position:
+        value = position / 10_000.0 * self._rows[species].maximum
+        press = self._active_presses.get(species)
+        if press is not None and position != press.start_position:
             press.moved = True
         if press is not None and not press.moved:
             self._set_value_projection(
@@ -274,27 +256,22 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             emit=True,
             interaction=(
                 SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE
-                if str(species) in self._active_presses
+                if species in self._active_presses
                 else SliderInteractionKind.EXACT_DIRECT_CHANGE
             ),
         )
 
     def _on_slider_pressed(self, species: str) -> None:
-        species_s = str(species)
-        row = self._rows.get(species_s)
-        if row is not None:
-            self._active_presses[species_s] = SliderPress(
-                start_position=int(row.slider.sliderPosition()),
-            )
+        self._active_presses[species] = SliderPress(
+            start_position=self._rows[species].slider.sliderPosition(),
+        )
 
     def _on_slider_released(self, species: str) -> None:
-        species_s = str(species)
-        press = self._active_presses.pop(species_s, None)
-        value = self._values.get(species_s)
-        if value is not None and press is not None and press.moved:
+        press = self._active_presses.pop(species, None)
+        if press is not None and press.moved:
             self.interactionRequested.emit(
-                species_s,
-                float(value),
+                species,
+                self._values[species],
                 SliderInteractionKind.EXACT_DRAG_RELEASE,
             )
 
@@ -302,14 +279,11 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         for species, row in self._rows.items():
             row.container.setVisible(species not in self._hidden_species)
 
-    def apply_visibility_projection(
-        self, visibility: dict[str, bool] | list[tuple[str, bool]]
-    ) -> None:
+    def apply_visibility_projection(self, projected: dict[str, bool]) -> None:
         """Set supplied picker choices, recalculating ranges on hidden-to-shown changes."""
-        projected = dict(visibility)
         for species in tuple(self._rows):
             if species in projected:
-                if bool(projected[species]):
+                if projected[species]:
                     if species in self._hidden_species:
                         row = self._rows[species]
                         value = self._values[species]
@@ -342,14 +316,12 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         *,
         mixed: bool,
     ) -> None:
-        row = self._rows.get(str(species))
-        if row is None:
-            return
-        set_bounded_label_text(row.name_label, str(species), max_width=16777215)
-        if self._editor_has_focus(species):
+        row = self._rows[species]
+        set_bounded_label_text(row.name_label, species, max_width=16777215)
+        if row.value_label.hasFocus():
             return
         self._set_value_projection(
-            str(species),
+            species,
             value,
             editor_text=("Multiple values" if mixed else None),
             emit=False,
@@ -364,18 +336,13 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         emit: bool,
         interaction: SliderInteractionKind | None = None,
     ) -> None:
-        species_s = str(species)
-        row = self._rows.get(species_s)
-        if row is None:
-            return
-        value_f = float(value)
-        if not math.isfinite(value_f) or value_f < 0.0:
-            return
+        species_s = species
+        row = self._rows[species_s]
+        value_f = value
         if value_f > row.maximum:
             row.maximum = max(
                 value_f,
                 _scale_finite_gui_range(row.maximum, 2.0),
-                1e-12,
             )
             row.maximum_label.setText(format_slider_value(row.maximum))
         self._values[species_s] = value_f
@@ -396,41 +363,22 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         if emit:
             self.interactionRequested.emit(species_s, value_f, interaction)
 
-    def _editor_has_focus(self, species: str) -> bool:
-        row = self._rows.get(str(species))
-        return bool(row is not None and row.value_label.hasFocus())
-
-    def _on_editor_started(self, species: str) -> None:
-        row = self._rows.get(str(species))
-        if row is None:
-            return
-        self.remember_editor_state(species)
-
     def remember_editor_state(self, species: str) -> None:
         """Remember the current value and text for subsequent local Escape."""
         self._editor_pre_edit_values[species] = self._values[species]
         self._editor_pre_edit_text[species] = self._rows[species].value_label.text()
 
     def _on_editor_escape(self, species: str) -> None:
-        species_s = str(species)
-        row = self._rows.get(species_s)
-        if row is None:
-            return
-        value = self._editor_pre_edit_values.get(
-            species_s, self._values.get(species_s, 0.0)
-        )
-        text = self._editor_pre_edit_text.get(
-            species_s, format_slider_value(value)
-        )
+        # Focus-in remembers the state before any key reaches the editor.
         self._set_value_projection(
-            species_s,
-            value,
-            editor_text=text,
+            species,
+            self._editor_pre_edit_values[species],
+            editor_text=self._editor_pre_edit_text[species],
             emit=False,
         )
 
     def _decorate_editor(self, species: str) -> None:
-        row = self._rows.get(str(species))
+        row = self._rows.get(species)
         if row is None:
             return
         try:
@@ -446,7 +394,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         )
 
     def _commit_editor(self, species: str) -> None:
-        species_s = str(species)
+        species_s = species
         row = self._rows.get(species_s)
         if row is None:
             return
@@ -475,10 +423,10 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
     def _set_editor_text(editor: QtWidgets.QLineEdit, text: str) -> None:
         blocker = QtCore.QSignalBlocker(editor)
         try:
-            editor.setText(str(text))
+            editor.setText(text)
         finally:
             del blocker
 
     @staticmethod
     def _value_to_position(value: float, maximum: float) -> int:
-        return max(0, min(10_000, round(float(value) / float(maximum) * 10_000)))
+        return max(0, min(10_000, round(value / maximum * 10_000)))

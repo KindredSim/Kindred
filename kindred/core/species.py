@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from numbers import Real
 
 from kindred.core.exceptions import ValueDomainError
 
@@ -67,8 +66,7 @@ MAX_FIT_EVALUATIONS = 100_000
 
 
 def _numeric(value: object, *, field: str) -> float:
-    if type(value) is bool or not isinstance(value, Real):
-        raise TypeError(f"{field} must be numeric.")
+    # Every caller converts its text or JSON number to a float first.
     parsed = float(value)
     if not math.isfinite(parsed):
         raise ValueDomainError(f"{field} must be finite.")

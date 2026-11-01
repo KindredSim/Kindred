@@ -189,7 +189,7 @@ class PracticeLesson(Lesson):
         attribute = "reuse" if reuse else "practice"
         if getattr(self, attribute) is None:
             identity = self.registry.active_tab_id
-            if identity in self._tabs_before or identity not in self.surfaces:
+            if identity in self._tabs_before:
                 return False
             setattr(self, attribute, identity)
             if reuse:
@@ -230,7 +230,7 @@ class PracticeLesson(Lesson):
 
     def _preset_rates_loaded(self) -> bool:
         values = {
-            item.name: float(item.value)
+            item.name: item.value
             for item in enumerate_parameter_coordinates(self.tab.prepared_dsl)
         }
         return all(
@@ -291,7 +291,8 @@ class PracticeLesson(Lesson):
                 for name, rate in rates.items()
             ):
                 return False
-        return bool(identities)
+        # Every caller passes at least one set.
+        return True
 
     def _added_set(self) -> bool:
         if self.extra_set is None:

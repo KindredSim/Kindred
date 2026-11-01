@@ -61,9 +61,7 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
         """
         names = tuple(sorted(parameters.keys(), key=_param_sort_key))
         current_names = tuple(
-            str(self.item(row, 0).data(QtCore.Qt.ItemDataRole.UserRole) or "")
-            if self.item(row, 0) is not None
-            else ""
+            self.item(row, 0).data(QtCore.Qt.ItemDataRole.UserRole)
             for row in range(self.rowCount())
         )
         if current_names != names:
@@ -98,7 +96,7 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
 def _value_text(low: float | None, high: float | None) -> str:
     if low is None or high is None:
         return "Unavailable"
-    low_text, high_text = six_digit_text(min(low, high)), six_digit_text(max(low, high))
+    low_text, high_text = six_digit_text(low), six_digit_text(high)
     return low_text if low_text == high_text else f"{low_text} – {high_text}"
 
 

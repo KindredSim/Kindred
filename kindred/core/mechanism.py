@@ -11,7 +11,7 @@ from fractions import Fraction
 from collections import OrderedDict
 from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Mapping
 
 from .kinetics import ForwardRateModel
 from .species import Species
@@ -19,7 +19,6 @@ from .equilibrium_rate_authority import (
     EquilibriumRateAuthority,
     normalize_equilibrium_rate_authority,
 )
-from .mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataKeys
 
 __all__ = [
     "Reaction",
@@ -204,7 +203,7 @@ class Mechanism:
         reactants: Mapping[str, float],
         products: Mapping[str, float],
         forward_model: ForwardRateModel,
-        factor: str | None = None,
+        factor: str | None,
     ) -> Reaction:
         """Add a reaction step; its builder declared every species it names."""
         rxn = Reaction(reactants=reactants, products=products, forward_model=forward_model, factor=factor)
@@ -217,14 +216,12 @@ class Mechanism:
         stoich_back: Mapping[str, float],
         *,
         forward_model: ForwardRateModel,
-        kr: float | None = None,
-        metadata: Optional[Mapping[str, Any]] = None,
-        factor: str | None = None,
+        kr: float | None,
+        metadata: Mapping[str, Any],
+        factor: str | None,
     ) -> Equilibrium:
         """Add one admitted forward model and exactly one reverse authority."""
-        meta = dict(metadata or {})
-        meta.setdefault(EquilibriumMetadataKeys.STANDARD_CONC_M,
-                        self.metadata.get(MechanismMetadataKeys.STANDARD_CONC_M, 1.0))
+        meta = dict(metadata)
         eq = Equilibrium(stoich_forward=stoich_forward, stoich_back=stoich_back,
                          forward_model=forward_model, kr=kr, metadata=meta, factor=factor)
         self.equilibria.append(eq)

@@ -72,7 +72,6 @@ class TutorialController(QtCore.QObject):
         self._visited: set[str] = set()
         self._verified: set[str] = set()
         self._skipped: set[str] = set()
-        self._chooser: QtWidgets.QDialog | None = None
         self.overlay = TutorialOverlay(parent)
         self.overlay.card.previousRequested.connect(self.previous)
         self.overlay.card.nextRequested.connect(self.next)
@@ -98,12 +97,8 @@ class TutorialController(QtCore.QObject):
             if self.overlay.card.isVisible():
                 self.overlay.card.raise_()
             return
-        if self._chooser is not None:
-            self._chooser.raise_()
-            self._chooser.activateWindow()
-            return
+        # The chooser is modal, so the Help menu cannot open a second one.
         dialog = QtWidgets.QDialog(self._window)
-        self._chooser = dialog
         dialog.setWindowTitle("Interactive Tutorials")
         layout = QtWidgets.QVBoxLayout(dialog)
         heading = QtWidgets.QLabel("Learn Kindred by Doing", dialog)
@@ -124,7 +119,7 @@ class TutorialController(QtCore.QObject):
         )
         layout.addWidget(description)
         buttons = QtWidgets.QDialogButtonBox(dialog)
-        start = buttons.addButton(
+        buttons.addButton(
             "Start Tutorial", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole
         )
         buttons.addButton(QtWidgets.QDialogButtonBox.StandardButton.Close)
@@ -133,11 +128,9 @@ class TutorialController(QtCore.QObject):
         choices.itemDoubleClicked.connect(lambda _item: dialog.accept())
         layout.addWidget(buttons)
         choices.setCurrentRow(0)
-        start.setEnabled(bool(self._lessons))
         dialog.resize(500, 340)
         accepted = dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted
         index = choices.currentRow()
-        self._chooser = None
         dialog.deleteLater()
         if accepted and index >= 0:
             self.start(self._lessons[index][2]())
@@ -175,10 +168,10 @@ class TutorialController(QtCore.QObject):
         self.stop()
         QtWidgets.QMessageBox.information(self._window, "Tutorial Ended", reason)
 
+    # The card's buttons, the lesson's signals and the refresh timers exist
+    # only while a lesson runs.
     def next(self) -> None:
         lesson = self.lesson
-        if lesson is None:
-            return
         position = self.position
         self.refresh()
         if (
@@ -208,42 +201,38 @@ class TutorialController(QtCore.QObject):
         self.lesson.enter(self.position)
 
     def skip(self) -> None:
-        if self.lesson is None:
-            return
         self._skipped.add(self.lesson.step.name)
         self._advance()
 
     def revisit(self, name: str) -> None:
-        if self.lesson is not None:
-            self.position = next(
-                index
-                for index, step in enumerate(self.lesson.steps)
-                if step.name == name
-            )
-            # Recovery redoes this step and the ones after it, so none keeps an
-            # earlier outcome, and each one redone is a newly completed outcome.
-            for step in self.lesson.steps[self.position:]:
-                self._visited.discard(step.name)
-                self._verified.discard(step.name)
-                self._skipped.discard(step.name)
-            self._enter_step()
-            self.refresh()
+        self.position = next(
+            index
+            for index, step in enumerate(self.lesson.steps)
+            if step.name == name
+        )
+        # Recovery redoes this step and the ones after it, so none keeps an
+        # earlier outcome, and each one redone is a newly completed outcome.
+        for step in self.lesson.steps[self.position:]:
+            self._visited.discard(step.name)
+            self._verified.discard(step.name)
+            self._skipped.discard(step.name)
+        self._enter_step()
+        self.refresh()
 
     def previous(self) -> None:
-        if self.lesson is not None and self.position > 0:
-            self.position -= 1
-            self._enter_step()
-            self.refresh()
+        # Previous is disabled on the first step.
+        self.position -= 1
+        self._enter_step()
+        self.refresh()
 
     def _recover(self) -> None:
-        if self._recovery is not None:
-            self._recovery()
-            self.schedule_refresh()
+        # Recovery and its button text are set together.
+        self._recovery()
+        self.schedule_refresh()
 
     def _act(self) -> None:
-        if self._action is not None:
-            self._action()
-            self.schedule_refresh()
+        self._action()
+        self.schedule_refresh()
 
     def schedule_refresh(self, *_args) -> None:
         if self.lesson is not None and not self._refresh_timer.isActive():
@@ -251,8 +240,6 @@ class TutorialController(QtCore.QObject):
 
     def refresh(self) -> None:
         lesson = self.lesson
-        if lesson is None:
-            return
         if not self._window.isVisible() or self._window.isMinimized():
             self.overlay.hide()
             return

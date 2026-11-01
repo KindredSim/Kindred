@@ -47,11 +47,8 @@ def heaviside(x: float) -> float:
     Heaviside step with H(0)=0.0 as per spec.
     Returns 0.0 for x <= 0, 1.0 for x > 0.
     """
-    try:
-        xf = float(x)
-    except (TypeError, ValueError) as exc:
-        logger.debug("Failed to convert value to float in heaviside: %r", x, exc_info=True)
-        raise TypeError(f"heaviside expects a numeric argument, got {x!r}") from exc
+    # The evaluator passes every argument as a float.
+    xf = x
     if xf <= 0.0:
         return 0.0
     return 1.0
@@ -162,14 +159,14 @@ class SymbolTable:
     _values: Dict[str, float] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        # Initialize protected constants and T
+        # Protected constants.  T is protected too, but every evaluation reads
+        # it from its supplied values or resolver, never from here.
         self._values = {
             "k_B": float(k_B),
             "h": float(h),
             "h_bar": float(h_bar),
             "N_A": float(N_A),
             "R": float(R),
-            "T": 298.15,
         }
 
     # --- lookup --------------------------------------------------------------

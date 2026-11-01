@@ -66,7 +66,7 @@ def _rank(rows: Sequence[Sequence[Fraction]]) -> int:
     if not rows:
         return 0
     matrix = [list(map(Fraction, row)) for row in rows]
-    width = len(matrix[0]) if matrix else 0
+    width = len(matrix[0])
     rank = 0
     for column in range(width):
         pivot = next(

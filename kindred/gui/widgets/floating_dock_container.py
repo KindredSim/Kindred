@@ -73,7 +73,7 @@ class FloatingDockContainer(QtWidgets.QWidget):
         self._floating_banner.setVisible(bool(floating))
 
     def _update_message(self, title: str) -> None:
-        panel_title = str(title).strip() or "This panel"
+        panel_title = title
         self._message_label.setText(
             f"{panel_title} is floating. Drag the title bar to snap it back to a side, or use Dock Back. "
             "Restore Default Panel Layout returns all panels to the factory arrangement."
