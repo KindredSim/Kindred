@@ -736,19 +736,11 @@ class ProjectController(QtCore.QObject):
             return False
         self._apply_discard(disposition)
         if disposition.clean_idle and self._async_owners_are_settled():
-            fit_idle_closed = self._fit_session.close_idle_for_application_close()
-            scan_idle_closed = self._scan.close_idle_for_application_close()
-            if fit_idle_closed and scan_idle_closed:
-                self._close_started = True
-                self._native_close_authorized = True
-                self.nativeCloseAuthorized.emit()
-                return True
-            # A failed synchronous idle-window teardown is still an owner
-            # cleanup problem. Continue through the normal owner settlement
-            # path so Close remains pending until every owner is settled.
-            self._set_status(
-                "Idle window cleanup did not finish. Waiting for active work to settle."
-            )
+            self._scan.close_idle_for_application_close()
+            self._close_started = True
+            self._native_close_authorized = True
+            self.nativeCloseAuthorized.emit()
+            return True
         self._close_started = True
         self._close_pending = True
         self.closeStarted.emit()

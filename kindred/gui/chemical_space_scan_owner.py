@@ -129,11 +129,8 @@ class ChemicalSpaceScanOwner(QtCore.QObject):
             self._destroy_dialog()
 
     def close_idle_for_application_close(self):
-        if self.busy:
-            return False
         self.close_fenced = True
         self._destroy_dialog()
-        return self.dialog is None
 
     @property
     def busy(self):
