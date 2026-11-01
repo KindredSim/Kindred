@@ -168,7 +168,7 @@ class TitrationsWithoutTime(PracticeLesson):
         prepared = self.tab.prepared_dsl
         if prepared is None or prepared.symbolic_equations_text() != _expected_equations():
             return False
-        values = {item.name: float(item.value) for item in enumerate_parameter_coordinates(prepared)}
+        values = {item.name: item.value for item in enumerate_parameter_coordinates(prepared)}
         return all(name in values and isclose(values[name], value) for name, value in _VALUES.items()) and (
             _LETS <= set(prepared.analysis.observable_names)
         )
@@ -201,13 +201,11 @@ class TitrationsWithoutTime(PracticeLesson):
         found = self._workbook()
         tab = self.tab
         sets = {item.set_id: dict(item.values) for item in tab.initial_condition_sets}
-        used = set()
         for run, dataset_id in found.items():
             link = tab.dataset_link(dataset_id)
             if (
                 link is None
                 or link.set_id not in sets
-                or link.set_id in used
                 or dict(link.observation_mapping) != {
                     series.raw_observation_id: series.column_name
                     for series in self.registry.document.dataset(dataset_id).observations
@@ -218,7 +216,6 @@ class TitrationsWithoutTime(PracticeLesson):
                 )
             ):
                 return False
-            used.add(link.set_id)
         return bool(found)
 
     def _fit_window(self) -> FittingWindow | None:
@@ -243,23 +240,21 @@ class TitrationsWithoutTime(PracticeLesson):
         end = window.findChild(QtWidgets.QLineEdit, "global_fit_simulation_end")
         error = window.findChild(QtWidgets.QLabel, "global_fit_data_range_error")
         table = window.findChild(QtWidgets.QTableWidget, "global_fit_unified_species_table")
-        current = None if datasets is None else datasets.currentItem()
-        if current is None or None in (against, start, end, error, table):
+        # The Fitting Window always builds these widgets.
+        current = datasets.currentItem()
+        if current is None:
             return
         headers = [table.horizontalHeaderItem(column).text() for column in range(table.columnCount())]
         include, weight, species = (headers.index(title) for title in ("Include", "Weight", "Species"))
         compared, x_weight = set(), ""
         for row in range(table.rowCount()):
             name, check, cell = table.item(row, species), table.item(row, include), table.item(row, weight)
-            if name is None:
-                continue
             if (
-                check is not None
-                and bool(check.flags() & QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                bool(check.flags() & QtCore.Qt.ItemFlag.ItemIsUserCheckable)
                 and check.checkState() == QtCore.Qt.CheckState.Checked
             ):
                 compared.add(name.text())
-            if name.text() == against.currentData() and cell is not None:
+            if name.text() == against.currentData():
                 x_weight = cell.text()
         self._data_seen[current.data(QtCore.Qt.ItemDataRole.UserRole)] = _FitData(
             against.currentData(),
@@ -274,7 +269,8 @@ class TitrationsWithoutTime(PracticeLesson):
     def _seen(self, sheets: tuple[str, ...]) -> dict[str, _FitData | None]:
         """The Fit Data settings last seen for each of these sheets."""
         found = self._workbook()
-        return {sheet: self._data_seen.get(found.get(sheet)) for sheet in sheets}
+        # Fit steps require the workbook.
+        return {sheet: self._data_seen.get(found[sheet]) for sheet in sheets}
 
     def _set_up(self, sheets: tuple[str, ...]) -> bool:
         """Each sheet was last seen fitted against its total and simulated from 0 to 1000 s."""
@@ -294,10 +290,10 @@ class TitrationsWithoutTime(PracticeLesson):
     def _targets_set(self, sheets: tuple[str, ...]) -> bool:
         """Each sheet was last seen comparing only its shifts, with its total weighted 1e3."""
 
-        def weighted(data: _FitData | None) -> bool:
+        def weighted(data: _FitData) -> bool:
             try:
                 return isclose(float(data.x_weight), _TOTAL_WEIGHT)
-            except (AttributeError, ValueError):
+            except ValueError:
                 return False
 
         return all(
@@ -307,11 +303,9 @@ class TitrationsWithoutTime(PracticeLesson):
 
     def _included_only(self, sheets: tuple[str, ...]) -> bool:
         """The open Fitting Window includes exactly these workbook datasets."""
-        window = self._fit_window()
-        datasets = None if window is None else window.findChild(QtWidgets.QListWidget, "global_fit_unified_dataset_list")
+        # Fit steps run their checks only while the window is open and the workbook is imported.
+        datasets = self._fit_window().findChild(QtWidgets.QListWidget, "global_fit_unified_dataset_list")
         found = self._workbook()
-        if datasets is None or not found:
-            return False
         checked = {
             item.data(QtCore.Qt.ItemDataRole.UserRole)
             for item in (datasets.item(row) for row in range(datasets.count()))
@@ -321,10 +315,7 @@ class TitrationsWithoutTime(PracticeLesson):
 
     def _varied(self, names: tuple[str, ...]) -> bool:
         """The open Fitting Window varies these values, and nothing else."""
-        window = self._fit_window()
-        roster = None if window is None else window.findChild(QtWidgets.QTableWidget, "fit_parameter_roster")
-        if roster is None:
-            return False
+        roster = self._fit_window().findChild(QtWidgets.QTableWidget, "fit_parameter_roster")
         headers = [roster.horizontalHeaderItem(column).text() for column in range(roster.columnCount())]
         name_column, vary_column = headers.index("Parameter"), headers.index("Vary")
         varied = set()
@@ -332,9 +323,7 @@ class TitrationsWithoutTime(PracticeLesson):
             name, vary = roster.item(row, name_column), roster.item(row, vary_column)
             # Rows of single datasets follow their parameter row.
             if (
-                name is not None
-                and vary is not None
-                and name.data(QtCore.Qt.ItemDataRole.UserRole + 1) is None
+                name.data(QtCore.Qt.ItemDataRole.UserRole + 1) is None
                 and vary.checkState() == QtCore.Qt.CheckState.Checked
             ):
                 varied.add(name.data(QtCore.Qt.ItemDataRole.UserRole))
@@ -343,11 +332,10 @@ class TitrationsWithoutTime(PracticeLesson):
     def _fit_result(self) -> bool:
         """The open Fitting Window has a current result to apply. Changing the fit setup makes the shown
         result stale until the fit runs again."""
-        window = self._fit_window()
-        apply = None if window is None else self._shown(
-            window, QtWidgets.QPushButton, lambda button: button.text().replace("&", "") == "Apply Fit"
+        apply = self._shown(
+            self._fit_window(), QtWidgets.QPushButton, lambda button: button.text().replace("&", "") == "Apply Fit"
         )
-        return apply is not None and apply.isEnabled()
+        return apply.isEnabled()
 
     def _fitted(self, sheets: tuple[str, ...], names: tuple[str, ...]) -> bool:
         """The open Fitting Window has a current result for these sheets, set up as the lesson asks, with

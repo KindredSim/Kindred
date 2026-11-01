@@ -121,7 +121,7 @@ class _SheetModel(QtCore.QAbstractTableModel):
         cell = index.row() + 1, index.column() + 1
         if cell not in self.cells:
             return False
-        return self.editor._commit_entry(*cell, str(value))
+        return self.editor._commit_entry(*cell, value)
 
 
 class _CellDelegate(QtWidgets.QStyledItemDelegate):
@@ -317,7 +317,7 @@ class _SheetHeader(QtWidgets.QHeaderView):
                 control.addItem(label, choice)
                 control.setItemData(control.count() - 1, markup, SCIENTIFIC_NAME_HTML_ROLE)
             control.addItem("Custom Expression…", "custom")
-            control.setCurrentIndex(max(0, control.findData(spec["unit"])))
+            control.setCurrentIndex(control.findData(spec["unit"]))
             control.activated.connect(lambda: self._unit_selected(control))
         self._input = control
         control.installEventFilter(self)
@@ -468,9 +468,10 @@ class _SheetTable(QtWidgets.QTableView):
         opened = super().edit(index, trigger, event)
         editor = self.dialog._delegate.active_editor
         # As in Excel, F2 puts the cursor at the end and a double-click where it was clicked.
-        if opened and editor is not None and trigger == QtWidgets.QAbstractItemView.EditKeyPressed:
+        # Qt opens an edit only after the delegate created its editor.
+        if opened and trigger == QtWidgets.QAbstractItemView.EditKeyPressed:
             editor.end(False)
-        elif opened and editor is not None and trigger == QtWidgets.QAbstractItemView.DoubleClicked and event is not None:
+        elif opened and trigger == QtWidgets.QAbstractItemView.DoubleClicked and event is not None:
             # The line edit places centred text when it paints.
             editor.repaint()
             editor.setCursorPosition(editor.cursorPositionAt(editor.mapFrom(self.viewport(), event.position().toPoint())))
@@ -863,7 +864,8 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._selection_changed()
 
     def _select_sheet(self, sheet):
-        if sheet < 0 or self._closing or not self._sheets:
+        # A queued choice can drain after Close.
+        if self._closing:
             return
         # Tab clicks can keep a line edit focused. Commit against the old
         # worksheet before projecting or queueing the requested worksheet.
@@ -1186,9 +1188,8 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._availability()
 
     def _update_gesture(self, point):
+        # Only an active gesture's pointer events and timer reach here.
         gesture = self._gesture
-        if gesture is None:
-            return
         self._gesture_point = point
         local = self._table.viewport().mapFromGlobal(point)
         if gesture["kind"] == "fill":
@@ -1225,8 +1226,7 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         return header.sectionViewportPosition(section)
 
     def _scroll_gesture(self):
-        if self._gesture is None or self._gesture_point is None:
-            return
+        # The timer runs only during a gesture with its pointer set.
         viewport = self._table.viewport()
         point = viewport.mapFromGlobal(self._gesture_point)
         horizontal = self._gesture["kind"] == "columns"
@@ -1265,8 +1265,7 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
             operation, args = "move_" + gesture["kind"], (start, count, delta)
             area = (top, left + delta, bottom, right + delta) if gesture["kind"] == "columns" else (top + delta, left, bottom + delta, right)
         self._result_area = operation, area
-        if not self._request(operation, args, sheet=gesture["sheet"]):
-            self._result_area = None
+        self._request(operation, args, sheet=gesture["sheet"])
 
     def _clear_cells(self):
         self._request("clear", self._area())
@@ -1287,9 +1286,8 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         elif timed and operation == "insert":
             left = max(2, left)
         # The session admits deletions, refusing ones that include Recorded Time.
-        count = max(0, right - left + 1) if operation == "delete" else 1
-        if count:
-            self._request("delete_columns" if operation == "delete" else "insert_columns", (left, count))
+        count = right - left + 1 if operation == "delete" else 1
+        self._request("delete_columns" if operation == "delete" else "insert_columns", (left, count))
 
     def _context_menu(self, point):
         menu = QtWidgets.QMenu(self)

@@ -25,7 +25,6 @@ from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
 from kindred.core.quantity_units import Unit
 from kindred.core.stoichiometry import directional_order_fraction
 from kindred.core.thermodynamics import concentration_Keq_from_deltaG_eq
-from kindred.core.simulator.dsl_build_input import source_coordinate_capabilities
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.core.units import admit_role_value
@@ -58,11 +57,11 @@ def build_parameter_target_map(
 
     for item in namespace.ordered_items:
         entry = step_roster[item.source_index]
-        kind = str(entry["kind"])
+        kind = entry["kind"]
         index_key = "reaction_index" if kind == "reaction" else "equilibrium_index"
-        index = int(entry[index_key])
-        role = str(item.info.role)
-        targets[str(item.canonical_name)] = (
+        index = entry[index_key]
+        role = item.info.role
+        targets[item.canonical_name] = (
             "indexed",
             kind,
             index,
@@ -71,18 +70,18 @@ def build_parameter_target_map(
         )
 
     for coordinate in namespace.source_coordinates:
-        name = str(coordinate.canonical_name)
+        name = coordinate.canonical_name
         if name in targets:
             continue
         entry = step_roster[coordinate.source_index]
-        kind = str(entry["kind"])
+        kind = entry["kind"]
         index_key = "reaction_index" if kind == "reaction" else "equilibrium_index"
-        index = int(entry[index_key])
+        index = entry[index_key]
         targets[name] = (
             "physical",
             kind,
             index,
-            str(coordinate.role),
+            coordinate.role,
             entry,
         )
     return targets
@@ -365,18 +364,17 @@ def apply_mechanism_coordinate_values(
 def read_mechanism_parameter_values(
     mechanism: object,
     *,
-    names: set[str] | None = None,
+    names: set[str],
     parameter_target_map: Mapping[str, ParameterTarget],
 ) -> dict[str, float]:
     """Read independent authored coordinates without deriving coefficients."""
 
-    wanted = set(parameter_target_map) if names is None else names
     out: dict[str, float] = {}
     reactions = mechanism.reactions
     equilibria = mechanism.equilibria
 
     for name, target in parameter_target_map.items():
-        if name not in wanted:
+        if name not in names:
             continue
         route, kind, index, role, _entry = target
         if kind == "reaction":
@@ -394,20 +392,18 @@ def read_mechanism_parameter_values(
                     value = authority.kr
                 elif role == "Keq" and authority.has_explicit_keq_param:
                     value = authority.Keq
-        elif source_coordinate_capabilities(role).algebra_target or role == "degeneracy":
+        else:
+            # Physical routes carry only A, Ea, dG_act, dG_eq, kappa and
+            # degeneracy, and each role exists only on its own rate family.
             model = step.forward_model
-            if role == "A" and isinstance(model, ArrheniusRateModel):
-                value = float(model.A)
-            elif role == "Ea" and isinstance(model, ArrheniusRateModel):
-                value = float(model.Ea_J_per_mol)
-            elif role == "dG_act" and isinstance(model, EyringRateModel):
-                value = float(model.dG_act_J_per_mol)
-            elif role == "kappa" and isinstance(model, EyringRateModel):
-                value = float(model.kappa)
-            elif role == "degeneracy" and isinstance(model, EyringRateModel):
-                value = float(model.degeneracy)
-            elif role == "dG_eq":
-                value = step.authority.dG_eq_J_per_mol
+            value = {
+                "A": lambda: model.A,
+                "Ea": lambda: model.Ea_J_per_mol,
+                "dG_act": lambda: model.dG_act_J_per_mol,
+                "kappa": lambda: model.kappa,
+                "degeneracy": lambda: model.degeneracy,
+                "dG_eq": lambda: step.authority.dG_eq_J_per_mol,
+            }[role]()
         if value is not None:
             out[name] = float(value)
     return out

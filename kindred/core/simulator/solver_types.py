@@ -11,7 +11,6 @@ from kindred.core.intervention_schedule_compiler import InterventionExecutionCon
 from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 from kindred.core.volume import SimulationBoundaryState, VolumeTrajectory
 
-DEFAULT_SOLVER_NAME = "BDF"
 
 
 class ODERhs(Protocol):
@@ -105,33 +104,30 @@ class SimulationRequest:
     # (line number, authored text) of each intervention declaration, by ordinal.
     intervention_lines: tuple[tuple[int, str], ...]
     parameter_values_at_temperature: Callable[[float, tuple[str, ...]], Mapping[str, float]]
-    solver: str = DEFAULT_SOLVER_NAME
-    rtol: float = 1e-6
-    atol: float = 1e-12
-    t_eval: Optional[np.ndarray] = None
-    grid: Optional[Mapping[str, float | int]] = None
-
-    species_names: Optional[Tuple[str, ...]] = None
-    cancellation_control: SimulationCancellationControl | None = None
-    candidate_evaluation: bool = False
+    solver: str
+    rtol: float
+    atol: float
+    # Fit's admitted sample times; None realizes ``grid`` instead.
+    t_eval: Optional[np.ndarray]
+    grid: Mapping[str, float | int]
+    species_names: Tuple[str, ...]
+    cancellation_control: SimulationCancellationControl
+    candidate_evaluation: bool
     # Also return the solver's accepted steps as rows, so the curve between
     # rows is a straight line across one solver step (measured-X Fit).
-    sample_solver_steps: bool = False
+    sample_solver_steps: bool
     # Also return each species' CTC over the executed span, integrated on the
     # solver's own step interpolant (Run and Preview without interventions).
-    species_ctc: bool = False
+    species_ctc: bool
     # Also return each species' largest concentration over the executed span
     # and its time, located on the solver's own step interpolant.
-    species_maximum: bool = False
-    stop_observable_value: Callable[[str, float, np.ndarray, float], float] | None = None
+    species_maximum: bool
+    stop_observable_value: Callable[[str, float, np.ndarray, float], float] | None
 
     def __post_init__(self) -> None:
-        # The span, solver policy, grid and Fit sample times arrive admitted with
-        # the execution request.  Fit evaluation supplies candidate initial
-        # concentrations here, so their state is checked at this boundary.
-        y0 = np.asarray(self.y0, dtype=float).reshape(-1).copy()
-        if y0.size == 0 or np.any(~np.isfinite(y0)) or np.any(y0 < 0.0):
-            raise ValueError("y0 must contain finite nonnegative runtime states.")
+        # Starting states arrive admitted nonnegative and finite, Fit
+        # candidates within their nonnegative bounds; the run keeps its own copy.
+        y0 = np.array(self.y0, dtype=float)
         y0.setflags(write=False)
         object.__setattr__(self, "y0", y0)
         if self.t_eval is not None:

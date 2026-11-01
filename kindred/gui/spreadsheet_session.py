@@ -320,9 +320,8 @@ class SpreadsheetSession:
                 native_count = 1
                 recalculate = source[2] + 1, bottom
             elif operation in ("move_rows", "move_columns"):
+                # The editor never sends a move onto the block itself.
                 start, count, delta = args
-                if not delta:
-                    return self.state()
                 if operation == "move_columns":
                     if info["timed"] and min(start, start + delta) == 1:
                         raise ValueError("Recorded time remains the first coordinate column.")
@@ -401,8 +400,6 @@ class SpreadsheetSession:
                     raise ValueError("New dataset name must not be blank.")
                 if name != info["name"]:
                     self._metadata(changes, sheet, "name", info["name"], name)
-            else:
-                raise ValueError(f"Unknown spreadsheet operation: {operation}")
             if native_count:
                 self._read_model = None
             if recalculate is not None:

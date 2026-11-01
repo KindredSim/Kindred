@@ -378,8 +378,6 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
         warning = self._warning_color()
         for index, row in enumerate(self._rows):
             item = self._list.topLevelItem(index)
-            if item is None:
-                continue
             problem = self._row_problem(row)
             item.setText(1, f"! {row.status}" if problem else row.status)
             item.setToolTip(1, problem or row.status)
@@ -467,12 +465,11 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
 
     def changeEvent(self, event: QtCore.QEvent) -> None:  # noqa: N802 - Qt override
         super().changeEvent(event)
-        if event.type() in (QtCore.QEvent.PaletteChange, QtCore.QEvent.ApplicationPaletteChange) and self._rows:
+        if event.type() in (QtCore.QEvent.PaletteChange, QtCore.QEvent.ApplicationPaletteChange):
             self._render()
 
     def _on_current_changed(self, current, _previous) -> None:
-        if current is None:
-            return
+        # Dataset rows are never removed, so a current row always exists.
         self._pages.setCurrentIndex(self._list.indexOfTopLevelItem(current))
         self._render_header()
         self._render_sets()

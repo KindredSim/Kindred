@@ -120,7 +120,7 @@ def compile_constraints(prepared, config: ScanConfig, fixed: dict[str, float]):
 
     def unscaled(node) -> Affine:
         if isinstance(node, NumberNode):
-            return Affine({}, literal_fraction(node.literal if node.literal is not None else str(node.value)))
+            return Affine({}, literal_fraction(node.literal))
         if isinstance(node, SpeciesRefNode):
             if node.kind != "init":
                 raise ValueError(f"[{node.name}] depends on simulated concentrations. Use an input-only quantity.")

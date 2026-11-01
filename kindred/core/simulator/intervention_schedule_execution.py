@@ -165,7 +165,7 @@ class InterventionScheduleExecutionOwner:
     def execute(self, request: ScheduleExecutionRequest) -> FinalSimulationOutput:
         req = request.request
         t0, t1 = req.t_span
-        t_eval = np.asarray(request.t_eval, dtype=float).reshape(-1)
+        t_eval = request.t_eval
         contract = req.intervention_execution
         has_stops = any(isinstance(item.then, InterventionStopAction) for item in contract.triggers)
         dense_segments: list[tuple[SegmentIdentity, Callable[[np.ndarray], np.ndarray], tuple[ExecutableHold, ...], int, TemperatureSegment]] = []
@@ -175,12 +175,8 @@ class InterventionScheduleExecutionOwner:
             species_index = _species_index(req)
             volume = VolumeExecution(species_names=species_index, parameter_values=req.parameter_values_at_temperature,
                                      end_time=t1, lines=req.intervention_lines)
-            current_y = np.asarray(req.y0, dtype=float).reshape(-1).copy()
-            cancellation_check = (
-                req.cancellation_control.cancel_requested
-                if req.cancellation_control is not None
-                else None
-            )
+            current_y = req.y0.copy()
+            cancellation_check = req.cancellation_control.cancel_requested
             # Each trigger's latest firing: its count, time and watched value.
             trigger_last_firings: list[TriggerFiring | None] = [None for _ in contract.triggers]
             trigger_firings: list[TriggerFiring] = []
@@ -233,10 +229,8 @@ class InterventionScheduleExecutionOwner:
                 ),
                 *temperature_changes,
             }
-            if any(not math.isfinite(value) for value in boundaries):
-                raise InterventionScheduleError(
-                    "Execution boundary arithmetic must remain finite."
-                )
+            # Admitted times are finite and bounded; the filter above drops
+            # anything outside the span.
             ordered_boundaries = sorted(boundaries)
 
             _raise_if_cancelled(cancellation_check)
@@ -289,8 +283,6 @@ class InterventionScheduleExecutionOwner:
                     break
                 outer_start = float(ordered_boundaries[boundary_index])
                 outer_end = float(ordered_boundaries[boundary_index + 1])
-                if outer_end <= outer_start:
-                    continue
                 sub_start = outer_start
                 while sub_start < outer_end and termination is None:
                     _raise_if_cancelled(cancellation_check)
@@ -803,15 +795,11 @@ class InterventionScheduleExecutionOwner:
             actual_end = t1 if termination is None else termination.actual_endpoint
             if termination is None:
                 termination = SimulationTermination(t1, "endpoint")
-            if outputs_t:
-                output_t = np.concatenate(outputs_t)
-                output_y = np.concatenate(outputs_y, axis=1)
-                output_temperature = np.concatenate(outputs_temperature)
-            else:
-                output_t = np.empty(0, dtype=float)
-                output_y = np.empty((current_y.size, 0), dtype=float)
-                output_temperature = np.empty(0, dtype=float)
-            if not output_t.size or float(output_t[-1]) != actual_end:
+            # The starting row is always emitted first.
+            output_t = np.concatenate(outputs_t)
+            output_y = np.concatenate(outputs_y, axis=1)
+            output_temperature = np.concatenate(outputs_temperature)
+            if float(output_t[-1]) != actual_end:
                 _append_identity_row(
                     outputs_t,
                     outputs_y,
@@ -864,8 +852,6 @@ class InterventionScheduleExecutionOwner:
                     ))
                     if sample_end == next_sample:
                         continue
-                    if sample_times[next_sample] < identity_record.t_start:
-                        raise InterventionScheduleError("Actual-interval sample is outside its continuous segment.")
                     projected_count = 0
                     max_negative_magnitude = 0.0
                     # Bound interpolation temporaries and check cancellation on
@@ -902,17 +888,13 @@ class InterventionScheduleExecutionOwner:
                         ),
                     )
                     next_sample = sample_end
-                if next_sample != sample_times.size:
-                    raise InterventionScheduleError("Actual-interval sample is outside its continuous segment.")
+                # The stored segments are contiguous from t0 and cover every sample.
                 _raise_if_cancelled(cancellation_check)
                 output_t, output_y = final_times, final_states
                 output_temperature = final_temperatures
                 output_segment_ids, output_discontinuity_ids = [final_ids], [final_discontinuities]
                 dense_segments.clear()
-            if output_t.size > 1 and np.any(np.diff(output_t) <= 0.0):
-                raise InterventionScheduleError(
-                    "Public result row times must be strictly increasing."
-                )
+            # Every emitted block increases and starts after the previous row.
             # Concatenation creates the final owned buffers.  Freeze them here so
             # the standalone result can adopt them without defensive recapture.
             output_t.setflags(write=False)
@@ -1074,10 +1056,7 @@ def _append_presentation_boundary(
 ) -> None:
     if boundary is None:
         return
-    if boundaries and boundary.time <= boundaries[-1].time:
-        raise InterventionScheduleError(
-            "Presentation boundaries must remain strictly ordered."
-        )
+    # Boundaries apply at t0, then at strictly later ends or roots.
     boundaries.append(boundary)
 
 
@@ -1096,16 +1075,8 @@ def _compose_direct_result_sample_identity(
     downstream boundary reconstructs execution authority from timestamps.
     """
 
-    ids = (
-        np.concatenate(segment_ids).astype(np.int64, copy=False)
-        if segment_ids
-        else np.empty(0, dtype=np.int64)
-    )
-    discontinuities = (
-        np.concatenate(discontinuity_ids).astype(np.int64, copy=False)
-        if discontinuity_ids
-        else np.empty(0, dtype=np.int64)
-    )
+    ids = np.concatenate(segment_ids).astype(np.int64, copy=False)
+    discontinuities = np.concatenate(discontinuity_ids).astype(np.int64, copy=False)
     ids.setflags(write=False)
     discontinuities.setflags(write=False)
     return ids, discontinuities
@@ -1117,12 +1088,7 @@ def _record_segment_projection(
     *,
     identity: SegmentIdentity,
 ) -> None:
-    key = identity.key
-    if key in records:
-        raise InterventionScheduleError(
-            f"Duplicate segment projection identity: {key!r}."
-        )
-    records[key] = SegmentProjection(
+    records[identity.key] = SegmentProjection(
         identity=identity,
         trajectory=result.trajectory_projection,
         event_states=result.event_state_projection,
@@ -1135,13 +1101,7 @@ def _record_continuation_projection(
     identity: SegmentIdentity,
     projection: NonnegativeProjection,
 ) -> None:
-    key = identity.key
-    record = records.get(key)
-    if record is None or record.identity != identity:
-        raise InterventionScheduleError(
-            f"Continuation projection has no exact segment identity: {key!r}."
-        )
-    records[key] = record.with_continuation(projection)
+    records[identity.key] = records[identity.key].with_continuation(projection)
 
 
 def _publish_segment_projection_provenance(
@@ -1177,8 +1137,6 @@ def _publish_segment_projection_provenance(
     for provenance_key, aggregate in summaries:
         if aggregate.projected:
             provenance[provenance_key] = aggregate.to_payload()
-        else:
-            provenance.pop(provenance_key, None)
 
 
 def _species_index(req: SimulationRequest) -> dict[str, int]:
@@ -1222,7 +1180,7 @@ def _purge_zero_crossing_events(
     active_holds: Sequence[ExecutableHold],
     species_index: Mapping[str, int],
     state: np.ndarray,
-    segment_start: float = 0.0,
+    segment_start: float,
 ) -> tuple[
     tuple[Callable[[float, np.ndarray], float], ...],
     tuple[int, ...],
@@ -1313,7 +1271,7 @@ def _apply_boundary(
     trigger_firings: list[TriggerFiring],
     species_index: Mapping[str, int],
     cancellation_check: Callable[[], bool] | None,
-    observable_value: Callable[[str, float, np.ndarray, float], float] | None = None,
+    observable_value: Callable[[str, float, np.ndarray, float], float] | None,
     changed_temperature_K: float | None = None,
     temperature_K: float,
     parameter_values, executed_values: dict, volume,
@@ -1491,8 +1449,6 @@ def _apply_instants(
     cancellation_check: Callable[[], bool] | None,
     held_indices: set[int],
 ) -> np.ndarray:
-    if not instants:
-        return state
     output = np.asarray(state, dtype=float).reshape(-1).copy()
     for instant in instants:
         _raise_if_cancelled(cancellation_check)
@@ -1778,9 +1734,9 @@ def _trigger_callables(
     segment_start: float,
     segment_state: np.ndarray,
     trigger_last_firings: Sequence[TriggerFiring | None],
-    observable_value: Callable[[str, float, np.ndarray, float], float] | None = None,
+    observable_value: Callable[[str, float, np.ndarray, float], float] | None,
     temperature_at,
-    parameter_values, holds=(),
+    parameter_values, holds,
 ) -> tuple[tuple[Callable[[float, np.ndarray], float], ...], tuple[int, ...]]:
     callables: list[Callable[[float, np.ndarray], float]] = []
     mapping: list[int] = []
@@ -1937,7 +1893,7 @@ def _append_identity_samples(
     emit_temperatures = np.asarray(temperatures, dtype=float)
     if not emit_times.size:
         return
-    if output_times and output_times[-1].size:
+    if output_times:
         last_time = float(output_times[-1][-1])
         if emit_times[0] == last_time:
             emit_times = emit_times[1:]

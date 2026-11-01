@@ -26,8 +26,8 @@ __all__ = [
 def _number_edit(
     parent: QtWidgets.QWidget, value: str, tooltip: str,
 ) -> QtWidgets.QLineEdit:
-    edit = QtWidgets.QLineEdit(str(value), parent)
-    edit.setToolTip(str(tooltip))
+    edit = QtWidgets.QLineEdit(value, parent)
+    edit.setToolTip(tooltip)
     edit.setMaximumWidth(190)
     return edit
 
@@ -63,14 +63,14 @@ class _RunSettingsFields:
 
     def set_settings(self, settings: SimulationExecutionSettings) -> None:
         self.solver_combo.setCurrentText(settings.solver)
-        self.t_start_edit.setText(repr(float(settings.t_start)))
-        self.t_end_edit.setText(repr(float(settings.t_end)))
+        self.t_start_edit.setText(repr(settings.t_start))
+        self.t_end_edit.setText(repr(settings.t_end))
         self.points_edit.setText(str(settings.integration_points))
 
     def settings(self) -> SimulationExecutionSettings:
         t_start, t_end = self.t_start_edit.text(), self.t_end_edit.text()
         candidate = SimulationExecutionSettings(
-            solver=str(self.solver_combo.currentText()),
+            solver=self.solver_combo.currentText(),
             t_start=parse_finite_numeric_text(t_start, field=f"Start time {t_start!r}"),
             t_end=parse_finite_numeric_text(t_end, field=f"End time {t_end!r}"),
             integration_points=parse_points_text(self.points_edit.text()),
@@ -85,10 +85,10 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         self,
         parent: QtWidgets.QWidget | None = None,
         *,
-        title: str = "Custom Run Settings",
+        title: str,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle(str(title))
+        self.setWindowTitle(title)
         self.setModal(True)
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -153,20 +153,19 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         body_layout.setContentsMargins(0, 0, 0, 0)
         science_box = QtWidgets.QGroupBox("Mechanism Settings", body)
         science_form = QtWidgets.QFormLayout(science_box)
-        factory = TabScientificSettings()
+        # The owner fills every editor before showing the dialog.
         self.temperature_edit = _number_edit(
             science_box,
-            repr(float(factory.temperature)),
+            "",
             "Default nominal temperature for this mechanism. An explicit T= directive "
             "overrides it. A temperature schedule uses it before its first listed time, "
             "and a response schedule starts from it.",
         )
-        self.standard_conc_edit = QtWidgets.QLineEdit(str(factory.standard_conc_M), science_box)
+        self.standard_conc_edit = QtWidgets.QLineEdit(science_box)
         self.energy_unit_combo = QtWidgets.QComboBox(science_box)
         self.energy_unit_combo.addItems(["J/mol", "kJ/mol", "kcal/mol"])
-        self.energy_unit_combo.setCurrentText(factory.energy_unit)
-        self.rtol_edit = QtWidgets.QLineEdit("1e-6", science_box)
-        self.atol_edit = QtWidgets.QLineEdit("1e-12", science_box)
+        self.rtol_edit = QtWidgets.QLineEdit(science_box)
+        self.atol_edit = QtWidgets.QLineEdit(science_box)
         self.standard_conc_edit.setToolTip(
             "Default standard-state concentration in M for Eyring rates and thermodynamic "
             "equilibrium constants. An explicit C0= directive overrides it."
@@ -193,7 +192,6 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             "Use These Settings as Defaults for New Projects and Tabs",
             science_box,
         )
-        self.scientific_defaults_check.setChecked(False)
         self.scientific_defaults_check.setToolTip(
             "Save all settings in this group, including the Jacobian and stopping "
             "preferences, as defaults for new projects and tabs. "
@@ -215,7 +213,6 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             "When enabled, a rule may end integration before t_end. When disabled, "
             "runs continue to t_end. Fitting against time always ignores stopping interventions."
         )
-        self._stopping_declarations: tuple[str, ...] = ()
         self.stopping_info_button = QtWidgets.QPushButton("Authored Rules…", science_box)
         self.stopping_info_button.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed,
@@ -227,7 +224,6 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         stopping_row.addStretch()
         science_form.addRow("", stopping_row)
         science_form.addRow("", self.scientific_defaults_check)
-        self.set_stopping_declarations(())
         body_layout.addWidget(science_box)
 
         run_box = QtWidgets.QGroupBox("Run Defaults for New Projects and Tabs", body)
@@ -243,12 +239,12 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         preview_form = QtWidgets.QFormLayout(preview_box)
         self.preview_points_edit = _number_edit(
             preview_box,
-            str(int(preview_points)),
+            str(preview_points),
             "Output points for all slider previews, including release and typed changes.",
         )
         self.preview_delay_edit = _number_edit(
             preview_box,
-            str(int(preview_delay_ms)),
+            str(preview_delay_ms),
             "Delay before requesting a preview while dragging any slider. "
             "Release, clicks, and typed changes request a preview immediately.",
         )
@@ -278,8 +274,6 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         parallel_row_layout.addWidget(self.parallel_maximum_edit)
         parallel_row_layout.addWidget(self._parallel_cores_label)
         parallel_row_layout.addStretch(1)
-        self._physical_cores = 1
-        self._automatic_parallel_workers = 1
         self.parallel_automatic_check.toggled.connect(self._show_parallel_automatic)
         parallel_form.addRow("Simultaneous simulations", self.parallel_automatic_check)
         parallel_form.addRow("Explicit maximum", parallel_row)
@@ -339,11 +333,11 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         message.exec()
 
     def set_scientific_settings(self, settings: TabScientificSettings) -> None:
-        self.temperature_edit.setText(repr(float(settings.temperature)))
-        self.standard_conc_edit.setText(repr(float(settings.standard_conc_M)))
+        self.temperature_edit.setText(repr(settings.temperature))
+        self.standard_conc_edit.setText(repr(settings.standard_conc_M))
         self.energy_unit_combo.setCurrentText(settings.energy_unit)
-        self.rtol_edit.setText(repr(float(settings.rtol)))
-        self.atol_edit.setText(repr(float(settings.atol)))
+        self.rtol_edit.setText(repr(settings.rtol))
+        self.atol_edit.setText(repr(settings.atol))
         self.analytic_jacobian_check.setChecked(settings.analytic_jacobian_policy)
         self.use_authored_stops_check.setChecked(settings.use_authored_stops)
 
@@ -362,7 +356,7 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             atol=parse_finite_numeric_text(
                 self.atol_edit.text(), field="Absolute tolerance"
             ),
-            analytic_jacobian_policy=bool(self.analytic_jacobian_check.isChecked()),
+            analytic_jacobian_policy=self.analytic_jacobian_check.isChecked(),
             use_authored_stops=self.use_authored_stops_check.isChecked(),
         )
         return validate_tab_scientific_settings(candidate)
@@ -370,7 +364,7 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
     def persist_scientific_defaults_requested(self) -> bool:
         """Return the passive application-default persistence intent."""
 
-        return bool(self.scientific_defaults_check.isChecked())
+        return self.scientific_defaults_check.isChecked()
 
     def set_new_tab_run_defaults(self, settings: SimulationExecutionSettings) -> None:
         self._run_default_fields.set_settings(settings)

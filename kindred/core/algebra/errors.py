@@ -74,8 +74,7 @@ class AlgebraError(KindredError):
 
     def __init__(self, msg: str, *, code: str, line: int, col: int, line_text: str | None = None):
         self.line = line
-        # Normalize the column to be at least 1
-        self.col = 1 if col is None or col < 1 else col
+        self.col = col
         self.line_text = line_text
         super().__init__(
             msg, code=code,

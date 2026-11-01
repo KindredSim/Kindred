@@ -55,9 +55,10 @@ class InteractiveSliders(PracticeLesson):
             return False
         repo = self.registry.tab_runtime(self.tab_id).result_repository
         for identity in identities:
-            result = repo.current_result(identity)
-            if identity not in repo.preview_set_ids() or result is None:
+            # A current Preview always pairs its request with a result.
+            if identity not in repo.preview_set_ids():
                 return False
+            result = repo.current_result(identity)
             parameters = {name: value for name, value, _unit in result.parameters}
             if any(
                 key not in parameters or not isclose(parameters[key], value, rel_tol=1e-8)

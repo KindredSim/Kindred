@@ -50,8 +50,7 @@ def apply_parameter_algebra_spec_to_mechanism(
     statements = {statement.name: statement for statement in spec.parameter_block.lines}
     literal = bind_scalar_expression_evaluator(
         spec.parameter_block, {},
-        literal_reader=lambda node: parse_finite_numeric_text(node.literal, field="Parameter literal")
-        if node.literal is not None else node.value,
+        literal_reader=lambda node: parse_finite_numeric_text(node.literal, field="Parameter literal"),
     )
     overrides = scalar_parameter_overrides or {}
     input_units = dict(spec.input_units)

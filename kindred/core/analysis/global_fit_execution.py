@@ -151,16 +151,14 @@ def _decode_admitted_physical(
     return decoded
 
 
-def _raise_if_fitting_cancelled(cancellation_check: Optional[Callable[[], bool]]) -> None:
-    if cancellation_check is not None and cancellation_check():
+def _raise_if_fitting_cancelled(cancellation_check: Callable[[], bool]) -> None:
+    if cancellation_check():
         raise FittingCancelled()
 
 
 def _raise_if_fitting_cancel_requested(
-    cancellation_control: SimulationCancellationControl | None,
+    cancellation_control: SimulationCancellationControl,
 ) -> None:
-    if cancellation_control is None:
-        return
     if cancellation_control.cancel_requested():
         raise FittingCancelled()
 
@@ -390,8 +388,6 @@ def _select_fit_rows(
     sim_t = np.asarray(sim_time, dtype=float).reshape(-1)
     obs_t = np.asarray(observation_time, dtype=float).reshape(-1)
     rows = np.searchsorted(sim_t, obs_t, side="left")
-    if np.any(rows == sim_t.size) or np.any(sim_t[np.minimum(rows, sim_t.size - 1)] != obs_t):
-        raise FitSimulationError("Expected every observation time to be a row of the simulation.")
     return np.asarray(model_y, dtype=float).reshape(-1)[rows]
 
 
@@ -445,27 +441,16 @@ def fit_result_target_values(
     """
 
     target_name = str(name)
-    details = {"dataset": dataset_id}
     time_size = np.asarray(result.t, dtype=float).reshape(-1).size
     if target_name in result.series:
         # A let undefined at some time points keeps them as NaN; the residual
         # path judges the points that data compares with.
         values = np.asarray(result.series[target_name], dtype=float).reshape(-1)
     elif target_name in result.scalars:
-        value = float(result.scalars[target_name])
-        if not np.isfinite(value):
-            raise FitSimulationError(
-                f"Fit scalar target {target_name!r} is nonfinite.",
-                details=details,
-            )
-        values = np.full(time_size, value, dtype=float)
+        # Finalization admits only finite scalars and row-aligned series.
+        values = np.full(time_size, result.scalars[target_name], dtype=float)
     else:
         raise _target_not_calculated(result, target_name, dataset_id)
-    if values.size != time_size:
-        raise FitSimulationError(
-            f"Fit target {target_name!r} is not a row-aligned output.",
-            details=details,
-        )
     return values
 
 
@@ -473,14 +458,11 @@ def _target_not_calculated(
     result: SimulationResultValue, target_name: str, dataset_id: str,
 ) -> FitSimulationError:
     """The fatal error for a target the Fit cannot compare, carrying its own cause."""
+    # A target is a species (always a series) or a let, which either succeeds
+    # or carries an error naming itself.
     algebra_cause = next(
-        (cause for cause in result.algebra_errors if cause.details.get("name") == target_name), None,
+        cause for cause in result.algebra_errors if cause.details["name"] == target_name
     )
-    if algebra_cause is None:
-        return FitSimulationError(
-            f"Fit target {target_name!r} is absent from the canonical simulation scalar/series outputs.",
-            details={"dataset": dataset_id},
-        )
     # Its own cause's sentence, on the authored line that failed.
     line, line_text = algebra_cause.location()
     return FitSimulationError(
@@ -868,7 +850,7 @@ def _build_dataset_fit_info(
     simulation: SimulationResultValue,
     *,
     weights: Mapping[str, float],
-    cancellation_control: SimulationCancellationControl | None = None,
+    cancellation_control: SimulationCancellationControl,
 ) -> DatasetFitInfo:
     """Project one simulation and build direct weighted residual facts.
 
@@ -894,7 +876,7 @@ def _build_dataset_fit_info(
             fit_result_target_values(simulation, name, dataset_id=dataset_id)
         # Match along the same curve the Fit plot draws: known pre-boundary
         # endpoints included, instantaneous jumps never crossed.
-        alignment_time, alignment_x, alignment_y, alignment_regions = alignment_rows(
+        alignment_x, alignment_y, alignment_regions = alignment_rows(
             simulation,
             SimulationSeriesAxisSelection(x_name),
             tuple((name, SimulationSeriesAxisSelection(name)) for name in payload.species_list),
@@ -902,7 +884,6 @@ def _build_dataset_fit_info(
         x_projection = align_parametric(
             observed_x=x_observations["x"],
             source_rows=x_observations["source_rows"],
-            model_time=alignment_time,
             model_x=alignment_x,
             regions=alignment_regions,
             observations=payload.observations,
@@ -994,7 +975,7 @@ def evaluate_dataset_simulation(
     fit_evaluators: Mapping[str, FittingEvaluator],
     item: ObjectiveDatasetInput,
     *,
-    cancellation_control: SimulationCancellationControl | None = None,
+    cancellation_control: SimulationCancellationControl,
     weights: Mapping[str, float],
 ) -> DatasetFitInfo | ScientificUnavailable:
     """Bind, simulate, align, weight, and evaluate one dataset directly.
@@ -1010,10 +991,7 @@ def evaluate_dataset_simulation(
     deadline = started + _DATASET_DEADLINE_SECONDS
     worker_cancel = cancellation_control
     task_control = SimulationCancellationControl(
-        lambda: (
-            worker_cancel is not None
-            and worker_cancel.cancel_requested()
-        )
+        lambda: worker_cancel.cancel_requested()
         or time.monotonic() >= deadline
     )
 
@@ -1083,7 +1061,7 @@ def _join_dataset_simulations(
     fit_evaluators: Mapping[str, FittingEvaluator],
     items: Sequence[ObjectiveDatasetInput],
     *,
-    cancellation_control: SimulationCancellationControl | None,
+    cancellation_control: SimulationCancellationControl,
     executor: Executor,
     weights: Mapping[str, float],
 ) -> list[DatasetFitInfo | ScientificUnavailable | BaseException]:
@@ -1115,8 +1093,8 @@ def evaluate_dataset_simulations(
     fit_evaluators: Mapping[str, FittingEvaluator],
     items: Sequence[ObjectiveDatasetInput],
     *,
-    cancellation_check: Optional[Callable[[], bool]] = None,
-    cancellation_control: SimulationCancellationControl | None = None,
+    cancellation_check: Callable[[], bool],
+    cancellation_control: SimulationCancellationControl,
     executor: Executor,
     weights: Mapping[str, float],
 ) -> list[DatasetFitInfo | ScientificUnavailable]:
@@ -1142,8 +1120,8 @@ class GlobalFitObjective:
         layout: FitParameterLayout,
         penalty_value: float,
         progress_callback: Optional[Callable[[FitProgress], None]],
-        cancellation_check: Optional[Callable[[], bool]],
-        cancellation_control: SimulationCancellationControl | None = None,
+        cancellation_check: Callable[[], bool],
+        cancellation_control: SimulationCancellationControl,
         executor: Executor,
     ) -> None:
         # One compiled Fit setup supplies the nonempty unique included
@@ -1575,12 +1553,12 @@ def _replay_fit_result(
     candidate_vector: np.ndarray,
     fixed_dataset_params: Dict[str, Dict[str, float]],
     weights: Dict[str, float],
-    cancellation_check: Optional[Callable[[], bool]],
+    cancellation_check: Callable[[], bool],
     ending: FitEnding,
     message: str,
     endpoint_replaced: bool,
     identifiability_warning: str | None,
-    cancellation_control: SimulationCancellationControl | None = None,
+    cancellation_control: SimulationCancellationControl,
     executor: Executor,
 ) -> GlobalFitResult | ScientificUnavailable:
     candidate_vector = np.asarray(candidate_vector, dtype=float).reshape(-1).copy()
@@ -1640,8 +1618,8 @@ def _assemble_fit_result_facts(
     layout: FitParameterLayout,
     candidate_vector: np.ndarray,
     facts: tuple[DatasetFitInfo, ...],
-    cancellation_check: Optional[Callable[[], bool]],
-    cancellation_control: SimulationCancellationControl | None,
+    cancellation_check: Callable[[], bool],
+    cancellation_control: SimulationCancellationControl,
     ending: FitEnding,
     message: str,
     endpoint_replaced: bool = False,

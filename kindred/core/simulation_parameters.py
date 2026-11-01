@@ -58,7 +58,7 @@ def enumerate_simulation_parameters(
     source_coordinate_names = namespace.source_coordinate_names
     step_by_index: dict[int, Mapping[str, object]] = {}
     for entry in get_step_index_map(mechanism):
-        step_by_index[int(entry["step_index"])] = entry
+        step_by_index[entry["step_index"]] = entry
     # Every coordinate is reported in its input unit: the param line's unit
     # for a mechanism input, energy= for energies, otherwise scientific units.
     input_units = dict(parameter_spec.input_units)
@@ -89,14 +89,11 @@ def enumerate_simulation_parameters(
     for item in namespace.ordered_items:
         info = item.info
         step_index = info.step_index
-        entry = step_by_index.get(step_index, {})
+        entry = step_by_index[step_index]
         kind = info.step_kind
         role = info.role
-        name = str(item.canonical_name)
-        source_coordinates = {
-            str(source_role): str(source_name)
-            for source_role, source_name in entry["source_coordinates"].items()
-        }
+        name = item.canonical_name
+        source_coordinates = entry["source_coordinates"]
         source_info = namespace.source_coordinate_info(name)
         if source_info is not None and not source_coordinate_capabilities(
             source_info.role
@@ -119,19 +116,17 @@ def enumerate_simulation_parameters(
             # projected below.
             if role != "k" or source_coordinates.get("k") != name:
                 continue
-            raw_index = int(entry["reaction_index"])
-            model = reactions[int(raw_index)].forward_model
+            model = reactions[entry["reaction_index"]].forward_model
             family = forward_rate_family(model)
             value = model.k
-        elif kind == "equilibrium":
+        else:
             # The indexed forward/reverse/Keq names are independent only when
             # their exact source role was authored.  This keeps derived
             # kf/kr/Keq values out of Slider and Fit while retaining their
             # readout semantics in the rest of the namespace.
             if source_coordinates.get(role) != name:
                 continue
-            raw_index = int(entry["equilibrium_index"])
-            equilibrium = equilibria[int(raw_index)]
+            equilibrium = equilibria[entry["equilibrium_index"]]
             authority = equilibrium.authority
             if role == "kf":
                 model = equilibrium.forward_model
@@ -143,8 +138,6 @@ def enumerate_simulation_parameters(
             elif role == "Keq":
                 family = "reverse"
                 value = authority.Keq
-        else:
-            continue
         coordinates.append(
             SimulationParameter(
                 name=name,
@@ -163,28 +156,22 @@ def enumerate_simulation_parameters(
     # allowed to collapse repeated reactions.
     physical_candidates: list[tuple[str, str, str, float]] = []
     for entry in step_by_index.values():
-        kind = str(entry["kind"])
+        kind = entry["kind"]
         source_coordinates = {
-            str(role): str(name)
+            role: name
             for role, name in entry["source_coordinates"].items()
-            if str(name) in source_coordinate_names
-            and source_coordinate_capabilities(str(role)).continuous
+            if name in source_coordinate_names
+            and source_coordinate_capabilities(role).continuous
         }
         if not source_coordinates:
             continue
-        model: ForwardRateModel | None = None
         authority = None
         if kind == "reaction":
-            raw_index = int(entry["reaction_index"])
-            reaction = reactions[int(raw_index)]
-            model = reaction.forward_model
-        elif kind == "equilibrium":
-            raw_index = int(entry["equilibrium_index"])
-            equilibrium = equilibria[int(raw_index)]
+            model = reactions[entry["reaction_index"]].forward_model
+        else:
+            equilibrium = equilibria[entry["equilibrium_index"]]
             authority = equilibrium.authority
             model = equilibrium.forward_model
-        if model is None:
-            continue
         for role, name in source_coordinates.items():
             # The parser ties each authored role to its rate family.
             if role == "A":

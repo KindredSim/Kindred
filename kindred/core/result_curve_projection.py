@@ -120,10 +120,9 @@ def alignment_rows(result, x_axis, series_axes):
     """
     chunks = physical_curve_chunks(result, x_axis, series_axes, range(len(result.t)))
     names = tuple(name for name, _axis in series_axes)
-    times, xs, regions = [], [], []
+    xs, regions = [], []
     ys = {name: [] for name in names}
     for region, chunk in enumerate(chunk for chunk in chunks if not chunk.instantaneous):
-        times.append(chunk.time)
         xs.append(chunk.x)
         regions.append(np.full(chunk.time.size, region, dtype=np.int64))
         for name, values in chunk.series:
@@ -133,7 +132,6 @@ def alignment_rows(result, x_axis, series_axes):
         return np.concatenate(parts) if parts else np.asarray([], dtype=dtype)
 
     return (
-        joined(times),
         joined(xs),
         {name: joined(ys[name]) for name in names},
         joined(regions, np.int64),

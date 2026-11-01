@@ -98,11 +98,10 @@ def _normal_event_states(
     *,
     count: int,
 ) -> tuple[tuple[np.ndarray, ...], ...]:
-    # SciPy gives None without events, else one (hits, states) array per event,
-    # shaped (0,) when the event never fired; the first ``count`` events are
-    # the boundary events.
+    # SciPy gives one (hits, states) array per event, shaped (0,) when the
+    # event never fired; the first ``count`` events are the boundary events.
     output: list[list[np.ndarray]] = [[] for _ in range(count)]
-    for idx, raw in enumerate(tuple(raw_states or ())[:count]):
+    for idx, raw in enumerate(tuple(raw_states)[:count]):
         arr = np.asarray(raw, dtype=float)
         if arr.size == 0:
             continue
@@ -145,7 +144,7 @@ def _build_provenance(req: _SimulationRequest, *, t_eval: np.ndarray) -> Dict[st
         "rtol": float(req.rtol),
         "atol": float(req.atol),
         "grid_type": ("explicit" if req.t_eval is not None else "N"),
-        "grid_params": ({"t_eval": list(t_eval)} if req.t_eval is not None else dict(req.grid or {})),
+        "grid_params": ({"t_eval": list(t_eval)} if req.t_eval is not None else dict(req.grid)),
     }
     prov.update(symbolic_jacobian.provenance_fields())
     intervention_execution = req.intervention_execution
@@ -165,24 +164,16 @@ def _build_provenance(req: _SimulationRequest, *, t_eval: np.ndarray) -> Dict[st
 
 def _guard_runtime_symbolic_jacobian(
     jacobian_func: Callable[[float, np.ndarray], np.ndarray],
-    cancellation_control: _SimulationCancellationControl | None,
+    cancellation_control: _SimulationCancellationControl,
 ) -> Callable[[float, np.ndarray], np.ndarray]:
     """Reject a non-finite symbolic Jacobian without reclassifying RHS errors."""
 
     def guarded(time: float, state: np.ndarray) -> np.ndarray:
-        if (
-            cancellation_control is not None
-            and cancellation_control.cancel_requested()
-        ):
+        if cancellation_control.cancel_requested():
             raise SimulationCancelled()
         values = np.asarray(state, dtype=float).reshape(-1)
         matrix = np.asarray(jacobian_func(float(time), values), dtype=float)
-        expected_shape = (values.size, values.size)
-        if matrix.shape != expected_shape:
-            raise _SymbolicJacobianEvaluationError(
-                time=float(time),
-                reason=f"its analytic Jacobian had shape {matrix.shape} instead of {expected_shape}",
-            )
+        # The Jacobian is built square over the state, volume included.
         if not np.all(np.isfinite(matrix)):
             raise _SymbolicJacobianEvaluationError(
                 time=float(time),
@@ -244,8 +235,7 @@ def _execute_scipy(
             return float(_event(absolute(t), y))
 
         _wrapped_event.terminal = terminal  # type: ignore[attr-defined]
-        if hasattr(event, "direction"):
-            _wrapped_event.direction = getattr(event, "direction")  # type: ignore[attr-defined]
+        _wrapped_event.direction = event.direction  # type: ignore[attr-defined]
         events_list.append(_wrapped_event)
     # SciPy evaluates every event at each accepted step (root searches stay
     # inside that step), so the largest observed time is the last accepted
@@ -278,10 +268,7 @@ def _execute_scipy(
         solve_kwargs["jac"] = jac_callable
 
     def _solve():
-        if (
-            req.cancellation_control is not None
-            and req.cancellation_control.cancel_requested()
-        ):
+        if req.cancellation_control.cancel_requested():
             raise SimulationCancelled()
         rhs_values = np.asarray(
             rhs(float(t0), np.asarray(y0, dtype=float).reshape(-1).copy()),
@@ -318,10 +305,7 @@ def _execute_scipy(
                 stage, reason = "nonfinite_step", "a step produced values that are not finite"
             else:
                 raise
-            if (
-                req.cancellation_control is not None
-                and req.cancellation_control.cancel_requested()
-            ):
+            if req.cancellation_control.cancel_requested():
                 raise SimulationCancelled() from exc
             error = create_solver_error(req.solver, last_accepted_time, reason, str(exc))
             if req.candidate_evaluation:
@@ -338,10 +322,7 @@ def _execute_scipy(
                     )
                 ) from exc
             raise error from exc
-        if (
-            req.cancellation_control is not None
-            and req.cancellation_control.cancel_requested()
-        ):
+        if req.cancellation_control.cancel_requested():
             if dense_output:
                 solved.sol = None
             raise SimulationCancelled()
@@ -350,10 +331,7 @@ def _execute_scipy(
     try:
         sol = _solve()
     except _SymbolicJacobianEvaluationError as exc:
-        if (
-            req.cancellation_control is not None
-            and req.cancellation_control.cancel_requested()
-        ):
+        if req.cancellation_control.cancel_requested():
             raise SimulationCancelled() from exc
         details = {
             "solver": req.solver,
@@ -430,12 +408,7 @@ def _execute_scipy(
             volume.record_segment(t0, absolute(float(local_dense.t_max)), dense)
             raw_trajectory = raw_trajectory[:species_count]
         raw_terminal_state = None
-        if (
-            t_out.size
-            and float(t_out[-1]) == float(t1)
-            and raw_trajectory.ndim == 2
-            and raw_trajectory.shape[1]
-        ):
+        if t_out.size and float(t_out[-1]) == float(t1):
             raw_terminal_state = raw_trajectory[:, -1].copy()
         Y_out, nonnegative_projection = project_nonnegative_trajectory(
             raw_trajectory,
@@ -452,15 +425,12 @@ def _execute_scipy(
         )
         raw_event_states, event_state_projection = (
             _normal_event_states_with_projection(
-                (tuple(np.asarray(states).reshape(-1, len(y0))[:, :species_count] for states in (sol.y_events or ()))
+                (tuple(np.asarray(states).reshape(-1, len(y0))[:, :species_count] for states in sol.y_events)
                  if volume is not None else sol.y_events),
                 count=event_count,
             )
         )
-        if (
-            req.cancellation_control is not None
-            and req.cancellation_control.cancel_requested()
-        ):
+        if req.cancellation_control.cancel_requested():
             raise SimulationCancelled()
         return SegmentRunResult(
             t=t_out,
@@ -522,17 +492,14 @@ def _normal_event_provenance(
 ) -> tuple[tuple[float, ...], ...]:
     out = [[] for _ in range(count)]
     # The first ``count`` SciPy events are the boundary events.
-    for idx, raw in enumerate(tuple(events or ())[:count]):
+    for idx, raw in enumerate(tuple(events)[:count]):
         out[idx].extend(float(value) for value in raw)
     return tuple(tuple(values) for values in out)
 
 def solve_ode(
     req: _SimulationRequest,
 ) -> _FinalSimulationOutput | _SimulationScientificUnavailability:
-    if (
-        req.cancellation_control is not None
-        and req.cancellation_control.cancel_requested()
-    ):
+    if req.cancellation_control.cancel_requested():
         raise SimulationCancelled()
     t0, t1 = map(float, req.t_span)
     t_eval = _prepare_time_grid(req, t0=t0, t1=t1)
@@ -549,10 +516,7 @@ def solve_ode(
             )
         )
     except _SimulationScientificUnavailabilitySignal as exc:
-        if (
-            req.cancellation_control is not None
-            and req.cancellation_control.cancel_requested()
-        ):
+        if req.cancellation_control.cancel_requested():
             raise SimulationCancelled() from exc
         if req.candidate_evaluation:
             return exc.outcome

@@ -70,11 +70,13 @@ def _get_log_level_from_env() -> str:
 def diagnostic_log_path() -> Path:
     """Return the active diagnostic log path."""
 
-    for handler in logging.getLogger().handlers:
-        if isinstance(handler, logging.handlers.RotatingFileHandler):
-            handler.flush()
-            return Path(handler.baseFilename)
-    raise RuntimeError("The diagnostic log is not available.")
+    # setup_logging installs the rotating file handler or startup stops.
+    handler = next(
+        item for item in logging.getLogger().handlers
+        if isinstance(item, logging.handlers.RotatingFileHandler)
+    )
+    handler.flush()
+    return Path(handler.baseFilename)
 
 
 def setup_logging() -> None:

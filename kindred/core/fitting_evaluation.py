@@ -94,13 +94,13 @@ class PreparedFittingExecutionContext:
 def prepare_fitting_execution_context(
     *,
     prepared_dsl: PreparedDslRequestSet,
-    t_start: float = 0.0,
+    t_start: float,
     t_end: float,
     objective_sample_times: Sequence[float],
     prepared_solver_config: PreparedSolverConfig,
     sample_solver_steps: bool,
     use_authored_stops: bool,
-    cancellation_control: SimulationCancellationControl | None = None,
+    cancellation_control: SimulationCancellationControl,
 ) -> PreparedFittingExecutionContext:
     """Prepare structured execution data for one per-dataset evaluator.
 
@@ -108,10 +108,7 @@ def prepare_fitting_execution_context(
     observation times inside the span; this builds one dataset's context.
     """
 
-    if (
-        cancellation_control is not None
-        and cancellation_control.cancel_requested()
-    ):
+    if cancellation_control.cancel_requested():
         raise FittingCancelled()
     regular_grid = build_time_grid(t_start, t_end, prepared_solver_config.grid)
     objective_times = np.asarray(tuple(objective_sample_times), dtype=float).reshape(-1)
@@ -127,10 +124,7 @@ def prepare_fitting_execution_context(
         )
     )
 
-    if (
-        cancellation_control is not None
-        and cancellation_control.cancel_requested()
-    ):
+    if cancellation_control.cancel_requested():
         raise FittingCancelled()
     species_names = tuple(prepared_dsl.accepted_mechanism_for_structure().species_names())
     # A form each candidate completes: its starting concentrations and values
@@ -333,6 +327,7 @@ class FittingEvaluator:
         )
         request = build_simulation_request_from_prepared_run(
             prepared_run,
+            cancellation_control=cancellation_control,
             t_eval=np.asarray(
                 self._context.requested_sample_times,
                 dtype=float,

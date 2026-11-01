@@ -153,7 +153,7 @@ def _emit(node: ExprNode, row: str, names: Iterator[str]) -> tuple[str, bool]:
     if blank:
         text = '""'
     elif isinstance(node, NumberNode):
-        text = node.literal if node.literal is not None else repr(node.value)
+        text = node.literal
     elif isinstance(node, IdentNode):
         text = repr(_CONSTANTS[node.name]) if node.name in _CONSTANTS else f"{node.name[:-1]}{row}"
     else:
@@ -228,7 +228,7 @@ def _compile_columns(columns: Sequence[Mapping[str, Any]]) -> dict[int, Compiled
     for column, info in enumerate(columns, 1):
         letter = ironcalc.column_name_from_number(column)
         name = f"{letter}1"
-        if info.get("formula") is not None:
+        if info["formula"] is not None:
             statements.append(f"let {name} = {_source(info['formula'])}")
             calculated.append(letter)
         else:

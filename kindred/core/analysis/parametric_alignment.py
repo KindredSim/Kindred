@@ -12,7 +12,7 @@ from dataclasses import dataclass, fields
 import numpy as np
 
 from kindred.core.analysis.fit_dataset_payload import FitObservationSeries
-from kindred.core.exceptions import FitSimulationError, FittingCancelled
+from kindred.core.exceptions import FittingCancelled
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 
 __all__ = ["ParametricProjection", "UndefinedComparedTargets", "align_parametric", "project_parametric_y"]
@@ -60,11 +60,10 @@ def align_parametric(
     observations: Mapping[str, FitObservationSeries],
     model_x: np.ndarray,
     model_y: Mapping[str, np.ndarray],
-    model_time: np.ndarray,
     regions: np.ndarray,
     multipliers: Mapping[str, float],
     x_name: str,
-    cancellation_control: SimulationCancellationControl | None,
+    cancellation_control: SimulationCancellationControl,
 ) -> ParametricProjection:
     """Minimize sum((weight multiplier * discrepancy)**2) on each segment.
 
@@ -75,14 +74,13 @@ def align_parametric(
     measures; a row with no such segment raises UndefinedComparedTargets with
     the quantities it measures.
     """
-    if cancellation_control is not None and cancellation_control.cancel_requested():
+    if cancellation_control.cancel_requested():
         raise FittingCancelled()
     names = tuple(sorted(observations))
     model = np.column_stack((model_x, *(model_y[name] for name in names)))
     region_ids = np.asarray(regions)
+    # Result rows increase within each region.
     continuous = region_ids[1:] == region_ids[:-1]
-    if np.any(np.diff(model_time)[continuous] <= 0.0):
-        raise FitSimulationError("Model time must increase within uninterrupted segments.")
     # Direct samples guarantee bounded matches even when no adjacent pair is valid.
     samples = np.arange(len(model))
     adjacent = np.flatnonzero(continuous)
@@ -100,7 +98,7 @@ def align_parametric(
     chosen_rows: list[int] = []
     chosen_fractions: list[float] = []
     for row, x_value in zip(source_rows, observed_x, strict=True):
-        if cancellation_control is not None and cancellation_control.cancel_requested():
+        if cancellation_control.cancel_requested():
             raise FittingCancelled()
         observed = np.asarray([x_value, *(observed_by_row[name].get(row, np.nan) for name in names)])
         available = np.isfinite(observed)

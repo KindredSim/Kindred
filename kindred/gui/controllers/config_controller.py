@@ -68,7 +68,6 @@ _DEFAULT_PREVIEW_POINTS = 50
 _DEFAULT_PREVIEW_DELAY_MS = 150
 
 _SPECIES_COLORS_KEY = "plot/species_colors"
-_EXPERIMENTAL_POINT_SHAPE_KEY = "plot/experimental_point_shape"
 _EXPERIMENTAL_POINT_SIZE_KEY = "plot/experimental_point_size"
 _EXPERIMENTAL_POINT_OPACITY_KEY = "plot/experimental_point_opacity"
 _WINDOW_LAYOUT_KEYS = {
@@ -78,7 +77,6 @@ _WINDOW_LAYOUT_KEYS = {
 }
 _DEFAULT_EXPERIMENTAL_POINT_SIZE = 6
 _DEFAULT_EXPERIMENTAL_POINT_OPACITY = 180.0 / 255.0
-_SPECIES_SUFFIXES = ("_conc", "_concentration")
 _BASE_SPECIES_RGB: tuple[tuple[int, int, int], ...] = (
     (230, 159, 0),
     (86, 180, 233),
@@ -93,11 +91,6 @@ _BASE_SPECIES_RGB: tuple[tuple[int, int, int], ...] = (
 
 class ConfigController(QtCore.QObject):
     """The sole QSettings-backed owner of admitted application settings."""
-
-    EXPERIMENTAL_POINT_SHAPES = (
-        ("Circle", "o"), ("Square", "s"), ("Triangle", "t"),
-        ("Diamond", "d"), ("Cross", "x"), ("Plus", "+"),
-    )
 
     applicationPlotPreferencesChanged = QtCore.Signal()
     recentProjectsChanged = QtCore.Signal()
@@ -116,7 +109,7 @@ class ConfigController(QtCore.QObject):
     @staticmethod
     def _parsed_int(value: object) -> int | None:
         if type(value) is int:
-            return int(value)
+            return value
         if isinstance(value, str):
             text = value.strip()
             if text and text.lstrip("+-").isdigit():
@@ -607,14 +600,19 @@ class ConfigController(QtCore.QObject):
     def species_color(
         self,
         species: str,
-        known_species: Sequence[str] = (),
+        known_species: Sequence[str],
     ) -> QtGui.QColor:
-        """Return one application preference color as an independent QColor."""
-        canonical = self._resolve_species_name(species, known_species)
-        override = self._species_color_overrides().get(canonical)
+        """Return one application preference color as an independent QColor.
+
+        ``species`` is one of the tab's quantities, ``known_species``; its
+        default color follows its place in their case-insensitive order.
+        """
+        override = self._species_color_overrides().get(species)
         if override is not None:
             return QtGui.QColor(override)
-        slot = self._default_species_slot(canonical, known_species)
+        slot = sorted(known_species, key=str.casefold).index(species) % len(
+            self._species_palette
+        )
         # qdarktheme supplies application Text while styling Base per widget.
         dark_mode = (
             QtWidgets.QApplication.palette().color(QtGui.QPalette.Text).lightness() > 128
@@ -625,11 +623,9 @@ class ConfigController(QtCore.QObject):
         self,
         species: str,
         color: QtGui.QColor,
-        known_species: Sequence[str] = (),
     ) -> None:
-        canonical = self._resolve_species_name(species, known_species)
         overrides = dict(self._species_color_overrides())
-        overrides[canonical] = QtGui.QColor(color).name(QtGui.QColor.NameFormat.HexRgb)
+        overrides[species] = QtGui.QColor(color).name(QtGui.QColor.NameFormat.HexRgb)
         settings = self._settings()
         snapshot = self._snapshot_settings(settings, (_SPECIES_COLORS_KEY,))
         settings.setValue(_SPECIES_COLORS_KEY, overrides)
@@ -639,22 +635,6 @@ class ConfigController(QtCore.QObject):
             snapshot=snapshot,
         )
         self.applicationPlotPreferencesChanged.emit()
-
-    def experimental_point_shape(self) -> str:
-        value = self._settings().value(_EXPERIMENTAL_POINT_SHAPE_KEY, "o")
-        return (
-            value
-            if value in tuple(code for _label, code in self.EXPERIMENTAL_POINT_SHAPES)
-            else "o"
-        )
-
-    def set_experimental_point_shape(self, shape: str) -> str:
-        settings = self._settings()
-        snapshot = self._snapshot_settings(settings, (_EXPERIMENTAL_POINT_SHAPE_KEY,))
-        settings.setValue(_EXPERIMENTAL_POINT_SHAPE_KEY, shape)
-        self._sync_or_report(settings, "experimental point shape", snapshot=snapshot)
-        self.applicationPlotPreferencesChanged.emit()
-        return shape
 
     def experimental_point_size(self) -> int:
         value = self._setting(
@@ -731,45 +711,6 @@ class ConfigController(QtCore.QObject):
         return MappingProxyType(accepted)
 
     @classmethod
-    def _resolve_species_name(
-        cls,
-        species: str,
-        known_species: Sequence[str],
-    ) -> str:
-        raw = species
-        roster = tuple(known_species)
-        if not roster:
-            return raw
-        exact = {name: name for name in roster}
-        if raw in exact:
-            return exact[raw]
-        folded = {name.casefold(): name for name in roster}
-        if raw.casefold() in folded:
-            return folded[raw.casefold()]
-        lowered = raw.casefold()
-        for suffix in _SPECIES_SUFFIXES:
-            if lowered.endswith(suffix) and len(raw) > len(suffix):
-                base = raw[: -len(suffix)].casefold()
-                if base in folded:
-                    return folded[base]
-        return raw
-
-    def _default_species_slot(
-        self,
-        canonical: str,
-        known_species: Sequence[str],
-    ) -> int:
-        roster = sorted(
-            known_species,
-            key=str.casefold,
-        )
-        if canonical in roster:
-            return roster.index(canonical) % len(self._species_palette)
-        return sum(ord(character) for character in canonical) % len(
-            self._species_palette
-        )
-
-    @classmethod
     def _build_species_palette(cls) -> tuple[QtGui.QColor, ...]:
         base = [QtGui.QColor(*rgb) for rgb in _BASE_SPECIES_RGB]
         darker = [
@@ -795,7 +736,8 @@ class ConfigController(QtCore.QObject):
                 if toward_white
                 else value * (1.0 - factor)
             )
-            return max(0, min(int(round(mixed)), 255))
+            # Mixing two channel values with 0 < factor < 1 stays within 0..255.
+            return round(mixed)
 
         return QtGui.QColor(
             channel(color.red()),

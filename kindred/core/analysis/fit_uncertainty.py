@@ -58,20 +58,13 @@ _LIKELIHOOD_MODEL = "independent Gaussian residuals with one noise level per ser
 
 def _confidence(value: object) -> float:
     result = float(value)
-    if not math.isfinite(result) or not 0.0 < result < 1.0:
+    if not 0.0 < result < 1.0:
         raise ValueError("Confidence level must lie strictly between zero and one.")
     return result
 
 
 def _coordinate_display(value: _fit_execution.FitCoordinate) -> str:
     return value.display_name
-
-
-def _names(values: Sequence[object], *, field: str) -> tuple[object, ...]:
-    names = tuple(values)
-    if not names:
-        raise ValueError(f"{field} must contain at least one coordinate.")
-    return names
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +93,7 @@ class ProfileLikelihoodConfig:
         object.__setattr__(
             self,
             "parameter_names",
-            _names(tuple(self.parameter_names), field="Profile parameter names"),
+            tuple(self.parameter_names),
         )
 
 
@@ -519,7 +512,6 @@ class ProfileLikelihoodResult:
         # The Profile owner builds every result from its admitted
         # configuration, literal statuses, a factual reason for an unavailable
         # result and a diagnostic for a failed one.
-        object.__setattr__(self, "method", _PROFILE_METHOD)
         object.__setattr__(self, "intervals", MappingProxyType(dict(self.intervals)))
         object.__setattr__(self, "provenance", MappingProxyType(dict(self.provenance)))
 
@@ -633,7 +625,7 @@ def profile_likelihood_result(
     def failure_result(
         cause: FactualCause,
         *,
-        provenance: Mapping[str, object] | None = None,
+        provenance: Mapping[str, object],
     ) -> ProfileLikelihoodResult:
         return finish(
             ProfileLikelihoodResult(
@@ -643,7 +635,7 @@ def profile_likelihood_result(
                 likelihood_model=_LIKELIHOOD_MODEL,
                 intervals={},
                 diagnostic=cause,
-                provenance={"settlement": "failed", **dict(provenance or {})},
+                provenance={"settlement": "failed", **provenance},
             )
         )
 
@@ -800,7 +792,7 @@ def profile_likelihood_result(
                     break
                 inner_x = float(fixed)
                 inner_record = record
-                inner_parameters = dict(fitted_parameters or inner_parameters)
+                inner_parameters = dict(fitted_parameters)
             if bracket is None:
                 # The last discovery step refits at the bound itself.
                 return None, ProfileLikelihoodEndpoint("bound", "search_limit_reached")

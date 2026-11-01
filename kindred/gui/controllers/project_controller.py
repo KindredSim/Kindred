@@ -203,7 +203,7 @@ class ProjectController(QtCore.QObject):
         self._scan.application_close_settlement_changed.connect(self.notify_close_progress)
 
     def _set_status(self, text: str) -> None:
-        self._set_status_text(str(text))
+        self._set_status_text(text)
 
     @property
     def mutation_admitted(self) -> bool:
@@ -246,12 +246,12 @@ class ProjectController(QtCore.QObject):
         self._capture_visible_tab_inputs()
         expected_token = self._session.capture_content_token()
         request = _ProjectDispositionRequest(
-            action=str(action),
+            action=action,
             archive_dirty=self._session.is_dirty(
                 self._tabs.workspace_presentation()
             ),
             transient=self._inspect_transient_state(),
-            application_close=bool(application_close),
+            application_close=application_close,
         )
         if not request.archive_dirty and not request.transient.has_any:
             return _DispositionResult(
@@ -277,13 +277,12 @@ class ProjectController(QtCore.QObject):
                 content_token=saved_token,
                 discard_slider_drafts=request.transient.slider_drafts,
             )
-        if choice is _DispositionChoice.DISCARD:
-            return _DispositionResult(
-                content_token=expected_token,
-                discard_all_authoring=request.transient.has_authoring_edits,
-                discard_slider_drafts=request.transient.slider_drafts,
-            )
-        return None
+        # DISCARD
+        return _DispositionResult(
+            content_token=expected_token,
+            discard_all_authoring=request.transient.has_authoring_edits,
+            discard_slider_drafts=request.transient.slider_drafts,
+        )
 
     def _prompt_disposition(
         self,

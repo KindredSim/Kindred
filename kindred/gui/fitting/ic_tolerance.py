@@ -120,4 +120,4 @@ class FitInitialTolerance:
             raise ValueError(
                 "Vary IC must resolve to minimum <= Starting IC <= maximum."
             )
-        return float(minimum), float(maximum)
+        return minimum, maximum

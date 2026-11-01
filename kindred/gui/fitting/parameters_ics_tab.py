@@ -341,7 +341,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._roster_height_initialized = False
         self._invalid_rows: dict[str, _InvalidRow] = {}
         self._projecting = False
-        self._running = False
         self._row_keys: tuple[tuple[str, str | None], ...] = ()
         self._build_ui()
 
@@ -489,7 +488,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._solver_combo.setObjectName("global_fit_solver")
         self._solver_combo.setToolTip(SOLVER_TOOLTIP)
         for solver in SUPPORTED_SOLVERS:
-            self._solver_combo.addItem(str(solver), str(solver))
+            self._solver_combo.addItem(solver, solver)
         self._method_combo = QtWidgets.QComboBox(settings_group)
         self._method_combo.setObjectName("global_fit_method")
         for method in SUPPORTED_FIT_METHODS:
@@ -945,39 +944,41 @@ class ParametersIcsTab(QtWidgets.QWidget):
         parent = -1
         datasets: list[tuple[int, str]] = []
         for row in range(self._param_table.rowCount()):
+            # Every roster row has a name cell carrying its identity.
             item = self._param_table.item(row, _C.NAME)
-            if item is None or item.data(QtCore.Qt.ItemDataRole.UserRole) != name:
+            if item.data(QtCore.Qt.ItemDataRole.UserRole) != name:
                 continue
             dataset_id = item.data(_DATASET_ROLE)
             if dataset_id is None:
                 parent = row
             else:
-                datasets.append((row, str(dataset_id)))
+                datasets.append((row, dataset_id))
         return parent, datasets
 
     def _on_roster_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
         if self._projecting:
             return
         name_item = self._param_table.item(item.row(), _C.NAME)
-        name = str(name_item.data(QtCore.Qt.ItemDataRole.UserRole))
+        name = name_item.data(QtCore.Qt.ItemDataRole.UserRole)
         dataset_id = name_item.data(_DATASET_ROLE)
         checked = item.checkState() == QtCore.Qt.CheckState.Checked
         if item.column() == _C.VARY and dataset_id is None:
             self._emit_vary_edit(name, checked)
         elif item.column() == _C.VARY:
-            self._on_dataset_vary_changed(name, str(dataset_id), checked)
+            self._on_dataset_vary_changed(name, dataset_id, checked)
         elif item.column() == _C.SCOPE and dataset_id is not None:
-            self._on_group_box_changed(name, str(dataset_id), checked)
+            self._on_group_box_changed(name, dataset_id, checked)
         elif item.column() == _C.PROFILE:
-            self._on_profile_tick(name, None if dataset_id is None else str(dataset_id), checked)
+            self._on_profile_tick(name, dataset_id, checked)
         elif item.column() in (_C.START, _C.MIN, _C.MAX, _C.LOG):
             self._emit_parameter_row_edit(name)
 
     def _selected_parameter(self) -> FitParameterVariable | None:
         row = self._param_table.currentRow()
-        item = self._param_table.item(row, _C.NAME) if row >= 0 else None
-        name = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if item is not None else ""
-        return self._parameter_by_name(name) if name else None
+        if row < 0:
+            return None
+        name = self._param_table.item(row, _C.NAME).data(QtCore.Qt.ItemDataRole.UserRole)
+        return self._parameter_by_name(name)
 
     def _row_raw_fields(self, parameter: FitParameterVariable) -> dict[str, str]:
         parent, datasets = self._parameter_rows(parameter.name)
@@ -1117,8 +1118,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def _emit_vary_edit(self, name: str, desired_fit: bool) -> None:
         """Apply the parameter row's Vary: every dataset varied, or every one fixed."""
 
-        if self._running:
-            return
         parameter = self._parameter_by_name(name)
         config = parameter.selected_config
         if desired_fit == config.fit and not config.fixed_dataset_ids:
@@ -1135,8 +1134,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def _on_dataset_vary_changed(self, name: str, dataset_id: str, checked: bool) -> None:
         """Vary or fix one dataset's value; a dataset that is fixed leaves its group."""
 
-        if self._running:
-            return
         parameter = self._parameter_by_name(name)
         config = parameter.per_dataset_config
         all_ids = {item for item, _value in config.dataset_values}
@@ -1160,8 +1157,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._emit_parameter_replacement(replacement)
 
     def _emit_parameter_row_edit(self, name: str) -> None:
-        if self._running:
-            return
         parameter = self._parameter_by_name(name)
         raw = self._row_raw_fields(parameter)
         edited, messages = self._parameter_projection_for_change(parameter, raw)
@@ -1183,7 +1178,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self.setupSnapshotRequested.emit(updated)
 
     def _open_bounds_dialog(self) -> None:
-        if self._projecting or self._running:
+        if self._projecting:
             return
         setup = self._projected_setup
         dialog = _ParameterBoundsDialog(setup.parameters, parent=self)
@@ -1216,12 +1211,11 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self.setupSnapshotRequested.emit(updated)
 
     def _on_scope_changed(self, name: str, combo: QtWidgets.QComboBox) -> None:
-        if self._projecting or self._running:
+        if self._projecting:
             return
+        # A scope combo exists only for a parameter of the projected setup.
         parameter = self._parameter_by_name(name)
-        if parameter is None:
-            return
-        desired = str(combo.currentData() or "")
+        desired = combo.currentData()
         if desired == parameter.scope:
             return
         replacement = convert_fit_parameter_scope(
@@ -1254,8 +1248,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def _on_group_box_changed(self, name: str, dataset_id: str, checked: bool) -> None:
         """Unchecking leaves the dataset's group; checking opens the membership dialog."""
 
-        if self._running:
-            return
         parameter = self._parameter_by_name(name)
         config = parameter.per_dataset_config
         if not checked:
@@ -1457,7 +1449,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         return labels
 
     def _emit_defaults_edit(self, *_args: object) -> None:
-        if self._projecting or self._running:
+        if self._projecting:
             return
         try:
             snapshot = replace(
@@ -1502,7 +1494,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._project_defaults(self._projected_setup.defaults)
 
     def _emit_solver_edit(self, *_args: object) -> None:
-        if self._projecting or self._running:
+        if self._projecting:
             return
         self.setupSnapshotRequested.emit(
             replace(self._projected_setup, solver=self._solver_combo.currentData())
@@ -1517,12 +1509,12 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self.setupSnapshotRequested.emit(replace(setup, profile=replace(setup.profile, **changes)))
 
     def _on_profile_toggled(self, enabled: bool) -> None:
-        if self._projecting or self._running:
+        if self._projecting:
             return
         self._emit_profile(enabled=enabled)
 
     def _open_profile_dialog(self) -> None:
-        if self._projecting or self._running:
+        if self._projecting:
             return
         dialog = _ProfileLikelihoodDialog(options=self._projected_setup.profile.options, parent=self)
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
@@ -1531,8 +1523,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def _on_profile_tick(self, name: str, dataset_id: str | None, checked: bool) -> None:
         """Tick or untick a row's fitted values; a parameter row covers all of them."""
 
-        if self._running:
-            return
         setup = self._projected_setup
         targets = {
             item for item in fit_uncertainty_coordinates(setup.parameters, setup.datasets)
@@ -1590,9 +1580,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
             }.get(item.checkState(), "No")
         # Copy carries the delegate's display text (numbers at six digits).
         return cell_text_as_shown(self._param_table, self._param_table.indexFromItem(item)).strip()
-
-    def set_running_state(self, running: bool) -> None:
-        self._running = bool(running)
 
     def clear_pending_setup_edits(self) -> None:
         self._retire_numeric_drafts()

@@ -300,10 +300,10 @@ def _set_label_projection(label, compact, *, max_width, tooltip, tooltip_text):
 def set_bounded_label_text(
     label: QtWidgets.QLabel, text: str, *,
     max_width: int = DEFAULT_DYNAMIC_LABEL_MAX_WIDTH,
-    empty_text: str = "", tooltip: bool = True,
+    tooltip: bool = True,
     tooltip_text: str | None = None,
 ) -> None:
-    full = str(text if text is not None else empty_text) or str(empty_text)
+    full = text
     _set_label_projection(label, CompactText(full, full, False),
                           max_width=max_width, tooltip=tooltip, tooltip_text=tooltip_text)
 

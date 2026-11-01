@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 from typing import Any, Callable, Mapping
 
-from kindred.core.constants import R
-from kindred.core.exceptions import ValueDomainError
 from kindred.core.kinetics import ForwardRateModel, forward_rate_model_payload
 from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
 from kindred.core.stoichiometry import directional_order_fraction
@@ -33,13 +30,8 @@ def derived_equilibrium_ratio_from_directional_rates(kf: float, kr: float) -> fl
     particular, it is not constrained by the authored-``Keq`` envelope.
     """
 
-    try:
-        ratio = kf / kr
-    except (OverflowError, ZeroDivisionError) as exc:
-        raise ValueDomainError("explicit kf+kr must derive a finite positive equilibrium ratio") from exc
-    if not math.isfinite(ratio) or ratio <= 0.0:
-        raise ValueDomainError("explicit kf+kr must derive a finite positive equilibrium ratio")
-    return float(ratio)
+    # Parsing and every override refuse a zero kf or kr.
+    return kf / kr
 
 
 class EquilibriumRateAuthorityKind:
@@ -86,9 +78,9 @@ def equilibrium_rate_symbolic_relations(
     temperature: object,
     literal: Callable[[object], object],
     exponential: Callable[[object], object],
-    source_coordinate: Callable[[str], object] | None = None,
+    source_coordinate: Callable[[str], object],
     standard_concentration: object,
-    constant: Callable[[str], object] | None = None,
+    constant: Callable[[str], object],
 ) -> EquilibriumRateSymbolicRelations:
     """Project accepted equilibrium authority without choosing a backend.
 
@@ -96,35 +88,26 @@ def equilibrium_rate_symbolic_relations(
     projects its accepted free-energy relation from the normalized authority;
     ``standard_concentration`` is the exact backend expression used for the
     concentration-form normalization.
-    ``constant`` optionally projects the named fixed gas constant instead of its
-    owned numeric literal, without changing thermodynamic or runtime authority.
+    ``constant`` projects the named fixed gas constant.
     """
 
     # The authority's kr, Keq and dG_eq arrive admitted by DSL parsing or the
     # grouped coordinate owner.
     authority = equilibrium.authority
     if authority.kind == EquilibriumRateAuthorityKind.KR:
-        reverse_relation = (
-            source_coordinate("kr")
-            if source_coordinate is not None
-            else literal(float(authority.kr))
-        )
+        reverse_relation = source_coordinate("kr")
         return EquilibriumRateSymbolicRelations(
             kr=reverse_relation,
             Keq=forward_relation / reverse_relation,  # type: ignore[operator]
         )
 
+    # Parsing admits exactly one of kr, Keq or dG_eq.
     if authority.has_explicit_keq_param:
-        keq_relation = (
-            source_coordinate("Keq")
-            if source_coordinate is not None
-            else literal(float(authority.Keq))
-        )
-    elif authority.dG_eq_J_per_mol is not None:
+        keq_relation = source_coordinate("Keq")
+    else:
         keq_relation = exponential(
-            -(source_coordinate("dG_eq") if source_coordinate is not None
-              else literal(float(authority.dG_eq_J_per_mol)))
-            / ((constant("R") if constant is not None else literal(float(R))) * temperature)  # type: ignore[operator]
+            -source_coordinate("dG_eq")
+            / (constant("R") * temperature)  # type: ignore[operator]
         )
         forward_order = directional_order_fraction(
             equilibrium.stoich_forward,
@@ -135,12 +118,6 @@ def equilibrium_rate_symbolic_relations(
         delta_n = reverse_order - forward_order
         if delta_n:
             keq_relation *= standard_concentration ** literal(delta_n)  # type: ignore[operator]
-    else:
-        keq_relation = (
-            source_coordinate("Keq")
-            if source_coordinate is not None
-            else literal(float(authority.Keq))
-        )
 
     reverse_relation = forward_relation / keq_relation  # type: ignore[operator]
     return EquilibriumRateSymbolicRelations(

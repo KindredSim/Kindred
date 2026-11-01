@@ -68,7 +68,6 @@ __all__ = [
     "SIMULATION_POINT_RANGE",
     "parse_points_text",
     "SUPPORTED_SOLVERS",
-    "validate_fit_solver",
     "fresh_mechanism_tab",
     "new_dataset_id",
     "new_project_id",
@@ -124,9 +123,9 @@ def new_project_id() -> str:
     return _new_id("project")
 
 
-def _require_name(value: object, label: str) -> str:
-    if not isinstance(value, str):
-        raise TypeError(f"{label} must be a str.")
+def _require_name(value: str, label: str) -> str:
+    # Archive decoding, the settings reader and the GUI parsers hand over
+    # typed values; these helpers judge only their content.
     normalized = value.strip()
     if not normalized:
         raise ValueError(f"{label} must not be blank.")
@@ -140,10 +139,8 @@ def _require_id(value: object, label: str) -> str:
     return normalized
 
 
-def _require_int(value: object, label: str, minimum: int, maximum: int) -> int:
-    if type(value) is bool or not isinstance(value, int):
-        raise TypeError(f"{label} must be an int.")
-    parsed = int(value)
+def _require_int(value: int, label: str, minimum: int, maximum: int) -> int:
+    parsed = value
     if parsed < minimum or parsed > maximum:
         raise ValueError(f"{label} must be between {minimum} and {maximum}.")
     return parsed
@@ -157,8 +154,6 @@ def _require_finite(
     maximum: float | None = None,
     strictly_positive: bool = False,
 ) -> float:
-    if type(value) is bool or not isinstance(value, Real):
-        raise TypeError(f"{label} must be numeric.")
     parsed = float(value)
     if not math.isfinite(parsed):
         raise ValueError(f"{label} must be finite.")
@@ -176,15 +171,15 @@ def _validate_initial_condition_values(
     *,
     context: str,
 ) -> tuple[tuple[str, float], ...]:
-    """Admit one set's species values: nonblank unique species, valid values."""
+    """Admit one set's species values: unique species, valid values.
+
+    Species names come from the parser or the archive decoder, which admit
+    them nonblank.
+    """
 
     validated: list[tuple[str, float]] = []
     seen: set[str] = set()
     for index, (species, value) in enumerate(values):
-        _require_name(
-            species,
-            f"{context} values[{index}][0] species name",
-        )
         if species in seen:
             raise ValueError(
                 f"Duplicate species {species!r} in {context}."
@@ -196,22 +191,6 @@ def _validate_initial_condition_values(
         seen.add(species)
         validated.append((species, parsed))
     return tuple(validated)
-
-
-def validate_fit_solver(value: object) -> str:
-    """Validate and return one canonical solver name for Fit execution."""
-
-    try:
-        normalized = normalize_solver_name(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"Fit solver must be one of {SUPPORTED_SOLVERS!r}."
-        ) from exc
-    if normalized not in SUPPORTED_SOLVERS:
-        raise ValueError(
-            f"Fit solver must be one of {SUPPORTED_SOLVERS!r}."
-        )
-    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,8 +247,9 @@ class InitialConditionSet:
     def __post_init__(self) -> None:
         """Admit an immutable, duplicate-free carrier at construction."""
 
+        # Set names are admitted nonblank by the name editor, the name
+        # allocators, the parser and the archive decoder.
         _require_id(self.set_id, "initial-condition set ID")
-        _require_name(self.name, "initial-condition set name")
         validated = _validate_initial_condition_values(
             self.values,
             context=f"initial-condition set {self.set_id!r}",
@@ -349,14 +329,14 @@ class MechanismTabDocument:
         return None if prepared is None else prepared.analysis
 
     def initial_condition_set(self, set_id: str) -> InitialConditionSet:
-        target = str(set_id)
+        target = set_id
         for item in self.initial_condition_sets:
             if item.set_id == target:
                 return item
         raise KeyError(f"Unknown initial-condition set ID: {target!r}.")
 
     def dataset_link(self, dataset_id: str) -> DatasetLink | None:
-        target = str(dataset_id)
+        target = dataset_id
         for current_id, link in self.dataset_links:
             if current_id == target:
                 return link
@@ -380,13 +360,7 @@ class MechanismTabDocument:
         self,
         initial_set: InitialConditionSet,
     ) -> "MechanismTabDocument":
-        if not any(
-            item.set_id == initial_set.set_id
-            for item in self.initial_condition_sets
-        ):
-            raise KeyError(
-                f"Unknown initial-condition set ID: {initial_set.set_id!r}."
-            )
+        # Every caller fetched this set from this tab first.
         return self.with_initial_condition_sets(
             tuple(
                 initial_set if item.set_id == initial_set.set_id else item
@@ -421,11 +395,9 @@ class MechanismTabDocument:
         self,
         sets: Sequence[InitialConditionSet],
     ) -> "MechanismTabDocument":
+        # Internal edits keep set IDs and names unique; archives are validated
+        # by validate_project_document.
         candidate_sets = tuple(sets)
-        _validate_initial_condition_set_carriers(
-            candidate_sets,
-            context="initial-condition sets",
-        )
         retained_ids = {item.set_id for item in candidate_sets}
         run_overrides = tuple(
             (set_id, settings)
@@ -452,16 +424,12 @@ class MechanismTabDocument:
         self,
         set_ids: Iterable[str],
     ) -> "MechanismTabDocument":
-        targets = {str(set_id) for set_id in set_ids}
-        if not targets:
-            return self
+        targets = set(set_ids)
         retained = tuple(
             item
             for item in self.initial_condition_sets
             if item.set_id not in targets
         )
-        if len(retained) == len(self.initial_condition_sets):
-            return self
         if not retained:
             retained = (
                 InitialConditionSet(
@@ -482,7 +450,7 @@ class MechanismTabDocument:
         return replace(self, dataset_links=tuple(links.items()))
 
     def without_dataset(self, dataset_id: str) -> "MechanismTabDocument":
-        target = str(dataset_id)
+        target = dataset_id
         return replace(
             self,
             dataset_links=tuple(
@@ -495,19 +463,11 @@ class MechanismTabDocument:
     def has_canonical_content(
         self,
         *,
-        fresh_run_defaults: SimulationExecutionSettings | None = None,
-        fresh_scientific_settings: TabScientificSettings | None = None,
+        fresh_run_defaults: SimulationExecutionSettings,
+        fresh_scientific_settings: TabScientificSettings,
     ) -> bool:
-        expected_run_defaults = (
-            default_simulation_execution_settings()
-            if fresh_run_defaults is None
-            else fresh_run_defaults
-        )
-        expected_scientific_settings = (
-            default_tab_scientific_settings()
-            if fresh_scientific_settings is None
-            else fresh_scientific_settings
-        )
+        expected_run_defaults = fresh_run_defaults
+        expected_scientific_settings = fresh_scientific_settings
         if self.mechanism_source != MechanismAuthoringSource():
             return True
         if self.notes.strip():
@@ -535,29 +495,28 @@ class ProjectDocument:
     imported_sources: tuple[dataset_foundation.ImportedSource, ...] = ()
 
     def tab(self, tab_id: str) -> MechanismTabDocument:
-        target = str(tab_id)
+        target = tab_id
         for item in self.tabs:
             if item.tab_id == target:
                 return item
         raise KeyError(f"Unknown mechanism tab ID: {target!r}.")
 
     def dataset(self, dataset_id: str) -> dataset_foundation.RawDatasetRecord:
-        target = str(dataset_id)
+        target = dataset_id
         for item in self.datasets:
             if item.dataset_id == target:
                 return item
         raise KeyError(f"Unknown dataset ID: {target!r}.")
 
     def imported_source(self, source_id: str) -> dataset_foundation.ImportedSource:
-        target = str(source_id)
+        target = source_id
         for source in self.imported_sources:
             if source.source_id == target:
                 return source
         raise KeyError(f"Unknown imported source ID: {target!r}.")
 
     def replace_tab(self, tab: MechanismTabDocument) -> "ProjectDocument":
-        if not any(item.tab_id == tab.tab_id for item in self.tabs):
-            raise KeyError(f"Unknown mechanism tab ID: {tab.tab_id!r}.")
+        # Callers take the tab from the current document.
         return replace(
             self,
             tabs=tuple(
@@ -569,8 +528,8 @@ class ProjectDocument:
     def add_tab(
         self,
         *,
-        run_defaults: SimulationExecutionSettings | None = None,
-        scientific_settings: TabScientificSettings | None = None,
+        run_defaults: SimulationExecutionSettings,
+        scientific_settings: TabScientificSettings,
     ) -> "ProjectDocument":
         new_tab = fresh_mechanism_tab(
             name=next_mechanism_name(item.name for item in self.tabs),
@@ -587,18 +546,13 @@ class ProjectDocument:
         _validate_unique(
             (item.name for item in candidate.tabs),
             "tab names",
-            key=lambda value: str(value).casefold(),
+            key=str.casefold,
         )
         return candidate
 
     def remove_tab(self, tab_id: str) -> "ProjectDocument":
-        if len(self.tabs) <= 1:
-            raise ValueError("The last mechanism tab cannot be closed.")
-        target = str(tab_id)
-        tabs = tuple(item for item in self.tabs if item.tab_id != target)
-        if len(tabs) == len(self.tabs):
-            raise KeyError(f"Unknown mechanism tab ID: {target!r}.")
-        return replace(self, tabs=tabs)
+        # Closing the last tab is refused, and closing finds the tab first.
+        return replace(self, tabs=tuple(item for item in self.tabs if item.tab_id != tab_id))
 
     def add_datasets(
         self,
@@ -618,10 +572,7 @@ class ProjectDocument:
         self,
         record: dataset_foundation.RawDatasetRecord,
     ) -> "ProjectDocument":
-        if not any(
-            item.dataset_id == record.dataset_id for item in self.datasets
-        ):
-            raise KeyError(f"Unknown dataset ID: {record.dataset_id!r}.")
+        # Its only caller looked the dataset up first.
         return replace(
             self,
             datasets=tuple(
@@ -644,9 +595,7 @@ class ProjectDocument:
         )
 
     def remove_dataset(self, dataset_id: str) -> "ProjectDocument":
-        target = str(dataset_id)
-        if not any(item.dataset_id == target for item in self.datasets):
-            raise KeyError(f"Unknown dataset ID: {target!r}.")
+        target = dataset_id
         datasets = tuple(
             item
             for item in self.datasets
@@ -727,8 +676,8 @@ def default_fit_defaults() -> FitDefaults:
 def fresh_mechanism_tab(
     *,
     name: str = "Mechanism 1",
-    run_defaults: SimulationExecutionSettings | None = None,
-    scientific_settings: TabScientificSettings | None = None,
+    run_defaults: SimulationExecutionSettings,
+    scientific_settings: TabScientificSettings,
 ) -> MechanismTabDocument:
     baseline_set = InitialConditionSet(
         set_id=new_set_id(),
@@ -741,20 +690,16 @@ def fresh_mechanism_tab(
         mechanism_source=MechanismAuthoringSource(),
         notes="",
         initial_condition_sets=(baseline_set,),
-        run_defaults=(
-            run_defaults or default_simulation_execution_settings()
-        ),
-        scientific_settings=(
-            scientific_settings or default_tab_scientific_settings()
-        ),
+        run_defaults=run_defaults,
+        scientific_settings=scientific_settings,
     )
 
 
 def default_project_document(
     *,
-    run_defaults: SimulationExecutionSettings | None = None,
-    scientific_settings: TabScientificSettings | None = None,
-    fit_defaults: FitDefaults | None = None,
+    run_defaults: SimulationExecutionSettings,
+    scientific_settings: TabScientificSettings,
+    fit_defaults: FitDefaults,
 ) -> ProjectDocument:
     """Construct one default project candidate without admitting it."""
 
@@ -767,7 +712,7 @@ def default_project_document(
                 scientific_settings=scientific_settings,
             ),
         ),
-        fit_defaults=fit_defaults or default_fit_defaults(),
+        fit_defaults=fit_defaults,
     )
 
 
@@ -776,7 +721,7 @@ def _next_sequential_name(
     prefix: str,
 ) -> str:
     occupied = {
-        str(name).strip().casefold()
+        name.strip().casefold()
         for name in existing_names
     }
     number = 1
@@ -822,7 +767,7 @@ def validate_simulation_execution_settings(
 ) -> SimulationExecutionSettings:
     """Admit Run settings; messages name the on-screen fields."""
     prefix = "" if label is None else f"{label}: "
-    normalized_solver = validate_fit_solver(settings.solver)
+    normalized_solver = normalize_solver_name(settings.solver)
     if normalized_solver != settings.solver:
         raise ValueError(
             f"{prefix}Solver {settings.solver!r} must use canonical supported spelling."
@@ -880,8 +825,6 @@ def validate_fit_defaults(defaults: FitDefaults) -> FitDefaults:
     """Validate the narrow Fit-default value without walking a project."""
 
     validate_fit_method(defaults.method)
-    if defaults.method != str(defaults.method).strip():
-        raise ValueError("fit_defaults.method must use canonical supported spelling.")
     _require_int(
         defaults.max_nfev,
         "fit_defaults.max_nfev",
@@ -959,7 +902,7 @@ def canonical_species_names(tab: MechanismTabDocument) -> tuple[str, ...]:
     prepared_dsl = tab.prepared_dsl
     if prepared_dsl is None:
         return ()
-    return tuple(str(name) for name in prepared_dsl.analysis.species_names)
+    return tuple(prepared_dsl.analysis.species_names)
 
 
 def canonical_observation_target_names(
@@ -972,8 +915,8 @@ def canonical_observation_target_names(
         return ()
     analysis = prepared_dsl.analysis
     return (
-        tuple(str(name) for name in analysis.species_names)
-        + tuple(str(name) for name in analysis.observable_names)
+        tuple(analysis.species_names)
+        + tuple(analysis.observable_names)
     )
 
 
@@ -985,7 +928,7 @@ def canonical_initial_values(
 
     canonical = tab.initial_condition_set(set_id).values_dict()
     return tuple(
-        (species, float(canonical.get(species, 0.0)))
+        (species, canonical.get(species, 0.0))
         for species in canonical_species_names(tab)
     )
 
@@ -1300,14 +1243,12 @@ def select_exact_correction_basis(
 ) -> ExactCorrectionAssessment:
     """Build a proposal from the original source for one exact selected basis."""
 
+    # The basis dialog is offered only with a proposal, which comes with its
+    # composition, and calls this only once the same plan is available.
     composition = assessment.composition
-    if composition is None:
-        raise ValueError("Exact correction composition is unavailable.")
     plan = CorrectionPlanner(composition, assessment.targets).plan_selected_basis(
         selected_basis
     )
-    if not plan.available:
-        raise ValueError(plan.reason or "Selected correction basis is unavailable.")
     proposal, corrections = _correction_proposal(visible_source, composition, plan)
     return replace(
         assessment,
@@ -1321,7 +1262,7 @@ def select_exact_correction_basis(
 def assess_tab_exact_correction(
     document: ProjectDocument,
     tab_id: str,
-    visible_source: MechanismAuthoringSource | None = None,
+    visible_source: MechanismAuthoringSource,
 ) -> ExactCorrectionAssessment:
     """Assess visible source and derive one exact correction proposal.
 
@@ -1335,7 +1276,7 @@ def assess_tab_exact_correction(
     """
 
     tab = document.tab(tab_id)
-    source = tab.mechanism_source if visible_source is None else visible_source
+    source = visible_source
 
     empty_composition = ExactConstraintComposition(())
     if not source.reactions_text.strip():
@@ -1369,7 +1310,7 @@ def assess_tab_exact_correction(
             )
         targets = _admitted_correction_targets(detached_tab, composition)
         plan = CorrectionPlanner(composition, targets).plan()
-    except (AuthoredSourceError, DSLError, TypeError, ValueError, OverflowError) as exc:
+    except (AuthoredSourceError, DSLError, ValueError, OverflowError) as exc:
         return ExactCorrectionAssessment(
             composition=None,
             targets=(),
@@ -1446,22 +1387,23 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
     _validate_unique(
         (_require_name(tab.name, "tab name") for tab in document.tabs),
         "tab names",
-        key=lambda value: str(value).casefold(),
+        key=str.casefold,
     )
     _validate_unique(
         (
-            _require_id(item.dataset_id, "dataset ID")
+            # validate_raw_dataset_record admitted each dataset.
+            item.dataset_id
             for item in document.datasets
         ),
         "dataset IDs",
     )
     _validate_unique(
         (
-            _require_name(item.display_name, "dataset display name")
+            item.display_name
             for item in document.datasets
         ),
         "dataset display names",
-        key=lambda value: str(value).casefold(),
+        key=str.casefold,
     )
 
     dataset_by_id = {

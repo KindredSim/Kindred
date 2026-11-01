@@ -35,7 +35,7 @@ class Highlight:
 
     def visible_rect(self) -> QtCore.QRect:
         """Clip to visible ancestors, including scroll-area viewports."""
-        if not isQObjectAlive(self.widget) or not self.widget.isVisible():
+        if not self.widget.isVisible():
             return QtCore.QRect()
         local = self.widget.rect() if self.rect is None else self.rect()
         result = QtCore.QRect(self.widget.mapToGlobal(local.topLeft()), local.size())
@@ -50,30 +50,29 @@ class Highlight:
 
 
 def menu_target(
-    menu: QtWidgets.QMenu, action_matches: Callable | None = None
+    menu: QtWidgets.QMenu, action_matches: Callable
 ) -> Highlight:
     """Follow a submenu action through its owning menus, resolving on each refresh."""
     # In PySide6 6.7, dropping a temporary QAction.menu() owner can invalidate
     # the Python menu wrapper while its Qt object remains alive. Resolve child
     # menus through their actual Qt parent instead of borrowing that wrapper.
-    if action_matches is not None:
-        action = next((item for item in menu.actions() if action_matches(item)), None)
-        if action is not None and menu.isVisible():
-            return Highlight(menu, lambda: menu.actionGeometry(action))
-        for child in menu.findChildren(
-            QtWidgets.QMenu, options=QtCore.Qt.FindChildOption.FindDirectChildrenOnly
-        ):
-            action = next(
-                (item for item in child.actions() if action_matches(item)), None
-            )
-            if action is not None:
-                if child.isVisible():
-                    return Highlight(child, lambda: child.actionGeometry(action))
-                if menu.isVisible():
-                    return Highlight(
-                        menu, lambda: menu.actionGeometry(child.menuAction())
-                    )
-                break
+    action = next((item for item in menu.actions() if action_matches(item)), None)
+    if action is not None and menu.isVisible():
+        return Highlight(menu, lambda: menu.actionGeometry(action))
+    for child in menu.findChildren(
+        QtWidgets.QMenu, options=QtCore.Qt.FindChildOption.FindDirectChildrenOnly
+    ):
+        action = next(
+            (item for item in child.actions() if action_matches(item)), None
+        )
+        if action is not None:
+            if child.isVisible():
+                return Highlight(child, lambda: child.actionGeometry(action))
+            if menu.isVisible():
+                return Highlight(
+                    menu, lambda: menu.actionGeometry(child.menuAction())
+                )
+            break
     bar = menu.parentWidget()
     return Highlight(bar, lambda: bar.actionGeometry(menu.menuAction()))
 
@@ -542,16 +541,13 @@ class TutorialOverlay(QtCore.QObject):
         complete: bool,
         previous: bool,
         final: bool,
-        recovery: str = "",
-        action: str = "",
-        manual: bool = False,
-        skipped: bool = False,
-        link: tuple[str, str] | None = None,
-        dialog: QtWidgets.QDialog | None = None,
+        recovery: str,
+        action: str,
+        manual: bool,
+        skipped: bool,
+        link: tuple[str, str] | None,
+        dialog: QtWidgets.QDialog | None,
     ) -> None:
-        # Qt can destroy a target window between refreshes. Drop its presentation
-        # references here; the lesson resolves a fresh target through its owner.
-        highlights = tuple(item for item in highlights if isQObjectAlive(item.widget))
         app = QtWidgets.QApplication.instance()
         modal = app.activeModalWidget()
         if isinstance(modal, QtWidgets.QFileDialog):

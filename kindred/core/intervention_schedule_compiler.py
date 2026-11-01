@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from types import MappingProxyType
@@ -69,18 +68,6 @@ def resolve_executable_values(item, values: Mapping[str, float], *, time: float)
             raise
         updates[f"{field}_param"] = None
     return replace(item, **updates) if updates else item
-
-
-def _finite_derived(value: object, *, context: str) -> float:
-    try:
-        number = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise InterventionScheduleError(
-            f"{context} must remain finite."
-        ) from exc
-    if not math.isfinite(number):
-        raise InterventionScheduleError(f"{context} must remain finite.")
-    return number
 
 
 def _raise_if_cancelled(
@@ -168,8 +155,8 @@ class ExecutableInstant:
             payload["window_ordinal"] = self.window_ordinal
         if self.authored_ordinal is not None:
             payload["authored_ordinal"] = self.authored_ordinal
-        for field in ("value", "delta", "flux_rate"):
-            parameter = getattr(self, f"{field}_param", None)
+        for field in ("value", "delta"):
+            parameter = getattr(self, f"{field}_param")
             if parameter is not None:
                 payload.pop(field, None)
                 payload[f"{field}_param"] = parameter
@@ -211,11 +198,9 @@ class ExecutableFlux:
             payload["window_ordinal"] = self.window_ordinal
         if self.authored_ordinal is not None:
             payload["authored_ordinal"] = self.authored_ordinal
-        for field in ("value", "delta", "flux_rate"):
-            parameter = getattr(self, f"{field}_param", None)
-            if parameter is not None:
-                payload.pop(field, None)
-                payload[f"{field}_param"] = parameter
+        if self.flux_rate_param is not None:
+            del payload["flux_rate"]
+            payload["flux_rate_param"] = self.flux_rate_param
         if self.physical is not None:
             for field in ("species", "value", "delta", "flux_rate"):
                 payload.pop(field, None)
@@ -253,11 +238,9 @@ class ExecutableHold:
             payload["window_ordinal"] = self.window_ordinal
         if self.authored_ordinal is not None:
             payload["authored_ordinal"] = self.authored_ordinal
-        for field in ("value", "delta", "flux_rate"):
-            parameter = getattr(self, f"{field}_param", None)
-            if parameter is not None:
-                payload.pop(field, None)
-                payload[f"{field}_param"] = parameter
+        if self.value_param is not None:
+            del payload["value"]
+            payload["value_param"] = self.value_param
         return payload
 
 
@@ -304,12 +287,7 @@ class TriggerFiring:
         object.__setattr__(
             self,
             "event_state",
-            MappingProxyType(
-                {
-                    str(name): float(value)
-                    for name, value in self.event_state.items()
-                }
-            ),
+            MappingProxyType(dict(self.event_state)),
         )
         object.__setattr__(
             self,
@@ -355,11 +333,7 @@ class InterventionExecutionContract:
             "protocol_lineage",
             tuple(_freeze(item) for item in self.protocol_lineage),
         )
-        object.__setattr__(
-            self,
-            "discontinuities",
-            tuple(float(value) for value in self.discontinuities),
-        )
+        object.__setattr__(self, "discontinuities", tuple(self.discontinuities))
 
     @property
     def is_empty(self) -> bool:
@@ -384,9 +358,9 @@ class InterventionExecutionContract:
             key=lambda item: (
                 int(item["declaration_ordinal"]),
                 int(item.get("window_ordinal", -1)),
-                {"ordinary": 0, "before": 1, "during": 2, "after": 3}.get(
-                    str(item.get("phase", "ordinary")), 4
-                ),
+                {"ordinary": 0, "before": 1, "during": 2, "after": 3}[
+                    item.get("phase", "ordinary")
+                ],
                 int(item.get("authored_ordinal", -1)),
             )
         )
@@ -408,35 +382,16 @@ class InterventionExecutionContract:
     def annotation_projection(
         self,
         *,
-        execution_start: float | None = None,
-        execution_end: float | None = None,
+        execution_start: float,
+        execution_end: float,
     ) -> tuple[Mapping[str, object], ...]:
-        if (execution_start is None) != (execution_end is None):
-            raise InterventionScheduleError(
-                "Annotation execution span requires both start and end."
-            )
-        span: tuple[float, float] | None = None
-        if execution_start is not None and execution_end is not None:
-            start = _finite_derived(
-                execution_start,
-                context="Annotation execution start",
-            )
-            end = _finite_derived(
-                execution_end,
-                context="Annotation execution end",
-            )
-            if end < start:
-                raise InterventionScheduleError(
-                    "Annotation execution end must not precede its start."
-                )
-            span = (start, end)
+        # A result's first and last rows: finite and in order.
+        span = (execution_start, execution_end)
         annotations: list[Mapping[str, object]] = []
         for instant in self.instants:
             if instant in self.skipped_instants:
                 continue
-            if span is not None and not (
-                span[0] <= instant.time <= span[1]
-            ):
+            if not span[0] <= instant.time <= span[1]:
                 continue
             annotations.append(
                 MappingProxyType(
@@ -458,11 +413,10 @@ class InterventionExecutionContract:
         for interval in self.fluxes + self.holds:
             visible_start = interval.start_time
             visible_end = interval.end_time
-            if span is not None:
-                visible_start = max(visible_start, span[0])
-                visible_end = min(visible_end, span[1])
-                if visible_end <= visible_start:
-                    continue
+            visible_start = max(visible_start, span[0])
+            visible_end = min(visible_end, span[1])
+            if visible_end <= visible_start:
+                continue
             annotations.append(
                 MappingProxyType(
                     {
@@ -480,9 +434,7 @@ class InterventionExecutionContract:
                 )
             )
         for firing in self.trigger_firings:
-            if span is not None and not (
-                span[0] <= firing.root_time <= span[1]
-            ):
+            if not span[0] <= firing.root_time <= span[1]:
                 continue
             nested_action_payload = firing.nested_action_payload
             annotations.append(
@@ -1010,10 +962,9 @@ def validate_boundary_conflicts(
 def _validate_hold_overlaps(
     holds: Sequence[ExecutableHold],
     *,
-    cancellation_check: Callable[[], bool] | None = None,
-    dependency_metadata: InterventionScheduleDependencyMetadata | None = None,
+    cancellation_check: Callable[[], bool] | None,
+    dependency_metadata: InterventionScheduleDependencyMetadata,
 ) -> None:
-    dependency_metadata = dependency_metadata or {}
     next_by_species: dict[str, ExecutableHold] = {}
     conflict: tuple[ExecutableHold, ExecutableHold] | None = None
     # Compilation orders positive intervals by start time. The next hold of

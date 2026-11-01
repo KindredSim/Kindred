@@ -246,7 +246,7 @@ class SimulationPanel(QtWidgets.QWidget):
         simulation_job_kind: str | None,
     ) -> None:
         kind = simulation_job_kind
-        previous_rendering = self._rendering
+        # Rendering is never nested inside another render.
         self._rendering = True
         try:
             preserve_candidate = (
@@ -259,7 +259,7 @@ class SimulationPanel(QtWidgets.QWidget):
                 self._reproject_canonical()
             self._sync_controls()
         finally:
-            self._rendering = previous_rendering
+            self._rendering = False
 
     def render_job_state(self, simulation_job_kind: str | None) -> None:
         """Project the live simulation owner's job state into Stop."""
@@ -283,7 +283,8 @@ class SimulationPanel(QtWidgets.QWidget):
             self.t_end_edit,
             self.points_edit,
         )
-        if focused is None or not any(
+        # The only caller passes a focus inside this panel.
+        if not any(
             focused is control or control.isAncestorOf(focused)
             for control in controls
         ):
@@ -414,8 +415,8 @@ class SimulationPanel(QtWidgets.QWidget):
 
     @QtCore.Slot()
     def _settle_after_edit(self, *_args) -> None:
-        if not self._rendering:
-            self.settle_run_defaults()
+        # setText during rendering never emits editingFinished.
+        self.settle_run_defaults()
 
     @QtCore.Slot()
     def _request_run(self) -> None:

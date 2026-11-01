@@ -80,11 +80,10 @@ def _lex(src: str, blank: bool = False) -> List[Token]:
     i = 0
     n = len(src)
     while i < n:
+        # The last alternative matches any one character, and every
+        # alternative is a named group.
         m = _TOKEN_RE.match(src, i)
-        if not m:
-            # Shouldn't happen given MISMATCH, but guard anyway
-            raise AlgebraSyntaxError("Lexical error.", line=line, col=(i - bol + 1), line_text=_line_of(src, line))
-        kind_name = m.lastgroup or "MISMATCH"
+        kind_name = m.lastgroup
         text = m.group(0)
         if kind_name == "SKIP":
             pass
@@ -133,15 +132,13 @@ class ExprNode:
 @dataclass(frozen=True)
 class NumberNode(ExprNode):
     value: float
-    literal: str | None = None
+    # The authored text of a finite number, which Fraction reads exactly.
+    literal: str
 
     @property
-    def exact_value(self) -> Fraction | None:
-        """Return the retained literal exactly when it is a finite rational."""
-        try:
-            return Fraction(self.literal if self.literal is not None else str(self.value))
-        except (TypeError, ValueError, ZeroDivisionError, OverflowError):
-            return None
+    def exact_value(self) -> Fraction:
+        """Return the retained literal exactly."""
+        return Fraction(self.literal)
 
 
 @dataclass(frozen=True)
@@ -183,10 +180,6 @@ class BlankNode(ExprNode):
 class SpeciesRefNode(ExprNode):
     name: str
     kind: Literal["now", "init"]
-
-    def __post_init__(self) -> None:
-        if self.kind not in {"now", "init"}:
-            raise ValueError("Species reference kind must be 'now' or 'init'.")
 
     def has_species_ref(self, kind: str | None = None) -> bool:
         return kind is None or self.kind == kind
@@ -297,18 +290,12 @@ class AlgebraBlock:
     evaluation_order: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        # Admission refused duplicate names; a given order comes from another
+        # block's or this parse's dependency order.
         lines = tuple(self.lines)
-        names = tuple(str(statement.name) for statement in lines)
-        if len(set(names)) != len(names):
-            duplicate = next(name for name in names if names.count(name) > 1)
-            raise ValueError(f"AlgebraBlock assignment names must be unique: {duplicate!r}.")
-        evaluation_order = tuple(str(name) for name in self.evaluation_order)
-        if not evaluation_order and names:
+        evaluation_order = tuple(self.evaluation_order)
+        if not evaluation_order and lines:
             evaluation_order = _topological_evaluation_order(lines)
-        if len(evaluation_order) != len(names) or set(evaluation_order) != set(names):
-            raise ValueError(
-                "AlgebraBlock evaluation order must contain every assignment name exactly once."
-            )
         object.__setattr__(self, "lines", lines)
         object.__setattr__(self, "evaluation_order", evaluation_order)
 
@@ -506,11 +493,8 @@ class Parser:
 
         # Number
         if self._match(TokenKind.NUMBER):
-            try:
-                val = float(t.text)
-            except Exception:
-                logger.debug(f"Failed to parse numeric literal: {t.text}", exc_info=True)
-                raise AlgebraSyntaxError("Invalid number.", line=t.line, col=t.col, line_text=t.line_text)
+            # The NUMBER pattern only matches text float() reads.
+            val = float(t.text)
             if not math.isfinite(val):
                 raise AlgebraSyntaxError(
                     "Numbers must be finite.",

@@ -73,7 +73,7 @@ class ChemicalSpaceScanOwner(QtCore.QObject):
         self.close_fenced = False
         self.session_closing = False
 
-    def open(self, initial_capture, selected_set_id=None):
+    def open(self, initial_capture, selected_set_id):
         if self.close_fenced or self.session_closing:
             return
         if self.dialog is None:
@@ -167,8 +167,6 @@ class ChemicalSpaceScanOwner(QtCore.QObject):
         # A modal overwrite question may have serviced other application events.
         if self.close_fenced or self.session_closing or self.dialog is None or self.exports.is_exporting:
             return False
-        if not check_only and same_local_path(config.destination, self._session.current_path):
-            raise ValueError("Cannot overwrite the currently open project archive.")
         if not self.gate.try_acquire(self, "scan"):
             return False
         # Each Start takes the Parallel Execution setting as it stands.

@@ -40,7 +40,8 @@ class _XlsxExportWorker(QtCore.QThread):
     ) -> None:
         super().__init__(parent)
         self._blocks = blocks
-        self._path = os.path.abspath(os.fspath(path))
+        # The export dialog's path, already made absolute by the main window.
+        self._path = path
         self._commit_started = False
 
     @property
@@ -62,7 +63,7 @@ class _XlsxExportWorker(QtCore.QThread):
         descriptor = -1
         try:
             self._check_cancelled()
-            parent = os.path.dirname(self._path) or os.curdir
+            parent = os.path.dirname(self._path)
             if not os.path.isdir(parent):
                 raise FileNotFoundError(
                     f"Export directory does not exist: {parent}."
@@ -158,14 +159,11 @@ class XlsxExportOwner(QtCore.QObject):
     ) -> None:
         """Admit and start exactly one worker; synchronous failures raise."""
 
-        absolute_path = os.path.abspath(os.fspath(path))
         if self._application_close_fenced:
             raise RuntimeError("XLSX export is unavailable while Kindred closes.")
-        if self._active_worker is not None:
-            raise RuntimeError("Another XLSX export is already active.")
         worker = _XlsxExportWorker(
             blocks=blocks,
-            path=absolute_path,
+            path=path,
             parent=self,
         )
         self._active_worker = worker
@@ -179,9 +177,8 @@ class XlsxExportOwner(QtCore.QObject):
 
     @QtCore.Slot()
     def _worker_finished(self) -> None:
-        worker = self.sender()
-        if worker is not self._active_worker:
-            return
+        # One export runs at a time; this is its own finish.
+        worker = self._active_worker
         self._active_worker = None
         worker.deleteLater()
         self.application_close_settlement_changed.emit()

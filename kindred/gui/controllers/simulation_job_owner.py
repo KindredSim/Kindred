@@ -235,7 +235,7 @@ class SimulationJobOwner(QtCore.QObject):
 
     @property
     def busy(self) -> bool:
-        return bool(
+        return (
             self._worker is not None
             or self._operation is not None
             or bool(self._pending_previews)
@@ -349,12 +349,12 @@ class SimulationJobOwner(QtCore.QObject):
         tab_id: str,
         set_ids: Iterable[str],
     ) -> bool:
-        pending = self._pending_previews.get(str(tab_id))
+        pending = self._pending_previews.get(tab_id)
         if pending is None or not set(set_ids).intersection(
             target.set_id for target in pending.targets
         ):
             return False
-        del self._pending_previews[str(tab_id)]
+        del self._pending_previews[tab_id]
         return True
 
     def fence_document_delta(self, delta: ScientificDocumentDelta) -> None:
@@ -410,7 +410,7 @@ class SimulationJobOwner(QtCore.QObject):
         for set_id in ids:
             repository.clear_preview(set_id)
             repository.restore_reference_or_current(set_id)
-        self.results_changed.emit(str(tab_id))
+        self.results_changed.emit(tab_id)
         if changed:
             self.state_changed.emit()
 
@@ -441,13 +441,13 @@ class SimulationJobOwner(QtCore.QObject):
         purpose: str = "ordinary",
         details: Iterable[str] = (),
     ) -> bool:
-        if not self._gate.try_acquire(self, kind):
-            return False
+        # Every caller found the gate idle just before.
+        self._gate.try_acquire(self, kind)
         worker = _DirectSimulationWorker(targets=targets, max_parallel=max_parallel, parent=self)
         self._operation = {
             "kind": kind,
             "purpose": purpose,
-            "tab_id": str(tab_id),
+            "tab_id": tab_id,
             "targets": targets,
             "outcomes": [],
             "details": list(details),
@@ -459,7 +459,7 @@ class SimulationJobOwner(QtCore.QObject):
         worker.finished.connect(self._on_worker_finished)
         worker.start()
         if kind == "run" and purpose == "ordinary":
-            repository = self._repository(str(tab_id))
+            repository = self._repository(tab_id)
             # A set showing nothing has nothing to clear or redraw.
             changed_request_ids = tuple(
                 target.set_id
@@ -469,10 +469,10 @@ class SimulationJobOwner(QtCore.QObject):
             )
             if changed_request_ids:
                 repository.deauthorize_sets(changed_request_ids)
-                self.results_changed.emit(str(tab_id))
+                self.results_changed.emit(tab_id)
         self.state_changed.emit()
         if kind == "run":
-            self.run_dispatched.emit(str(tab_id), tuple(target.set_id for target in targets))
+            self.run_dispatched.emit(tab_id, tuple(target.set_id for target in targets))
         return True
 
     @staticmethod
@@ -484,10 +484,10 @@ class SimulationJobOwner(QtCore.QObject):
 
         current_request = repository.current_request(target.set_id)
         current_result = repository.current_result(target.set_id)
-        return bool(
+        return (
             current_request is not None
             and current_result is not None
-            and (current_request == target.execution_request)
+            and current_request == target.execution_request
         )
 
     def capture_settled_preview(
@@ -530,7 +530,7 @@ class SimulationJobOwner(QtCore.QObject):
         repository = self._repository(tab_id)
         for set_id, request, result in preview_pairs:
             repository.publish_run(set_id, request, result)
-        self.results_changed.emit(str(tab_id))
+        self.results_changed.emit(tab_id)
 
     def request_preview(
         self,
@@ -673,7 +673,7 @@ class SimulationJobOwner(QtCore.QObject):
             self.reconcile_canonical_targets(tab_id, known)
 
     def cancel_current(self) -> None:
-        changed = bool(
+        changed = (
             self._worker is not None
             or bool(self._pending_previews)
             or self._pending_interactive_preview is not None
@@ -732,8 +732,7 @@ class SimulationJobOwner(QtCore.QObject):
 
     @QtCore.Slot()
     def _on_worker_finished(self) -> None:
-        if self.sender() is not self._worker:
-            return
+        # One worker exists at a time, and finished is the last signal it posts.
         operation = self._operation
         operation_kind = operation["kind"]
         operation_purpose = operation["purpose"]

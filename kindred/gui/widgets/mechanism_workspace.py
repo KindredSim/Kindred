@@ -214,9 +214,9 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
 
     def redock_dock(self, dock: QtWidgets.QDockWidget) -> None:
         dock.setFloating(False)
+        # Every dock records its default area when built.
         area = dock.property("kindred/defaultDockArea")
-        if area is not None:
-            self.addDockWidget(QtCore.Qt.DockWidgetArea(int(area)), dock)
+        self.addDockWidget(QtCore.Qt.DockWidgetArea(int(area)), dock)
         dock.show()
 
     def recover_floating_docks(self) -> None:
@@ -282,7 +282,7 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
             self._analysis_stack.addWidget(analysis)
 
     def _ensure_plot(self, tab_id: str) -> PyQtGraphPlotPanel:
-        target = str(tab_id)
+        target = tab_id
         plot = self._plot_by_tab_id.get(target)
         if plot is not None:
             return plot
@@ -299,7 +299,7 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         return plot
 
     def plot_for_tab(self, tab_id: str) -> PyQtGraphPlotPanel:
-        return self._plot_by_tab_id[str(tab_id)]
+        return self._plot_by_tab_id[tab_id]
 
     def main_plot_analysis_widget(self) -> QtWidgets.QStackedWidget:
         """Return the physical analysis stack used by the Analysis dock."""
@@ -319,7 +319,7 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         A failure propagates; the permanent root stays usable.
         """
 
-        target_active = str(active_tab_id)
+        target_active = active_tab_id
         document.tab(target_active)
         current_tab_ids = {tab.tab_id for tab in document.tabs}
         for tab in document.tabs:
@@ -338,17 +338,14 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
                 ):
                     self._tab_bar.removeTab(index)
 
-            plus_indexes = [
-                index
+            # Only this render adds the one "+" tab, which always stays last:
+            # inserted tabs go before it and the bar is not movable.
+            if not any(
+                self._tab_bar.tabData(index) is None
                 for index in range(self._tab_bar.count())
-                if self._tab_bar.tabData(index) is None
-            ]
-            if plus_indexes:
-                plus_index = plus_indexes[0]
-                for index in reversed(plus_indexes[1:]):
-                    self._tab_bar.removeTab(index)
-            else:
+            ):
                 plus_index = self._tab_bar.addTab("+")
+                self._tab_bar.setTabToolTip(plus_index, _CREATE_TAB_TOOLTIP)
 
             for desired_index, tab in enumerate(document.tabs):
                 try:
@@ -368,17 +365,6 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
                 )
                 self._tab_bar.setTabToolTip(current_index, tab.name)
 
-            plus_index = next(
-                index
-                for index in range(self._tab_bar.count())
-                if self._tab_bar.tabData(index) is None
-            )
-            if plus_index != self._tab_bar.count() - 1:
-                self._tab_bar.moveTab(plus_index, self._tab_bar.count() - 1)
-            plus_index = self._tab_bar.count() - 1
-            self._tab_bar.setTabText(plus_index, "+")
-            self._tab_bar.setTabData(plus_index, None)
-            self._tab_bar.setTabToolTip(plus_index, _CREATE_TAB_TOOLTIP)
             active_index = self._index_for_tab_id(target_active)
             self._tab_bar.setCurrentIndex(active_index)
         finally:
@@ -403,10 +389,9 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         self._analysis_stack.setCurrentWidget(plot.analysis_tabs())
 
     def drop_tab_session_state(self, tab_id: str) -> None:
-        target = str(tab_id)
-        plot = self._plot_by_tab_id.pop(target, None)
-        if plot is None:
-            return
+        # Called for an existing tab's plot, before any re-render.
+        target = tab_id
+        plot = self._plot_by_tab_id.pop(target)
         analysis = plot.analysis_tabs()
         self._plot_stack.removeWidget(plot)
         self._analysis_stack.removeWidget(analysis)
@@ -437,13 +422,13 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         global_position = self._tab_bar.mapToGlobal(rect.bottomLeft())
         QtWidgets.QToolTip.showText(
             global_position,
-            str(message),
+            message,
             self._tab_bar,
             rect,
         )
 
     def _index_for_tab_id(self, tab_id: str) -> int:
-        target = str(tab_id)
+        target = tab_id
         for index in range(self._tab_bar.count()):
             if self._tab_bar.tabData(index) == target:
                 return index
@@ -607,7 +592,8 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         menu.deleteLater()
 
     def _on_tab_clicked(self, index: int) -> None:
-        if index < 0 or index >= self._tab_bar.count():
+        # Qt reports -1 for a click beside the tabs.
+        if index < 0:
             return
         tab_id = self._tab_bar.tabData(index)
         if tab_id is None:

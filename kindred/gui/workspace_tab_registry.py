@@ -191,10 +191,7 @@ class WorkspaceTabRegistry:
             presentation,
             path=path,
             baseline_document=baseline_document,
-            expected_token=expected_token,
         )
-        if token is None:
-            return None
         self._assign_workspace_state(presentation, runtime_by_tab_id)
         return token
 
@@ -274,38 +271,33 @@ class WorkspaceTabRegistry:
         replacement_by_tab_id = {tab.tab_id: tab for tab in replacement.tabs}
         # Unapplied Slider values belong to the parsed mechanism they were set
         # on; any accepted change to a tab's mechanism discards them.
+        # The runtimes cover exactly the previous document's tabs.
         for tab_id, runtime in existing_runtime.items():
-            old_tab, new_tab = previous_by_tab_id.get(tab_id), replacement_by_tab_id.get(tab_id)
-            if old_tab is not None and new_tab is not None and old_tab.prepared_dsl is not new_tab.prepared_dsl:
+            old_tab, new_tab = previous_by_tab_id[tab_id], replacement_by_tab_id.get(tab_id)
+            if new_tab is not None and old_tab.prepared_dsl is not new_tab.prepared_dsl:
                 runtime.slider_parameter_draft.clear()
                 runtime.slider_species_drafts_by_set_id.clear()
         for tab_id, affected_ids in delta.affected_targets_by_tab:
-            runtime = existing_runtime.get(tab_id)
-            if runtime is not None:
-                runtime.result_repository.deauthorize_sets(affected_ids)
+            existing_runtime[tab_id].result_repository.deauthorize_sets(affected_ids)
         for tab_id, removed_ids in delta.removed_targets_by_tab:
-            runtime = existing_runtime.get(tab_id)
-            if runtime is not None:
-                removed = set(removed_ids)
-                runtime.selected_run_set_ids = tuple(
-                    set_id
-                    for set_id in runtime.selected_run_set_ids
-                    if set_id not in removed
-                )
-                for set_id in removed:
-                    runtime.initial_text_by_set_id.pop(set_id, None)
-                    runtime.slider_species_drafts_by_set_id.pop(set_id, None)
-                runtime.result_repository.deauthorize_sets(removed_ids)
+            runtime = existing_runtime[tab_id]
+            removed = set(removed_ids)
+            runtime.selected_run_set_ids = tuple(
+                set_id
+                for set_id in runtime.selected_run_set_ids
+                if set_id not in removed
+            )
+            for set_id in removed:
+                runtime.initial_text_by_set_id.pop(set_id, None)
+                runtime.slider_species_drafts_by_set_id.pop(set_id, None)
+            runtime.result_repository.deauthorize_sets(removed_ids)
 
     def select_tab(
         self,
         tab_id: str,
     ) -> None:
-        target = tab_id
-        self._session.document.tab(target)
-        if target == self.active_tab_id:
-            return
-        self._active_tab_id = target
+        # Called for a rendered or just-published tab.
+        self._active_tab_id = tab_id
 
     def set_presentation(
         self,
@@ -547,8 +539,8 @@ class WorkspaceTabRegistry:
         self,
         tab_id: str,
         *,
-        fresh_run_defaults: SimulationExecutionSettings | None = None,
-        fresh_scientific_settings: TabScientificSettings | None = None,
+        fresh_run_defaults: SimulationExecutionSettings,
+        fresh_scientific_settings: TabScientificSettings,
     ) -> bool:
         tab = self._session.document.tab(tab_id)
         return bool(
@@ -646,11 +638,8 @@ class WorkspaceTabRegistry:
         *,
         expected_token: ProjectContentToken,
     ) -> ProjectContentToken | None:
-        targets = tuple(dict.fromkeys(str(set_id) for set_id in set_ids))
-        if not targets:
-            if not self._session.is_content_token_current(expected_token):
-                return None
-            return self._session.capture_content_token()
+        # The table returns early when nothing is selected.
+        targets = tuple(set_ids)
         tab = self.tab(tab_id)
         candidate = tab.without_initial_condition_sets(targets)
         return self.replace_tab(

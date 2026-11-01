@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 
 from kindred.core.algebra.grammar import ASSOCIATIVITY, PRECEDENCE
 from kindred.core.algebra.parser import (
@@ -52,10 +51,7 @@ def _binary_child_source(child: ExprNode, *, parent_op: str, side: str) -> str:
 
 def expression_to_source(expr: ExprNode) -> str:
     if isinstance(expr, NumberNode):
-        value = float(expr.value)
-        if not math.isfinite(value):
-            raise ValueError("Cannot emit nonfinite Algebra numeric literal.")
-        return expr.literal if expr.literal is not None else str(value)
+        return expr.literal
     if isinstance(expr, IdentNode):
         return str(expr.name)
     if isinstance(expr, SpeciesRefNode):
@@ -66,8 +62,6 @@ def expression_to_source(expr: ExprNode) -> str:
         rhs = expression_to_source(expr.rhs)
         if _child_needs_parentheses(expr.rhs, parent_op="unary"):
             rhs = f"({rhs})"
-        if str(expr.op).isalpha():
-            return f"{expr.op} {rhs}"
         return f"{expr.op}{rhs}"
     if isinstance(expr, BinaryNode):
         lhs = _binary_child_source(expr.lhs, parent_op=str(expr.op), side="left")

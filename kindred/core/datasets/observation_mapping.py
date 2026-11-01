@@ -26,14 +26,6 @@ class ObservationMappingSuggestion:
     model_target: str
 
 
-def _canonical_text(value: object, label: str) -> str:
-    if type(value) is not str or not value or value != value.strip():
-        raise ObservationMappingError(
-            f"{label} must be a nonblank edge-normalized string."
-        )
-    return value
-
-
 def normalize_observation_mapping(
     mapping: Iterable[tuple[str, str]],
     *,
@@ -49,11 +41,9 @@ def normalize_observation_mapping(
     by_raw_id: dict[str, str] = {}
     raw_id_by_target: dict[str, str] = {}
     for raw_observation_id, raw_target in mapping:
-        raw_id = _canonical_text(
-            raw_observation_id,
-            "Mapped raw observation ID",
-        )
-        target = _canonical_text(raw_target, "Mapped model target")
+        # The membership tests below admit only canonical raw IDs and targets.
+        raw_id = raw_observation_id
+        target = raw_target
         if raw_id not in available_ids:
             raise ObservationMappingError(
                 f"Explicit raw observation ID {raw_id!r} is no longer present "

@@ -1065,7 +1065,6 @@ def fit_setup_readiness(
     initials: Iterable[FitInitialVariable],
     shared_initial_groups: Iterable[FitSharedInitialGroup],
     profile: FitProfileSetup,
-    check_observations: bool = True,
 ) -> str | None:
     """Return the shared cheap structural Run Fit readiness truth.
 
@@ -1087,13 +1086,12 @@ def fit_setup_readiness(
         mapped = mapped_by_id[local.dataset_id]
         if not local.target_species:
             return f"Dataset {mapped.display_name!r} must select at least one target."
-        if check_observations:
-            try:
-                observations, _ = selected_observations(mapped, local)
-            except ValueError as exc:
-                return f"Dataset {mapped.display_name!r}: {exc}"
-            if not observations:
-                return f"Dataset {mapped.display_name!r} has no selected observations."
+        try:
+            observations, _ = selected_observations(mapped, local)
+        except ValueError as exc:
+            return f"Dataset {mapped.display_name!r}: {exc}"
+        if not observations:
+            return f"Dataset {mapped.display_name!r} has no selected observations."
 
     included_ids = {item.dataset_id for item in included}
     has_fitted_initial = any(
@@ -1349,18 +1347,11 @@ def build_fit_execution_request(
     setup: FitSetupSnapshot,
     workers: int,
 ) -> FitExecutionRequest:
-    """Compile one exact accepted setup into its immutable execution request."""
-    readiness = fit_setup_readiness(
-        origin=setup.origin,
-        datasets=setup.datasets,
-        parameters=setup.parameters,
-        initials=setup.initials,
-        shared_initial_groups=setup.shared_initial_groups,
-        profile=setup.profile,
-        check_observations=False,
-    )
-    if readiness is not None:
-        raise ValueError(readiness)
+    """Compile one exact accepted setup into its immutable execution request.
+
+    Run is enabled only when the window's readiness check passed for this
+    exact setup.
+    """
     prepared_datasets = _prepare_fit_datasets(
         setup=setup,
     )

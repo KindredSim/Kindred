@@ -19,7 +19,7 @@ from kindred.gui.display_name_policy import scientific_symbol_html
 
 
 def number(edit):
-    return parse_finite_numeric_text(edit.text().strip())
+    return parse_finite_numeric_text(edit.text())
 
 
 def entry(value, parent=None):

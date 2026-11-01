@@ -377,7 +377,7 @@ class PreparedDslRequestSet:
             else self.__intervention_execution.triggers
         )
         return tuple(item.source_text for item in triggers
-                     if isinstance(item.then, InterventionStopAction) and item.source_text is not None)
+                     if isinstance(item.then, InterventionStopAction))
 
     def intervention_execution_contract(self) -> InterventionExecutionContract | None:
         return self.__intervention_execution

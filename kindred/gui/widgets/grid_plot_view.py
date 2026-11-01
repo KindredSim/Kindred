@@ -42,13 +42,6 @@ ColorResolver = Callable[[str], object]
 _FIT_COPY_ROWS_PER_CHUNK = 2048
 
 
-def _color_value(value: object) -> object:
-    if isinstance(value, QtGui.QColor):
-        return value
-    if isinstance(value, (str, tuple, list)):
-        return value
-    return str(value)
-
 
 def _fit_y_axis_label(
     unit: Unit | None,
@@ -112,8 +105,8 @@ class GridPlotView(QtWidgets.QWidget):
     def __init__(
         self,
         *,
-        color_resolver: ColorResolver | None = None,
-        observation_style: tuple[str, float, float],
+        color_resolver: ColorResolver,
+        observation_style: tuple[float, float],
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -395,12 +388,9 @@ class GridPlotView(QtWidgets.QWidget):
         menu.menuAction().setEnabled(bool(menu.actions()))
 
     def _toggle_extra(self, name: str, checked: bool) -> None:
-        target = self._context_target
-        if target is None:
-            return
-        dataset_id, plot = target
-        if self._plot_items.get(dataset_id) is not plot:
-            return
+        # Context actions fire only while the menu is open for its target;
+        # removing that plot clears the target and closes the menu.
+        dataset_id, plot = self._context_target
         current = tuple(item for item in self._extras.get(dataset_id, ()) if item != name)
         self._extras[dataset_id] = (*current, name) if checked else current
         if not checked:
@@ -452,12 +442,9 @@ class GridPlotView(QtWidgets.QWidget):
 
     def _context_action_triggered(self, checked: bool) -> None:
         kind = next(key for key, action in self._context_actions.items() if action is self.sender())
-        target = self._context_target
-        if target is None:
-            return
-        dataset_id, plot = target
-        if self._plot_items.get(dataset_id) is not plot:
-            return
+        # Context actions fire only while the menu is open for its target;
+        # removing that plot clears the target and closes the menu.
+        dataset_id, plot = self._context_target
         if kind in {"copy", "copy_all"}:
             if self.copy_eligible():
                 self.copyFitDataRequested.emit(dataset_id, kind == "copy_all")
@@ -529,8 +516,6 @@ class GridPlotView(QtWidgets.QWidget):
             if columns and dataset_columns:
                 columns.append(("", ()))
             columns.extend(dataset_columns)
-        if not columns:
-            raise ValueError("No Fit curves are available to copy.")
         row_count = max(len(values) for _header, values in columns)
         cell_count = (row_count + 1) * len(columns)
         if cell_count > MAX_COPY_CELLS:
@@ -576,11 +561,9 @@ class GridPlotView(QtWidgets.QWidget):
 
     @QtCore.Slot()
     def _continue_copy(self) -> None:
+        # The copy timer runs only while both are set.
         chunks = self._copy_chunks
         output = self._copy_output
-        if chunks is None or output is None:
-            self.cancel_copy()
-            return
         try:
             output.write(next(chunks))
         except StopIteration:
@@ -685,8 +668,7 @@ class GridPlotView(QtWidgets.QWidget):
         return any(self._extras.get(identity) for identity in self._dataset_ids)
 
     def _legend_key(self) -> str:
-        marker = {"o": "●", "s": "■", "t": "▼", "d": "◆", "x": "×", "+": "+"}[self._observation_style[0]]
-        return (f"— Model &nbsp; {marker} Observed"
+        return ("— Model &nbsp; ● Observed"
                 + (" &nbsp; ··· Simulated" if self._has_extras() else ""))
 
     def _update_legend(self) -> None:
@@ -706,9 +688,9 @@ class GridPlotView(QtWidgets.QWidget):
         super().resizeEvent(event)
         self._update_legend()
 
-    def set_observation_style(self, shape: str, size: float, opacity: float) -> None:
-        if self._observation_style != (shape, size, opacity):
-            self._observation_style = (shape, size, opacity)
+    def set_observation_style(self, size: float, opacity: float) -> None:
+        if self._observation_style != (size, opacity):
+            self._observation_style = (size, opacity)
             self._refresh_appearance()
 
     def _reconcile_structure(self, structure: tuple) -> None:
@@ -798,14 +780,15 @@ class GridPlotView(QtWidgets.QWidget):
         style = (color.rgba(), kind, self._observation_style if kind == "observed" else None)
         if getattr(item, "_kindred_style", None) != style:
             if kind == "observed":
-                shape, size, opacity = self._observation_style
+                # Each Fit plot holds one set, so measured points need no
+                # set-distinguishing shape.
+                size, opacity = self._observation_style
                 color.setAlphaF(opacity)
-                item.setSymbol(shape)
+                item.setSymbol("o")
                 item.setSymbolSize(size)
                 item.setSymbolBrush(self._pg.mkBrush(color))
                 item.setSymbolPen(self._pg.mkPen(color=color, width=1))
             elif kind == "extra":
-                # Dashed already means Reference in the main plot.
                 item.setPen(self._pg.mkPen(color=color, width=1, style=QtCore.Qt.PenStyle.DotLine))
             else:
                 item.setPen(self._pg.mkPen(color=color, width=2))
@@ -822,7 +805,7 @@ class GridPlotView(QtWidgets.QWidget):
 
     def changeEvent(self, event: QtCore.QEvent) -> None:
         super().changeEvent(event)
-        if event.type() == QtCore.QEvent.Type.FontChange and hasattr(self, "_scroll"):
+        if event.type() == QtCore.QEvent.Type.FontChange:
             self._refresh_appearance()
             self.finish_preparation()
 
@@ -864,10 +847,8 @@ class GridPlotView(QtWidgets.QWidget):
             (*(item.model_target for identity in self._dataset_ids
                for item in configs[identity].selected_observations),
              *(name for identity in self._dataset_ids for name in self._extras.get(identity, ())))))
-        if species_names and self._color_resolver is None:
-            raise ValueError("Fit curves require an injected species-color resolver.")
         self._color_by_species = MappingProxyType({
-            species: VESSEL_VOLUME_COLOR if species == VESSEL_VOLUME else _color_value(self._color_resolver(species))
+            species: VESSEL_VOLUME_COLOR if species == VESSEL_VOLUME else self._color_resolver(species)
             for species in species_names})
         for identity in self._dataset_ids:
             config = configs[identity]

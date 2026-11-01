@@ -85,7 +85,6 @@ class ObservationMappingWidget(QtWidgets.QWidget):
         self._manual: dict[str, str | None] = {name: None for name in self._species}
         # Computed once per change of this table; every reader uses it.
         self._starts: tuple[SpeciesStart, ...] = ()
-        self._updating = False
 
         # A saved mapping with mapped columns opens exactly as saved; a dataset
         # without a mapped column receives name suggestions.
@@ -220,8 +219,7 @@ class ObservationMappingWidget(QtWidgets.QWidget):
         return (self._source_combo.currentData() if self._reads_data() else None), manual
 
     def problems(self) -> tuple[str, ...]:
-        if not self._create_set:
-            return ()
+        """Problems with the starting values of a set this editor creates."""
         return tuple(item.problem for item in self.starts() if item.problem)
 
     def show_problem(self, text: str) -> None:
@@ -391,8 +389,6 @@ class ObservationMappingWidget(QtWidgets.QWidget):
         self._table.setCellWidget(row, 2, source)
 
     def _on_source_changed(self, species: str) -> None:
-        if self._updating:
-            return
         # Choosing From data discards a typed value; choosing Manual starts empty.
         self._manual[species] = None if self._source_combos[species].currentData() == _DATA else ""
         self._refresh()
@@ -408,15 +404,12 @@ class ObservationMappingWidget(QtWidgets.QWidget):
         self.changed.emit()
 
     def _draw(self, keep_text: str = "") -> None:
-        self._updating = True
-        try:
-            self._refresh_columns()
-            if self._create_set:
-                self._refresh_starts(keep_text)
-            else:
-                self._refresh_existing()
-        finally:
-            self._updating = False
+        # Drawing changes source choices only under signal blockers.
+        self._refresh_columns()
+        if self._create_set:
+            self._refresh_starts(keep_text)
+        else:
+            self._refresh_existing()
 
     def _refresh_columns(self) -> None:
         # A column feeds one target, so columns in use elsewhere are unavailable.

@@ -203,26 +203,13 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self,
         *,
         setup: FitSetupSnapshot,
-        mechanism_species: Sequence[str] = (),
+        mechanism_species: Sequence[str],
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._projected_setup = setup
-        self._mechanism_species = tuple(
-            dict.fromkeys(
-                str(species).strip()
-                for species in mechanism_species
-                if str(species).strip()
-            )
-        )
-        if not self._mechanism_species:
-            self._mechanism_species = tuple(
-                dict.fromkeys(
-                    species
-                    for mapped in setup.origin.mapped_datasets
-                    for species, _value in mapped.initial_values
-                )
-            )
+        # The window passes the admitted, de-duplicated mechanism species.
+        self._mechanism_species = tuple(mechanism_species)
 
         self._current_dataset_id: str | None = None
         # Weight text that could not apply, keyed ("target_weight", dataset,
@@ -461,7 +448,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     def set_running_state(self, running: bool) -> None:
         """Lock every editor while a Fit runs."""
 
-        self._running = bool(running)
+        self._running = running
         self._table.setEnabled(not self._running)
         self._weight_mode_combo.setEnabled(not self._running)
         if self._running:
@@ -478,7 +465,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             button.setEnabled(not self._running)
 
     def set_status(self, text: str) -> None:
-        self.statusMessage.emit(str(text))
+        self.statusMessage.emit(text)
 
     def _submit(self, replacement: FitSetupSnapshot) -> None:
         """Submit one complete setup; the owner projects the accepted one back."""
@@ -510,14 +497,12 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             return None
         return self._projected_dataset(self._current_dataset_id)
 
-    def _mapped_dataset(self, dataset_id: str) -> FitMappedDatasetSnapshot | None:
+    def _mapped_dataset(self, dataset_id: str) -> FitMappedDatasetSnapshot:
+        # The setup holds exactly one dataset per mapped dataset.
         return next(
-            (
-                item
-                for item in self._origin.mapped_datasets
-                if item.dataset_id == dataset_id
-            ),
-            None,
+            item
+            for item in self._origin.mapped_datasets
+            if item.dataset_id == dataset_id
         )
 
     @staticmethod
@@ -560,14 +545,12 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         mapped = self._mapped_dataset(dataset.dataset_id)
         observed = (
             [self._observation_target(dataset, observation) for observation in mapped.observations]
-            if mapped is not None
-            else []
         )
         projected_initials = (
             [
                 item.species
                 for item in self._projected_setup.initials
-                if mapped is not None and item.set_id == mapped.set_id
+                if item.set_id == mapped.set_id
             ]
         )
         return list(
@@ -587,8 +570,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     ) -> FitInitialVariable | None:
         setup = self._projected_setup
         mapped = self._mapped_dataset(dataset.dataset_id)
-        if mapped is None:
-            return None
         return next(
             (
                 item
@@ -615,7 +596,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 if initial.tolerance.upper is None
                 else UnifiedSpeciesTable._float_text(initial.tolerance.upper)
             ),
-            "log10": bool(initial.log10),
+            "log10": initial.log10,
         }
 
     def _shared_initial_group(
@@ -634,20 +615,17 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
     def _dataset_name(self, dataset_id: str) -> str:
         mapped = self._mapped_dataset(dataset_id)
-        return mapped.display_name if mapped is not None else dataset_id
+        return mapped.display_name
 
     def _refresh_vary_global_availability(self, row: int) -> None:
         """Refresh one Vary Global cell without rebuilding the table."""
 
+        # _populate_table gives every row all its cells and identities.
         global_item = self._table.item(row, _Col.VARY_GLOBAL)
         initial_item = self._table.item(row, _Col.INITIAL)
-        if global_item is None or initial_item is None:
-            return
-        dataset_id = str(initial_item.data(_DATASET_ROLE) or "").strip()
-        set_id = str(initial_item.data(_SET_ROLE) or "").strip()
-        species = str(initial_item.data(_SPECIES_ROLE) or "").strip()
-        if not dataset_id or not set_id or not species:
-            return
+        dataset_id = initial_item.data(_DATASET_ROLE)
+        set_id = initial_item.data(_SET_ROLE)
+        species = initial_item.data(_SPECIES_ROLE)
         group = self._shared_initial_group(dataset_id, species)
         if group is not None:
             checked = True
@@ -778,12 +756,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     def _on_vary_global_changed(self, row: int, item: QtWidgets.QTableWidgetItem) -> None:
         """Untick leaves the dataset's group; tick opens the membership dialog."""
 
-        if self._refreshing or self._running:
+        if self._refreshing:
             return
-        dataset_id = str(item.data(_DATASET_ROLE) or "").strip()
-        species = str(item.data(_SPECIES_ROLE) or "").strip()
-        if not dataset_id or not species:
-            return
+        dataset_id = item.data(_DATASET_ROLE)
+        species = item.data(_SPECIES_ROLE)
         group = self._shared_initial_group(dataset_id, species)
         if group is not None:
             if item.checkState() != Qt.CheckState.Checked:
@@ -795,8 +771,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         local = self._local_initial(current_dataset, species) if current_dataset else None
         mapped = self._mapped_dataset(dataset_id)
         if (
-            mapped is None
-            or local is None
+            local is None
             or not local.fit
             or (mapped.set_id, species) in self._invalid_initial_rows
         ):
@@ -841,8 +816,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         target: str,
     ) -> tuple[FitObservationSnapshot, ...]:
         mapped = self._mapped_dataset(dataset.dataset_id)
-        if mapped is None:
-            return ()
         return tuple(
             observation
             for observation in mapped.observations
@@ -868,8 +841,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             return
 
         mapped = self._mapped_dataset(dataset.dataset_id)
-        if mapped is None:
-            return
         self._group.setTitle(f"Species Table — {mapped.display_name}")
         x_name = dataset.parametric.x_name if dataset.parametric is not None else None
         selected = set(dataset.target_species)
@@ -1055,10 +1026,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         """Keep the closed combo tooltip equal to its selected popup item."""
 
         index = combo.currentIndex()
-        tooltip = "" if index < 0 else str(
-            combo.itemData(index, Qt.ItemDataRole.ToolTipRole) or ""
-        )
-        combo.setToolTip(tooltip)
+        combo.setToolTip(combo.itemData(index, Qt.ItemDataRole.ToolTipRole))
 
     def _on_vary_ic_mode_changed(
         self,
@@ -1068,12 +1036,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         """Author one complete fresh range for a Vary IC mode transition."""
 
         self._set_vary_ic_combo_tooltip(combo)
-        if self._refreshing or self._running:
+        if self._refreshing:
             return
         mode = combo.currentData()
         initial_item = self._table.item(row, _Col.INITIAL)
-        if initial_item is None:
-            return
         try:
             initial = float(initial_item.text())
             if not math.isfinite(initial) or initial < 0.0:
@@ -1086,8 +1052,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
         lower_item = self._table.item(row, _Col.LOWER)
         upper_item = self._table.item(row, _Col.UPPER)
-        if lower_item is None or upper_item is None:
-            return
         if mode == "disabled":
             lower, upper, disable_log = "", "", True
         elif mode == "symmetric_percent":
@@ -1109,9 +1073,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         lower_item.setText(lower)
         upper_item.setText(upper)
         if disable_log:
-            log_item = self._table.item(row, _Col.LOG10)
-            if log_item is not None:
-                self._set_checkable(log_item, False, mode != "disabled")
+            self._set_checkable(self._table.item(row, _Col.LOG10), False, mode != "disabled")
         del table_blocker
         self._stage_initial_row_at(row)
 
@@ -1152,12 +1114,11 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     # Edits
     # ------------------------------------------------------------------
     def _on_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
-        if self._refreshing or self._running:
+        if self._refreshing:
             return
-        dataset_id = str(item.data(_DATASET_ROLE) or "")
-        species = str(item.data(_SPECIES_ROLE) or item.data(_MODEL_TARGET_ROLE) or "")
-        if not dataset_id or not species:
-            return
+        # Every cell carries its dataset and species.
+        dataset_id = item.data(_DATASET_ROLE)
+        species = item.data(_SPECIES_ROLE)
         if item.column() in {
             _Col.INITIAL,
             _Col.LOG10,
@@ -1214,13 +1175,9 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         """Apply one complete initial-condition row, or hold its text."""
 
         identity_item = self._table.item(row, _Col.INITIAL)
-        if identity_item is None:
-            return
-        set_id = str(identity_item.data(_SET_ROLE) or "").strip()
-        species = str(identity_item.data(_SPECIES_ROLE) or "").strip()
-        dataset_id = str(identity_item.data(_DATASET_ROLE) or "").strip()
-        if not set_id or not species:
-            return
+        set_id = identity_item.data(_SET_ROLE)
+        species = identity_item.data(_SPECIES_ROLE)
+        dataset_id = identity_item.data(_DATASET_ROLE)
         items = {
             "initial": self._table.item(row, _Col.INITIAL),
             "lower": self._table.item(row, _Col.LOWER),
@@ -1228,12 +1185,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         }
         mode_widget = self._table.cellWidget(row, _Col.TOLERANCE_MODE)
         log_item = self._table.item(row, _Col.LOG10)
-        if (
-            any(value is None for value in items.values())
-            or not isinstance(mode_widget, QtWidgets.QComboBox)
-            or log_item is None
-        ):
-            return
         accepted = self._accepted_initial(set_id, species)
         if accepted is None:
             return
@@ -1241,10 +1192,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         group = self._shared_initial_group(dataset_id, species)
         if group is not None and group.origin_dataset_id != dataset_id:
             return
-        mode = str(mode_widget.currentData() or "disabled")
+        mode = mode_widget.currentData()
         log10 = mode != "disabled" and log_item.checkState() == Qt.CheckState.Checked
         raw: dict[str, object] = {
-            field: str(value.text()) for field, value in items.items()
+            field: value.text() for field, value in items.items()
         }
         raw.update({"mode": mode, "log10": log10})
 
@@ -1359,11 +1310,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         if projected is None:
             return
         checked = {
-            str(item.data(_MODEL_TARGET_ROLE) or "").strip()
+            item.data(_MODEL_TARGET_ROLE)
             for row in range(self._table.rowCount())
             for item in (self._table.item(row, _Col.INCLUDE),)
-            if item is not None
-            and str(item.data(_DATASET_ROLE) or "") == dataset_id
+            if item.data(_DATASET_ROLE) == dataset_id
             and item.checkState() == Qt.CheckState.Checked
         }
         # Targets keep the dataset's column order, as on open and Copy
@@ -1375,7 +1325,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._submit_dataset(self._with_targets(projected, selected))
 
     def _on_dataset_weight_edited(self) -> None:
-        if self._refreshing or self._running:
+        if self._refreshing:
             return
         raw = self._dataset_weight_edit.text()
         dataset_id = str(self._current_dataset_id or "").strip()
@@ -1528,8 +1478,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             return
 
         source_mapped = self._mapped_dataset(source.dataset_id)
-        if source_mapped is None:
-            return
         source_weights = dict(source.target_weights)
         source_weighted = self._weighted_species(source)
         copied_ranges = 0
@@ -1548,8 +1496,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             if destination.dataset_id == source.dataset_id:
                 continue
             destination_mapped = self._mapped_dataset(destination.dataset_id)
-            if destination_mapped is None:
-                continue
             destination_weighted = self._weighted_species(destination)
             for species, source_initial in source_initials.items():
                 destination_key = (destination_mapped.set_id, species)
@@ -1636,7 +1582,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     # Weight-mode and validation presentation
     # ------------------------------------------------------------------
     def _on_weight_mode_changed(self) -> None:
-        if self._refreshing or self._running:
+        if self._refreshing:
             return
         mode = str(self._weight_mode_combo.currentData() or "implicit")
         if mode == self._projected_setup.dataset_weight_mode:

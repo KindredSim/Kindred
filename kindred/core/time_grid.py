@@ -19,11 +19,8 @@ def build_time_grid(t0: float, t1: float, grid: Mapping[str, int]) -> np.ndarray
     """
     n = grid["N"]
     t = np.linspace(t0, t1, n, dtype=float)
-    if (
-        float(t[0]) != t0
-        or float(t[-1]) != t1
-        or np.any(np.diff(t) <= 0.0)
-    ):
+    # At least 10 points; linspace keeps both endpoints exactly.
+    if np.any(np.diff(t) <= 0.0):
         raise ValueError(
             "generated N time grid cannot realize exactly N finite, strictly "
             "increasing binary64 values including both endpoints"

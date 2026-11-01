@@ -91,8 +91,8 @@ def read_csv_rows_from_bytes(
     or explicitly closed.  Header positions remain physical, including blank
     and sparse positions, for the shared ``parse_physical_rows`` boundary.
     """
-    owned_bytes = bytes(source_bytes)
-    label = str(source_label).strip() or "<csv>"
+    owned_bytes = source_bytes
+    label = source_label
     handle = io.TextIOWrapper(
         io.BytesIO(owned_bytes),
         encoding="utf-8-sig",
@@ -150,10 +150,10 @@ def parse_physical_rows(
     time_unit: Unit,
     observation_units: Mapping[str, Unit],
     interruption_checker: Callable[[], bool] | None = None,
-    source_label: str | None = None,
+    source_label: str,
     sheet_name: str | None = None,
-    source_row_start: int = 2,
-    metadata_extras: Mapping[str, object] | None = None,
+    source_row_start: int,
+    metadata_extras: Mapping[str, object],
 ) -> DatasetObservationPayload:
     """Convert physical source rows without ever keying by authored headers."""
     # The sheet plan comes from resolve_sheet_plan or admitted replay metadata.
@@ -165,8 +165,7 @@ def parse_physical_rows(
 
     def _source_prefix() -> str:
         parts: list[str] = []
-        if str(source_label or "").strip():
-            parts.append(f"File {str(source_label).strip()!r}")
+        parts.append(f"File {source_label!r}")
         if sheet_name is not None:
             parts.append(f"sheet {sheet_name!r}")
         return "" if not parts else ", ".join(parts) + ", "
@@ -341,8 +340,8 @@ def parse_physical_rows(
         "mapping_source": "explicit",
     }
     if sheet_name is not None:
-        metadata["sheet_name"] = str(sheet_name)
-    metadata.update(metadata_extras or {})
+        metadata["sheet_name"] = sheet_name
+    metadata.update(metadata_extras)
     return DatasetObservationPayload(
         observations=tuple(observations),
         source_metadata=freeze_json_value(metadata),

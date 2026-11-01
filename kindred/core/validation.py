@@ -70,31 +70,3 @@ def six_digit_source_text(value: float) -> str:
     return text if float(text) == float(value) else repr(float(value))
 
 
-def try_parse_finite_float(value: object) -> tuple[float, bool]:
-    """
-    Best-effort float parsing with an explicit validity flag.
-
-    Returns (parsed_value, ok). When ok is False, parsed_value is 0.0 and callers
-    must decide how to handle the invalid input at their boundary layer.
-    """
-    try:
-        v = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError):
-        return 0.0, False
-    if not math.isfinite(v):
-        return 0.0, False
-    return float(v), True
-
-
-def try_parse_nonneg_finite_float(value: object) -> tuple[float, bool]:
-    """
-    Best-effort float parsing for non-negative finite values.
-
-    Returns (parsed_value, ok). When ok is False, parsed_value is 0.0.
-    """
-    v, ok = try_parse_finite_float(value)
-    if not ok or v < 0.0:
-        return 0.0, False
-    return float(v), True
-
-

@@ -128,13 +128,10 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
             )
         )
 
-    def inputs_enabled(self) -> bool:
-        return bool(self._query_edit.isEnabled() and self._evaluate_button.isEnabled())
-
     def render_state(self, state: SymbolicCalculatorViewState) -> None:
         if state == self._last_state:
             return
-        available = bool(state.available)
+        available = state.available
         previous_index = self._solution_combo.currentIndex() if self._latest_query == state.latest_query else 0
         # An unavailable current mechanism has no result.  Do not let a
         # stale or malformed view state make a previous source look current.
@@ -174,7 +171,8 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
 
     @QtCore.Slot()
     def use_result(self) -> None:
-        query = self._on_use_result(self._latest_query, max(0, self._solution_combo.currentIndex()))
+        # Use is enabled only with answers, so the combo has a current index.
+        query = self._on_use_result(self._latest_query, self._solution_combo.currentIndex())
         if query:
             self._query_edit.setText(query)
             self._query_edit.setFocus()
@@ -203,9 +201,8 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
 
     @QtCore.Slot()
     def evaluate_current_query(self) -> None:
-        if not self.inputs_enabled():
-            return
-        query = str(self._query_edit.text() or "").strip()
+        # Evaluate and Enter act only while the inputs are enabled.
+        query = self._query_edit.text().strip()
         if not query:
             return
         self.render_state(self._on_evaluate(query))
@@ -216,14 +213,14 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
 
     @QtCore.Slot()
     def copy_compact_result(self) -> None:
-        text = str(self._on_copy_result() or "")
+        text = self._on_copy_result()
         if not text:
             return
         QtWidgets.QApplication.clipboard().setText(text)
 
     @QtCore.Slot()
     def copy_full_context(self) -> None:
-        text = str(self._on_copy_context() or "")
+        text = self._on_copy_context()
         if not text:
             return
         QtWidgets.QApplication.clipboard().setText(text)

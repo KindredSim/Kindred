@@ -126,14 +126,13 @@ def _format_mechanism_reference(
         )
         for statement in parameter_spec.parameter_block.lines
     ]
-    if parameter_spec.observable_block is not None:
-        algebra_lines.extend(
-            html.escape(
-                f"let {statement.name} = {expression_to_source(statement.expr)}"
-                + (f"; unit={statement.declared_unit.symbol}" if statement.declared_unit is not None else "")
-            )
-            for statement in parameter_spec.observable_block.lines
+    algebra_lines.extend(
+        html.escape(
+            f"let {statement.name} = {expression_to_source(statement.expr)}"
+            + (f"; unit={statement.declared_unit.symbol}" if statement.declared_unit is not None else "")
         )
+        for statement in parameter_spec.observable_block.lines
+    )
     if algebra_lines:
         lines.extend(("", "Algebra", *algebra_lines))
     return "<pre>" + "\n".join(lines) + "</pre>"
@@ -147,23 +146,20 @@ def _format_mechanism_step(
     units: Mapping[str, Unit],
 ) -> tuple[str, bool]:
     """Project one step; units come from the admitted parameter spec."""
-    step_index = int(entry["step_index"])
-    kind = str(entry["kind"])
+    step_index = entry["step_index"]
+    kind = entry["kind"]
     context = html.escape(reaction_text(entry["context"]))
-    source_coordinates = {
-        str(role): str(name)
-        for role, name in entry["source_coordinates"].items()
-    }
+    source_coordinates = dict(entry["source_coordinates"])
 
     if kind == "reaction":
         reaction = mechanism.reactions[
-            int(entry["reaction_index"])
+            entry["reaction_index"]
         ]
         forward_model = reaction.forward_model
         equilibrium = None
     else:
         equilibrium = mechanism.equilibria[
-            int(entry["equilibrium_index"])
+            entry["equilibrium_index"]
         ]
         forward_model = equilibrium.forward_model
     factor = (reaction if equilibrium is None else equilibrium).factor
@@ -301,55 +297,53 @@ def _format_steps(
     entries = get_step_index_map(mechanism)
     parameter_names_by_step_index: dict[int, list[str]] = {}
     for param_name, entry, _role in iter_canonical_parameters(mechanism):
-        parameter_names_by_step_index.setdefault(int(entry["step_index"]), []).append(
+        parameter_names_by_step_index.setdefault(entry["step_index"], []).append(
             param_name
         )
 
     lines: list[str] = []
-    if entries:
-        for entry in entries:
-            step_index = int(entry["step_index"])
-            kind = str(entry["kind"])
-            context = str(entry["context"])
-            lines.append(f"Step {step_index} {kind}: {context}")
-            parameter_names = parameter_names_by_step_index.get(step_index, [])
-            if parameter_names:
-                lines.append(f"  Parameters: {', '.join(parameter_names)}")
-            if kind == "equilibrium":
-                lines.append(
-                    _equilibrium_authority_line(
-                        mechanism.equilibria[int(entry["equilibrium_index"])],
-                        step_index,
-                    )
-                )
-            step = (mechanism.reactions[int(entry["reaction_index"])] if kind == "reaction"
-                    else mechanism.equilibria[int(entry["equilibrium_index"])])
-            if step.factor is not None:
-                let = next(statement for statement in parameter_spec.observable_block.lines
-                           if statement.name == step.factor)
-                lines.append(f"  Rate multiplied by: {let.name} = {expression_to_source(let.expr)}")
-            rate_authority = _rate_authority_for_step(
-                mechanism,
-                entry,
-                authority_snapshot,
-            )
+    # Admission requires at least one reaction, so every mechanism has steps.
+    for entry in entries:
+        step_index = entry["step_index"]
+        kind = entry["kind"]
+        context = entry["context"]
+        lines.append(f"Step {step_index} {kind}: {context}")
+        parameter_names = parameter_names_by_step_index.get(step_index, [])
+        if parameter_names:
+            lines.append(f"  Parameters: {', '.join(parameter_names)}")
+        if kind == "equilibrium":
             lines.append(
-                "  Model inputs (before calculated param lines): "
-                + json.dumps(
-                    _plain_json_value(rate_authority),
-                    sort_keys=True,
+                _equilibrium_authority_line(
+                    mechanism.equilibria[entry["equilibrium_index"]],
+                    step_index,
                 )
             )
-            coordinate_names = set(entry["source_coordinates"].values()) | set(parameter_names)
-            for statement in parameter_spec.parameter_block.lines:
-                if statement.name in coordinate_names:
-                    kind = parameter_spec.parameter_assignment_kind(statement.name)
-                    declaration = f"{statement.name} = {expression_to_source(statement.expr)}"
-                    if statement.declared_unit is not None:
-                        declaration += f"; unit={statement.declared_unit.symbol}"
-                    lines.append(f"  Retained {kind}: {declaration}")
-    else:
-        lines.append("No indexed DSL reaction or equilibrium steps.")
+        step = (mechanism.reactions[entry["reaction_index"]] if kind == "reaction"
+                else mechanism.equilibria[entry["equilibrium_index"]])
+        if step.factor is not None:
+            let = next(statement for statement in parameter_spec.observable_block.lines
+                       if statement.name == step.factor)
+            lines.append(f"  Rate multiplied by: {let.name} = {expression_to_source(let.expr)}")
+        rate_authority = _rate_authority_for_step(
+            mechanism,
+            entry,
+            authority_snapshot,
+        )
+        lines.append(
+            "  Model inputs (before calculated param lines): "
+            + json.dumps(
+                _plain_json_value(rate_authority),
+                sort_keys=True,
+            )
+        )
+        coordinate_names = set(entry["source_coordinates"].values()) | set(parameter_names)
+        for statement in parameter_spec.parameter_block.lines:
+            if statement.name in coordinate_names:
+                kind = parameter_spec.parameter_assignment_kind(statement.name)
+                declaration = f"{statement.name} = {expression_to_source(statement.expr)}"
+                if statement.declared_unit is not None:
+                    declaration += f"; unit={statement.declared_unit.symbol}"
+                lines.append(f"  Retained {kind}: {declaration}")
 
     return "\n".join(lines)
 
@@ -409,7 +403,7 @@ def _format_equations(equations: object, mechanism: object, *, has_interventions
     lines.append("")
     lines.append(
         "Canonical parameter symbols: "
-        + (", ".join(equations.parameter_symbols) or "none")
+        + ", ".join(equations.parameter_symbols)
     )
     return "\n".join(lines)
 
@@ -515,29 +509,16 @@ class MechanismInspectorDialog(QtWidgets.QDialog):
 
         sections = build_mechanism_inspector_sections(prepared_dsl)
 
-        for title, text, object_name, no_wrap, tooltip in (
+        for title, text, object_name, tooltip in (
             (
                 "Mechanism",
                 sections.mechanism_text,
                 "mechanismInspectorMechanismText",
-                True,
                 "Accepted symbolic mechanism. Fit values remain in Parameters & ICs.",
             ),
-            ("Steps", sections.steps_text, "mechanismInspectorStepsText", False, ""),
-            (
-                "Equations",
-                sections.equations_text,
-                "mechanismInspectorEquationsText",
-                False,
-                "",
-            ),
-            (
-                "Interventions",
-                sections.interventions_text,
-                "mechanismInspectorInterventionsText",
-                False,
-                "",
-            ),
+            ("Steps", sections.steps_text, "mechanismInspectorStepsText", ""),
+            ("Equations", sections.equations_text, "mechanismInspectorEquationsText", ""),
+            ("Interventions", sections.interventions_text, "mechanismInspectorInterventionsText", ""),
         ):
             editor = (
                 QtWidgets.QTextBrowser(self)
@@ -546,8 +527,6 @@ class MechanismInspectorDialog(QtWidgets.QDialog):
             )
             editor.setObjectName(object_name)
             editor.setReadOnly(True)
-            if no_wrap and isinstance(editor, QtWidgets.QPlainTextEdit):
-                editor.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
             if isinstance(editor, QtWidgets.QTextBrowser):
                 editor.setOpenLinks(False)
                 editor.setOpenExternalLinks(False)

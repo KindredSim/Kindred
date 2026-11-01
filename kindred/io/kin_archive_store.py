@@ -9,7 +9,6 @@ import os
 import stat
 import uuid
 import zipfile
-from contextlib import nullcontext
 from dataclasses import dataclass
 from numbers import Real
 from typing import Mapping, Sequence
@@ -192,9 +191,8 @@ def _decode_execution(
     value: object,
     label: str,
 ) -> SimulationExecutionSettings:
-    data = _object(value, label)
-    _exact_fields(
-        data,
+    data = _exact_fields(
+        value,
         label,
         {"solver", "t_start", "t_end", "integration_points"},
     )
@@ -515,46 +513,38 @@ def _replay_imported_dataset(
         return
 
     sheet_name = metadata["sheet_name"]
-    workbook_context = (
-        nullcontext(workbooks)
-        if workbooks is not None
-        else ExcelWorkbookPair(
-            source.exact_source_bytes,
-            source_label=source.original_filename,
+    # An xlsx dataset is replayed inside its source's open workbook pair.
+    rows = workbooks.read_sheet_rows(sheet_name)
+    try:
+        row_iter = iter(rows)
+        first_row = next(row_iter, None)
+        if first_row is None:
+            raise ValueError(f"{label} worksheet contains no data rows.")
+        columns_from_source = tuple(first_row)
+        if columns_from_source != columns:
+            raise ValueError(f"{label} physical columns do not replay exactly.")
+        rows_to_parse = (
+            row_iter
+            if skip_unit_row
+            else itertools.chain((first_row,), row_iter)
         )
-    )
-    with workbook_context as active_workbooks:
-        rows = active_workbooks.read_sheet_rows(sheet_name)
-        try:
-            row_iter = iter(rows)
-            first_row = next(row_iter, None)
-            if first_row is None:
-                raise ValueError(f"{label} worksheet contains no data rows.")
-            columns_from_source = tuple(first_row)
-            if columns_from_source != columns:
-                raise ValueError(f"{label} physical columns do not replay exactly.")
-            rows_to_parse = (
-                row_iter
-                if skip_unit_row
-                else itertools.chain((first_row,), row_iter)
-            )
-            payload = parse_physical_rows(
-                rows_to_parse,
-                columns=columns,
-                time_column=time_column,
-                species_columns=species_columns,
-                source_label=source.original_filename,
-                sheet_name=sheet_name,
-                source_row_start=3 if skip_unit_row else 2,
-                time_unit=time_unit,
-                observation_units=observation_units,
-                metadata_extras={
-                    "skip_unit_row": skip_unit_row,
-                },
-            )
-            _compare(payload)
-        finally:
-            rows.close()
+        payload = parse_physical_rows(
+            rows_to_parse,
+            columns=columns,
+            time_column=time_column,
+            species_columns=species_columns,
+            source_label=source.original_filename,
+            sheet_name=sheet_name,
+            source_row_start=3 if skip_unit_row else 2,
+            time_unit=time_unit,
+            observation_units=observation_units,
+            metadata_extras={
+                "skip_unit_row": skip_unit_row,
+            },
+        )
+        _compare(payload)
+    finally:
+        rows.close()
 
 
 def _require_replay_metadata(
@@ -868,12 +858,7 @@ def _decode_document(
                     f"species {species!r}",
                     nonnegative=True,
                 )
-                value_pairs.append(
-                    (
-                        species,
-                        0.0 if concentration == 0.0 else concentration,
-                    )
-                )
+                value_pairs.append((species, concentration))
             initial_sets.append(
                 InitialConditionSet(
                     set_id=set_id,
@@ -1042,13 +1027,11 @@ def _encode_axis_selection(
             "kind": "simulation",
             "series_name": selection.series_name,
         }
-    if isinstance(selection, ExperimentalAxisSelection):
-        return {
-            "kind": "experimental",
-            "dataset_id": selection.dataset_id,
-            "raw_observation_id": selection.raw_observation_id,
-        }
-    raise TypeError("Axis selection has an unsupported type.")
+    return {
+        "kind": "experimental",
+        "dataset_id": selection.dataset_id,
+        "raw_observation_id": selection.raw_observation_id,
+    }
 
 
 def _decode_axis_selection(
@@ -1428,26 +1411,15 @@ class KinArchiveStore:
             + "\n"
         ).encode("utf-8")
 
-        descriptor: int | None = None
-        temporary_path = ""
-        for _attempt in range(100):
-            temporary_path = os.path.join(
-                parent,
-                f".{os.path.basename(archive_path)}.{uuid.uuid4().hex}.tmp",
-            )
-            try:
-                descriptor = os.open(
-                    temporary_path,
-                    os.O_RDWR | os.O_CREAT | os.O_EXCL,
-                    0o666,
-                )
-            except FileExistsError:
-                continue
-            break
-        if descriptor is None:
-            raise FileExistsError(
-                f"Could not allocate a sibling temporary archive in {parent}."
-            )
+        temporary_path = os.path.join(
+            parent,
+            f".{os.path.basename(archive_path)}.{uuid.uuid4().hex}.tmp",
+        )
+        descriptor = os.open(
+            temporary_path,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL,
+            0o666,
+        )
         try:
             with os.fdopen(descriptor, mode="w+b") as handle:
                 with zipfile.ZipFile(

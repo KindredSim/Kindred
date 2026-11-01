@@ -32,9 +32,9 @@ class EquilibriumMetadataKeys:
 # Temperature and standard concentrations arrive admitted by DSL parsing.
 @dataclass(frozen=True)
 class MechanismMetadataView:
-    temperature_K: float = 298.15
-    standard_conc_M: float = 1.0
-    energy_unit: str = "kJ/mol"
+    temperature_K: float
+    standard_conc_M: float
+    energy_unit: str
     temperature_changes: tuple[TemperatureChange, ...] = ()
 
     @classmethod
@@ -47,26 +47,24 @@ class MechanismMetadataView:
         )
 
     def apply_to_metadata(self, meta: MutableMapping[str, Any]) -> None:
-        meta[MechanismMetadataKeys.TEMPERATURE_K] = float(self.temperature_K)
-        meta[MechanismMetadataKeys.STANDARD_CONC_M] = float(self.standard_conc_M)
-        meta[MechanismMetadataKeys.ENERGY_UNIT] = str(self.energy_unit)
-        if self.temperature_changes:
-            meta[MechanismMetadataKeys.TEMPERATURE_CHANGES] = self.temperature_changes
+        # The builder writes the temperature schedule itself.
+        meta[MechanismMetadataKeys.TEMPERATURE_K] = self.temperature_K
+        meta[MechanismMetadataKeys.STANDARD_CONC_M] = self.standard_conc_M
+        meta[MechanismMetadataKeys.ENERGY_UNIT] = self.energy_unit
 
 
 @dataclass(frozen=True)
 class EquilibriumMetadataView:
+    standard_conc_M: float
     dG_eq_J_per_mol: Optional[float] = None
     Keq_input: Optional[object] = None
-    standard_conc_M: Optional[float] = None
 
     def to_metadata(self) -> dict[str, object]:
         out: dict[str, object] = {
+            EquilibriumMetadataKeys.STANDARD_CONC_M: self.standard_conc_M,
         }
         if self.dG_eq_J_per_mol is not None:
             out[EquilibriumMetadataKeys.DG_EQ_J_PER_MOL] = float(self.dG_eq_J_per_mol)
         if self.Keq_input is not None:
             out[EquilibriumMetadataKeys.KEQ_INPUT] = self.Keq_input
-        if self.standard_conc_M is not None:
-            out[EquilibriumMetadataKeys.STANDARD_CONC_M] = float(self.standard_conc_M)
         return out

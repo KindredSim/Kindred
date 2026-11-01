@@ -162,9 +162,8 @@ class _DatasetImportBatchWorker(QtCore.QThread):
         ) as workbooks:
             for plan in config.plans:
                 self._check_interrupted()
+                # Every xlsx plan names one of the workbook's sheets.
                 sheet_name = plan.sheet_name
-                if sheet_name is None:
-                    raise ValueError("XLSX import plans require a sheet name.")
                 rows = workbooks.read_sheet_rows(sheet_name)
                 with closing(rows):
                     row_iter = iter(rows)
@@ -250,12 +249,8 @@ def build_raw_record_batch_proposal(
             display_name = f"{base}_{counter}{extension}"
             counter += 1
         used_names.add(display_name.casefold())
+        # Each import config captures one uuid-named source for all its units.
         source = unit.source
-        previous_source = sources_by_id.get(source.source_id)
-        if previous_source is not None and previous_source != source:
-            raise ValueError(
-                f"Import captured multiple distinct sources with source ID {source.source_id!r}."
-            )
         sources_by_id[source.source_id] = source
         metadata = thaw_json_value(unit.payload.source_metadata)
         candidate = RawDatasetRecord(
@@ -303,8 +298,7 @@ class DatasetImportStaging(QtCore.QObject):
         origin_tab_id: str,
         configs: tuple[ImportConfig, ...],
     ) -> None:
-        if self._active_worker is not None:
-            raise RuntimeError("A dataset import is already active.")
+        # Import actions are disabled while one runs, and its dialogs are modal.
         worker = _DatasetImportBatchWorker(
             origin_tab_id=origin_tab_id,
             configs=configs,
@@ -329,9 +323,8 @@ class DatasetImportStaging(QtCore.QObject):
 
     @QtCore.Slot()
     def _worker_finished(self) -> None:
-        worker = self.sender()
-        if worker is not self._active_worker:
-            return
+        # One import runs at a time; this is its own finish.
+        worker = self._active_worker
         self._active_worker = None
         worker.deleteLater()
         self.busyChanged.emit(False)

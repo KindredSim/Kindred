@@ -22,10 +22,7 @@ from kindred.core._bounded_rational import ExactWorkLimit, literal_fraction, rat
 from kindred.core.equilibrium_rate_authority import equilibrium_rate_symbolic_relations
 from kindred.core.kinetics import ConstantRateModel, forward_rate_symbolic_relation
 from kindred.core.simulator.dsl_build_input import source_coordinate_name_parts
-from kindred.core.simulator.step_indexing import (
-    get_step_index_map,
-    lookup_source_coordinate_target,
-)
+from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.core.simulator.wegscheider_symbolic import analyze_wegscheider_topology
 
 if TYPE_CHECKING:
@@ -397,7 +394,7 @@ def _unscaled_monomial_from_ast(
 
     if isinstance(expr, NumberNode):
         try:
-            return ExactMonomial(literal_fraction(expr.literal if expr.literal is not None else str(expr.value)))
+            return ExactMonomial(literal_fraction(expr.literal))
         except ValueError:
             return None
     if isinstance(expr, IdentNode):
@@ -585,10 +582,8 @@ def _mechanism_relations(
     )
 
     def literal(value: object) -> ExactMonomial:
-        try:
-            return ExactMonomial(Fraction(str(value)))
-        except (TypeError, ValueError, ZeroDivisionError, OverflowError) as exc:
-            raise ValueError(f"Unsupported exact literal {value!r}.") from exc
+        # Only Fraction exponents and finite kappa/degeneracy defaults arrive.
+        return ExactMonomial(Fraction(str(value)))
 
     def exponential(value: ExactMonomial) -> ExactMonomial:
         return ExactMonomial(Fraction(1), (), (value,))
@@ -607,28 +602,15 @@ def _mechanism_relations(
         def source_coordinate(role: str) -> ExactMonomial | None:
             """Resolve one admitted source role through the source owner."""
 
-            name = source_coordinates.get(role)
-            if name is None:
-                if role in {"kappa", "degeneracy"}:
-                    # Omitted Eyring coordinates retain their exact defaults.
-                    return None
-                raise ValueError(
-                    f"missing canonical source coordinate for {role!r}"
-                )
+            # Parsing records every family's required roles; an omitted Eyring
+            # kappa or degeneracy keeps its exact default.
+            if role in {"kappa", "degeneracy"} and role not in source_coordinates:
+                return None
+            name = source_coordinates[role]
 
-            # The source owner decides whether the named coordinate is an
-            # admitted authored source.  This is a trusted in-process lookup;
-            # exact composition does not duplicate source admission or span
-            # validation here.
-            # Every accepted source role, including Constant ``kfN`` and an
-            # explicit reverse authority, is resolved through the producer's
-            # source map.  A calculated indexed readout is not source-backed
-            # merely because it has the same canonical spelling.
-            target = lookup_source_coordinate_target(mechanism, name)
-            if target is None:
-                raise ValueError(
-                    f"source coordinate {name!r} is not an admitted authored role"
-                )
+            # The step's own source map names only admitted authored roles,
+            # including Constant ``kfN`` and an explicit reverse authority; a
+            # calculated indexed readout never appears in it.
             return ExactMonomial(Fraction(1), ((name, Fraction(1)),))
 
         projected = forward_rate_symbolic_relation(

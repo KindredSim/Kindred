@@ -147,11 +147,8 @@ class FactualCause:
 def _linked_exception(exc: BaseException) -> BaseException | None:
     """Select the strongest available Python causal link."""
 
-    explicit = exc.__cause__
-    if isinstance(explicit, BaseException):
-        return explicit
-    contextual = exc.__context__
-    return contextual if isinstance(contextual, BaseException) else None
+    # Python allows only an exception or None in both links.
+    return exc.__cause__ if exc.__cause__ is not None else exc.__context__
 
 
 def factual_cause_from_exception(

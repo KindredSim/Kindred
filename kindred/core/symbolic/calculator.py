@@ -478,7 +478,6 @@ def build_calculator_context(mechanism: Any, *, mechanism_source: str) -> Calcul
             ("param", spec.parameter_block),
             ("let", spec.observable_block),
         )
-        if block is not None
         for statement in block.lines
     )
     context = CalculatorContext(

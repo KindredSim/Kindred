@@ -17,7 +17,6 @@ from kindred.core.authored_source_errors import AuthoredSourceError
 from kindred.core.dataset_mapping import (
     DatasetMappingError,
     DatasetMappingChoice,
-    OccupiedSetChoice,
     DatasetMappingBatchProposal,
     DatasetMappingProposal,
     apply_dataset_mapping_batch,
@@ -110,7 +109,7 @@ from kindred.gui.fitting.constants import (
 )
 from kindred.gui.main_window_variable_runtime import TabSliderBinding
 from kindred.gui.symbolic_calculator_owner import SymbolicCalculatorOwner
-from kindred.gui.theme_manager import ThemeManager
+from kindred.gui.theme_manager import ThemeManager, semantic_color
 from kindred.gui.widgets.batch_initial_conditions_table import (
     BatchInitialConditionsTableModel,
     BatchInitialConditionsTableView,
@@ -193,15 +192,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self._rendering_workspace = False
-        self._recent_menu: QtWidgets.QMenu | None = None
         self._tab_surfaces: dict[str, _TabSurfaceBundle] = {}
-        self._dark_mode_action: QtGui.QAction | None = None
-        self._run_action: QtGui.QAction | None = None
-        self._scan_action: QtGui.QAction | None = None
-        self._new_project_action: QtGui.QAction | None = None
-        self._open_project_action: QtGui.QAction | None = None
+        # Menu actions are created by _create_menus during construction.
         self._load_data_action: QtGui.QAction | None = None
-        self._xlsx_export_action: QtGui.QAction | None = None
         self._diagnostic_log_dialog: QtWidgets.QDialog | None = None
         self._dataset_import_progress_dialog: QtWidgets.QProgressDialog | None = None
         self._last_export_directory: str | None = None
@@ -250,7 +243,6 @@ class MainWindow(QtWidgets.QMainWindow):
             color_resolver=self.config_controller.species_color,
             parallel_workers=self.config_controller.parallel_workers,
             observation_style_getter=lambda: (
-                self.config_controller.experimental_point_shape(),
                 self.config_controller.experimental_point_size(),
                 self.config_controller.experimental_point_opacity(),
             ),
@@ -301,7 +293,10 @@ class MainWindow(QtWidgets.QMainWindow):
             calculator_owners=lambda: tuple(self._calculator_owners),
             spreadsheet_editor=lambda: self._spreadsheet_editor,
             set_status_text=self.set_status_text,
-            capture_visible_tab_inputs=self._capture_visible_tab_inputs,
+            # Only the active tab's editors are visible, so only they can hold focus.
+            capture_visible_tab_inputs=lambda: self._capture_visible_tab_inputs(
+                tab_id=self._workspace_tab_registry.active_tab_id
+            ),
             prepare_before_save=self._prepare_before_save,
             commit_saved_document=self._commit_saved_document,
             inspect_transient_state=self._inspect_transient_state,
@@ -407,7 +402,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._workspace,
             import_action=data_panel.import_action,
             color_for_species=self.config_controller.species_color,
-            experimental_point_shape=self.config_controller.experimental_point_shape,
             experimental_point_size=self.config_controller.experimental_point_size,
             experimental_point_opacity=(
                 self.config_controller.experimental_point_opacity
@@ -644,9 +638,6 @@ class MainWindow(QtWidgets.QMainWindow):
         bundle.overlay_panel.speciesColorRequested.connect(
             self._set_species_color
         )
-        bundle.overlay_panel.experimentalPointShapeRequested.connect(
-            self._set_experimental_point_shape
-        )
         bundle.overlay_panel.experimentalPointSizeRequested.connect(
             self._set_experimental_point_size
         )
@@ -658,10 +649,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         tab_id: str,
     ) -> None:
-        target = str(tab_id)
-        bundle = self._tab_surfaces.pop(target, None)
-        if bundle is None:
-            return
+        # Both callers drop a surface that exists.
+        bundle = self._tab_surfaces.pop(tab_id)
         if self._load_data_action is bundle.data_panel.import_action:
             self._file_menu.removeAction(self._load_data_action)
             self._load_data_action = None
@@ -681,21 +670,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         species: str,
         color: QtGui.QColor,
-        known_species: tuple[str, ...],
     ) -> None:
         if self._mutation_input_admitted("Change Species Color"):
             try:
-                self.config_controller.set_species_color(species, color, known_species)
+                self.config_controller.set_species_color(species, color)
             except OSError as exc:
                 self.set_status_text(str(exc))
-
-    def _set_experimental_point_shape(self, shape: str) -> None:
-        if self._mutation_input_admitted("Change Experimental Point Shape"):
-            try:
-                self.config_controller.set_experimental_point_shape(shape)
-            except OSError as exc:
-                self.set_status_text(str(exc))
-                self._refresh_application_plot_preferences()
 
     def _set_experimental_point_size(self, request: object) -> None:
         if self._mutation_input_admitted("Change Experimental Point Size"):
@@ -834,7 +814,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _select_tab_surfaces(self, tab_id: str) -> None:
         """Raise retained pages; selecting a tab never reconstructs them."""
 
-        target = str(tab_id)
+        target = tab_id
         bundle = self._tab_surfaces[target]
         self._mechanism_stack.setCurrentWidget(bundle.editor_panel)
         self._slider_stack.setCurrentWidget(bundle.slider_panel)
@@ -863,7 +843,7 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         """Bind one retained plot only to intents from its owning tab."""
 
-        target = str(tab_id)
+        target = tab_id
         plot.referenceLayerVisibilityRequested.connect(
             lambda visible: self._set_reference_lines_visible(target, visible)
         )
@@ -949,7 +929,7 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         """Refresh one tab's controls, sliders and data views."""
 
-        target = str(tab_id)
+        target = tab_id
         bundle = self._tab_surfaces[target]
         document = self._project_session.document
         tab = self._workspace_tab_registry.tab(target)
@@ -1010,7 +990,7 @@ class MainWindow(QtWidgets.QMainWindow):
         targets = (
             tuple(tab.tab_id for tab in document.tabs)
             if tab_ids is None
-            else tuple(dict.fromkeys(str(tab_id) for tab_id in tab_ids))
+            else tuple(dict.fromkeys(tab_ids))
         )
         try:
             for tab_id in targets:
@@ -1080,11 +1060,17 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             for species in simulation_series
         }
+        # A measurement takes its mapped quantity's colour; an unmapped one is
+        # neutral, so it never looks like a model quantity it was not mapped to.
+        unmapped_color = semantic_color(
+            "muted", self._theme_manager.applied_dark_mode,
+        ).name(QtGui.QColor.NameFormat.HexRgb)
         for layer in experimental_layers:
-            color_name = layer.model_target or layer.raw_column
             color_by_axis_selection[layer.axis] = (
-                self.config_controller.species_color(
-                    color_name,
+                unmapped_color
+                if layer.model_target is None
+                else self.config_controller.species_color(
+                    layer.model_target,
                     modeled_species,
                 ).name(QtGui.QColor.NameFormat.HexRgb)
             )
@@ -1100,7 +1086,6 @@ class MainWindow(QtWidgets.QMainWindow):
             intervention_labels_visible=presentation.intervention_labels_visible,
             active_overlay_layers=experimental_layers,
             color_by_axis_selection=color_by_axis_selection,
-            experimental_point_shape=self.config_controller.experimental_point_shape(),
             experimental_point_size=(
                 self.config_controller.experimental_point_size()
             ),
@@ -1124,7 +1109,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _render_results_for_tab(self, tab_id: str) -> None:
-        target = str(tab_id)
+        target = tab_id
         try:
             self._project_session.document.tab(target)
         except KeyError:
@@ -1140,7 +1125,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _canonical_export_available(self, tab_id: str) -> bool:
         """Return whether the active-tab repositories own any retained result."""
 
-        target = str(tab_id)
+        target = tab_id
         tab = self._project_session.document.tab(target)
         repository = self._repository_for_tab(target)
         return any(
@@ -1150,7 +1135,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _canonical_export_blocks(self, tab_id: str):
-        target = str(tab_id)
+        target = tab_id
         return compose_canonical_export_blocks(
             document=self._project_session.document,
             tab_id=target,
@@ -1160,7 +1145,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _copy_all_for_tab(self, tab_id: str) -> bool:
         """Serialize the active tab's complete canonical export roster once."""
 
-        target = str(tab_id)
+        target = tab_id
         blocks = self._canonical_export_blocks(target)
         if not blocks:
             self.set_status_text("No current result data is available to copy.")
@@ -1184,7 +1169,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_results_changed(self, tab_id: str) -> None:
         """Recompose result publications after their owner-side retirement."""
 
-        target = str(tab_id)
+        target = tab_id
         if self._rendering_workspace:
             return
         if (
@@ -1198,22 +1183,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _plot_sets(self, tab_id: str, set_ids: object) -> None:
         """Add a Run's or a Slider Preview's sets to the plot."""
 
-        target = str(tab_id)
-        bundle = self._tab_surfaces.get(target)
-        if bundle is None:
+        # Run dispatch and the slider binding emit for a live tab.
+        target = tab_id
+        bundle = self._tab_surfaces[target]
+        if not bundle.initial_actions.union_plot_membership(set_ids):
             return
-        target_set_ids = tuple(str(set_id) for set_id in set_ids)
-        plotted = set(self._workspace_tab_registry.presentation(target).plot_set_ids)
-        if not bundle.initial_actions.union_plot_membership(target_set_ids):
-            return
-        # Only a newly plotted set that already has a result changes the plot;
-        # the others draw when their result arrives.
-        repository = self._repository_for_tab(target)
-        if any(
-            set_id not in plotted and repository.has_result(set_id)
-            for set_id in target_set_ids
-        ):
-            self._render_results_for_tab(target)
+        # A newly plotted set restyles its linked measurements at once, even
+        # before, or without, a result of its own.
+        self._render_results_for_tab(target)
         self._refresh_project_state()
 
     def _repository_for_tab(self, tab_id: str) -> ResultRepository:
@@ -1236,7 +1213,7 @@ class MainWindow(QtWidgets.QMainWindow):
     ):
         """Build one bound Run target through the direct request path."""
 
-        target = tab.initial_condition_set(str(set_id))
+        target = tab.initial_condition_set(set_id)
         return build_explicit_target(
             prepared_dsl=tab.prepared_dsl,
             set_id=target.set_id,
@@ -1253,11 +1230,10 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         """Select the first newly materialized authored set after publication."""
 
-        ids = tuple(str(set_id) for set_id in materialized_set_ids)
+        ids = materialized_set_ids
         if not ids:
             return
-        target = str(tab_id)
-        self._workspace_tab_registry.tab(target).initial_condition_set(ids[0])
+        target = tab_id
         current = self._workspace_tab_registry.presentation(target)
         next_state = replace(current, current_set_id=ids[0])
         self._workspace_tab_registry.set_presentation(
@@ -1279,7 +1255,7 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> ProjectContentToken | None:
         """Publish one admitted source proposal and clear its draft."""
 
-        tab_id = str(tab_id)
+        tab_id = tab_id
         runtime = self._workspace_tab_registry.tab_runtime(tab_id)
         result = self._workspace_tab_registry.replace_document(
             proposal.proposed_document,
@@ -1326,7 +1302,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _select_tab(self, tab_id: str) -> None:
         if not self._mutation_input_admitted("Select Tab"):
             return
-        target = str(tab_id)
+        target = tab_id
         previous = self._workspace_tab_registry.active_tab_id
         if target == previous:
             return
@@ -1407,9 +1383,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if len(document.tabs) <= 1:
             self.set_status_text("The last mechanism tab cannot be deleted.")
             return
-        self._capture_visible_tab_inputs(tab_id=str(tab_id))
+        self._capture_visible_tab_inputs(tab_id=tab_id)
         runtime = self._workspace_tab_registry.tab_runtime(tab_id)
-        bundle = self._tab_surfaces[str(tab_id)]
+        bundle = self._tab_surfaces[tab_id]
         has_content = self._workspace_tab_registry.tab_has_content(
             tab_id,
             fresh_run_defaults=self.config_controller.application_run_defaults(),
@@ -1465,8 +1441,8 @@ class MainWindow(QtWidgets.QMainWindow):
             description="Add Initial Conditions Set",
         ):
             return
-        if self._tab_surfaces[tab_id].initial_actions.add_set() is not None:
-            self._refresh_dataset_views((tab_id,))
+        self._tab_surfaces[tab_id].initial_actions.add_set()
+        self._refresh_dataset_views((tab_id,))
 
     def _move_initial_sets(self, tab_id: str, delta: int) -> None:
         if not self._mutation_input_admitted("Move Initial Conditions Set"):
@@ -1563,7 +1539,7 @@ class MainWindow(QtWidgets.QMainWindow):
             bundle.slider_binding.render()
 
     def _run_admitted(self, tab_id: str) -> bool:
-        bundle = self._tab_surfaces[str(tab_id)]
+        bundle = self._tab_surfaces[tab_id]
         selected = bundle.initial_actions.selected_run_set_ids()
         if not self._computation_gate.is_idle:
             return False
@@ -1581,15 +1557,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_tab_run_enabled(self, tab_id: str, enabled: bool) -> None:
         admitted = bool(enabled) and self._mutation_input_admitted()
-        bundle = self._tab_surfaces.get(str(tab_id))
+        bundle = self._tab_surfaces.get(tab_id)
         if bundle is None:
             return
         bundle.editor.set_run_enabled(admitted)
         bundle.simulation_panel.run_btn.setEnabled(admitted)
-        if (
-            self._run_action is not None
-            and str(tab_id) == self._workspace_tab_registry.active_tab_id
-        ):
+        if tab_id == self._workspace_tab_registry.active_tab_id:
             self._run_action.setEnabled(admitted)
 
     def _settle_visible_tab_inputs(self) -> None:
@@ -1610,33 +1583,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self._clear_settled_input_drafts((target,), candidate)
         self._refresh_tab_controls(target)
 
-    def _capture_visible_tab_inputs(self, *, tab_id: str | None = None) -> None:
+    def _capture_visible_tab_inputs(self, *, tab_id: str) -> None:
         """Capture the one focused IC or Run-default editor before inspection."""
 
         focused = QtWidgets.QApplication.focusWidget()
-        targets = (
-            (str(tab_id),)
-            if tab_id is not None
-            else tuple(self._tab_surfaces)
-        )
-        for target in targets:
-            bundle = self._tab_surfaces.get(target)
-            if bundle is None:
-                continue
-            # Check the table before the enclosing panel: delegate editors are
-            # descendants of both widgets.
-            if focused is not None and (
-                focused is bundle.batch_table
-                or bundle.batch_table.isAncestorOf(focused)
-            ):
-                bundle.initial_actions.capture_active_editor()
-                return
-            if focused is not None and (
-                focused is bundle.simulation_panel
-                or bundle.simulation_panel.isAncestorOf(focused)
-            ) and bundle.simulation_panel.capture_run_defaults_draft():
-                self._on_initial_draft_state_changed(target)
-                return
+        bundle = self._tab_surfaces[tab_id]
+        # Check the table before the enclosing panel: delegate editors are
+        # descendants of both widgets.
+        if focused is not None and (
+            focused is bundle.batch_table
+            or bundle.batch_table.isAncestorOf(focused)
+        ):
+            bundle.initial_actions.capture_active_editor()
+            return
+        if focused is not None and (
+            focused is bundle.simulation_panel
+            or bundle.simulation_panel.isAncestorOf(focused)
+        ) and bundle.simulation_panel.capture_run_defaults_draft():
+            self._on_initial_draft_state_changed(tab_id)
 
     def _captured_input_candidate(
         self,
@@ -1768,7 +1732,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _discard_slider_draft(self, tab_id: str) -> None:
         """Reset or Discard one tab's Slider drafts and Slider-owned curves."""
 
-        self._tab_surfaces[str(tab_id)].slider_binding.discard_slider_draft()
+        self._tab_surfaces[tab_id].slider_binding.discard_slider_draft()
 
     def _start_selected_run(self, tab_id: str | None = None) -> bool:
         if not self._mutation_input_admitted("Run"):
@@ -1776,7 +1740,7 @@ class MainWindow(QtWidgets.QMainWindow):
         target = (
             self._workspace_tab_registry.active_tab_id
             if tab_id is None
-            else str(tab_id)
+            else tab_id
         )
         bundle = self._tab_surfaces[target]
         if not self._computation_gate.is_idle:
@@ -2033,7 +1997,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_selected_run_sets_changed(self, tab_id: str) -> None:
         """Refresh one tab's Run eligibility after its selected rows change."""
 
-        target = str(tab_id)
+        target = tab_id
         self._set_tab_run_enabled(target, self._run_admitted(target))
         self._refresh_project_state()
 
@@ -2041,20 +2005,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_current_row_changed(
         self,
         tab_id: str,
-        previous_index: QtCore.QModelIndex | None = None,
+        previous_index: QtCore.QModelIndex,
     ) -> None:
         """Refresh one current-row gesture through one guarded owner path."""
 
-        target = str(tab_id)
+        target = tab_id
         if self._rendering_workspace:
             return
-        bundle = self._tab_surfaces.get(target)
-        if bundle is None:
-            return
+        bundle = self._tab_surfaces[target]
         previous_set_id = (
-            None
-            if previous_index is None
-            else bundle.batch_model.set_id_for_live_index(previous_index)
+            bundle.batch_model.set_id_for_live_index(previous_index)
         )
         current_set_id = self._workspace_tab_registry.presentation(
             target
@@ -2079,10 +2039,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_initial_draft_state_changed(self, tab_id: str) -> None:
         """Apply current IC-draft admission to the owning tab."""
 
-        target = str(tab_id)
-        bundle = self._tab_surfaces.get(target)
-        if bundle is None:
-            return
+        target = tab_id
         self._workspace.set_tab_dirty(target, self._tab_has_drafts(target))
         self._set_tab_run_enabled(target, self._run_admitted(target))
         self._refresh_title()
@@ -2092,10 +2049,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_initial_values_changed(self, tab_id: str) -> None:
         """Refresh the owning Slider projection after canonical IC mutation."""
 
-        target = str(tab_id)
-        bundle = self._tab_surfaces.get(target)
-        if bundle is None:
-            return
+        target = tab_id
+        bundle = self._tab_surfaces[target]
         bundle.slider_binding.render()
         self._refresh_project_state()
 
@@ -2103,10 +2058,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_initial_set_name_changed(self, tab_id: str) -> None:
         """Reproject every display label after one accepted set rename."""
 
-        target = str(tab_id)
-        bundle = self._tab_surfaces.get(target)
-        if bundle is None:
-            return
+        target = tab_id
+        bundle = self._tab_surfaces[target]
         self._refresh_dataset_views((target,))
         self._refresh_slider_target_summary(
             target,
@@ -2119,10 +2072,9 @@ class MainWindow(QtWidgets.QMainWindow):
         tab_id: str,
         target_set_ids: object,
     ) -> None:
-        bundle = self._tab_surfaces[str(tab_id)]
-        targets = tuple(str(set_id) for set_id in target_set_ids)
+        bundle = self._tab_surfaces[tab_id]
         tab = self._workspace_tab_registry.tab(tab_id)
-        names = [tab.initial_condition_set(set_id).name for set_id in targets]
+        names = [tab.initial_condition_set(set_id).name for set_id in target_set_ids]
         bundle.editor.set_slider_edit_targets_summary(
             "Initial-condition sets: " + (", ".join(names) if names else "none")
         )
@@ -2131,9 +2083,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _apply_slider_draft(self, tab_id: str) -> bool:
         """Publish one Slider Apply, then reproject every existing consumer."""
 
-        target = str(tab_id)
-        bundle = self._tab_surfaces.get(target)
-        if bundle is None or target in self._slider_apply_refreshing:
+        target = tab_id
+        bundle = self._tab_surfaces[target]
+        if target in self._slider_apply_refreshing:
             return False
         self._slider_apply_refreshing.add(target)
         try:
@@ -2160,7 +2112,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _accept_visible_source_result(
         self,
-        tab_id: str | None = None,
+        tab_id: str,
         *,
         description: str,
         source: MechanismAuthoringSource | None = None,
@@ -2169,11 +2121,6 @@ class MainWindow(QtWidgets.QMainWindow):
         """Admit one action against retained truth or one exact visible draft."""
         if not self._mutation_input_admitted(description):
             return None
-        tab_id = (
-            self._workspace_tab_registry.active_tab_id
-            if tab_id is None
-            else str(tab_id)
-        )
         document = self._project_session.document
         runtime = self._workspace_tab_registry.tab_runtime(tab_id)
         if source is None and runtime.reactions_draft is None:
@@ -2205,7 +2152,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _accept_visible_source(
         self,
-        tab_id: str | None = None,
+        tab_id: str,
         *,
         description: str,
         source: MechanismAuthoringSource | None = None,
@@ -2474,7 +2421,7 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> bool:
         if not self._mutation_input_admitted(description):
             return False
-        target = str(tab_id)
+        target = tab_id
         self._capture_visible_tab_inputs(tab_id=target)
         runtime = self._workspace_tab_registry.tab_runtime(target)
         if runtime.reactions_draft is not None or runtime.has_slider_draft:
@@ -2658,7 +2605,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_import_progress(self, percent: int) -> None:
         dialog = self._dataset_import_progress_dialog
         if dialog is not None:
-            dialog.setValue(int(percent))
+            dialog.setValue(percent)
 
     @QtCore.Slot(str)
     def _on_import_failure(self, message: str) -> None:
@@ -2717,14 +2664,8 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._refresh_dataset_views()
         message = f"Imported {count_text(len(batch_proposal.records), 'raw dataset')}."
+        # The window-modal progress dialog keeps the tab open until completion.
         origin_tab_id = batch_proposal.origin_tab_id
-        if origin_tab_id not in self._tab_surfaces:
-            self.set_status_text(
-                message
-                + " The initiating mechanism no longer exists. Raw data "
-                "remains committed and optional mapping was skipped."
-            )
-            return
         proposal = self._accept_visible_source_result(
             origin_tab_id,
             description="Import Data",
@@ -3075,9 +3016,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
                 finally:
                     dialog.deleteLater()
-            elif choice is DatasetMappingChoice.MAP_EXISTING:
-                if occupied_choice == OccupiedSetChoice.CANCEL.value:
-                    return
+            else:
+                # The Data panel emits only create_set and map_existing, and
+                # returns on a cancelled occupied-set prompt.
                 link = tab.dataset_link(dataset.dataset_id)
                 proposal = DatasetMappingProposal(
                     dataset_id=dataset.dataset_id,
@@ -3088,8 +3029,6 @@ class MainWindow(QtWidgets.QMainWindow):
                         link.observation_mapping if link is not None else ()
                     ),
                 )
-            else:
-                return
             # The same fold as batch import mapping owns occupancy and naming.
             candidate_tab = apply_dataset_mapping_batch(
                 document=self._project_session.document,
@@ -3246,7 +3185,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_y_series(self, tab_id: str, selections: object) -> None:
         if not self._mutation_input_admitted("Change Y Series"):
             return
-        selected = tuple(selections or ())
+        selected = selections
         state = self._workspace_tab_registry.presentation(tab_id)
         self._workspace_tab_registry.set_presentation(
             tab_id,
@@ -3293,8 +3232,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _populate_recent_menu(self) -> None:
         menu = self._recent_menu
-        if menu is None:
-            return
         menu.clear()
         recent = self.config_controller.recent_projects()
         for path in recent:
@@ -4013,11 +3950,7 @@ class MainWindow(QtWidgets.QMainWindow):
         path = os.path.abspath(os.fspath(path))
         if not path.lower().endswith(".xlsx"):
             path += ".xlsx"
-        if self._xlsx_export_owner.owns_destination(path):
-            self.set_status_text(
-                "XLSX export rejected: another export owns that destination."
-            )
-            return False
+        # Export is disabled while one runs, and its dialogs are modal.
         if self.project_controller.is_current_project_path(path):
             self.set_status_text(
                 "XLSX export rejected: the destination is the current project archive."
@@ -4042,7 +3975,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return True
 
     def _remember_export_directory(self, path: str) -> None:
-        directory = os.path.dirname(os.path.abspath(os.fspath(path)))
+        directory = os.path.dirname(path)
         if os.path.isdir(directory):
             self._last_export_directory = directory
 
@@ -4091,7 +4024,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_actions()
 
     def _refresh_symbolic_calculator(self, tab_id: str) -> None:
-        bundle = self._tab_surfaces[str(tab_id)]
+        bundle = self._tab_surfaces[tab_id]
         if self._workspace_tab_registry.tab_runtime(
             tab_id
         ).reactions_draft is not None:
@@ -4115,9 +4048,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._mutation_input_admitted("Open Symbolic Calculator"):
             return
         self._refresh_symbolic_calculator(tab_id)
-        bundle = self._tab_surfaces[str(tab_id)]
-        if str(tab_id) == self._workspace_tab_registry.active_tab_id:
-            self._calculator_stack.setCurrentWidget(bundle.calculator_panel)
+        # The stacks already show the active tab, the only one that reaches here.
         self._workspace.reveal_dock(SYMBOLIC_CALCULATOR_DOCK_SPEC.identity_key)
 
     def _toggle_interactive_sliders(self, tab_id: str) -> None:
@@ -4128,13 +4059,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._workspace.is_dock_frontmost(identity):
             dock.hide()
             return
-        bundle = self._tab_surfaces[str(tab_id)]
-        if str(tab_id) == self._workspace_tab_registry.active_tab_id:
-            self._slider_stack.setCurrentWidget(bundle.slider_panel)
         self._workspace.reveal_dock(identity)
 
     def _evaluate_symbolic(self, tab_id: str, query: str):
-        bundle = self._tab_surfaces[str(tab_id)]
+        bundle = self._tab_surfaces[tab_id]
         if not self._mutation_input_admitted("Evaluate Symbolic Expression"):
             return bundle.calculator_owner.view_state()
         if self._workspace_tab_registry.tab_runtime(tab_id).reactions_draft is not None:
@@ -4261,8 +4189,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _about_brand_asset_path(self) -> str:
         """Return the bundled brand image for the currently applied theme."""
-        action = self._dark_mode_action
-        if action is not None and action.isChecked():
+        if self._dark_mode_action.isChecked():
             return "assets/kindred-full-mark-dark.png"
         return "assets/kindred-full-mark.png"
 
@@ -4392,8 +4319,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         requested_dark = self.config_controller.theme_preference()
         self._theme_manager.apply(requested_dark, None)
-        if self._dark_mode_action is not None:
-            self._dark_mode_action.setChecked(self._theme_manager.applied_dark_mode)
+        self._dark_mode_action.setChecked(self._theme_manager.applied_dark_mode)
 
     def _save_settings(self) -> bool:
         """Persist physical shell state through Config's restore contract."""
@@ -4458,8 +4384,9 @@ class MainWindow(QtWidgets.QMainWindow):
         return bool(self._simulation_jobs.busy) or self._slider_held()
 
     def _slider_held(self) -> bool:
-        bundle = self._tab_surfaces.get(self._workspace_tab_registry.active_tab_id)
-        return bundle is not None and bundle.slider_binding.drag_held
+        # Reached only when the active tab has its surface (_refresh_actions
+        # returns first during project replacement).
+        return self._tab_surfaces[self._workspace_tab_registry.active_tab_id].slider_binding.drag_held
 
     def _simulation_panel_kind(self) -> str | None:
         # A held Slider shows Stop even between drag requests.
@@ -4476,11 +4403,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_actions()
 
     @QtCore.Slot(object)
-    def _on_fit_project_document_changed(self, tab_id: object) -> None:
+    def _on_fit_project_document_changed(self, tab_id: str | None) -> None:
         if tab_id is None:
             self._refresh_project_state()
             return
-        target = str(tab_id)
+        target = tab_id
         created = target not in self._tab_surfaces
         if created:
             self._create_tab_surface(target)
@@ -4526,16 +4453,15 @@ class MainWindow(QtWidgets.QMainWindow):
         mutation_admitted = self._mutation_input_admitted()
         for surface in self._tab_surfaces.values():
             surface.data_panel.set_creation_busy(self._spreadsheet_editor is not None or not mutation_admitted)
-        if self._xlsx_export_action is not None:
-            import_action = bundle.data_panel.import_action
-            if self._load_data_action is not import_action:
-                self._file_menu.insertAction(self._xlsx_export_action, import_action)
-                if self._load_data_action is not None:
-                    self._file_menu.removeAction(self._load_data_action)
-                self._load_data_action = import_action
-            self._load_data_action.setEnabled(
-                mutation_admitted and not self._dataset_import_staging.busy
-            )
+        import_action = bundle.data_panel.import_action
+        if self._load_data_action is not import_action:
+            self._file_menu.insertAction(self._xlsx_export_action, import_action)
+            if self._load_data_action is not None:
+                self._file_menu.removeAction(self._load_data_action)
+            self._load_data_action = import_action
+        self._load_data_action.setEnabled(
+            mutation_admitted and not self._dataset_import_staging.busy
+        )
         self._undo_action.setEnabled(
             mutation_admitted and bundle.editor.native_undo_available()
         )
@@ -4558,30 +4484,25 @@ class MainWindow(QtWidgets.QMainWindow):
             and not self._fit_session_owner.active
         )
         active_work = self._active_project_work()
-        if self._scan_action is not None:
-            self._scan_action.setEnabled(
-                mutation_admitted and (self._scan_owner.dialog is not None
-                                       or has_reactions and not active_work and self._computation_gate.is_idle)
-            )
+        self._scan_action.setEnabled(
+            mutation_admitted and (self._scan_owner.dialog is not None
+                                   or has_reactions and not active_work and self._computation_gate.is_idle)
+        )
         project_actions_enabled = mutation_admitted and not active_work
-        if self._new_project_action is not None:
-            self._new_project_action.setEnabled(project_actions_enabled)
-        if self._open_project_action is not None:
-            self._open_project_action.setEnabled(project_actions_enabled)
-        if self._recent_menu is not None:
-            self._recent_menu.setEnabled(project_actions_enabled)
-        if self._xlsx_export_action is not None:
-            # Export snapshots retained results; only Run/Preview, Scan and
-            # another export exclude it (Close is the mutation fence).
-            self._xlsx_export_action.setEnabled(
-                mutation_admitted
-                and not self._simulation_work_active()
-                and not self._scan_owner.busy
-                and not self._xlsx_export_owner.is_exporting
-                and self._canonical_export_available(
-                    self._workspace_tab_registry.active_tab_id
-                )
+        self._new_project_action.setEnabled(project_actions_enabled)
+        self._open_project_action.setEnabled(project_actions_enabled)
+        self._recent_menu.setEnabled(project_actions_enabled)
+        # Export snapshots retained results; only Run/Preview, Scan and
+        # another export exclude it (Close is the mutation fence).
+        self._xlsx_export_action.setEnabled(
+            mutation_admitted
+            and not self._simulation_work_active()
+            and not self._scan_owner.busy
+            and not self._xlsx_export_owner.is_exporting
+            and self._canonical_export_available(
+                self._workspace_tab_registry.active_tab_id
             )
+        )
 
     def _apply_slider_preview_settings(self) -> None:
         for bundle in self._tab_surfaces.values():

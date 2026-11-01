@@ -84,8 +84,8 @@ class PreparedSolverConfig:
 def build_runtime_symbolic_jacobian(
     *,
     use_analytic_jacobian: bool,
-    symbolic_structure: Any = None,
-    symbolic_support: Any = None,
+    symbolic_structure: Any,
+    symbolic_support: Any,
     coefficient_evaluator: Any,
 ) -> SymbolicJacobianExecution:
     """Prepare the symbolic Jacobian a Run uses, or why it uses none, as the
@@ -123,19 +123,15 @@ class PreparedSimulationRun:
     y0: np.ndarray
     species_names: tuple[str, ...]
     parameter_algebra_spec: Any
-    intervention_execution: InterventionExecutionContract | None
+    intervention_execution: InterventionExecutionContract
     symbolic_jacobian: SymbolicJacobianExecution
     initials_for_algebra: Mapping[str, float]
     request: SimulationExecutionRequest
     parameter_values_at_temperature: Callable[[float, tuple[str, ...]], Mapping[str, float]]
-    cancellation_control: SimulationCancellationControl | None = None
     stop_observable_value: Callable[[str, float, np.ndarray, float], float] | None = None
 
     def __post_init__(self) -> None:
-        y0 = np.asarray(self.y0, dtype=float).reshape(-1).copy()
-        y0.setflags(write=False)
-        object.__setattr__(self, "y0", y0)
-        object.__setattr__(self, "species_names", tuple(self.species_names))
+        self.y0.setflags(write=False)
         object.__setattr__(
             self,
             "initials_for_algebra",
@@ -144,6 +140,7 @@ class PreparedSimulationRun:
 def build_simulation_request_from_prepared_run(
     prepared_run: PreparedSimulationRun,
     *,
+    cancellation_control: SimulationCancellationControl,
     t_eval: np.ndarray | None = None,
     candidate_evaluation: bool = False,
     sample_solver_steps: bool = False,
@@ -153,20 +150,19 @@ def build_simulation_request_from_prepared_run(
     """Solve exactly what preparation admitted: its starting state, schedule,
     Jacobian and cancellation owner."""
     request = prepared_run.request
-    cancellation_control = prepared_run.cancellation_control
     _raise_if_cancelled(cancellation_control)
     result = SimulationRequest(
         rhs=prepared_run.rhs,
-        reference_temperature_K=float(request.prepared_dsl.analysis.temperature_K),
+        reference_temperature_K=request.prepared_dsl.analysis.temperature_K,
         t_span=request.t_span,
-        y0=np.asarray(prepared_run.y0, dtype=float).reshape(-1),
+        y0=prepared_run.y0,
         intervention_execution=prepared_run.intervention_execution,
         symbolic_jacobian=prepared_run.symbolic_jacobian,
         solver=request.solver_config.solver,
         rtol=request.solver_config.rtol,
         atol=request.solver_config.atol,
         grid=request.solver_config.grid,
-        species_names=tuple(prepared_run.species_names),
+        species_names=prepared_run.species_names,
         cancellation_control=cancellation_control,
         t_eval=t_eval,
         candidate_evaluation=candidate_evaluation,
@@ -253,7 +249,7 @@ def build_simulation_execution_request(
         # Realize the generated N grid at the Run/Preview request boundary so
         # binary64-unrepresentable spans fail before worker launch.
         build_time_grid(*request.t_span, solver_config.grid)
-    except (TypeError, ValueError) as exc:
+    except ValueError as exc:
         raise ValueError("execution grid cannot be realized on this time span.") from exc
     return request
 
@@ -326,8 +322,9 @@ def prepare_simulation_run(
 
     mechanism = execution_request.prepared_dsl.mutable_mechanism_shell()
     rhs: Callable[..., np.ndarray] | None = None
-    species_names = list(execution_request.species_names)
-    y0 = np.asarray(execution_request.y0, dtype=float).reshape(-1).copy()
+    species_names = execution_request.species_names
+    # Every producer hands over a flat tuple of floats.
+    y0 = np.asarray(execution_request.y0, dtype=float)
     # Params and lets read the run's starting concentrations as [X]_0.
     initials_for_algebra = {sp: float(y0[idx]) for idx, sp in enumerate(species_names)}
     parameter_algebra_spec = execution_request.prepared_dsl.parameter_algebra_spec_for_execution()
@@ -400,70 +397,69 @@ def prepare_simulation_run(
     runtime_names = runtime_algebra_symbol_names(parameter_algebra_spec)
     symbols = _coefficient_evaluator.parameter_values
     stop_observable_value = None
-    if intervention_execution is not None:
-        stops = tuple(
-            item for item in intervention_execution.triggers
-            if isinstance(item.then, InterventionStopAction) and isinstance(item.condition, ObservableTriggerCondition)
+    # Preparation compiled any schedule parsing left to bind.
+    stops = tuple(
+        item for item in intervention_execution.triggers
+        if isinstance(item.then, InterventionStopAction) and isinstance(item.condition, ObservableTriggerCondition)
+    )
+    targets = tuple(dict.fromkeys(item.condition.name for item in stops))
+    if targets:
+        observable_block = parameter_algebra_spec.observable_block
+        t_start = execution_request.t_span[0]
+        start_temperature = starting_temperature_segment(
+            intervention_execution.temperature_changes,
+            _coefficient_evaluator.nominal_temperature_K, t_start,
+        )(t_start)
+        evaluator = PreparedAlgebraPointEvaluator(
+            observable_block,
+            species_names=species_names, initials=initials_for_algebra,
+            symbol_resolver=lambda name, _row: (
+                symbols(start_temperature, (name,))[name]
+                if name in parameter_algebra_spec.evaluation_dependencies else None
+            ),
+            runtime_symbol_names=set(runtime_names),
         )
-        targets = tuple(dict.fromkeys(item.condition.name for item in stops))
-        if targets:
-            observable_block = parameter_algebra_spec.observable_block
-            t_start = execution_request.t_span[0]
-            start_temperature = starting_temperature_segment(
-                intervention_execution.temperature_changes,
-                _coefficient_evaluator.nominal_temperature_K, t_start,
-            )(t_start)
-            evaluator = PreparedAlgebraPointEvaluator(
-                observable_block,
-                species_names=tuple(species_names), initials=initials_for_algebra,
-                symbol_resolver=lambda name, _row: (
-                    symbols(start_temperature, (name,))[name]
-                    if name in parameter_algebra_spec.evaluation_dependencies else None
-                ),
-                runtime_symbol_names=set(runtime_names),
-            )
-            for target in targets:
-                try:
-                    evaluator.admit(target)
-                except AlgebraError as exc:
-                    if "assignment" in exc.details:
-                        # A param it reads failed and names itself.
-                        raise
-                    if isinstance(exc, UNCOMPUTABLE_ERRORS):
-                        # A value the watched quantity reads cannot be
-                        # calculated for these inputs; it names its inputs as a
-                        # let's failure does.
-                        exc.annotate(**failing_let_facts(parameter_algebra_spec, exc))
-                    else:
-                        exc.annotate(prefix="A stop condition cannot watch this value: ")
+        for target in targets:
+            try:
+                evaluator.admit(target)
+            except AlgebraError as exc:
+                if "assignment" in exc.details:
+                    # A param it reads failed and names itself.
                     raise
+                if isinstance(exc, UNCOMPUTABLE_ERRORS):
+                    # A value the watched quantity reads cannot be
+                    # calculated for these inputs; it names its inputs as a
+                    # let's failure does.
+                    exc.annotate(**failing_let_facts(parameter_algebra_spec, exc))
+                else:
+                    exc.annotate(prefix="A stop condition cannot watch this value: ")
+                raise
 
-            def stop_observable_value(name: str, time: float, state: np.ndarray, temperature_K: float) -> float:
-                # Admission calculated the fixed values; the run reads a value
-                # that changes with time when the quantity reads it.
-                try:
-                    return evaluator.evaluate(name, time, state, lambda root: (
-                        symbols(temperature_K, (root,))[root]
-                        if root in parameter_algebra_spec.evaluation_dependencies else None
-                    ))
-                except (AlgebraError, ValueDomainError) as exc:
-                    # A param it reads that failed names its own inputs.
-                    if "assignment" not in exc.details:
-                        exc.annotate(**failing_let_facts(parameter_algebra_spec, exc))
-                    raise
+        def stop_observable_value(name: str, time: float, state: np.ndarray, temperature_K: float) -> float:
+            # Admission calculated the fixed values; the run reads a value
+            # that changes with time when the quantity reads it.
+            try:
+                return evaluator.evaluate(name, time, state, lambda root: (
+                    symbols(temperature_K, (root,))[root]
+                    if root in parameter_algebra_spec.evaluation_dependencies else None
+                ))
+            except (AlgebraError, ValueDomainError) as exc:
+                # A param it reads that failed names its own inputs.
+                if "assignment" not in exc.details:
+                    exc.annotate(**failing_let_facts(parameter_algebra_spec, exc))
+                raise
 
     request = execution_request
 
     return PreparedSimulationRun(
         rhs=rhs,
-        y0=np.asarray(y0, dtype=float).reshape(-1),
-        species_names=list(species_names),
+        y0=y0,
+        species_names=species_names,
         parameter_algebra_spec=parameter_algebra_spec,
         intervention_execution=intervention_execution,
         symbolic_jacobian=runtime_symbolic_jacobian,
         initials_for_algebra=initials_for_algebra,
         request=request,
-        cancellation_control=cancellation_control,
         stop_observable_value=stop_observable_value,
         parameter_values_at_temperature=symbols,
     )

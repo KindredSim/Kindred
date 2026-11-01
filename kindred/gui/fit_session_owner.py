@@ -67,10 +67,10 @@ class FitSessionOwner(QtCore.QObject):
         session: ProjectSession,
         registry: WorkspaceTabRegistry,
         gate: ComputationGate,
-        observation_style_getter: Callable[[], tuple[str, float, float]],
+        observation_style_getter: Callable[[], tuple[float, float]],
         color_resolver: ColorResolver,
         parallel_workers: Callable[[], int],
-        parent_widget: QtWidgets.QWidget | None = None,
+        parent_widget: QtWidgets.QWidget,
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -111,19 +111,13 @@ class FitSessionOwner(QtCore.QObject):
     def active(self) -> bool:
         """Return whether Fit owns an open window or worker."""
 
-        return bool(self._window is not None or self._worker is not None)
+        return self._window is not None or self._worker is not None
 
     @property
     def application_close_settled(self) -> bool:
         """Return whether Close-facing Fit cleanup is fully owner-settled."""
 
-        return bool(
-            self._worker is None
-            and (
-                not (self._application_close_fenced or self._closing)
-                or self._window is None
-            )
-        )
+        return self._worker is None and (not self._closing or self._window is None)
 
     def _notify_application_close_settled(self) -> None:
         """Publish only the transition reached after complete owner cleanup."""
@@ -138,13 +132,12 @@ class FitSessionOwner(QtCore.QObject):
     @QtCore.Slot(object)
     def open_fit_configuration(
         self,
-        tab_id: str | None = None,
+        tab_id: str,
     ) -> FittingWindow | None:
         """Open an idle configuration from one admitted document origin."""
 
         if (
-            self._application_close_fenced
-            or self._closing
+            self._closing
             or self._window is not None
             or self._worker is not None
         ):
@@ -152,11 +145,10 @@ class FitSessionOwner(QtCore.QObject):
         if not self._gate.is_idle:
             self._set_status(
                 "Fit Open rejected: "
-                f"{self._gate.active_kind or 'another computation'} is active."
+                f"{self._gate.active_kind} is active."
             )
             return None
-        requested_id = str(tab_id or self._registry.active_tab_id)
-        origin = capture_fit_origin(self._session.document, requested_id)
+        origin = capture_fit_origin(self._session.document, tab_id)
         setup = create_initial_fit_setup(origin)
         analysis = origin.prepared_dsl.analysis
         modeled_species = tuple(
@@ -165,7 +157,7 @@ class FitSessionOwner(QtCore.QObject):
             )
         )
         def fit_color_resolver(species):
-            return self._color_resolver(str(species), modeled_species)
+            return self._color_resolver(species, modeled_species)
 
         window = FittingWindow(
             setup,
@@ -176,11 +168,9 @@ class FitSessionOwner(QtCore.QObject):
         )
         self._window = window
         self._install_setup(setup)
+        # The previous window's destruction cleared its last Fit and result.
         self._initial_setup_snapshot = setup
-        self._last_fit_setup_snapshot = None
-        self._invalidate_candidate_custody()
         window.project_setup_snapshot(setup)
-        window.set_apply_available(False, "Run a fit to obtain values to apply.")
 
         window.executeRequested.connect(self.execute)
         window.stopRequested.connect(self.stop)
@@ -217,59 +207,42 @@ class FitSessionOwner(QtCore.QObject):
         return window
 
     @QtCore.Slot()
-    def execute(self) -> bool:
+    def execute(self) -> None:
         """Admit one Fit worker from the current accepted setup."""
         window = self._window
-        if self._closing or self._application_close_fenced:
+        if self._closing:
             self._set_status("Fit rejected while the window is closing.")
-            return False
+            return
         if not self._origin_is_current():
             self._set_status("Fit rejected: origin science is no longer current.")
-            return False
+            return
         if not self._gate.is_idle:
             self._set_status(
-                f"Fit rejected: {self._gate.active_kind or 'another computation'} is active."
+                f"Fit rejected: {self._gate.active_kind} is active."
             )
-            return False
+            return
         request = self._build_request()
-        if not self._gate.try_acquire(self, "fit"):
-            self._set_status("Fit rejected: another computation is active.")
-            return False
+        # The gate was idle just above, with nothing in between to take it.
+        self._gate.try_acquire(self, "fit")
         # A retained result of another setup ends here; one of this setup
         # stays for a failed or cancelled attempt.
         if self._candidate is not None and self._candidate.setup_snapshot != request.setup:
             self._invalidate_candidate_custody()
         worker = GlobalFitWorker(request, parent=self)
-        # The worker object is the sole callback fence.  Queued callbacks
-        # from a settled/replaced QThread are harmless because every
-        # callback checks exact QObject custody before touching state.
-        worker.execution_started.connect(
-            lambda w=worker, r=request: self._on_execution_started(w, r)
-        )
-        worker.progress.connect(
-            lambda done, total, text, w=worker: self._on_progress(w, done, total, text)
-        )
-        worker.best_updated.connect(
-            lambda update, w=worker: self._on_best(w, update)
-        )
-        worker.curves_updated.connect(
-            lambda curves, w=worker: self._on_live_curves(w, curves)
-        )
+        # One worker exists at a time, and its finished signal is queued
+        # after every other signal from its run, so callbacks need no
+        # worker-identity check.
+        worker.execution_started.connect(self._on_execution_started)
+        worker.progress.connect(self._on_progress)
+        worker.best_updated.connect(self._on_best)
+        worker.curves_updated.connect(self._on_live_curves)
         worker.candidate_ready.connect(
             lambda candidate, w=worker: self._on_candidate(w, candidate)
         )
-        worker.factual_failure.connect(
-            lambda failure, w=worker: self._on_failure(w, failure)
-        )
-        worker.scientific_unavailable.connect(
-            lambda unavailable, w=worker: self._on_unavailable(w, unavailable)
-        )
-        worker.cancelled.connect(
-            lambda w=worker: self._on_cancelled(w)
-        )
-        worker.finished.connect(
-            lambda w=worker, r=request: self._finish_worker(w, r)
-        )
+        worker.factual_failure.connect(self._on_failure)
+        worker.scientific_unavailable.connect(self._on_unavailable)
+        worker.cancelled.connect(self._on_cancelled)
+        worker.finished.connect(lambda r=request: self._finish_worker(r))
         self._worker = worker
         self._application_close_settlement_pending = True
         window.set_executing(True)
@@ -277,37 +250,30 @@ class FitSessionOwner(QtCore.QObject):
         window.prepare_fit_plots(request, waiting=True)
         self._set_status("Preparing Fit plots.", phase="Preparing", detail="Preparing all dataset views")
         QtCore.QTimer.singleShot(0, lambda: self._launch_worker(worker, request))
-        return True
 
     def _launch_worker(self, worker: GlobalFitWorker, request: FitExecutionRequest) -> None:
-        if self._worker is not worker:
-            return
-        if self._closing or self._application_close_fenced:
-            self._finish_worker(worker, request)
+        if self._closing:
+            self._finish_worker(request)
             return
         worker.start()
 
-    def _on_execution_started(self, worker: GlobalFitWorker, request: FitExecutionRequest) -> None:
-        if self._worker is not worker or self._closing or self._application_close_fenced:
+    def _on_execution_started(self) -> None:
+        if self._closing:
             return
         self._set_status("Fit started.", phase="Running", detail="Waiting for the first complete candidate")
 
     @QtCore.Slot(object)
-    def _on_setup_snapshot(self, snapshot: object) -> bool:
+    def _on_setup_snapshot(self, snapshot: object) -> None:
         """Admit one complete leaf-authored setup snapshot."""
 
-        if self._closing or self._application_close_fenced:
-            return False
+        # Setup edits come only from the open, idle window: every setup
+        # control is disabled while a Fit runs.
+        if self._closing:
+            return
         window = self._window
-        origin = self._current_origin()
         previous = self._accepted_setup()
-        if window is None or origin is None or previous is None:
-            return False
-        if self._worker is not None:
-            window.set_status("Fit setup is locked while execution is active.")
-            return False
         if snapshot == previous:
-            return False
+            return
         self._record_setup_change(previous)
         self._install_setup(snapshot)
         # An accepted edit is the user's latest action; an action that reports
@@ -315,49 +281,32 @@ class FitSessionOwner(QtCore.QObject):
         window.set_status("")
         self._refresh_result_currency()
         window.project_setup_snapshot(snapshot)
-        return True
 
     @QtCore.Slot()
-    def stop(self) -> bool:
-        if self._closing or self._application_close_fenced:
-            return False
+    def stop(self) -> None:
         worker = self._worker
         if worker is None:
-            return False
+            return
         worker.request_stop()
         self._set_status("Fit stop requested. The best complete candidate of this run is kept.",
                          phase="Stopping", detail="Best complete candidate will be retained")
-        return True
 
     @QtCore.Slot()
-    def pause(self) -> bool:
-        if (
-            self._closing
-            or self._application_close_fenced
-            or self._worker is None
-        ):
-            return False
+    def pause(self) -> None:
+        # Reached only through the window's Pause, which checks it is running.
         self._worker.pause()
         self._set_status(
             "Fit pause requested. The current evaluation will finish before execution pauses.",
             phase="Pause requested", detail="Pauses after the current evaluation"
         )
-        return True
 
     @QtCore.Slot()
-    def resume(self) -> bool:
-        if (
-            self._closing
-            or self._application_close_fenced
-            or self._worker is None
-        ):
-            return False
+    def resume(self) -> None:
         self._worker.resume()
         self._set_status("Fit resumed.", phase="Running", detail="")
-        return True
 
     @QtCore.Slot(object)
-    def reset_setup(self, reset_kind: str, part: str = "both") -> bool:
+    def reset_setup(self, reset_kind: str, part: str) -> None:
         """Restore Data and Targets, Parameters or both from a retained setup.
 
         Data and Targets owns the datasets, initial concentrations, shared
@@ -365,30 +314,16 @@ class FitSessionOwner(QtCore.QObject):
         settings and Profile.
         """
 
+        # Reset is offered only by the open, idle window.
+        # "Last Fit" is offered only once a Fit set that snapshot, and Apply
+        # rebases both snapshots with the setup.
         window = self._window
-        origin = self._current_origin()
-        if (
-            self._closing
-            or self._application_close_fenced
-            or self._worker is not None
-            or window is None
-            or origin is None
-        ):
-            return False
         kind = reset_kind
         snapshot = (
             self._initial_setup_snapshot
             if kind == "initial"
             else self._last_fit_setup_snapshot
         )
-        if snapshot is None:
-            self._set_status(
-                "Fit setup reset rejected: the selected owner snapshot is unavailable."
-            )
-            return False
-        if snapshot.origin is not origin:
-            self._set_status("Fit setup reset rejected: the owner snapshot is stale.")
-            return False
         current = self._accepted_setup()
         if part != "both":
             fields = _DATA_FIELDS if part == "data" else _PARAMETER_FIELDS
@@ -401,34 +336,28 @@ class FitSessionOwner(QtCore.QObject):
         target = "the setup when this window opened" if kind == "initial" else "the last Fit"
         scope = {"data": "Data and Targets", "parameters": "Parameters", "both": "Fit setup"}[part]
         self._set_status(f"{scope} reset to {target}.")
-        return True
 
     @QtCore.Slot()
-    def undo_setup(self) -> bool:
+    def undo_setup(self) -> None:
         """Restore the accepted setup before the last change."""
 
-        return self._step_setup_history(self._undo_setups, self._redo_setups, "undone")
+        self._step_setup_history(self._undo_setups, self._redo_setups, "undone")
 
     @QtCore.Slot()
-    def redo_setup(self) -> bool:
+    def redo_setup(self) -> None:
         """Restore the accepted setup the last Undo left."""
 
-        return self._step_setup_history(self._redo_setups, self._undo_setups, "redone")
+        self._step_setup_history(self._redo_setups, self._undo_setups, "redone")
 
     def _step_setup_history(
         self,
         source: list[FitSetupSnapshot],
         destination: list[FitSetupSnapshot],
         verb: str,
-    ) -> bool:
-        if (
-            self._closing
-            or self._application_close_fenced
-            or self._worker is not None
-            or self._window is None
-            or not source
-        ):
-            return False
+    ) -> None:
+        # Ctrl+Z and Ctrl+Y fire during a run and while stopping.
+        if self._closing or self._worker is not None or not source:
+            return
         current = self._accepted_setup()
         snapshot = source.pop()
         # Held invalid text keeps its whole row or dataset, so like a reset,
@@ -440,7 +369,6 @@ class FitSessionOwner(QtCore.QObject):
         destination.append(current)
         self._restore_setup(snapshot)
         self._set_status(f"Fit setup change {verb}.")
-        return True
 
     def _record_setup_change(self, previous: FitSetupSnapshot) -> None:
         """Keep the setup a change replaces for Undo; a new change ends Redo."""
@@ -467,7 +395,6 @@ class FitSessionOwner(QtCore.QObject):
         setup = self._accepted_setup()
         return (
             candidate is not None
-            and setup is not None
             and replace(setup, origin=candidate.setup_snapshot.origin) == candidate.setup_snapshot
         )
 
@@ -475,8 +402,6 @@ class FitSessionOwner(QtCore.QObject):
         """Mark the shown result stale, or current again after Undo or Reset."""
 
         window = self._window
-        if window is None:
-            return
         if self._candidate is None:
             # A failure or stop shown without a result is stale after any change.
             window.mark_results_stale()
@@ -488,15 +413,12 @@ class FitSessionOwner(QtCore.QObject):
             window.mark_results_stale()
 
     @QtCore.Slot()
-    def results_summary(self) -> bool:
+    def results_summary(self) -> None:
         """Render the human-readable Summary from retained Fit facts."""
 
-        if self._window is None:
-            return False
         # Results already projects the current execution or terminal. Retained
         # candidate custody may still belong to a previous attempt during retry.
         self._window.render_results_summary()
-        return True
 
     def _invalidate_candidate_custody(self) -> None:
         """Release the current terminal candidate."""
@@ -507,8 +429,6 @@ class FitSessionOwner(QtCore.QObject):
         self._candidate_applied_to_project = False
 
     def set_project_defaults(self, defaults: FitDefaults) -> bool:
-        if self._closing or self._application_close_fenced:
-            return False
         expected_token = self._session.capture_content_token()
         successor_token = self._registry.replace_document(
             replace(self._session.document, fit_defaults=defaults),
@@ -533,22 +453,16 @@ class FitSessionOwner(QtCore.QObject):
             return True
         return self._destroy_window_after_cleanup()
 
-    def fence_application_close_admission(self) -> None:
-        """Reject Fit admission and continuation for the active Close attempt."""
-
-        if self._application_close_fenced:
-            return
-        self._application_close_fenced = True
-        if not self.application_close_settled:
-            self._application_close_settlement_pending = True
-
     def cancel_for_application_close(self) -> None:
         """Dispose Fit state and close through the existing owner lifecycle."""
 
         was_closing = self._closing
-        if not self._application_close_fenced:
-            self.fence_application_close_admission()
+        first_close_attempt = not self._application_close_fenced
+        # The fence silences Fit status lines for the rest of Close.
+        self._application_close_fenced = True
         self._closing = True
+        if first_close_attempt and not self.application_close_settled:
+            self._application_close_settlement_pending = True
         window = self._window
         worker = self._worker
         self._discard_local()
@@ -562,12 +476,10 @@ class FitSessionOwner(QtCore.QObject):
             worker.request_cancel()
 
     def _request_window_close(self) -> bool:
-        if self._closing:
-            return False
+        # Only the window's closeEvent calls this, once it has entered
+        # stopping and while not already closing.
         self._closing = True
         if self._worker is not None:
-            if self._window is not None:
-                self._window.enter_stopping()
             self._worker.request_cancel()
             return False
         self._discard_local()
@@ -608,8 +520,6 @@ class FitSessionOwner(QtCore.QObject):
 
     @QtCore.Slot()
     def _on_window_destroyed(self, *_args: object) -> None:
-        if self._window is None:
-            return
         self._window = None
         self._setup_state = None
         self._invalidate_candidate_custody()
@@ -623,45 +533,26 @@ class FitSessionOwner(QtCore.QObject):
         self._notify_application_close_settled()
         self._set_status("Fit closed. All temporary fit state was discarded.")
 
-    def _on_progress(self, worker: GlobalFitWorker, done: int, total: int, text: str) -> None:
-        if (
-            self._application_close_fenced
-            or self._closing
-            or self._worker is not worker
-        ):
+    def _on_progress(self, done: int, total: int, text: str) -> None:
+        if self._closing:
             return
-        if self._window is not None:
-            self._window.set_progress(done, total)
+        self._window.set_progress(done, total)
         self._set_status(text)
 
-    def _on_best(self, worker: GlobalFitWorker, update: object) -> None:
-        if (
-            self._application_close_fenced
-            or self._closing
-            or self._worker is not worker
-        ):
+    def _on_best(self, update: object) -> None:
+        if self._closing:
             return
-        if self._window is not None:
-            self._window.set_live_best(update)
+        self._window.set_live_best(update)
 
-    def _on_live_curves(self, worker: GlobalFitWorker, curves: object) -> None:
-        if (
-            self._application_close_fenced
-            or self._closing
-            or self._worker is not worker
-        ):
+    def _on_live_curves(self, curves: object) -> None:
+        if self._closing:
             return
-        if self._window is not None:
-            self._window.set_live_curves(curves)
+        self._window.set_live_curves(curves)
 
     def _on_candidate(self, worker: GlobalFitWorker, candidate: object) -> None:
         """Retain and present the worker's direct typed candidate terminal."""
 
-        if (
-            self._application_close_fenced
-            or self._closing
-            or self._worker is not worker
-        ):
+        if self._closing:
             return
         self._invalidate_candidate_custody()
         self._candidate = candidate
@@ -728,21 +619,19 @@ class FitSessionOwner(QtCore.QObject):
         return "" if parameter_values or initial_values else "This fit has no fitted values to apply."
 
     @QtCore.Slot()
-    def apply_fit_to_project(self) -> bool:
+    def apply_fit_to_project(self) -> None:
         """Apply one complete, current terminal Fit candidate atomically."""
 
-        return self._apply_fit(to_copy=False)
+        self._apply_fit(to_copy=False)
 
     @QtCore.Slot()
-    def apply_fit_to_tab_copy(self) -> bool:
+    def apply_fit_to_tab_copy(self) -> None:
         """Publish one fitted copy while retaining the original Fit origin."""
 
-        return self._apply_fit(to_copy=True)
+        self._apply_fit(to_copy=True)
 
     def _refresh_apply_availability(self) -> None:
         window = self._window
-        if window is None:
-            return
         if self._candidate_applied_to_project:
             reason = "These Fit values have already been applied to the project. Run a new fit to apply again."
         elif self._candidate is None:
@@ -760,31 +649,20 @@ class FitSessionOwner(QtCore.QObject):
             not reason, reason, copy_available=not copy_reason, copy_reason=copy_reason,
         )
 
-    def _apply_fit(self, *, to_copy: bool) -> bool:
+    def _apply_fit(self, *, to_copy: bool) -> None:
+        # Both Apply actions are enabled only while idle with a current,
+        # unapplied candidate; every change to those disables them at once.
         candidate = self._candidate
         origin = self._current_origin()
         setup = self._accepted_setup()
         window = self._window
-        if (
-            self._closing
-            or self._application_close_fenced
-            or candidate is None
-            or origin is None
-            or setup is None
-            or window is None
-            or self._worker is not None
-            or self._candidate_applied_to_project
-            or (to_copy and self._candidate_copy_name is not None)
-            or not self._candidate_is_current()
-        ):
-            return False
         if not self._origin_science_is_current(candidate.origin):
             self._set_status("Fit Apply rejected: origin science is no longer current.")
-            return False
+            return
         reason = self._candidate_apply_reason(candidate)
         if reason:
             self._set_status(f"Fit Apply rejected: {reason}")
-            return False
+            return
         token = self._session.capture_content_token()
         if to_copy:
             document, copied, set_ids = self._registry.prepare_tab_copy(
@@ -793,7 +671,6 @@ class FitSessionOwner(QtCore.QObject):
             proposed_document = self._prepare_fit_application(
                 candidate, document, copied.tab_id, set_ids=set_ids,
             )
-            capture_fit_origin(proposed_document, copied.tab_id)
             published = self._registry.publish_tab_copy(
                 origin.tab_id, copied, set_ids, proposed_document,
                 expected_token=token, activate=False,
@@ -807,19 +684,15 @@ class FitSessionOwner(QtCore.QObject):
                 f"This fitting session remains attached to '{origin_name}'."
             )
             self._set_status(message)
-            return True
+            return
         proposed_document = self._prepare_fit_application(
             candidate, self._registry.document, origin.tab_id,
         )
         successor_origin = capture_fit_origin(proposed_document, origin.tab_id)
         rebased_setup = replace(setup, origin=successor_origin)
-        rebased_initial_setup = (
-            None
-            if self._initial_setup_snapshot is None
-            else replace(
-                self._initial_setup_snapshot,
-                origin=successor_origin,
-            )
+        rebased_initial_setup = replace(
+            self._initial_setup_snapshot,
+            origin=successor_origin,
         )
         rebased_last_fit_setup = replace(
             candidate.setup_snapshot,
@@ -842,7 +715,6 @@ class FitSessionOwner(QtCore.QObject):
         self.project_document_changed.emit(origin.tab_id)
         self._refresh_apply_availability()
         self._set_status("Fit applied to the project.")
-        return True
 
     def _prepare_fit_application(
         self,
@@ -928,36 +800,22 @@ class FitSessionOwner(QtCore.QObject):
             )
         return tuple(lines)
 
-    def _on_failure(self, worker: GlobalFitWorker, failure: object) -> None:
+    def _on_failure(self, failure: object) -> None:
         """Present the worker's direct factual failure terminal once."""
 
-        if (
-            self._application_close_fenced
-            or self._closing
-            or self._worker is not worker
-        ):
+        if self._closing:
             return
-        if self._window is not None:
-            self._window.clear_candidate()
-            self._window.set_terminal_failure(failure)
+        self._window.clear_candidate()
+        self._window.set_terminal_failure(failure)
         self._failure_status = f"Fit failed: {located(failure.message, *failure.location())}"
         self._set_status(self._failure_status, present=False)
 
-    def _on_unavailable(
-        self,
-        worker: GlobalFitWorker,
-        unavailable: object,
-    ) -> None:
+    def _on_unavailable(self, unavailable: object) -> None:
         """Present the worker's direct scientific-unavailability terminal."""
 
-        if (
-            self._application_close_fenced
-            or self._closing
-            or self._worker is not worker
-        ):
+        if self._closing:
             return
-        if self._window is not None:
-            self._window.set_terminal_unavailable(unavailable)
+        self._window.set_terminal_unavailable(unavailable)
         cause = unavailable.factual_cause
         self._set_status(
             "No valid candidate found: "
@@ -965,31 +823,25 @@ class FitSessionOwner(QtCore.QObject):
             present=False,
         )
 
-    def _on_cancelled(self, worker: GlobalFitWorker) -> None:
+    def _on_cancelled(self) -> None:
         """Publish the direct cancellation terminal once."""
 
-        if (
-            self._application_close_fenced
-            or self._closing
-            or self._worker is not worker
-        ):
+        if self._closing:
             return
-        if self._window is not None:
-            self._window.clear_candidate()
+        self._window.clear_candidate()
         self._invalidate_candidate_custody()
         self._set_status("Fit stopped before any complete candidate was evaluated.",
                          phase="Stopped", detail="No complete candidate was evaluated")
 
-    def _finish_worker(self, expected: GlobalFitWorker, request: FitExecutionRequest) -> None:
+    def _finish_worker(self, request: FitExecutionRequest) -> None:
         """Release custody and present only this request's terminal candidate."""
+        # Its own finished signal, posted last; one worker exists at a time.
         worker = self._worker
-        if worker is not expected:
-            return
         self._worker = None
         self._gate.release(self)
         failure_status, self._failure_status = self._failure_status, None
         closing = self._closing
-        if self._window is not None and not self._application_close_fenced and not closing:
+        if not closing:
             self._window.set_executing(False)
             if self._candidate is not None:
                 if self._candidate.request is request:
@@ -1007,8 +859,7 @@ class FitSessionOwner(QtCore.QObject):
                     # is not shown again, so it can no longer be applied.
                     self._invalidate_candidate_custody()
         self.execution_changed.emit(False)
-        if worker is not None:
-            worker.deleteLater()
+        worker.deleteLater()
         if closing:
             self._discard_local()
             self._destroy_window_after_cleanup()
@@ -1016,10 +867,7 @@ class FitSessionOwner(QtCore.QObject):
             self._notify_application_close_settled()
 
     def _origin_is_current(self) -> bool:
-        origin = self._current_origin()
-        if origin is None:
-            return False
-        return self._origin_science_is_current(origin)
+        return self._origin_science_is_current(self._current_origin())
 
     def _origin_science_is_current(
         self,
@@ -1027,13 +875,11 @@ class FitSessionOwner(QtCore.QObject):
     ) -> bool:
         """Compare retained Fit science while excluding defaults/presentation."""
 
-        try:
-            current = capture_fit_origin(
-                self._session.document,
-                captured.tab_id,
-            )
-        except (KeyError, ValueError):
-            return False
+        # Nothing removes the origin tab or its mechanism while Fit is open.
+        current = capture_fit_origin(
+            self._session.document,
+            captured.tab_id,
+        )
 
         def dataset_science(item: object) -> tuple[object, ...]:
             return (
@@ -1055,7 +901,7 @@ class FitSessionOwner(QtCore.QObject):
                 ),
             )
 
-        return bool(
+        return (
             captured.tab_id == current.tab_id
             and captured.mechanism_source == current.mechanism_source
             and captured.prepared_dsl is current.prepared_dsl
@@ -1107,7 +953,7 @@ class FitSessionOwner(QtCore.QObject):
         if self._application_close_fenced:
             return
         origin = self._current_origin()
-        message = str(text) if origin is None else fit_identity_text(str(text), origin)
+        message = text if origin is None else fit_identity_text(text, origin)
         if self._window is not None:
             if phase is not None:
                 self._window.set_execution_status(phase, detail)

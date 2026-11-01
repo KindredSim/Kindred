@@ -16,15 +16,14 @@ UNCERTAINTY_FIT_METHODS = ("trf", "dogbox")
 LEAST_SQUARES_TOLERANCE = 1e-10
 
 
-def validate_fit_method(value: object) -> str:
-    """Return one stable optimizer identifier or reject the value."""
+def validate_fit_method(value: str) -> None:
+    """Reject a method that is not one of the supported optimizer identifiers.
 
-    if not isinstance(value, str):
-        raise TypeError("Fit optimization method must be a string identifier.")
-    normalized = value.strip()
-    if normalized not in SUPPORTED_FIT_METHODS:
+    The archive decoder, settings reader and method combos hand over text.
+    """
+
+    if value not in SUPPORTED_FIT_METHODS:
         raise ValueError(
             "Fit optimization method must be one of "
             f"{SUPPORTED_FIT_METHODS!r}."
         )
-    return normalized

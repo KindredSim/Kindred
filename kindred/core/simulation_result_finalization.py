@@ -187,7 +187,7 @@ def finalize_simulation_result(
     parameters: tuple[tuple[str, float, str], ...] = (),
     parameter_classifications: tuple[tuple[str, str, str], ...] = (),
     derived_parameters: tuple[DerivedParameterValue, ...] = (),
-    cancellation_control: SimulationCancellationControl | None = None,
+    cancellation_control: SimulationCancellationControl,
 ) -> SimulationResultValue:
     """Admit one solver output through canonical row finalization.
 
@@ -197,7 +197,7 @@ def finalize_simulation_result(
     """
 
     def check_cancelled() -> None:
-        if cancellation_control is not None and cancellation_control.cancel_requested():
+        if cancellation_control.cancel_requested():
             raise SimulationCancelled()
 
     check_cancelled()
@@ -221,7 +221,7 @@ def finalize_simulation_result(
             species_series={name: result_y[index, :] for index, name in enumerate(base_species_names)},
             initials=initials_for_algebra,
             parameter_values_at_temperature=parameter_values_at_temperature,
-            cancellation_check=None if cancellation_control is None else cancellation_control.cancel_requested,
+            cancellation_check=cancellation_control.cancel_requested,
         )
         finalized_algebra_errors = tuple(
             _algebra_cause(error, parameter_algebra_spec) for error in algebra_errors
@@ -236,9 +236,9 @@ def finalize_simulation_result(
         name for name in finalized_series if name not in base_species_names
     )
     failed_names = {
-        str(error.details.get("name") or "")
+        error.details["name"]
         for error in finalized_algebra_errors
-        if str(error.details.get("name") or "") in requested_algebra_outputs
+        if error.details["name"] in requested_algebra_outputs
     }
     succeeded_algebra_outputs = tuple(
         name
