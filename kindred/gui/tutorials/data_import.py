@@ -246,7 +246,7 @@ class ImportAndMapData(PracticeLesson):
                 instruction="<p>Open <b>Examples → Preset Mechanisms → M11: PB cascade</b>.</p>"
                 "<p>M11 has eight species: <b>A</b>, <b>B</b>, <b>C</b>, <b>Int</b>, <b>Water</b>, "
                 "<b>PB</b>, <b>PH</b>, and <b>BOH</b>. It also defines two let quantities, "
-                "<b>total_PB = [PB] + [PH]</b> and <b>selectivity</b>. "
+                "<b>total_PB = [PB] + [PH]</b> and <b>hydrolyzed_fraction</b>. "
                 "A measured column can map to a let quantity as well as to a species.</p>"
                 "<p>M11 adds <b>preset_set1</b>. In this lesson, further sets come from the data.</p>",
                 complete=self._mechanism_loaded,

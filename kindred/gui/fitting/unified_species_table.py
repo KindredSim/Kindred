@@ -533,18 +533,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         )
 
-    @staticmethod
-    def _observation_target(
-        dataset: FitDatasetLocalSettings,
-        observation: FitObservationSnapshot,
-    ) -> str:
-        mapping = dict(dataset.observation_targets)
-        return str(mapping.get(observation.raw_observation_id, observation.model_target))
-
     def _row_species(self, dataset: FitDatasetLocalSettings) -> list[str]:
         mapped = self._mapped_dataset(dataset.dataset_id)
         observed = (
-            [self._observation_target(dataset, observation) for observation in mapped.observations]
+            [observation.model_target for observation in mapped.observations]
         )
         projected_initials = (
             [
@@ -819,7 +811,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         return tuple(
             observation
             for observation in mapped.observations
-            if self._observation_target(dataset, observation) == target
+            if observation.model_target == target
         )
 
     def _observation_tooltip(
@@ -828,7 +820,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         target: str,
     ) -> str:
         return "\n".join(
-            f"Data column {item.raw_column} → {self._observation_target(dataset, item)}"
+            f"Data column {item.raw_column} → {item.model_target}"
             for item in self._observations_for_target(dataset, target)
         )
 
@@ -1373,13 +1365,11 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         if dataset is None or mapped is None:
             return ()
         x_name = dataset.parametric.x_name if dataset.parametric is not None else None
+        # The admitted mapping gives each target exactly one column.
         return tuple(
-            dict.fromkeys(
-                target
-                for observation in mapped.observations
-                for target in (self._observation_target(dataset, observation),)
-                if target and target != x_name
-            )
+            observation.model_target
+            for observation in mapped.observations
+            if observation.model_target != x_name
         )
 
     def _discard_current_invalid_entries(self) -> None:
