@@ -3784,7 +3784,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _configure_fitting(self) -> bool:
         if not self._mutation_input_admitted("Configure Fitting"):
             return False
-        defaults = self._fit_session_owner.project_defaults
+        defaults = self._project_session.document.fit_defaults
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle("Fitting Defaults")
         layout = QtWidgets.QVBoxLayout(dialog)
@@ -3824,7 +3824,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def load_selected_defaults(_index: int) -> None:
             selected = (
-                self._fit_session_owner.project_defaults
+                self._project_session.document.fit_defaults
                 if scope.currentData() == "project"
                 else self.config_controller.application_fit_defaults()
             )
@@ -3906,8 +3906,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # accept_candidate admitted these values before the dialog closed.
         candidate = read_candidate()
         if scope.currentData() == "project":
-            changed = self._fit_session_owner.set_project_defaults(candidate)
+            expected_token = self._project_session.capture_content_token()
+            changed = self._workspace_tab_registry.replace_document(
+                replace(self._project_session.document, fit_defaults=candidate),
+                expected_token=expected_token,
+            ) != expected_token
             if changed:
+                self.set_status_text("Current-project Fit defaults updated.")
                 self._refresh_project_state()
             return changed
         try:
@@ -4402,11 +4407,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_fit_execution_changed(self, _executing: bool) -> None:
         self._refresh_actions()
 
-    @QtCore.Slot(object)
-    def _on_fit_project_document_changed(self, tab_id: str | None) -> None:
-        if tab_id is None:
-            self._refresh_project_state()
-            return
+    @QtCore.Slot(str)
+    def _on_fit_project_document_changed(self, tab_id: str) -> None:
         target = tab_id
         created = target not in self._tab_surfaces
         if created:

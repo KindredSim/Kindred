@@ -17,4 +17,4 @@ preset_set1 = {
 
 param concentration_floor = 1e-18; unit = M
 let total_PB = [PB] + [PH]
-let selectivity = [PH] / max([PH] + [BOH], concentration_floor)
+let hydrolyzed_fraction = [PH] / max(total_PB, concentration_floor)

@@ -50,7 +50,6 @@ class FittingWindow(QtWidgets.QDialog):
     resetRequested = QtCore.Signal(str, str)
     undoRequested = QtCore.Signal()
     redoRequested = QtCore.Signal()
-    resultsSummaryRequested = QtCore.Signal()
 
     def __init__(
         self,
@@ -195,7 +194,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._copy_button.setEnabled(False)
         self._copy_button.clicked.connect(self._run_results_tab.copy_active_to_clipboard)
         self._results_summary_button = QtWidgets.QPushButton("S&ummary", footer)
-        self._results_summary_button.clicked.connect(self.resultsSummaryRequested)
+        self._results_summary_button.clicked.connect(self._run_results_tab.render_results_summary)
         # A push button with a menu matches the footer's other buttons.
         self._apply_button = QtWidgets.QPushButton("&Apply Fit", footer)
         apply_menu = QtWidgets.QMenu(self._apply_button)
@@ -544,32 +543,12 @@ class FittingWindow(QtWidgets.QDialog):
         }
 
     def _eligible_parametric_x(self, dataset_id: str) -> tuple[str, ...]:
-        setup = self._projected_setup
-        mapped = self._mapped_dataset(dataset_id)
-        dataset = next(
-            item for item in setup.datasets if item.dataset_id == dataset_id
-        )
-        target_by_raw_id = dict(dataset.observation_targets)
-        resolved_observations = tuple(
-            (
-                observation,
-                target_by_raw_id.get(observation.raw_observation_id),
-            )
-            for observation in mapped.observations
-            if observation.raw_observation_id in target_by_raw_id
-        )
-        counts: dict[str, int] = {}
-        for _observation, target in resolved_observations:
-            if target is not None:
-                counts[target] = counts.get(target, 0) + 1
-        # A ticked target is eligible too: choosing it as X removes it from
-        # the targets (see _project_dataset_settings).
+        # The admitted mapping gives each target exactly one column. A ticked
+        # target is eligible too: choosing it as X removes it from the targets
+        # (see _project_dataset_settings).
         return tuple(
-            dict.fromkeys(
-                target
-                for _observation, target in resolved_observations
-                if target is not None and counts[target] == 1
-            )
+            observation.model_target
+            for observation in self._mapped_dataset(dataset_id).observations
         )
 
     def _fit_default_settings_for_dataset(self, dataset_id: str) -> dict[str, object]:
@@ -606,10 +585,10 @@ class FittingWindow(QtWidgets.QDialog):
     ) -> FitDatasetLocalSettings:
         """Project one Data-tab config onto the authoritative dataset shape.
 
-        Validation and application use this same target, weight, and
-        mapping projection.  Parametric X is an additional weighted target, never a
+        Validation and application use this same target and weight
+        projection.  Parametric X is an additional weighted target, never a
         Y target.  Each species keeps its weight whether or not it is a
-        target or the X, and observation mappings stay untouched.
+        target or the X.
         """
 
         parametric = FittingWindow._parametric_from_config(config)
@@ -630,7 +609,6 @@ class FittingWindow(QtWidgets.QDialog):
             parametric=parametric,
             target_species=target_species,
             target_weights=tuple(weight_by_target.items()),
-            observation_targets=current.observation_targets,
         )
 
     def _on_dataset_include_changed(
@@ -852,9 +830,6 @@ class FittingWindow(QtWidgets.QDialog):
     def mark_results_current(self) -> None:
         """The setup is back to the shown result's own."""
         self._run_results_tab.mark_current()
-
-    def render_results_summary(self) -> None:
-        self._run_results_tab.render_results_summary()
 
     def set_terminal_failure(self, failure: FactualCause) -> None:
         """Present a worker failure as its one located sentence."""

@@ -9,7 +9,6 @@ from PySide6 import QtCore, QtWidgets
 
 from kindred.core.exceptions import located
 from kindred.core.project_document import (
-    FitDefaults,
     MechanismSourceReconciliation,
     ProjectDocument,
     reconcile_tab_mechanism_source,
@@ -58,7 +57,7 @@ class FitSessionOwner(QtCore.QObject):
     window_changed = QtCore.Signal(bool)
     execution_changed = QtCore.Signal(bool)
     status_changed = QtCore.Signal(str)
-    project_document_changed = QtCore.Signal(object)
+    project_document_changed = QtCore.Signal(str)
     application_close_settlement_changed = QtCore.Signal()
 
     def __init__(
@@ -102,10 +101,6 @@ class FitSessionOwner(QtCore.QObject):
     def refresh_plot_preferences(self) -> None:
         if self._window is not None:
             self._window.set_observation_style(*self._observation_style_getter())
-
-    @property
-    def project_defaults(self) -> FitDefaults:
-        return self._session.document.fit_defaults
 
     @property
     def active(self) -> bool:
@@ -176,7 +171,6 @@ class FitSessionOwner(QtCore.QObject):
         window.stopRequested.connect(self.stop)
         window.pauseRequested.connect(self.pause)
         window.resumeRequested.connect(self.resume)
-        window.resultsSummaryRequested.connect(self.results_summary)
         window.applyRequested.connect(self.apply_fit_to_project)
         window.applyToCopyRequested.connect(self.apply_fit_to_tab_copy)
         window.setupSnapshotRequested.connect(self._on_setup_snapshot)
@@ -412,14 +406,6 @@ class FitSessionOwner(QtCore.QObject):
         else:
             window.mark_results_stale()
 
-    @QtCore.Slot()
-    def results_summary(self) -> None:
-        """Render the human-readable Summary from retained Fit facts."""
-
-        # Results already projects the current execution or terminal. Retained
-        # candidate custody may still belong to a previous attempt during retry.
-        self._window.render_results_summary()
-
     def _invalidate_candidate_custody(self) -> None:
         """Release the current terminal candidate."""
 
@@ -427,18 +413,6 @@ class FitSessionOwner(QtCore.QObject):
         self._candidate_projection = None
         self._candidate_copy_name = None
         self._candidate_applied_to_project = False
-
-    def set_project_defaults(self, defaults: FitDefaults) -> bool:
-        expected_token = self._session.capture_content_token()
-        successor_token = self._registry.replace_document(
-            replace(self._session.document, fit_defaults=defaults),
-            expected_token=expected_token,
-        )
-        if successor_token == expected_token:
-            return False
-        self.project_document_changed.emit(None)
-        self._set_status("Current-project Fit defaults updated.")
-        return True
 
     def cancel_for_application_close(self) -> None:
         """Dispose Fit state and close through the existing owner lifecycle."""

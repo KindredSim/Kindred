@@ -74,7 +74,6 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         layout.addWidget(self._tab_bar)
 
         self._dark_mode = False
-        self._active_tab_id: str | None = None
         self._plot_by_tab_id: dict[str, PyQtGraphPlotPanel] = {}
         self._initial_plot = self._new_plot_panel()
         self._initial_plot.setObjectName("plotPanel")
@@ -371,7 +370,6 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
             self._tab_bar.blockSignals(previous)
 
         active_plot = self._ensure_plot(target_active)
-        self._active_tab_id = target_active
         self._plot_stack.setCurrentWidget(active_plot)
         self._analysis_stack.setCurrentWidget(active_plot.analysis_tabs())
 
@@ -384,7 +382,6 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
             self._tab_bar.setCurrentIndex(index)
         finally:
             self._tab_bar.blockSignals(blocked)
-        self._active_tab_id = target
         self._plot_stack.setCurrentWidget(plot)
         self._analysis_stack.setCurrentWidget(plot.analysis_tabs())
 
@@ -397,8 +394,6 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         self._analysis_stack.removeWidget(analysis)
         analysis.deleteLater()
         plot.deleteLater()
-        if self._active_tab_id == target:
-            self._active_tab_id = None
 
     def set_theme(self, *, dark_mode: bool) -> None:
         self._dark_mode = bool(dark_mode)

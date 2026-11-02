@@ -565,7 +565,6 @@ class FitDatasetLocalSettings:
     weight: float = 1.0
     target_species: tuple[str, ...] = ()
     target_weights: tuple[tuple[str, float], ...] = ()
-    observation_targets: tuple[tuple[str, str], ...] = ()
     parametric: FitParametricSettings | None = None
 
     def __post_init__(self) -> None:
@@ -867,13 +866,6 @@ def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
                 (observation.model_target, 1.0)
                 for observation in mapped.observations
             ),
-            observation_targets=tuple(
-                (
-                    observation.raw_observation_id,
-                    observation.model_target,
-                )
-                for observation in mapped.observations
-            ),
         ))
     values_by_key = {
         (mapped.set_id, species): value
@@ -972,32 +964,22 @@ def selected_observations(
     local: FitDatasetLocalSettings,
 ) -> tuple[tuple[FitObservationSnapshot, ...], FitObservationSnapshot | None]:
     """Select Y observations and their shared measured-X row capture."""
-    target_by_raw_id = {
-        raw_id: model_target
-        for raw_id, model_target in local.observation_targets
-    }
     wanted = set(local.target_species)
     observations_by_target: dict[str, FitObservationSnapshot] = {}
     for observation in mapped.observations:
-        target = target_by_raw_id.get(observation.raw_observation_id)
-        if target is None or target not in wanted:
+        if observation.model_target not in wanted:
             continue
         # The admitted mapping gives each target exactly one column.
-        observations_by_target[target] = observation
+        observations_by_target[observation.model_target] = observation
 
     x_rows: set[int] | None = None
     x_observation: FitObservationSnapshot | None = None
     if local.parametric is not None:
         # The admitted mapping gives measured X exactly one column, never a Y column.
-        x_raw_id = next(
-            raw_id
-            for raw_id, current_target in local.observation_targets
-            if current_target == local.parametric.x_name
-        )
         x_observation = next(
             observation
             for observation in mapped.observations
-            if observation.raw_observation_id == x_raw_id
+            if observation.model_target == local.parametric.x_name
         )
         x_rows = set(x_observation.source_rows)
 

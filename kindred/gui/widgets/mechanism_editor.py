@@ -583,7 +583,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "</table>"
             "<p>Stopping triggers do not accept <code>max_count</code> or <code>min_interval</code>.</p>"
             "<p>For a concentration threshold, enter <code>threshold</code> in M. For 1 mM, write <code>threshold=0.001</code>, including when the watched quantity has <code>; unit = mM</code>.</p>"
-            "<pre>param floor = 1e-12; unit = M\nlet selectivity = [B] / max([A] + [B], floor)\nintervention: op=trigger; watch_observable=selectivity; threshold=0.9; direction=rising; then={op=stop}</pre>"
+            "<pre>param floor = 1e-12; unit = M\nlet fraction_B = [B] / max([A] + [B], floor)\nintervention: op=trigger; watch_observable=fraction_B; threshold=0.9; direction=rising; then={op=stop}</pre>"
             "<p>A stopping condition produces a completed result. <b>Stop</b> cancels a Run instead.</p>"
             "<h3>Stopping Order and Output</h3>"
             "<ul>"

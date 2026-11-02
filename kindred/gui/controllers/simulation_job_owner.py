@@ -145,14 +145,22 @@ class _DirectSimulationWorker(QtCore.QThread):
         self._targets = tuple(targets)
         self._max_parallel = max(1, min(int(max_parallel), len(self._targets)))
         self._cancel_event = Event()
-        self._control = SimulationCancellationControl(self._cancel_event.is_set)
+        # Rebound on the GUI thread and read by pool threads; a frozenset is
+        # never mutated in place.
+        self._cancelled_set_ids: frozenset[str] = frozenset()
 
     def cancel(self) -> None:
         self._cancel_event.set()
 
+    def cancel_sets(self, set_ids: Iterable[str]) -> None:
+        self._cancelled_set_ids |= frozenset(set_ids)
+
     @property
     def cancelled(self) -> bool:
         return self._cancel_event.is_set()
+
+    def set_cancelled(self, set_id: str) -> bool:
+        return self._cancel_event.is_set() or set_id in self._cancelled_set_ids
 
     def run(self) -> None:
         if self.cancelled:
@@ -185,11 +193,13 @@ class _DirectSimulationWorker(QtCore.QThread):
         self,
         target: ExplicitRunTarget | PreviewTarget | InteractivePreviewTarget,
     ) -> _TargetTerminalOutcome:
-        if self.cancelled:
+        set_id = target.set_id
+        if self.set_cancelled(set_id):
             return _TargetTerminalOutcome(target, "cancelled", message="Simulation canceled.")
         try:
             result = execute_simulation(
-                target.execution_request, cancellation_control=self._control,
+                target.execution_request,
+                cancellation_control=SimulationCancellationControl(lambda: self.set_cancelled(set_id)),
                 species_statistics=True,
             )
         except SimulationCancelled:
@@ -217,7 +227,8 @@ class SimulationJobOwner(QtCore.QObject):
         self._repository_for_tab = repository_for_tab
         self._parallel_workers = parallel_workers
         # The operation and its worker are set and cleared together; the
-        # worker's cancel event is the one record of a cancellation.
+        # worker's cancel event and cancelled sets are the one record of a
+        # cancellation.
         self._operation: dict[str, object] | None = None
         self._worker: _DirectSimulationWorker | None = None
         # Each tab's latest waiting exact Preview, started oldest first.
@@ -315,9 +326,14 @@ class SimulationJobOwner(QtCore.QObject):
             return False
         if not include_run and operation["kind"] != "preview":
             return False
-        if not ids.intersection(target.set_id for target in operation["targets"]):
+        hit = ids.intersection(target.set_id for target in operation["targets"])
+        if not hit:
             return False
-        self._worker.cancel()
+        if operation["kind"] == "run" and operation["purpose"] == "ordinary":
+            # A user-started Run completes for the sets the change left current.
+            self._worker.cancel_sets(hit)
+        else:
+            self._worker.cancel()
         return True
 
     def reset_project_session(self) -> None:
@@ -361,8 +377,9 @@ class SimulationJobOwner(QtCore.QObject):
         """Fence computation for one admitted document delta.
 
         The registry owns repository mutation.  This operation only retires
-        computation intent and records removed identities on the operation
-        being cancelled.
+        the affected computation (the changed sets of a user-started Run, any
+        other operation whole) and records removed identities on the current
+        operation.
         """
 
         targets_by_tab = delta.targets_by_tab()
@@ -691,7 +708,7 @@ class SimulationJobOwner(QtCore.QObject):
 
     @QtCore.Slot(object)
     def _on_target_terminal(self, outcome: _TargetTerminalOutcome) -> None:
-        if not self._operation_is_current():
+        if not self._operation_is_current() or self._worker.set_cancelled(outcome.target.set_id):
             return
         operation = self._operation
         target = outcome.target
@@ -741,7 +758,7 @@ class SimulationJobOwner(QtCore.QObject):
         seen = {id(target) for target, _state in operation["outcomes"]}
         for target in operation["targets"]:
             if id(target) not in seen:
-                # Only a cancelled worker leaves a target without an outcome.
+                # Only a cancelled worker or set leaves a target without an outcome.
                 operation["outcomes"].append((target, "cancelled"))
         pending_interactive = self._pending_interactive_preview
         superseded_preview = operation_tab_id in self._pending_previews or (

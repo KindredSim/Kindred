@@ -132,6 +132,13 @@ def _fixed_constant_values():
     return {sp.Symbol(name, positive=True): sp.Rational(str(getattr(constants, name))) for name in _FIXED_CONSTANTS}
 
 
+def _decide(condition):
+    """Decide a predicate on the constants' values; an undecided one keeps their names."""
+    sp = require_sympy()
+    decided = _native_substitute(condition, _fixed_constant_values(), equations=False)
+    return decided if decided in (sp.true, sp.false) else condition
+
+
 def _boolean_result(parts, transform, *, conjunction=True):
     """A decisive Boolean operand precedes errors in irrelevant companions."""
     sp = require_sympy()
@@ -161,12 +168,11 @@ def _conditions(current=(), *, replacements=None, before_substitution=(), additi
     additional = tuple(c for c in additional if c not in current or c in affected)
     if not substituted and not additional:
         return current
-    fixed = _fixed_constant_values()
     def evaluate(part):
         condition, mapping = part
         if mapping:
             condition = _native_substitute(condition, mapping, equations=False)
-        return _native_substitute(condition, fixed, equations=False)
+        return _decide(condition)
     changed = _boolean_result((*((c, replacements) for c in substituted), *((c, None) for c in additional)), evaluate)
     return _condition_tuple(sp.And(*(c for c in current if c not in affected), changed))
 
@@ -788,7 +794,7 @@ def _determinant(value):
 
     def unestablished():
         # Without a dimension contract, entries enter in their scientific coordinates.
-        return _scientific(matrix, value.quantity).det(), None
+        return _scientific(matrix, value.quantity).det(method="domain-ge"), None
 
     rows, columns = [None]*n, [None]*n
     cells = {(i, j): _matrix_cell(value, i, j) for i in range(n) for j in range(n)
@@ -820,7 +826,7 @@ def _determinant(value):
     for unit in (*rows, *columns):
         raw = raw.multiply(unit)
     normalized = scientific_unit(raw.dimensions)
-    return aligned.det() * conversion_scale(raw, normalized).symbolic(), normalized
+    return aligned.det(method="domain-ge") * conversion_scale(raw, normalized).symbolic(), normalized
 
 
 def _equations(left: _Value, right: _Value):
@@ -900,6 +906,35 @@ def _solution_set(equations, conditions, variables):
                            sp.ProductSet(*(_calculus_domain(x) for x in variables)))
 
 
+def _linear_solutions(matrix, vector, variables):
+    """Domain elimination; each answer entry is cancelled once, in linsolve's form."""
+    sp = require_sympy()
+    from sympy.polys.matrices import DomainMatrix
+    augmented = DomainMatrix.from_Matrix(matrix.row_join(vector), field=True, extension=True)
+    if augmented.domain.is_EX:
+        # Clearing denominators over general expressions grows with the numbers in exponents.
+        reduced, pivots = augmented.to_dense().rref()
+        denominator = augmented.domain.one
+    else:
+        reduced, denominator, pivots = augmented.rref_den(method="CD", keep_domain=False)
+    count = len(variables)
+    if pivots and pivots[-1] == count:
+        return sp.S.EmptySet
+    ring, field = reduced.domain, augmented.domain
+    denominator = field.convert_from(denominator, ring)
+    rows = reduced.to_sdm()
+    solution = list(variables)
+    for row, pivot in enumerate(pivots):
+        entries = rows.get(row, {})
+
+        def value(j, entries=entries):
+            return field.convert_from(entries[j], ring) / denominator
+
+        solution[pivot] = sp.Add(*(field.to_sympy(value(j)) if j == count else variables[j] * field.to_sympy(-value(j))
+                                   for j in sorted(entries) if j not in pivots))
+    return sp.FiniteSet(sp.Tuple(*solution))
+
+
 def _solve(context: CalculatorContext, problem: _Value, coordinates: _Value, conditions):
     """Own this invocation's native solving, candidate admission and current remainder."""
     applicable = conditions
@@ -916,15 +951,25 @@ def _solve(context: CalculatorContext, problem: _Value, coordinates: _Value, con
         if not equations or any(not isinstance(item, sp.Equality) for item in equations):
             raise SymbolicCalculatorError("Invalid input: solve requires equations made with eq.")
         variables = tuple(sp.Dummy(x.name, **x.assumptions0) for x in labels)
-        mapping = {**_fixed_constant_values(), **dict(zip(labels, variables, strict=True))}
+        # Kindred's R is exactly k_B*N_A; N_A, absent from the rate laws, carries the identity.
+        mapping = {context.symbols["N_A"]: context.symbols["R"] / context.symbols["k_B"],
+                   **dict(zip(labels, variables, strict=True))}
         conditions = _conditions(conditions, replacements=mapping)
         bound = _admit_native(_native_substitute(sp.Tuple(*equations), mapping), conditions)
         def solve(equations, residual):
             if isinstance(residual.expression, (_UnavailableDiagnostic, _UnresolvedProblem)):
                 return _Alternatives((residual,))
             expressions, conditions = residual.expression, residual.conditions
-            parameters = equations.free_symbols - set(variables)
+            from sympy.core.evalf import prec_to_dps
+            floats = equations.atoms(sp.Float) | sp.Tuple(*expressions).atoms(sp.Float)
+            # Decisions on approx decimals use each decimal's exact value.
+            exact_values = {f: sp.Rational(str(f)) for f in floats}
+            digits = min((prec_to_dps(f._prec) for f in floats), default=None)
+            parameters = equations.free_symbols - set(variables) - _fixed_constant_values().keys()
             candidates = []
+            exact = False
+            decided = False
+            dropped = False
             complete = False
             explanation, detail = "Calculator could not resolve these remaining possibilities.", ""
             try:
@@ -932,7 +977,7 @@ def _solve(context: CalculatorContext, problem: _Value, coordinates: _Value, con
                     matrix, vector = sp.linear_eq_to_matrix(expressions, variables)
                 except NonlinearError:
                     if len(variables) == len(expressions) == 1:
-                        native = sp.solveset(expressions[0], variables[0], domain=_calculus_domain(variables[0]))
+                        native = sp.solveset(sp.powsimp(expressions[0], combine="exp"), variables[0], domain=_calculus_domain(variables[0]))
                         def finite_roots(result):
                             if isinstance(result, sp.FiniteSet):
                                 return list(result)
@@ -944,16 +989,35 @@ def _solve(context: CalculatorContext, problem: _Value, coordinates: _Value, con
                             return []
                         candidates = [sp.Tuple(x) for x in finite_roots(native)]
                     else:
-                        native = sp.nonlinsolve(expressions, variables)
+                        native = sp.nonlinsolve([sp.powsimp(x, combine="exp") for x in expressions], variables)
                         candidates = list(native) if isinstance(native, sp.FiniteSet) else []
+                        # nonlinsolve writes an unknown it could not solve as itself, like a free one;
+                        # an equation still naming a solved unknown after substitution tells them apart.
+                        def unsolved(c):
+                            return (isinstance(c, sp.Tuple) and all(isinstance(x, sp.Expr) for x in c)
+                                    and any(x == v for x, v in zip(c, variables))
+                                    and any(sp.simplify((eq.lhs - eq.rhs).subs(dict(zip(variables, c)), simultaneous=True)).free_symbols
+                                            & set(variables) for eq in equations))
+                        if floats and any(unsolved(c) for c in candidates):
+                            if all(x.is_polynomial(*variables) for x in expressions):
+                                decided, candidates = True, []
+                                native = sp.nonlinsolve([sp.powsimp(x.xreplace(exact_values), combine="exp") for x in expressions], variables)
+                                candidates = list(native) if isinstance(native, sp.FiniteSet) else []
+                            else:
+                                dropped, candidates = True, [c for c in candidates if not unsolved(c)]
                 else:
-                    native = sp.linsolve((matrix, vector), variables)
+                    if floats:
+                        decided = True
+                        matrix, vector = matrix.xreplace(exact_values), vector.xreplace(exact_values)
+                    native = _linear_solutions(matrix, vector, variables)
+                    # Elimination answers satisfy the equations by construction.
+                    exact = True
                     candidates = list(native) if isinstance(native, sp.FiniteSet) else []
-                    constant_matrix = not matrix.free_symbols and all(x.is_finite is True for x in matrix)
+                    constant_matrix = not matrix.free_symbols & parameters and all(x.is_finite is True for x in matrix)
                     unique = (matrix.rows == matrix.cols and all(x.is_finite is True for x in matrix)
-                              and matrix.det().is_zero is False)
+                              and matrix.det(method="domain-ge").is_zero is False)
                     complete = isinstance(native, sp.FiniteSet) and (constant_matrix or unique)
-                complete |= not parameters and (isinstance(native, sp.FiniteSet) or native == sp.S.EmptySet)
+                complete = (complete or not parameters and (isinstance(native, sp.FiniteSet) or native == sp.S.EmptySet)) and not dropped
             except (NotImplementedError, ValueError, TypeError, ArithmeticError, KeyError) as exc:
                 detail = str(exc)
 
@@ -963,12 +1027,29 @@ def _solve(context: CalculatorContext, problem: _Value, coordinates: _Value, con
                     complete = False
                     continue
                 replacements = dict(zip(variables, candidate, strict=True))
+                # Answers from decimal equations continue in the stated digits, without rounding residue.
+                published = sp.Tuple(*(sp.nfloat(x, digits).replace(lambda n: n.is_Add and n.is_number,
+                                                                    lambda n: n.evalf(digits, chop=True))
+                                       for x in candidate)) if floats else candidate
+                shown = dict(zip(variables, published, strict=True))
                 try:
-                    restrictions = _conditions(conditions, replacements=replacements, additional=(
-                        *(sp.Ne(sp.denom(x), 0, evaluate=False) for x in candidate), *_relationship_domains(replacements)))
-                    residuals = tuple(sp.simplify(eq.subs(replacements, simultaneous=True)) for eq in equations)
-                    restrictions = _conditions(restrictions, additional=residuals)
-                    admitted = _admit_native(candidate, restrictions)
+                    restrictions = _conditions(conditions, replacements=shown, additional=(
+                        *(sp.Ne(sp.denom(x), 0, evaluate=False) for x in published), *_relationship_domains(shown)))
+                    # Rounded decimals cannot satisfy an exact check, so other decimal candidates are admitted unchecked.
+                    # SymPy's evaluated equality rules some true numeric equations false, so an equation
+                    # stays unevaluated until simplified, and one left without symbols is the solver's own.
+                    sides = (tuple(s.xreplace(exact_values).subs(replacements, simultaneous=True) for s in (eq.lhs, eq.rhs))
+                             for eq in equations)
+                    residuals = () if exact or (floats and not decided) else tuple(
+                        sp.simplify(sp.Eq(*pair, evaluate=False)) for pair in sides if sp.Tuple(*pair).free_symbols)
+                    # A residual that still constrains a solved coordinate is an unsolved
+                    # equation, not an applicability condition.
+                    if any(r.free_symbols.intersection(variables) for r in residuals):
+                        complete = False
+                        continue
+                    restrictions = _conditions(restrictions, additional=(
+                        tuple(sp.nfloat(r, digits) for r in residuals) if decided else residuals))
+                    admitted = _admit_native(published, restrictions)
                 except _ConditionInapplicable:
                     continue
                 except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError):
@@ -1334,7 +1415,7 @@ def _conditions_cover_interval(conditions, variable, lower, upper):
         else:
             return False
         remaining = _conditions(before_substitution=copied[:-2], replacements={variable: point})
-        return sp.simplify(sp.And(*remaining), doit=False) is sp.true
+        return sp.simplify(_native_substitute(sp.And(*remaining), _fixed_constant_values(), equations=False), doit=False) is sp.true
     except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError):
         # Unestablished interval coverage is not false applicability of the input.
         return False
@@ -1390,7 +1471,7 @@ def _calculus_call(context: CalculatorContext, name: str, args: Sequence[_Value]
             prepared = _native_substitute(expression, {variable: bound}) if restricted else expression
             operand = (sp.Piecewise(
                 (prepared if restricted else expression.xreplace({variable: bound}),
-                 _native_substitute(sp.And(*dependent), {variable: bound}, equations=False)),
+                 _native_substitute(sp.And(*dependent), {**_fixed_constant_values(), variable: bound}, equations=False)),
                 (sp.nan, True), evaluate=False,
             ) if dependent else expression)
             if name == "integrate":
@@ -1779,8 +1860,8 @@ def _admit_native(expression, conditions=(), *, notices=(), classify=None):
     unresolved = expression if isinstance(expression, _UnresolvedProblem) else None
     template = unresolved.problem if unresolved else expression
     if unresolved and isinstance(template, sp.Set):
-        problem = _native_substitute(template, fixed, equations=False)
-        return _Alternatives(()) if problem == sp.S.EmptySet else _Value(replace(unresolved, problem=problem), conditions, notices)
+        empty = _native_substitute(template, fixed, equations=False) == sp.S.EmptySet
+        return _Alternatives(()) if empty else _Value(unresolved, conditions, notices)
 
     def conditional(node, choices):
         if isinstance(node, sp.Piecewise):
@@ -1823,7 +1904,7 @@ def _admit_native(expression, conditions=(), *, notices=(), classify=None):
                 # Predicates are transformed lazily: a false guard wins over an
                 # invalid comparison belonging only to that inapplicable branch.
                 changed = _boolean_result((*guards, *(c for c in conditions if c not in unchanged)),
-                    lambda c: _native_substitute(materialize(c, choices), fixed, equations=False))
+                    lambda c: _decide(materialize(c, choices)))
                 restrictions = _condition_tuple(sp.And(*unchanged, changed))
             materialize(template, choices, check=True)
             body = materialize(template, choices) if choices else template
@@ -1932,7 +2013,7 @@ def _package_result(context: CalculatorContext, query: str, result) -> SymbolicC
         "Coordinates are real. T is positive and fixed in time unless explicit expression dependence is supplied.",
         "Definitions are prepared before calculation. Independent parameters and initial concentrations are fixed in time, and partial differentiates prepared mathematics.",
         "Independent inputs remain symbolic. Supply concrete values explicitly with subs. Accepted defaults are not Calculator inputs.",
-        "Physical constants keep their names and the values Kindred uses. Approximation does not add precision beyond the source.",
+        "Physical constants keep their names (solve writes N_A as R/k_B) and the values Kindred uses. Approximation does not add precision beyond the source.",
         "Special functions, conditional or unresolved sets, and some root or order forms may not be accepted back as typed input. Nested operations still work.",
         "Calculations use SymPy 1.14.0. Its known error when integrating rational functions that contain parameters (sympy/sympy#28596) is not corrected or checked by Kindred.",
         "Algebra and calculus follow the expression as written. A simplified result does not show where the original expression is defined, or that an integral with parameters is well behaved.",

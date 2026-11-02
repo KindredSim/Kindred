@@ -282,6 +282,8 @@ def _result_provenance_payload(result: SimulationResultValue) -> Mapping[str, ob
             "provenance": MappingProxyType(
                 {
                     "solver": result.solver_provenance,
+                    "parameters": result.parameters,
+                    "derived_parameters": result.derived_parameters,
                     "termination": result.termination,
                     "volume": result.volume,
                     "boundaries": result.presentation_boundaries,
