@@ -100,7 +100,7 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         self._copy_result_button = QtWidgets.QPushButton("Copy Result", self)
         self._copy_result_button.setObjectName("symbolicCalculatorCopyResultButton")
         self._copy_result_button.setToolTip(
-            "Copy every answer, including conditions and explanations, to the clipboard. "
+            "Copy every answer, including notices and explanations, to the clipboard. "
             "Your selection does not limit what gets copied."
         )
         self._copy_result_button.clicked.connect(self.copy_compact_result)
