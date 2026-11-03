@@ -5,8 +5,8 @@ from fractions import Fraction
 from collections.abc import Mapping
 from typing import Any
 
-from kindred.core.equilibrium_rate_authority import equilibrium_rate_symbolic_relations
-from kindred.core.kinetics import forward_rate_symbolic_relation
+from kindred.core.equilibrium_rate_authority import EquilibriumRateAuthorityKind, equilibrium_rate_symbolic_relations
+from kindred.core.kinetics import ArrheniusRateModel, EyringRateModel, forward_rate_symbolic_relation
 from kindred.core.mechanism import Mechanism
 from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
@@ -18,8 +18,9 @@ from .backend import require_sympy
 def build_calculator_chemistry_relations(
     mechanism: Mechanism, *, parameter_spec: ParameterAlgebraSpec,
     symbols: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Lower chemistry readouts without evaluating Algebra or independent inputs."""
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Lower chemistry readouts without evaluating Algebra or independent inputs. Also name, for each
+    Arrhenius or Eyring rate constant and each Keq taken from dG_eq, the energy whose exponential defines it."""
 
     sympy = require_sympy()
 
@@ -37,6 +38,7 @@ def build_calculator_chemistry_relations(
 
     derived = parameter_spec.chemistry_dependencies
     chemistry_relations: dict[str, Any] = {}
+    energies: dict[str, Any] = {}
     for source_index, entry in enumerate(get_step_index_map(mechanism)):
         reaction = entry["kind"] == "reaction"
         step = (
@@ -64,6 +66,8 @@ def build_calculator_chemistry_relations(
         )
         if forward_name in derived:
             chemistry_relations[forward_name] = forward
+            if isinstance(step.forward_model, (ArrheniusRateModel, EyringRateModel)):
+                energies[forward_name] = source_coordinate("Ea" if isinstance(step.forward_model, ArrheniusRateModel) else "dG_act")
         if reaction:
             continue
         standard_concentration = step.metadata[EquilibriumMetadataKeys.STANDARD_CONC_M]
@@ -81,4 +85,7 @@ def build_calculator_chemistry_relations(
             name = readouts[role]
             if name in derived:
                 chemistry_relations[name] = expression
-    return chemistry_relations
+        authority = step.authority
+        if authority.kind == EquilibriumRateAuthorityKind.KEQ and not authority.has_explicit_keq_param:
+            energies[readouts["Keq"]] = source_coordinate("dG_eq")
+    return chemistry_relations, energies
