@@ -1,7 +1,7 @@
 This project's original source code is licensed under the MIT License.
 See the file LICENSE.
 
-Distributed Windows binaries of this project may include Qt for Python
+Distributed binaries of this project may include Qt for Python
 components, including PySide6 and shiboken6, provided for open-source use
 under the GNU Lesser General Public License version 3 (LGPLv3), or
 alternatively under GPLv2/GPLv3 terms, as provided by the Qt Project.
