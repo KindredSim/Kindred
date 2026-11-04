@@ -12,9 +12,6 @@ from collections.abc import Mapping
 
 __all__ = ["insert_scalar_source_declarations"]
 
-# The parser owns semantic admission; insertion only needs the identifier
-# guard for newly materialized scalar declarations.
-
 
 def insert_scalar_source_declarations(
     source_text: str,
@@ -22,25 +19,9 @@ def insert_scalar_source_declarations(
 ) -> str:
     """Insert one deterministic scalar block without rewriting authored bytes."""
 
-    # The single caller passes exact correction output.
-    if not corrections:
-        return source_text
+    # The single caller passes exact correction output, one line per target.
     newline_match = re.search(r"\r\n|\r|\n", source_text)
     ending = newline_match.group(0) if newline_match is not None else "\n"
-    existing = {
-        str(match.group("name"))
-        for line in source_text.splitlines()
-        for match in [
-            re.match(r"^\s*(?i:param)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=", line)
-        ]
-        if match is not None
-    }
-    duplicates = tuple(sorted(set(corrections).intersection(existing)))
-    if duplicates:
-        raise ValueError(
-            "Scalar correction declaration already exists: "
-            + ", ".join(duplicates)
-        )
     had_final_ending = source_text.endswith(("\n", "\r"))
     prefix = source_text if not source_text or had_final_ending else source_text + ending
     declarations = ending.join(

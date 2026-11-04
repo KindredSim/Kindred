@@ -27,7 +27,7 @@ class InteractiveSliders(PracticeLesson):
 
     def blocked(self):
         missing = super().blocked()
-        if missing is not None or self.tab_id is None:
+        if missing is not None:
             return missing
         name = self.step.name
         if name in {"preview_first", "preview_second", "drag_slider", "fine_slider", "preview_both"}:

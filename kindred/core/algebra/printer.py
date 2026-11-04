@@ -6,7 +6,6 @@ from __future__ import annotations
 from kindred.core.algebra.grammar import ASSOCIATIVITY, PRECEDENCE
 from kindred.core.algebra.parser import (
     BinaryNode,
-    CallNode,
     ExprNode,
     IdentNode,
     NumberNode,
@@ -67,7 +66,6 @@ def expression_to_source(expr: ExprNode) -> str:
         lhs = _binary_child_source(expr.lhs, parent_op=str(expr.op), side="left")
         rhs = _binary_child_source(expr.rhs, parent_op=str(expr.op), side="right")
         return f"{lhs} {expr.op} {rhs}"
-    if isinstance(expr, CallNode):
-        args = ", ".join(expression_to_source(arg) for arg in expr.args)
-        return f"{expr.name}({args})"
-    return str(expr)
+    # Admitted expressions hold no other node.
+    args = ", ".join(expression_to_source(arg) for arg in expr.args)
+    return f"{expr.name}({args})"

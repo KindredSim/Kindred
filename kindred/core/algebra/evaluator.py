@@ -283,16 +283,12 @@ class _Compiler:
                 # concentration always makes its row dynamic, so y is given.
                 self.emit(f"{r} = float(y[{self.point.species_names.index(nm)}])", ind)
                 return r, "f"
+            # Admission refused unknown species, and every evaluator receives
+            # every species' series and starting concentration.
             if node.kind == "now":
-                if nm in ev.ctx.species_series:
-                    self.emit(f"{r} = float({self.const(ev.ctx.species_series[nm])}[i])", ind)
-                    return r, "f"
-                self.emit(f"{self.err(AlgebraNameError, f'Unknown species {nm!r}.')}()", ind)
-                return "0.0", "f"
+                self.emit(f"{r} = float({self.const(ev.ctx.species_series[nm])}[i])", ind)
+                return r, "f"
             if node.kind == "init":
-                if nm not in ev.ctx.initials:
-                    self.emit(f"{self.err(AlgebraNameError, f'Unknown species {nm!r}.')}()", ind)
-                    return "0.0", "f"
                 self.emit(f"{r} = float({self.const(ev.ctx.initials)}[{nm!r}])", ind)
                 return r, "f"
         if isinstance(node, UnaryNode):
@@ -456,9 +452,7 @@ class _Evaluator:
                 return expr_dynamic(expr.rhs)
             if isinstance(expr, BinaryNode):
                 return expr_dynamic(expr.lhs) or expr_dynamic(expr.rhs)
-            if isinstance(expr, CallNode):
-                return any(expr_dynamic(arg) for arg in expr.args)
-            return True
+            return any(expr_dynamic(arg) for arg in expr.args)
 
         def let_dynamic(name: str) -> bool:
             if name in state:
@@ -740,15 +734,13 @@ class PreparedAlgebraPointEvaluator:
                 reject(f"the runtime operator {node.op!r}")
             self._admit(node.lhs, stmt, evaluator)
             self._admit(node.rhs, stmt, evaluator)
-        elif isinstance(node, CallNode):
+        else:
             if node.name == "pow" and len(node.args) == 2:
                 admit_power(node.args[1])
             elif node.name not in {"abs", "min", "max", "clip", "exp", "expm1", "sin", "cos", "erf"}:
                 reject(f"the runtime function {node.name!r}")
             for arg in node.args:
                 self._admit(arg, stmt, evaluator)
-        else:
-            reject("an unsupported runtime expression")
         self._admitted.add(id(node))
 
     def evaluate(

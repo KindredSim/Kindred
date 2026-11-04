@@ -55,7 +55,8 @@ def rational_binary(operation: str, left: Fraction, right: Fraction) -> Fraction
             raise ZeroDivisionError("division by zero")
         _size(ln + rd, ld + rn)
         value = left / right
-    elif operation in {"^", "**"}:
+    else:
+        # Callers pass only + - * / ^ **.
         if right.denominator != 1:
             raise ValueError("An exact constant power requires an integer exponent.")
         exponent = right.numerator
@@ -65,6 +66,4 @@ def rational_binary(operation: str, left: Fraction, right: Fraction) -> Fraction
             return left ** exponent
         _size(ln * abs(exponent), ld * abs(exponent))
         value = left ** exponent
-    else:
-        raise ValueError(f"Unsupported exact arithmetic: {operation}.")
     return checked_fraction(value)

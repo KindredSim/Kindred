@@ -261,13 +261,9 @@ class InitialConditionSet:
     def values_dict(self) -> dict[str, float]:
         return dict(self.values)
 
-    def with_values(
-        self,
-        values: Mapping[str, Real] | Iterable[tuple[str, Real]],
-    ) -> "InitialConditionSet":
-        items = values.items() if isinstance(values, Mapping) else values
+    def with_values(self, values: Mapping[str, Real]) -> "InitialConditionSet":
         # The constructor admits species names and concentrations once.
-        return replace(self, values=tuple(items))
+        return replace(self, values=tuple(values.items()))
 
 
 def _validate_initial_condition_set_carriers(
@@ -1067,7 +1063,7 @@ def reconcile_tab_mechanism_source(
     anonymous_target: InitialConditionSet | None = None
     for declaration in admission.declarations:
         if declaration.source_kind == "named":
-            target_name = str(declaration.source_name)
+            target_name = declaration.source_name
             target_index = index_by_name.get(target_name.casefold())
             values = {species: 0.0 for species in new_species}
             declaration_values = {
@@ -1107,7 +1103,7 @@ def reconcile_tab_mechanism_source(
             materialized_ids.append(anonymous_target.set_id)
         anonymous_values = anonymous_target.values_dict()
         values = {
-            species: float(anonymous_values.get(species, 0.0))
+            species: anonymous_values.get(species, 0.0)
             for species in new_species
         }
         declaration_values = {
@@ -1328,7 +1324,7 @@ def assess_tab_exact_correction(
 
     try:
         proposal, corrections = _correction_proposal(source, composition, plan)
-    except (TypeError, ValueError, OverflowError) as exc:
+    except ValueError as exc:
         return ExactCorrectionAssessment(
             composition=composition,
             targets=targets,

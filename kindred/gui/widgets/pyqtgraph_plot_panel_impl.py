@@ -205,27 +205,11 @@ class _RenderedPointChunk:
     sample_time: np.ndarray | None
     instantaneous: bool = False
 
-    def __post_init__(self) -> None:
-        x = np.asarray(self.x)
-        x.setflags(write=False)
-        series = tuple(
-            (str(name), np.asarray(values)) for name, values in self.series
-        )
-        for _name, values in series:
-            values.setflags(write=False)
-        if self.sample_time is not None:
-            sample_time = np.asarray(self.sample_time)
-            sample_time.setflags(write=False)
-            object.__setattr__(self, "sample_time", sample_time)
-        object.__setattr__(self, "x", x)
-        object.__setattr__(self, "series", series)
-
 
 @dataclass(frozen=True, slots=True)
 class _RenderedPointBlock:
     """Private sampled roster entry; it is not result or export authority."""
 
-    block_id: str
     group_id: str
     label: str
     kind: str
@@ -237,18 +221,6 @@ class _RenderedPointBlock:
     y_units: tuple[tuple[str, str | None], ...]
     chunks: tuple[_RenderedPointChunk, ...]
     left_endpoint: bool = False
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "block_id", str(self.block_id))
-        object.__setattr__(self, "label", str(self.label))
-        object.__setattr__(self, "kind", str(self.kind))
-        object.__setattr__(self, "x_name", str(self.x_name))
-        object.__setattr__(
-            self,
-            "x_unit",
-            None if self.x_unit is None else str(self.x_unit),
-        )
-        object.__setattr__(self, "chunks", tuple(self.chunks))
 
 
 class PyQtGraphPlotPanel(QtWidgets.QWidget):
@@ -1072,7 +1044,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 sample_time=None if block.sample_time is None else block.sample_time[sample],
             ),)
         rendered_block = _RenderedPointBlock(
-            block_id=block.block_id,
             group_id=(
                 block.block_id.dataset_id
                 if block.kind is ResultLayerKind.EXPERIMENTAL else block.block_id
@@ -1759,7 +1730,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     ) -> None:
         # The WorkspaceTabRegistry is the sole accepted presentation owner.
         # Do not mutate local state or visible pyqtgraph items until it has
-        # validated and stored this intent.
+        # stored this intent.
         self.plotPresentationIntentRequested.emit(option, value)
 
     def _apply_plot_presentation(

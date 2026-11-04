@@ -298,8 +298,13 @@ class GridPlotView(QtWidgets.QWidget):
         self._refresh_copy_actions()
 
     def _refresh_copy_actions(self) -> None:
+        # A plot's menu copies only its own dataset, so that dataset needs a curve.
+        target = self._context_target
+        enabled = self.copy_eligible() and (
+            target is None or any(curve.dataset_id == target[0] for curve in self._curves)
+        )
         for key in ("copy", "copy_all"):
-            self._context_actions[key].setEnabled(self.copy_eligible())
+            self._context_actions[key].setEnabled(enabled)
 
     def _shown_extras(self, identity: str, targets: tuple[str, ...], x_name: str) -> tuple[str, ...]:
         """Ticked quantities that are not this panel's fitted targets or X."""

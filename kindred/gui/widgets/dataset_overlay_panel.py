@@ -152,7 +152,7 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         """Render one snapshot while retaining expansion and scroll position."""
         rendered_records = tuple(records)
         expanded_dataset_ids = {
-            str(item.data(0, Qt.UserRole))
+            item.data(0, Qt.UserRole)
             for index in range(self._tree.topLevelItemCount())
             if (item := self._tree.topLevelItem(index)).isExpanded()
         }
@@ -328,9 +328,9 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
                 )
         finally:
             self._tree.blockSignals(False)
-        dataset_id = str(parent.data(0, Qt.UserRole))
+        dataset_id = parent.data(0, Qt.UserRole)
         raw_observation_ids = tuple(
-            str(parent.child(index).data(0, Qt.UserRole + 1))
+            parent.child(index).data(0, Qt.UserRole + 1)
             for index in range(parent.childCount())
             if parent.child(index).checkState(0) == Qt.CheckState.Checked
         )
@@ -351,9 +351,7 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
                 selected = set(self._links_by_dataset_id[dataset_id].overlay_raw_observation_ids)
                 for child_index in range(parent.childCount()):
                     child = parent.child(child_index)
-                    raw_observation_id = str(
-                        child.data(0, Qt.UserRole + 1)
-                    )
+                    raw_observation_id = child.data(0, Qt.UserRole + 1)
                     child.setCheckState(
                         0,
                         Qt.CheckState.Checked

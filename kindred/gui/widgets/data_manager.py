@@ -650,15 +650,11 @@ class DataManagerPanel(QtWidgets.QWidget):
     def _remove_dataset(self):
         """Emit one global-delete intent; confirmation belongs to integration."""
         dataset_id = self._selected_dataset_id()
-        if not dataset_id:
-            return
         self.datasetDeleteRequested.emit(dataset_id)
 
     def _export_original(self) -> None:
         """Request the integration-owned destination dialog for exact bytes."""
         dataset_id = self._selected_dataset_id()
-        if not dataset_id:
-            return
         self.datasetExportOriginalRequested.emit(dataset_id)
 
     def _rename_dataset(self) -> None:
@@ -726,8 +722,6 @@ class DataManagerPanel(QtWidgets.QWidget):
         occupied_choice: str | None = None,
     ) -> None:
         dataset_id = self._selected_dataset_id()
-        if not dataset_id:
-            return
         self.datasetMappingRequested.emit(
             dataset_id,
             action,
@@ -805,6 +799,4 @@ class DataManagerPanel(QtWidgets.QWidget):
 
     def _request_observation_mapping(self) -> None:
         dataset_id = self._selected_dataset_id()
-        if not dataset_id:
-            return
         self.datasetObservationMappingRequested.emit(dataset_id)

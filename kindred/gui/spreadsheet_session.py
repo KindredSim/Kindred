@@ -446,11 +446,11 @@ class SpreadsheetSession:
             time = (columns[0][1], columns[0][2]) if info["timed"] else None
             try:
                 payload = created_dataset_payload(columns[1:] if info["timed"] else columns, time=time)
-                record = RawDatasetRecord(dataset_id=new_dataset_id(), display_name=info["name"].strip(),
+                record = RawDatasetRecord(dataset_id=new_dataset_id(), display_name=info["name"],
                                           time_column_name=columns[0][0] if info["timed"] else None,
                                           source_id=None, source_metadata=None, observations=payload.observations)
                 records.append(record)
-            except (ValueError, TypeError) as exc:
+            except ValueError as exc:
                 raise ValueError(f"{info['sheet']}: {exc}") from exc
         return tuple(records)
 
@@ -465,7 +465,7 @@ def run_spreadsheet_child(pipe, records, names):
             if operation == "outputs":
                 try:
                     pipe.send((operation, session.outputs(), ""))
-                except (ValueError, TypeError) as exc:
+                except ValueError as exc:
                     pipe.send((operation, None, str(exc)))
             elif operation == "view":
                 pipe.send((operation, session.view(sheet, args), ""))

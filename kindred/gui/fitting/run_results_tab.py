@@ -586,7 +586,9 @@ class RunResultsTab(QtWidgets.QWidget):
         self._refresh_summary()
 
     def copy_eligible(self) -> bool:
-        return self._copy_allowed and bool(self._curves)
+        # The active view holds exactly the curves its Copy copies.
+        view = self._subtab_stack.currentWidget()
+        return view is not None and view.copy_eligible()
 
     def set_copy_allowed(self, allowed: bool) -> None:
         self._copy_allowed = bool(allowed)

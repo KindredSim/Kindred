@@ -117,7 +117,7 @@ def _protected_indexed_identifier_match(raw_name: str) -> re.Match[str] | None:
     """
 
     return _PROTECTED_INDEXED_IDENTIFIER_RE.fullmatch(
-        str(raw_name or "").casefold()
+        raw_name.casefold()
     )
 
 

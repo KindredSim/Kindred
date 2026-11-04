@@ -10,7 +10,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any
 
 from kindred.core.exceptions import ErrorContext
 
@@ -55,16 +54,14 @@ def _plain_value(value: object) -> object:
     return value
 
 
-def _context_values(context: ErrorContext | Mapping[str, Any] | None) -> Mapping[str, object]:
+def _context_values(context: ErrorContext | None) -> Mapping[str, object]:
+    # Only Kindred errors carry a context; no dependency exception does.
     if context is None:
         return {}
-    if isinstance(context, Mapping):
-        source = context
-    else:
-        source = {
-            "line": getattr(context, "line", None),
-            "line_text": getattr(context, "line_text", None),
-        }
+    source = {
+        "line": getattr(context, "line", None),
+        "line_text": getattr(context, "line_text", None),
+    }
     def value_for(key: str) -> object:
         return source[key] if key in source else None
 
@@ -111,16 +108,12 @@ class FactualCause:
     def __post_init__(self) -> None:
         # Producers pass literal domains and origins and a message (an
         # exception's own text); exception attributes are normalized here.
-        domain = str(self.domain).strip()
-        origin = str(self.origin).strip()
         message = str(self.message).strip()
         normalized_code = (
             str(self.code).strip()
             if self.code is not None and str(self.code).strip()
             else None
         )
-        object.__setattr__(self, "domain", domain)
-        object.__setattr__(self, "origin", origin)
         object.__setattr__(self, "code", normalized_code)
         object.__setattr__(self, "message", message)
         object.__setattr__(self, "context", freeze_factual_value(self.context))

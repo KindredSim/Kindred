@@ -101,21 +101,14 @@ class ProjectSession:
             presentation
         )
 
-    def replace_document(
-        self,
-        document: ProjectDocument,
-        *,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
-        """Publish one admitted document directly under the current token.
+    def replace_document(self, document: ProjectDocument) -> ProjectContentToken:
+        """Publish one admitted document directly.
 
-        ``None`` means a newer canonical document or presentation superseded
-        the caller.  An unchanged document is an accepted no-op and returns
-        the still-current token.
+        The registry checked the caller's token immediately before.  An
+        unchanged document is an accepted no-op and returns the still-current
+        token.
         """
 
-        if not self.is_content_token_current(expected_token):
-            return None
         if document == self.document:
             return self.capture_content_token()
         self._document = document
@@ -131,8 +124,8 @@ class ProjectSession:
     ) -> ProjectContentToken:
         """Publish one admitted project identity and its saved baseline.
 
-        The registry checked the caller's token immediately before; ``path``
-        is already absolute.
+        The project controller checked the caller's token immediately before;
+        ``path`` is already absolute.
         """
 
         self._document = document

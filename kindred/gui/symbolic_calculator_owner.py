@@ -61,7 +61,7 @@ class SymbolicCalculatorOwner(QtCore.QObject):
         self._latest_result: SymbolicCalculatorLatestResult | None = None
         self._worker: CalculatorWorker | None = None
         self._retiring: set[CalculatorWorker] = set()
-        self._request: tuple[CalculatorWorker, SymbolicCalculatorSnapshot, str] | None = None
+        self._request: tuple[CalculatorWorker, SymbolicCalculatorSnapshot] | None = None
         self._available = False
         self._reason = "Write reactions and click Run to use the Calculator."
         self._status = ""
@@ -140,7 +140,7 @@ class SymbolicCalculatorOwner(QtCore.QObject):
             worker.failed.connect(self._worker_failed)
             worker.finished.connect(self._worker_finished)
         worker = self._worker
-        self._request = (worker, snapshot, query)
+        self._request = (worker, snapshot)
         self._status = f"Evaluating {query}"
         worker.submit(query)
         if not worker.isRunning():
@@ -150,11 +150,11 @@ class SymbolicCalculatorOwner(QtCore.QObject):
     @QtCore.Slot(str, str, str, bool, str, object)
     def _receive_result(self, query, result_html, context, error, copy_text, reuse_queries):
         worker = self.sender()
+        # A snapshot change or Close retires the worker first, and only one
+        # query is ever in flight.
         if self._request is None or self._request[0] is not worker or self._worker is not worker:
             return
-        _, snapshot, requested = self._request
-        if self._closed or snapshot is not self._snapshot or requested != query:
-            return
+        snapshot = self._request[1]
         self._latest_result = SymbolicCalculatorLatestResult(
             snapshot.prepared_dsl, query, result_html, context,
             copy_text, error, reuse_queries,

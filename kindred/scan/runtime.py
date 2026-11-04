@@ -50,15 +50,11 @@ def execute_input(config, prepared, solver, run, cancellation):
 
 def _worker(config, connection, cancel):
     try:
-        try:
-            prepared = prepare_dsl_request_set(config.source, units=UnitsModel(
-                energy_unit=config.energy_unit, temperature_K=config.temperature_K,
-                standard_conc_M=config.standard_conc_M))
-            solver = PreparedSolverConfig(solver=config.solver, rtol=config.rtol, atol=config.atol,
-                                          grid={"N": config.points}, use_analytic_jacobian=config.analytic_jacobian)
-        except Exception as exc:
-            connection.send(("bootstrap_failure", str(exc)))
-            return
+        prepared = prepare_dsl_request_set(config.source, units=UnitsModel(
+            energy_unit=config.energy_unit, temperature_K=config.temperature_K,
+            standard_conc_M=config.standard_conc_M))
+        solver = PreparedSolverConfig(solver=config.solver, rtol=config.rtol, atol=config.atol,
+                                      grid={"N": config.points}, use_analytic_jacobian=config.analytic_jacobian)
         control = SimulationCancellationControl(lambda: cancel.value)
         while True:
             run = connection.recv()
@@ -225,9 +221,6 @@ def run_scan(config, prepared, cancel, progress_callback):
                             dispatch(child)
                         elif kind == "not_started":
                             dispatch(child)
-                        elif kind == "bootstrap_failure":
-                            fail(f"Worker preparation failed: {payload}")
-                            child.run = None
                 # Drain the pipe before declaring a started attempt lost. A worker
                 # that dies before adopting its pipe end never closes it, so its
                 # exit is read from the process itself.

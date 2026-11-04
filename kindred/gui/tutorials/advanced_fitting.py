@@ -306,7 +306,7 @@ class AdvancedFittingLesson(PracticeLesson):
             name for name, cells in roster.items()
             if cells["Vary"].checkState() == QtCore.Qt.CheckState.Checked
         }
-        return bool(roster) and varied == set(self._fitted if names is None else names)
+        return varied == set(self._fitted if names is None else names)
 
     def _lesson_fit(self, names: tuple[str, ...] | None = None) -> bool:
         """The open Fitting Window has a current result for the lesson's datasets and species, with
@@ -747,7 +747,7 @@ class CalculatedQuantitiesAndConstraints(AdvancedFittingLesson):
     def _processed(self) -> dict[str, str]:
         """base run -> the newest dataset Create from Data made from it for the copy only: its total_PB is
         the sum of its PB and PH and maps to the let total_PB, and its set starts from its row at time 0."""
-        if self.reuse is None or self.practice is None:
+        if self.reuse is None:
             return {}
         copy, setup = self.registry.tab(self.reuse), self.registry.tab(self.practice)
         sets = {item.set_id: item for item in copy.initial_condition_sets}
@@ -1129,7 +1129,7 @@ class PerDatasetRateConstants(AdvancedFittingLesson):
 
     def _per_dataset(self) -> bool:
         choice, _cells = self._k2_rows()
-        return choice is not None and choice.currentData() == "per_dataset"
+        return choice.currentData() == "per_dataset"
 
     def _k2_shared(self) -> bool:
         """k2runs1 and k2runs2 share one group of k2, and k2runs3 has its own k2."""
@@ -1259,8 +1259,7 @@ class ProfileLikelihood(AdvancedFittingLesson):
         )
         roster = self._roster()
         return check.isChecked() and all(
-            name in roster
-            and roster[name]["Profile"].checkState() == QtCore.Qt.CheckState.Checked
+            roster[name]["Profile"].checkState() == QtCore.Qt.CheckState.Checked
             for name in names
         )
 
@@ -1433,7 +1432,7 @@ class FittingAgainstMeasuredQuantity(AdvancedFittingLesson):
         roster = self._roster()
         try:
             return {name: float(roster[name]["Last Fit Result"].text()) for name in self._fitted}
-        except (KeyError, ValueError):
+        except ValueError:
             return {}
 
     def _scaled_fit(self) -> bool:

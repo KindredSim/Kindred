@@ -30,11 +30,9 @@ class TemperatureDSLError(AuthoredSourceError):
 
 
 def _parse_finite_number(text: str, *, field: str) -> float:
-    token = text.strip()
-    if not token:
-        raise TemperatureDSLError(f"{field} must not be empty.")
+    # Callers have already refused empty text.
     try:
-        return parse_finite_numeric_text(token, field=field)
+        return parse_finite_numeric_text(text, field=field)
     except ValueError as exc:
         raise TemperatureDSLError(str(exc)) from exc
 

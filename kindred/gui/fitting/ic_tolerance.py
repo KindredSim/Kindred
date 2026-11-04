@@ -39,7 +39,7 @@ class FitInitialTolerance:
         lower = self.lower
         upper = self.upper
         if mode == "symmetric_percent":
-            if lower < 0.0 or upper != lower or lower == 0.0:
+            if lower <= 0.0:
                 raise ValueError(
                     "Symmetric Vary IC requires one positive percentage."
                 )

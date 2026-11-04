@@ -551,7 +551,7 @@ def _float_or_none(s: Optional[str], field: str) -> Optional[float]:
         return None
     try:
         v = float(s)
-    except (TypeError, ValueError, OverflowError):
+    except ValueError:
         raise invalid_number_error(str(s), field)
     if not math.isfinite(v):
         raise invalid_number_error(str(s), field)
@@ -702,7 +702,7 @@ def _inline_initial_number(
     )
     try:
         value = float(str(token).strip())
-    except (TypeError, ValueError, OverflowError) as exc:
+    except ValueError as exc:
         raise _DSLError(
             f"Initial condition value for {context} must be numeric.",
             line_number=line_number,
@@ -796,19 +796,11 @@ def _inline_initial_assignments(
     )
 
 
-def _commented_initial_source(
-    lines: list[str],
-    claimed_indexes: set[int],
-) -> str:
-    rendered = [
-        (
-            INITIAL_PROVENANCE_PREFIX + line.rstrip()
-            if index in claimed_indexes
-            else line.rstrip()
-        )
-        for index, line in enumerate(lines)
-    ]
-    return "\n".join(rendered).strip()
+def _commented_initial_source(text: str, claimed_indexes: set[int]) -> str:
+    return "".join(
+        INITIAL_PROVENANCE_PREFIX + line if index in claimed_indexes else line
+        for index, line in enumerate(text.splitlines(keepends=True))
+    )
 
 
 def _admit_unique_initial_assignments(
@@ -1009,10 +1001,7 @@ def _admit_inline_initial_conditions(
     return (
         DslInitialConditionAdmission(
             declarations=tuple(declarations),
-            materialized_source=_commented_initial_source(
-                lines,
-                claimed_indexes,
-            ),
+            materialized_source=_commented_initial_source(text, claimed_indexes),
         ),
         frozenset(claimed_indexes),
     )
@@ -1058,54 +1047,24 @@ def _source_coordinates_from_key_value_spans(
     physical_line_index: int,
     step_index: int,
     step: DslBuildStep,
-    line_content: str,
 ) -> tuple[DslSourceCoordinate, ...]:
-    """Project parser-captured value spans into canonical source identities."""
+    """Project parser-captured value spans into canonical source identities.
 
-    equilibrium = step.reversible
+    The reaction-line parser has already refused unknown, duplicate and
+    misplaced fields, so every role here belongs to this step.
+    """
+
     coordinates: list[DslSourceCoordinate] = []
-    seen_names: set[str] = set()
     for role, value_start, value_end in key_value_spans:
-        if role in {"k", "kf"}:
-            if equilibrium:
-                canonical_role = "kf"
-            else:
-                canonical_role = "k"
-        elif role in {"kr", "Keq"}:
-            if not equilibrium:
-                continue
-            canonical_role = role
-        elif role in {"A", "Ea", "dG_act", "dG_eq"}:
-            if role == "dG_eq" and not equilibrium:
-                continue
-            canonical_role = role
-        elif role == "degeneracy":
-            if not isinstance(step.forward_model, EyringRateModel):
-                continue
-            canonical_role = role
-        elif role == "kappa":
-            # kappa is a physical Eyring coordinate only when explicitly
-            # authored.  Its source span remains tied to the original key
-            # spelling; only the canonical authority name is normalized.
-            if not isinstance(step.forward_model, EyringRateModel):
-                continue
-            canonical_role = "kappa"
-        else:
+        if role == "factor":
             continue
-        canonical_name = canonical_source_coordinate_name(
-            step_index,
-            canonical_role,
-        )
-        if canonical_name in seen_names:
-            raise _DSLError(
-                f"Duplicate source coordinate {canonical_name!r}.",
-                line_number=physical_line_index + 1,
-                line_content=line_content,
-            )
-        seen_names.add(canonical_name)
+        if role in {"k", "kf"}:
+            canonical_role = "kf" if step.reversible else "k"
+        else:
+            canonical_role = role
         coordinates.append(
             DslSourceCoordinate(
-                canonical_name=canonical_name,
+                canonical_name=canonical_source_coordinate_name(step_index, canonical_role),
                 role=canonical_role,
                 physical_line_index=physical_line_index,
                 value_start=value_start,
@@ -1505,7 +1464,7 @@ def _parse_reaction_like_step(
         delta_g = energy("dG_eq") if "dG_eq" in params else None
     except _DSLError:
         raise
-    except (TypeError, ValueError, OverflowError) as exc:
+    except ValueError as exc:
         raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
     # Which let it names is checked once the let lines are admitted.
     factor = params.get("factor")
@@ -1568,7 +1527,6 @@ def _parse_bare_arrow_step(
             physical_line_index=physical_line_index,
             step_index=step_index,
             step=parsed_step,
-            line_content=line_content,
         ),
     )
 
@@ -1780,18 +1738,11 @@ def derive_source_with_parameter_updates(
     base: PreparedDslRequestSet,
     updates: tuple[DslParameterCoordinateUpdate, ...],
 ) -> str:
-    """Authenticate typed coordinates and rewrite the visible source bytes."""
+    """Rewrite the visible source bytes of enumerated writable coordinates.
 
-    if base.analysis.inline_initial_conditions.has_declarations:
-        raise ValueError(
-            "Typed parameter derivation requires canonical materialized "
-            "initial conditions."
-        )
-    if not updates:
-        raise ValueError("Typed DSL parameter derivation requires updates.")
-    names = tuple(item.name for item in updates)
-    if len(names) != len(set(names)):
-        raise ValueError("DSL parameter update names must be unique.")
+    Slider Apply and Fit Apply send unique, enumerated writable names for the
+    accepted source, which never holds live initial-condition declarations.
+    """
 
     spec = base.parameter_algebra_spec_for_execution()
     raw_lines = source_text.splitlines(keepends=True)
@@ -1800,9 +1751,6 @@ def derive_source_with_parameter_updates(
         line[len(content):]
         for line, content in zip(raw_lines, source_lines)
     ]
-    if not raw_lines and source_text:
-        source_lines = [source_text]
-        line_endings = [""]
 
     # Coordinates retain their physical line index and exact half-open span in
     # the source this analysis was admitted from.
@@ -1822,29 +1770,14 @@ def derive_source_with_parameter_updates(
         )
 
     for update in updates:
-        spans = source_coordinates.get(update.name)
-        if spans is None:
-            raise LookupError(
-                f"Parameter {update.name!r} is absent from retained DSL."
-            )
+        spans = source_coordinates[update.name]
         try:
             assignment_kind = spec.parameter_assignment_kind(update.name)
         except KeyError:
             assignment_kind = None
-        # Classify from the admitted Algebra dependency map before inspecting
-        # the coordinate role.  Algebra-owned assignments are never rewritten
-        # as if their source spelling were an independent mechanism value.
-        if assignment_kind in {"derived scalar", "mechanism-bound"}:
-            raise ValueError(
-                f"Scalar parameter {update.name!r} is not writable."
-            )
+        # An independent scalar or mechanism input is written on its param line.
         if assignment_kind in {"independent scalar", "mechanism input"}:
-            coordinate = spans.get("param")
-            if coordinate is None:
-                raise ValueError(
-                    f"Scalar parameter {update.name!r} is not writable."
-                )
-            retain_replacement(coordinate, six_digit_source_text(update.value))
+            retain_replacement(spans["param"], six_digit_source_text(update.value))
             continue
         # A source identity's param line only restates its reaction field,
         # which stays the writable coordinate.

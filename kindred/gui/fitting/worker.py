@@ -20,9 +20,6 @@ logger = logging.getLogger(__name__)
 _TERMINAL_EVENTS = frozenset({
     "candidate_ready", "factual_failure", "scientific_unavailable", "cancelled",
 })
-_LIVE_EVENTS = frozenset({
-    "progress", "best_updated", "curves_updated",
-})
 
 
 class GlobalFitWorker(QtCore.QThread):
@@ -148,17 +145,13 @@ class GlobalFitWorker(QtCore.QThread):
                             continue
                         try:
                             name, args = codec.decode_fit(payload, references)
-                            if terminal is not None:
-                                raise RuntimeError("Fit process sent output after its terminal event.")
                             if name == "candidate_ready":
                                 candidate, projection = args
                                 terminal = (name, (candidate,))
                             elif name in _TERMINAL_EVENTS:
                                 terminal = (name, args)
-                            elif name in _LIVE_EVENTS:
-                                getattr(self, name).emit(*args)
                             else:
-                                raise RuntimeError(f"Unknown Fit event: {name!r}.")
+                                getattr(self, name).emit(*args)
                             if terminal is not None:
                                 self._commands.put(None)
                                 self._shutdown.set()

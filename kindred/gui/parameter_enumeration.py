@@ -9,7 +9,6 @@ coordinate carries its Slider range and its independent default Fit range.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.quantity_units import parse_unit, scientific_unit, convert_value
@@ -51,23 +50,9 @@ def _positive_bounds(value: float, *, minimum: float, maximum: float) -> tuple[f
 
 
 def _signed_bounds(value: float) -> tuple[float, float]:
+    # Declared unit scales keep admitted values within 1e60, far from float64 limits.
     span = max(1.0, abs(value) * 0.5)
-    low = value - span
-    high = value + span
-    if not math.isfinite(low) or low >= value:
-        low = value
-    if not math.isfinite(high) or high <= value:
-        high = value
-    if low == high:
-        low = math.nextafter(value, -math.inf)
-        high = math.nextafter(value, math.inf)
-    if not math.isfinite(low):
-        low = value
-    if not math.isfinite(high):
-        high = value
-    if not low < high:
-        raise ValueError("Finite scalar has no representable finite Fit interval.")
-    return float(low), float(high)
+    return value - span, value + span
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,8 +104,6 @@ def enumerate_parameter_coordinates(
                 low = 0.0
             if 0.0 < abs(high) < floor:
                 high = 0.0
-            if low == high:
-                low, high = -floor, floor
         if item.role not in {"Ea", "dG_act", "dG_eq"}:
             fit_low, fit_high = low, high
         display_name = item.name

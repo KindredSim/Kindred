@@ -405,7 +405,7 @@ class Interventions(PracticeLesson):
                 (float(roster[name][0]["Minimum"].text()), float(roster[name][0]["Maximum"].text()))
                 for name in _TIMES
             ]
-        except (KeyError, ValueError):
+        except ValueError:
             return False
         return ranges[0][0] >= 0 and all(
             earlier[1] < later[0] for earlier, later in zip(ranges, ranges[1:])

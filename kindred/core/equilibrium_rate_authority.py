@@ -17,7 +17,6 @@ __all__ = [
     "EquilibriumRateSymbolicRelations",
     "equilibrium_rate_symbolic_relations",
     "effective_reverse_rate_from_keq",
-    "json_safe_equilibrium_authority_payload",
     "validate_equilibrium_rate_authority_flags",
     "normalize_equilibrium_rate_authority",
 ]
@@ -130,16 +129,6 @@ def effective_reverse_rate_from_keq(kf: float, Keq: float) -> float:
     """Return the reverse coefficient of thermodynamic authority, admitted as a rate."""
 
     return admit_rate(kf / Keq, field="The calculated kr (kf/Keq)", allow_zero=kf == 0.0)
-
-
-def json_safe_equilibrium_authority_payload(value: object) -> object:
-    # identity_items holds only str, finite float, int, None and mappings.
-    if isinstance(value, Mapping):
-        return {
-            str(key): json_safe_equilibrium_authority_payload(value[key])
-            for key in sorted(value.keys(), key=lambda item: str(item))
-        }
-    return value
 
 
 def validate_equilibrium_rate_authority_flags(

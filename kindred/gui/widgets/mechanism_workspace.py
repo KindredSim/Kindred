@@ -318,8 +318,6 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         A failure propagates; the permanent root stays usable.
         """
 
-        target_active = active_tab_id
-        document.tab(target_active)
         current_tab_ids = {tab.tab_id for tab in document.tabs}
         for tab in document.tabs:
             self._ensure_plot(tab.tab_id)
@@ -364,12 +362,12 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
                 )
                 self._tab_bar.setTabToolTip(current_index, tab.name)
 
-            active_index = self._index_for_tab_id(target_active)
+            active_index = self._index_for_tab_id(active_tab_id)
             self._tab_bar.setCurrentIndex(active_index)
         finally:
             self._tab_bar.blockSignals(previous)
 
-        active_plot = self._ensure_plot(target_active)
+        active_plot = self._ensure_plot(active_tab_id)
         self._plot_stack.setCurrentWidget(active_plot)
         self._analysis_stack.setCurrentWidget(active_plot.analysis_tabs())
 
