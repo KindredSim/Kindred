@@ -1,4 +1,4 @@
-"""Installed Windows fitting runtime (stdlib and Kindred's stdlib-only startup)."""
+"""Installed fitting runtime (stdlib and Kindred's stdlib-only startup)."""
 
 from __future__ import annotations
 
@@ -20,15 +20,13 @@ def scientific_environment() -> dict[str, str]:
 
 
 def fitting_process_command() -> tuple[list[str], dict[str, str], Path]:
-    if sys.platform != "win32":
-        raise RuntimeError("Fitting requires the installed native Windows scientific runtime.")
     # Keep the complete interpreter two levels below the GUI prefix so CPython
     # cannot mistake the GUI's parent pyvenv.cfg for its own environment.
     directory = Path(sys.prefix).resolve() / "kindred-fitting-runtime" / "python"
-    executable = directory / "python.exe"
+    executable = directory / ("python.exe" if sys.platform == "win32" else "bin/python3")
     if not executable.is_file():
         raise FileNotFoundError(
-            f"Missing fitting runtime: {executable}. Provision the dedicated Windows "
+            f"Missing fitting runtime: {executable}. Provision the dedicated "
             "Python 3.15t runtime with matching Kindred code and scientific dependencies."
         )
     return (
@@ -40,8 +38,8 @@ def fitting_process_command() -> tuple[list[str], dict[str, str], Path]:
 
 def check_scientific_runtime() -> None:
     """Admit the actual interpreter and imported native dependency state."""
-    if sys.platform != "win32" or sys.version_info[:2] != (3, 15):
-        raise RuntimeError("Fitting requires native Windows Python 3.15t.")
+    if sys.version_info[:2] != (3, 15):
+        raise RuntimeError("Fitting requires Python 3.15t.")
     if not sysconfig.get_config_var("Py_GIL_DISABLED"):
         raise RuntimeError("The fitting interpreter is not a free-threaded build.")
     if sys._is_gil_enabled():
