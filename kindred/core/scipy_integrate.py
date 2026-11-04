@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import sys
-from numbers import Real
 from typing import Any, Callable
 
 __all__ = [
@@ -17,8 +16,6 @@ SCIPY_MIN_RTOL: float = 100.0 * sys.float_info.epsilon
 def validate_scipy_rtol(value: object, *, field: str = "rtol") -> float:
     """Validate one relative tolerance accepted by the pinned SciPy backend."""
 
-    if type(value) is bool or not isinstance(value, Real):
-        raise TypeError(f"{field} must be numeric.")
     parsed = float(value)
     if not math.isfinite(parsed):
         raise ValueError(f"{field} must be finite.")

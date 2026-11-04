@@ -14,7 +14,6 @@ from kindred.core.datasets.observation_mapping import (
     first_data_row,
     initial_samples,
     initial_time,
-    normalize_observation_mapping,
     suggest_observation_mapping,
     supplies_concentration,
 )
@@ -197,11 +196,10 @@ class ObservationMappingWidget(QtWidgets.QWidget):
 
     # -- public surface ---------------------------------------------------------
     def confirmed_mapping(self) -> tuple[tuple[str, str], ...]:
-        return normalize_observation_mapping(
-            tuple((combo.currentData(), target) for target, combo in self._column_combos.items()
-                  if combo.currentData() is not None),
-            raw_observations=tuple((item.raw_observation_id, item.column_name) for item in self._record.observations),
-            model_targets=self._targets,
+        # Columns in use elsewhere are disabled, and core admits the mapping.
+        return tuple(
+            (combo.currentData(), target) for target, combo in self._column_combos.items()
+            if combo.currentData() is not None
         )
 
     def creation_inputs(
@@ -523,7 +521,6 @@ class ObservationMappingDialog(QtWidgets.QDialog):
 
     def _accept_mapping(self) -> None:
         try:
-            self.editor.confirmed_mapping()
             if self._create_set:
                 self.editor.creation_inputs()
         except ObservationMappingError as exc:

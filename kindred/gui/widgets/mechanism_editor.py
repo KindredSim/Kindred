@@ -1144,20 +1144,10 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         if self._reactions_text.toPlainText() != text:
             self._reactions_text.setPlainText(text)
 
-    def apply_accepted_reactions_rewrite(
-        self,
-        *,
-        expected_visible_text: str,
-        accepted_text: str,
-    ) -> bool:
-        """Install parser-authored provenance as one undoable native edit."""
+    def revert_reactions_text(self, accepted_text: str) -> None:
+        """Restore the accepted Reactions text as one undoable native edit."""
 
-        if self.reactions_text() != expected_visible_text:
-            return False
-        if accepted_text == self.reactions_text():
-            return False
         self._replace_text_undoably(self._reactions_text, accepted_text)
-        return True
 
     @staticmethod
     def _replace_text_undoably(
@@ -1317,15 +1307,13 @@ class MechanismEditorBinding(QtCore.QObject):
         self.draftStateChanged.emit(tab.tab_id)
 
     @QtCore.Slot()
-    def revert_reactions_draft(self) -> bool:
-        """Restore canonical source as one native undoable edit."""
+    def revert_reactions_draft(self) -> None:
+        """Restore canonical source as one native undoable edit.
 
-        tab = self._registry.tab(self._tab_id)
-        runtime = self._registry.tab_runtime(self._tab_id)
-        draft = runtime.reactions_draft
-        if draft is None:
-            return False
-        return self._editor.apply_accepted_reactions_rewrite(
-            expected_visible_text=draft.reactions_text,
-            accepted_text=tab.mechanism_source.reactions_text,
+        Revert is enabled only while a draft exists, and the draft is the
+        editor text.
+        """
+
+        self._editor.revert_reactions_text(
+            self._registry.tab(self._tab_id).mechanism_source.reactions_text
         )

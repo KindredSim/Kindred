@@ -530,15 +530,7 @@ class AxisToolbar(QtWidgets.QWidget):
         self.xChanged.emit(self.current_x())
 
     def _on_y_item_changed(self, item: QtWidgets.QListWidgetItem) -> None:
-        selection = item.data(Qt.ItemDataRole.UserRole)
-        if selection in self._locked_checked_y:
-            blocker = QtCore.QSignalBlocker(self._y_list)
-            try:
-                item.setCheckState(Qt.CheckState.Checked)
-            finally:
-                del blocker
-            self._update_y_selector_text()
-            return
+        # Locked rows are not user-checkable, and programmatic writes block signals.
         self._update_y_selector_text()
         self.ySelectionChanged.emit(self.selected_y())
 

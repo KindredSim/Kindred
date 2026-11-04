@@ -7,14 +7,11 @@ define a versioned action graph, identity, or serialization format.
 
 from __future__ import annotations
 
-import dataclasses
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 import html
 import math
 import statistics
 from collections.abc import Mapping, Sequence
-
-import numpy as np
 
 from kindred.core.analysis.fit_statistics import FitMetric
 from kindred.core.analysis.global_fit_execution import FitCoordinate, parameter_group_variable_id
@@ -65,48 +62,6 @@ def fit_identity_text(text: str, origin: FitOriginSnapshot) -> str:
     for mapped in origin.mapped_datasets:
         text = text.replace(mapped.set_id, mapped.set_name)
     return text
-
-
-def _plain(value: object) -> object:
-    """Make one presentation leaf from an admitted typed value."""
-
-    if value is None or isinstance(value, (bool, int, str)):
-        return value
-    if isinstance(value, float):
-        if math.isfinite(value):
-            return value
-        if math.isnan(value):
-            return "NaN"
-        return "Infinity" if value > 0 else "-Infinity"
-    if isinstance(value, FitMetric):
-        return _plain(value.to_payload())
-    if isinstance(value, FactualCause):
-        return _plain(value.to_payload())
-    if isinstance(value, np.ndarray):
-        return [_plain(item) for item in value.reshape(-1).tolist()]
-    if isinstance(value, np.generic):
-        return _plain(value.item())
-    if isinstance(value, Mapping):
-        return {str(key): _plain(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list)):
-        return [_plain(item) for item in value]
-    if isinstance(value, (set, frozenset)):
-        return [_plain(item) for item in sorted(value, key=repr)]
-    to_payload = getattr(value, "to_payload", None)
-    if callable(to_payload):
-        return _plain(to_payload())
-    if dataclasses.is_dataclass(value):
-        return {
-            field.name: _plain(getattr(value, field.name))
-            for field in dataclasses.fields(value)
-        }
-    return str(value)
-
-
-def _metric(value: FitMetric | None) -> object:
-    if value is None:
-        return None
-    return _plain(value.to_payload())
 
 
 def _terminal_dataset_value(
@@ -183,7 +138,7 @@ def _profile_data(candidate: FitCandidate) -> dict[str, object]:
         ),
         "noise_blocks": result.noise_blocks,
         "unavailable_reason": result.unavailable_reason,
-        "diagnostic": _plain(result.diagnostic),
+        "diagnostic": result.diagnostic,
         "settlement": result.provenance.get("settlement"),
         "intervals": [
             _profile_interval(coordinate, interval)
@@ -201,10 +156,10 @@ def _dataset_metrics(candidate: FitCandidate) -> list[dict[str, object]]:
         dataset_id = str(info.dataset_id)
         metric: dict[str, object] = {
             "dataset_display_name": display_names.get(dataset_id, dataset_id),
-            "weighted_sse": _metric(info.weighted_residual_sse),
-            "weighted_mse": _metric(info.weighted_residual_mse),
-            "weighted_rmse": _metric(info.weighted_rmse),
-            "weighted_mae": _metric(info.weighted_mae),
+            "weighted_sse": info.weighted_residual_sse,
+            "weighted_mse": info.weighted_residual_mse,
+            "weighted_rmse": info.weighted_rmse,
+            "weighted_mae": info.weighted_mae,
             "effective_weight": float(info.weight),
         }
         metrics.append(metric)
@@ -250,11 +205,11 @@ def _series_metric_rows(candidate: FitCandidate) -> list[tuple[str, str, str, st
             r_squared = info.r_squared_by_series.get(series)
             shown = (
                 _display(scale_values((rms.value,), source, measured)[0])
-                if rms.available else _metric_text(_metric(rms))
+                if rms.available else _metric_text(rms)
             )
             rows.append((
                 names[prepared.dataset_id], series,
-                "—" if r_squared is None else _metric_text(_metric(r_squared)),
+                "—" if r_squared is None else _metric_text(r_squared),
                 shown, format_unit_for_display(measured) or "",
             ))
     return rows
@@ -274,7 +229,7 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
     individual: list[dict[str, object]] = []
 
     def append_row(target: list[dict[str, object]], **row: object) -> None:
-        target.append({str(key): _plain(value) for key, value in row.items()})
+        target.append(row)
 
     for parameter in terminal_setup.parameters:
         configuration = parameter.selected_config
@@ -452,12 +407,10 @@ def _overall_statistics(candidate: FitCandidate) -> str:
     return body
 
 
-def _metric_text(value: object) -> str:
-    if not isinstance(value, Mapping):
-        return _display(value)
-    if bool(value.get("available")):
-        return _display(value.get("value"))
-    return f"Unavailable: {value.get('unavailable_reason')}"
+def _metric_text(metric: FitMetric) -> str:
+    if metric.available:
+        return _display(metric.value)
+    return f"Unavailable: {metric.unavailable_reason}"
 
 
 def _text(value: object) -> str:
@@ -481,14 +434,14 @@ def _table(headers: tuple[str, ...], rows: object, *, rich_columns: tuple[int, .
 def _diagnostic(value: object, origin: FitOriginSnapshot) -> str:
     """A plain message, or a cause chain's messages, each once and as sentences."""
 
-    if isinstance(value, Mapping):
+    if isinstance(value, FactualCause):
         sentences: list[str] = []
         while value is not None:
-            message = str(value["message"])
+            message = value.message
             message = message if message.endswith((".", "!", "?")) else message + "."
             if message not in sentences:
                 sentences.append(message)
-            value = value["cause"]
+            value = value.cause
         text = " ".join(sentences)
     else:
         text = str(value)
@@ -702,13 +655,13 @@ def _analysis_section(title: str, data: Mapping[str, object], request: object,
         text, level_label = _interval_text(interval, float(data["confidence_level"]), position)
         details = [_text(level_label)] if level_label else []
         for side in ("lower", "upper"):
-            endpoint = interval.get(side + "_resolution") or {}
-            reason = endpoint.get("reason")
+            endpoint = interval[side + "_resolution"]
+            reason = endpoint["reason"]
             # A reason the interval itself states is not repeated.
             if reason and _ENDPOINT_REASONS[reason] != text:
                 details.append(_text(f"{side.capitalize()} end: {_ENDPOINT_REASONS[reason]}"))
             limiting = [f"the {_text(bound)} bound of {label(other)}"
-                        for other, bound in endpoint.get("limiting_bounds", ())]
+                        for other, bound in endpoint["limiting_bounds"]]
             if limiting:
                 details.append(f"{_text(side.capitalize())} end is set by {and_join(limiting)}")
         freedom = f"{float(interval['degrees_of_freedom']):.1f}".rstrip("0").rstrip(".")
@@ -832,7 +785,7 @@ def fit_candidate_presentation(
     rows = shared + individual + _initial_rows(candidate)
     phase = _fit_completion_text(candidate)
     model = candidate.origin.tab_name
-    objective = _metric_text(_metric(result.weighted_residual_sse))
+    objective = _metric_text(result.weighted_residual_sse)
     fitted_values = len(candidate.request.dispatch.ordinary_optimizer_layout.opt_param_keys())
     overview = fit_overview(phase, model, objective, len(result.dataset_info), fitted_values)
     parameters = {parameter.name: parameter for parameter in candidate.setup_snapshot.parameters}
@@ -865,7 +818,7 @@ def fit_candidate_presentation(
                      "only faster or slower.</p>")
     body = f"<h2>{_text(phase)}</h2><p>Mechanism: {_text(model)}</p>" + warnings
     body += (f"<p><b>Weighted SSE:</b> {_text(objective)} &nbsp; "
-             f"<b>Weighted MSE:</b> {_text(_metric_text(_metric(result.weighted_residual_mse)))}</p>")
+             f"<b>Weighted MSE:</b> {_text(_metric_text(result.weighted_residual_mse))}</p>")
     if rows:
         body += "<h3>Estimates</h3>" + _table(
             ("Parameter", "Scope", "Estimate", "Unit", "Initial Guess", "Bounds", "Bound Position"),
@@ -1033,7 +986,7 @@ def fit_candidate_presentation(
             rich_columns=(5,),
         )
     entries = tuple(
-        (tuple(row["identity"]) if row["kind"] != "shared_parameter" else ("shared", str(row["name"])),
+        (row["identity"] if row["kind"] != "shared_parameter" else ("shared", str(row["name"])),
          html.escape(str(row["display_name"])) if row["kind"] == "initial" else symbols[str(row["name"])],
          str(row["display_name"]) if row["kind"] == "initial" else str(row["name"]),
          str(row["scope"]), float(row["fitted_value"]), str(row["unit"]))

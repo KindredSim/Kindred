@@ -96,7 +96,7 @@ def _validate_template_payload(data: Mapping[str, Any]) -> Dict[str, Any]:
     return {
         "id": _nonblank_string(data["id"], "template ID"),
         "name": _template_name(data["name"]),
-        "description": str(data["description"]),
+        "description": data["description"],
         "category": _nonblank_string(data["category"], "template category"),
         "tags": list(tags),
         "reactions_text": source.reactions_text,
@@ -339,11 +339,10 @@ class TemplateManager:
     ) -> Template:
         """Create a new template; never select or overwrite an existing one."""
 
-        normalized_name = _template_name(name)
-        self._assert_available_name(normalized_name)
+        self._assert_available_name(name)
         template = Template(
             id=Template.generate_id(),
-            name=normalized_name,
+            name=name,
             description=description,
             category=category,
             tags=list(tags),

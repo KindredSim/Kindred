@@ -1425,11 +1425,9 @@ def _physical_quantity(data: Mapping[str, Any], field: str, *, optional: bool = 
     value, parameter = data.get(field), data.get(field + "_param")
     if optional and value is None and parameter is None:
         return None
-    authored = data.get(field + "_authored")
+    # Authored fields arrive as text; a parameter reference has no value.
+    authored = value
     declared_unit = None
-    convert_literal = isinstance(value, str)
-    if convert_literal:
-        authored = value
     if authored is not None:
         match = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*(.*?)\s*", authored)
         if match is None:
@@ -1440,15 +1438,13 @@ def _physical_quantity(data: Mapping[str, Any], field: str, *, optional: bool = 
         if field in _VOLUME_FIELDS and not unit_text:
             raise InterventionScheduleError(f"{field} requires an explicit volume unit.")
         try:
-            if convert_literal:
-                value = parse_finite_numeric_text(number, field=field)
+            value = parse_finite_numeric_text(number, field=field)
         except ValueError as exc:
             raise InterventionScheduleError(str(exc)) from exc
         if field != "factor":
             try:
                 declared_unit = parse_declared_unit(unit_text or "M")
-                if convert_literal:
-                    value = convert_value(value, declared_unit, _FIELD_UNITS[field])
+                value = convert_value(value, declared_unit, _FIELD_UNITS[field])
             except ValueError as exc:
                 # The unit refusal does not name the field it was written for.
                 raise InterventionScheduleError(f"{field}: {exc}") from exc
@@ -1462,34 +1458,30 @@ def _physical_from_fields(data: Mapping[str, Any], *, extra_keys: set[str] = fro
         raise InterventionScheduleError(f"op={op} does not permit a solution.")
     allowed = {"op", *extra_keys}
     if op != "scale":
-        allowed.update({"initial_volume", "initial_volume_param", "initial_volume_authored"})
+        allowed.update({"initial_volume", "initial_volume_param"})
     field = {"jump": "volume", "flux": "volume_rate", "scale": "factor", "withdraw": "volume"}[op]
     stock = []
     if op in {"jump", "flux"}:
         allowed.add("solution")
-        solution = data.get("solution")
-        if isinstance(solution, str):
-            solution = _parse_record_fields(_unwrap_envelope(solution, context="solution"), delimiter=",", context="solution", lower=False)
-        if not isinstance(solution, Mapping):
-            raise InterventionScheduleError("Physical addition requires a solution record.")
-        _reject_keys(solution, frozenset({field, field + "_param", field + "_authored", "stock"}), context="solution")
-        composition = solution.get("stock")
-        if isinstance(composition, str):
-            inner = _unwrap_envelope(composition, context="stock")
-            composition = [] if not inner.strip() else [
-                _parse_record_fields(record, delimiter=",", context="stock component", lower=False)
-                for record in _split_nested(inner, ";", context="stock")
-            ]
-        if not isinstance(composition, (list, tuple)):
+        # Physical operations are parsed only when a solution was written.
+        solution = _parse_record_fields(
+            _unwrap_envelope(data["solution"], context="solution"),
+            delimiter=",", context="solution", lower=False,
+        )
+        _reject_keys(solution, frozenset({field, field + "_param", "stock"}), context="solution")
+        if "stock" not in solution:
             raise InterventionScheduleError("A solution requires a stock composition, and stock={} denotes solvent.")
+        inner = _unwrap_envelope(solution["stock"], context="stock")
+        composition = [] if not inner.strip() else [
+            _parse_record_fields(record, delimiter=",", context="stock component", lower=False)
+            for record in _split_nested(inner, ";", context="stock")
+        ]
         for component in composition:
-            if not isinstance(component, Mapping):
-                raise InterventionScheduleError("Stock components must be records.")
-            _reject_keys(component, frozenset({"species", "value", "value_param", "value_authored"}), context="stock component")
+            _reject_keys(component, frozenset({"species", "value", "value_param"}), context="stock component")
             stock.append((_name(component.get("species"), field="stock species"), _physical_quantity(component, "value")))
         amount = _physical_quantity(solution, field)
     else:
-        allowed.update({field, field + "_param", field + "_authored"})
+        allowed.update({field, field + "_param"})
         amount = _physical_quantity(data, field)
     _reject_keys(data, frozenset(allowed), context=f"physical {op}")
     return PhysicalAction(op, amount, tuple(stock), _physical_quantity(data, "initial_volume", optional=True))

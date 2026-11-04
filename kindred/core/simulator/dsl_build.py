@@ -88,7 +88,7 @@ def build_mechanism_from_ir(
         arrow = "<->" if is_equilibrium_step else "->"
         context = f"{_fmt_side(reactants)} {arrow} {_fmt_side(products)}"
         entry: Dict[str, object] = {
-            "step_index": int(authored_step_no),
+            "step_index": authored_step_no,
             "kind": "equilibrium" if is_equilibrium_step else "reaction",
             "context": context,
             "line": step.line,
@@ -98,13 +98,13 @@ def build_mechanism_from_ir(
         # established metadata map.  Canonical indexed rate coordinates stay
         # in the same namespace; their authored spans remain on DslAnalysis.
         source_coordinates: dict[str, str] = {
-            str(coordinate.role): str(coordinate.canonical_name)
+            coordinate.role: coordinate.canonical_name
             for coordinate in step.source_coordinates
         }
         if is_equilibrium_step:
-            entry["equilibrium_index"] = int(eq_index)
+            entry["equilibrium_index"] = eq_index
         else:
-            entry["reaction_index"] = int(rxn_index)
+            entry["reaction_index"] = rxn_index
         entry["source_coordinates"] = source_coordinates
         step_index_map.append(entry)
 

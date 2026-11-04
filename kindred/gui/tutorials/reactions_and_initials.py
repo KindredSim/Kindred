@@ -21,7 +21,7 @@ class ReactionsAndInitialConditions(PracticeLesson):
 
     def blocked(self):
         missing = super().blocked()
-        if missing is not None or self.tab_id is None:
+        if missing is not None:
             return missing
         if self.step.name in {"move_set_up", "move_set_down"}:
             if self.original_set not in {

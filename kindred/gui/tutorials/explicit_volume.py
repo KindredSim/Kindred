@@ -35,8 +35,6 @@ def _action(physical, op: str, amount, stock: dict | None = None, initial_volume
     """A solution addition or inflow, scale or withdrawal with this amount, exactly this stock, and this
     start volume."""
     stock = stock or {}
-    if physical is None:
-        return False
     composition = dict(physical.stock)
     return (
         physical.op == op
@@ -187,7 +185,7 @@ class ModelsWithExplicitVolume(PracticeLesson):
                 "<p>This lesson adds volume-aware interventions to one model, one at a time. Each step replaces "
                 "the intervention of the step before.</p>"
                 "<p>Paste the model below into the <b>Reactions</b> box. This is the same model as <b>I13</b> in "
-                "<b>Examples → Intervention Examples</b>, without its interventions.</p>"
+                "<b>Examples → Intervention Examples</b>, without its interventions, and with B present from the start.</p>"
                 + _lines(
                     "A + B <-> C ; kf=0.02 ; kr=0.004",
                     "C + B <-> D ; kf=0.01 ; kr=0.002",

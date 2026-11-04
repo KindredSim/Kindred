@@ -5,7 +5,6 @@ import math
 
 import numpy as np
 
-from kindred.core.analysis.global_fit_execution import fit_result_target_values
 from kindred.core.project_presentation_state import SimulationSeriesAxisSelection, VesselVolumeAxisSelection
 from kindred.core.quantity_units import CUBIC_METRE, MOLAR, SECOND, conversion_scale
 from kindred.core.result_curve_projection import physical_curve_chunks
@@ -112,12 +111,7 @@ def model_chunks(dataset, names):
 
 
 def focused_model_chunks(dataset):
-    result = dataset.simulation
-    targets = tuple(name for name, _ in dataset.observed_y)
-    for name in dict.fromkeys((dataset.x_name, *targets)):
-        if name != "t":
-            fit_result_target_values(result, name, dataset_id=dataset.dataset_id)
-    return model_chunks(dataset, targets)
+    return model_chunks(dataset, tuple(name for name, _ in dataset.observed_y))
 
 
 def focused_model_rows(dataset, names=None):

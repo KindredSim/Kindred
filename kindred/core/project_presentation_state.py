@@ -21,7 +21,6 @@ __all__ = [
     "default_project_presentation_state",
     "default_workspace_presentation_state",
     "reconcile_workspace_presentation_state",
-    "validate_project_presentation_state",
     "validate_workspace_presentation_state",
 ]
 
@@ -293,7 +292,7 @@ def _validate_axis_selection(
     )
 
 
-def validate_project_presentation_state(
+def _validate_project_presentation_state(
     document: ProjectDocument,
     tab: MechanismTabDocument,
     state: ProjectPresentationState,
@@ -394,21 +393,11 @@ def reconcile_workspace_presentation_state(
 ) -> WorkspacePresentationState:
     """Reconcile current choices while retaining accepted selected-X identity."""
 
-    entries = state.presentation_by_tab_id
-    return validate_workspace_presentation_state(
-        document,
-        WorkspacePresentationState(
-            active_tab_id=state.active_tab_id,
-            presentation_by_tab_id=tuple(
-                (
-                    tab_id,
-                    tab_state.reconciled(
-                        document,
-                        document.tab(tab_id),
-                    ),
-                )
-                for tab_id, tab_state in entries
-            ),
+    return WorkspacePresentationState(
+        active_tab_id=state.active_tab_id,
+        presentation_by_tab_id=tuple(
+            (tab_id, tab_state.reconciled(document, document.tab(tab_id)))
+            for tab_id, tab_state in state.presentation_by_tab_id
         ),
     )
 
@@ -427,7 +416,7 @@ def validate_workspace_presentation_state(
             "in document order."
         )
     for tab_id, tab_state in entries:
-        validate_project_presentation_state(
+        _validate_project_presentation_state(
             document,
             document.tab(tab_id),
             tab_state,

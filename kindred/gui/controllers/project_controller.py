@@ -92,16 +92,6 @@ class ProjectTransientState:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class _ProjectDispositionRequest:
-    """One call-local combined disposition input."""
-
-    action: str
-    archive_dirty: bool
-    transient: ProjectTransientState
-    application_close: bool = False
-
-
 class _DispositionChoice(Enum):
     SAVE = "save"
     DISCARD = "discard"
@@ -245,20 +235,19 @@ class ProjectController(QtCore.QObject):
     ) -> _DispositionResult | None:
         self._capture_visible_tab_inputs()
         expected_token = self._session.capture_content_token()
-        request = _ProjectDispositionRequest(
-            action=action,
-            archive_dirty=self._session.is_dirty(
-                self._tabs.workspace_presentation()
-            ),
-            transient=self._inspect_transient_state(),
-            application_close=application_close,
-        )
-        if not request.archive_dirty and not request.transient.has_any:
+        archive_dirty = self._session.is_dirty(self._tabs.workspace_presentation())
+        transient = self._inspect_transient_state()
+        if not archive_dirty and not transient.has_any:
             return _DispositionResult(
                 content_token=expected_token,
                 clean_idle=True,
             )
-        choice = self._prompt_disposition(request)
+        choice = self._prompt_disposition(
+            action,
+            archive_dirty=archive_dirty,
+            transient=transient,
+            application_close=application_close,
+        )
         if not self._content_token_is_current(
             expected_token,
             action=action,
@@ -269,28 +258,31 @@ class ProjectController(QtCore.QObject):
         if choice is _DispositionChoice.SAVE:
             saved_token = self._save_project_from_token(
                 expected_token,
-                discard_invalid_authoring=request.transient.has_invalid_authoring,
+                discard_invalid_authoring=transient.has_invalid_authoring,
             )
             if saved_token is None:
                 return None
             return _DispositionResult(
                 content_token=saved_token,
-                discard_slider_drafts=request.transient.slider_drafts,
+                discard_slider_drafts=transient.slider_drafts,
             )
         # DISCARD
         return _DispositionResult(
             content_token=expected_token,
-            discard_all_authoring=request.transient.has_authoring_edits,
-            discard_slider_drafts=request.transient.slider_drafts,
+            discard_all_authoring=transient.has_authoring_edits,
+            discard_slider_drafts=transient.slider_drafts,
         )
 
     def _prompt_disposition(
         self,
-        request: _ProjectDispositionRequest,
+        action: str,
+        *,
+        archive_dirty: bool,
+        transient: ProjectTransientState,
+        application_close: bool,
     ) -> _DispositionChoice:
-        transient = request.transient
         details: list[str] = []
-        if request.archive_dirty:
+        if archive_dirty:
             details.append(
                 "The project document or saved workspace presentation has "
                 "unsaved changes."
@@ -324,7 +316,7 @@ class ProjectController(QtCore.QObject):
             details.append("A Calculator query is still active.")
         if transient.active_spreadsheet:
             details.append("The spreadsheet editor has temporary data. Closing discards it, and Save saves only project data already created.")
-        details.append(f"Choose once how to proceed before {request.action}.")
+        details.append(f"Choose once how to proceed before {action}.")
 
         dialog = QtWidgets.QMessageBox(self._parent_widget)
         dialog.setWindowTitle("Unsaved Project Work")
@@ -333,13 +325,13 @@ class ProjectController(QtCore.QObject):
 
         choices: dict[QtWidgets.QAbstractButton, _DispositionChoice] = {}
         if (
-            request.archive_dirty
+            archive_dirty
             or transient.notes_draft
             or transient.reactions_draft
             or transient.initial_condition_drafts
             or transient.run_defaults_drafts
         ):
-            if request.application_close:
+            if application_close:
                 if transient.has_active_work:
                     label = (
                         "Discard Invalid Edits, Save, Stop Active Work, and Close"
@@ -365,7 +357,7 @@ class ProjectController(QtCore.QObject):
             choices[button] = _DispositionChoice.SAVE
 
         discard_parts: list[str] = []
-        if request.archive_dirty:
+        if archive_dirty:
             discard_parts.append("Project Changes")
         if transient.reactions_draft:
             discard_parts.append("Reactions Edit")
@@ -380,7 +372,7 @@ class ProjectController(QtCore.QObject):
         if transient.slider_drafts:
             discard_parts.append("Slider Preview")
         discard_subject = and_join(discard_parts)
-        if request.application_close:
+        if application_close:
             if transient.has_active_work:
                 discard_label = (
                     f"Discard {discard_subject}, Stop Active Work, and Close"
@@ -436,7 +428,6 @@ class ProjectController(QtCore.QObject):
             presentation,
             path=path,
             baseline_document=baseline_document,
-            expected_token=expected_token,
         )
         status = (
             "Created new project." if path is None else f"Loaded project: {path}"

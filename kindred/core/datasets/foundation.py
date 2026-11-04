@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from numbers import Real
 from pathlib import Path
 from typing import Mapping, TypeAlias
 from kindred.core.quantity_units import Unit
@@ -52,8 +51,6 @@ FrozenJsonValue: TypeAlias = JsonScalar | FrozenJsonArray | FrozenJsonObject
 
 
 def _require_finite(value: object, label: str) -> float:
-    if type(value) is bool or not isinstance(value, Real):
-        raise TypeError(f"{label} must be numeric.")
     parsed = float(value)
     if not math.isfinite(parsed):
         raise ValueError(f"{label} must be finite.")

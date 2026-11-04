@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from typing import Iterable, Literal, Mapping, Sequence
+from typing import Iterable, Literal, Sequence
 
 from kindred.core.quantity_units import Unit
 
@@ -141,10 +141,7 @@ class FitParameterConfiguration:
     def __post_init__(self) -> None:
         if self.minimum >= self.maximum:
             raise ValueError("Parameter requires minimum < maximum.")
-        groups = tuple(
-            (group[0], *sorted(group[1:])) if group else ()
-            for group in self.groups
-        )
+        groups = tuple((group[0], *sorted(group[1:])) for group in self.groups)
         object.__setattr__(self, "groups", tuple(sorted(groups)))
         object.__setattr__(self, "fixed_dataset_ids", tuple(sorted(set(self.fixed_dataset_ids))))
 
@@ -155,38 +152,6 @@ class FitParameterConfiguration:
         if not self.fit:
             return frozenset()
         return frozenset(dataset_id for dataset_id, _value in self.dataset_values) - set(self.fixed_dataset_ids)
-
-
-def _admit_parameter_groups(
-    configuration: FitParameterConfiguration,
-    dataset_values: Mapping[str, float],
-    *,
-    parameter_name: str,
-) -> None:
-    """Admit disjoint groups of at least two retained, equal-valued, varied members.
-
-    Fixed datasets must be retained, and a varied parameter keeps at least one
-    varied dataset; every dataset fixed is the parameter's Vary off.
-    """
-
-    fixed = set(configuration.fixed_dataset_ids)
-    if fixed and (not configuration.fit or not fixed.issubset(dataset_values)):
-        raise ValueError(f"{parameter_name} fixed datasets require Vary and retained datasets.")
-    if fixed and fixed == set(dataset_values):
-        raise ValueError(f"{parameter_name} with every dataset fixed is Vary off.")
-    occupied: set[str] = set()
-    for group in configuration.groups:
-        if not configuration.fit or fixed.intersection(group):
-            raise ValueError(f"{parameter_name} groups require Vary.")
-        if len(group) < 2 or len(set(group)) != len(group):
-            raise ValueError(f"{parameter_name} groups require at least two unique datasets.")
-        if occupied.intersection(group):
-            raise ValueError(f"{parameter_name} groups cannot share a dataset.")
-        occupied.update(group)
-        if any(member not in dataset_values for member in group):
-            raise ValueError(f"{parameter_name} group members must be retained datasets.")
-        if len({dataset_values[member] for member in group}) != 1:
-            raise ValueError(f"{parameter_name} group members must hold one value.")
 
 
 def _admit_fit_parameter_configuration(
@@ -224,8 +189,8 @@ def _admit_fit_parameter_configuration(
     value = configuration.value
     dataset_values = configuration.dataset_values
     if dataset_scoped and dataset_values:
-        # A group member holds its origin's start (group admission checks
-        # that), so only origins and ungrouped datasets are checked and named.
+        # A group member holds its origin's start (the group editors copy
+        # it), so only origins and ungrouped datasets are checked and named.
         members = {member for group in configuration.groups for member in group[1:]}
         dataset_values = tuple(
             (dataset_id, item if dataset_id in members
@@ -234,11 +199,6 @@ def _admit_fit_parameter_configuration(
         )
     else:
         value = admit_start(value, "Initial guess")
-    _admit_parameter_groups(
-        configuration,
-        dict(dataset_values) if dataset_scoped else {},
-        parameter_name=parameter_name,
-    )
     return replace(
         configuration,
         value=value,
@@ -497,22 +457,8 @@ class FitSharedInitialGroup:
     log10: bool = False
 
     def __post_init__(self) -> None:
-        species = self.species
         origin = self.origin_dataset_id
-        members = self.member_dataset_ids
-        if len(members) < 2 or len(set(members)) != len(members):
-            raise ValueError("Shared initial groups require at least two unique datasets.")
-        if origin not in members:
-            raise ValueError("Shared initial group origin must be a member dataset.")
-        initial = validate_concentration(self.initial, field=f"{species} initial")
-        minimum, _maximum = self.tolerance.bounds_for(initial)
-        if self.log10 and (not self.tolerance.enabled or minimum <= 0.0 or initial <= 0.0):
-            raise ValueError(f"{species} log10 fitting requires positive varying bounds.")
-        object.__setattr__(self, "species", species)
-        object.__setattr__(self, "origin_dataset_id", origin)
-        object.__setattr__(self, "member_dataset_ids", (origin, *tuple(item for item in sorted(members) if item != origin)))
-        object.__setattr__(self, "initial", initial)
-        object.__setattr__(self, "log10", bool(self.log10))
+        object.__setattr__(self, "member_dataset_ids", (origin, *tuple(item for item in sorted(self.member_dataset_ids) if item != origin)))
 
     @property
     def fit(self) -> bool:
@@ -570,16 +516,6 @@ class FitDatasetLocalSettings:
     def __post_init__(self) -> None:
         if self.parametric is None and self.data_range_max < self.data_range_min:
             raise ValueError("Data Range maximum must be >= minimum.")
-        maximum = (
-            None
-            if self.maximum_observations_per_target in (None, 0)
-            else int(self.maximum_observations_per_target)
-        )
-        if maximum is not None and maximum < 2:
-            raise ValueError(
-                "Maximum observations per target must be All or at least 2."
-            )
-        object.__setattr__(self, "maximum_observations_per_target", maximum)
 
 
 @dataclass(frozen=True, slots=True)
@@ -783,13 +719,9 @@ class FitSetupSnapshot:
         object.__setattr__(self, "parameters", parameters)
         object.__setattr__(self, "initials", initials)
         object.__setattr__(self, "shared_initial_groups", tuple(sorted(shared_initial_groups, key=lambda item: (item.species, item.origin_dataset_id))))
-        if not self.profile.unticked <= set(fit_uncertainty_coordinates(parameters, datasets)):
-            raise ValueError("Profile setup references an unavailable fitted coordinate.")
 
 
 def _scan_parameters(tab: MechanismTabDocument) -> tuple[FitParameterVariable, ...]:
-    if not tab.mechanism_source.reactions_text.strip():
-        return ()
     variables: list[FitParameterVariable] = []
     coordinates = enumerate_parameter_coordinates(tab.prepared_dsl)
     # Vary starts off; the user chooses what is fitted.
@@ -905,8 +837,6 @@ def capture_fit_origin(
 ) -> FitOriginSnapshot:
     """Copy mapped dataset science from one exact tab."""
     tab = document.tab(tab_id)
-    if tab.prepared_dsl is None:
-        raise ValueError("Enter a valid mechanism before opening Global Fit.")
     mapped: list[FitMappedDatasetSnapshot] = []
     links = dict(tab.dataset_links)
     # Fit lists datasets in the project's import order, as the main window does.
@@ -1139,14 +1069,6 @@ def _prepare_fit_datasets(
         execution_t_start, execution_t_end = fit_execution_span(
             local.t_start, local.simulation_end
         )
-        if any(
-            value < execution_t_start or value > execution_t_end
-            for value in retained_times
-        ):
-            raise ValueError(
-                f"Dataset {mapped.display_name!r} has selected experimental times "
-                "outside the Simulation interval. Adjust Simulation start, Simulation end, or Data Range."
-            )
         prepared.append(
             FitPreparedDatasetConfig(
                 dataset_id=local.dataset_id,

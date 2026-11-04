@@ -439,9 +439,8 @@ class _InitialConditionsItemDelegate(QtWidgets.QStyledItemDelegate):
         self,
         editor: QtWidgets.QLineEdit,
     ) -> QtCore.QModelIndex:
+        # The table view is this delegate's parent.
         view = self.parent()
-        if not isinstance(view, BatchInitialConditionsTableView):
-            return QtCore.QModelIndex()
         center = editor.mapTo(view.viewport(), editor.rect().center())
         return view.indexAt(center)
 
@@ -1018,15 +1017,11 @@ class InitialConditionsTableActions(QtCore.QObject):
 
     @QtCore.Slot(str, bool)
     def toggle_custom_run_settings(self, set_id: str, checked: bool) -> bool:
+        # The Custom box shows the rendered override state, and every
+        # override change re-renders the table.
         tab = self._registry.tab(self._tab_id)
-        overrides = dict(tab.run_overrides_by_set_id)
-        has_override = set_id in overrides
         if checked:
-            if has_override:
-                return True
             return self._open_settings_dialog(set_id, tab.run_defaults)
-        if not has_override:
-            return True
         answer = QtWidgets.QMessageBox.question(
             self._table,
             "Use Tab Defaults",
@@ -1043,11 +1038,9 @@ class InitialConditionsTableActions(QtCore.QObject):
 
     @QtCore.Slot(str)
     def edit_custom_run_settings(self, set_id: str) -> bool:
+        # The gear is offered only for a set with custom Run settings.
         tab = self._registry.tab(self._tab_id)
-        override = dict(tab.run_overrides_by_set_id).get(set_id)
-        if override is None:
-            return False
-        return self._open_settings_dialog(set_id, override)
+        return self._open_settings_dialog(set_id, dict(tab.run_overrides_by_set_id)[set_id])
 
     def _open_settings_dialog(
         self,

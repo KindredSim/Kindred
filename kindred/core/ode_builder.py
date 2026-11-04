@@ -18,9 +18,6 @@ from typing import Callable, Mapping
 
 import numpy as np
 
-from .equilibrium_rate_authority import (
-    json_safe_equilibrium_authority_payload,
-)
 from .mechanism import Equilibrium, FrozenDict, Mechanism, Reaction
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.core.simulator.parameter_algebra_eval import bind_parameter_evaluation
@@ -109,7 +106,7 @@ def rate_authority_snapshot(mechanism: Mechanism) -> tuple[Mapping[str, object],
                     "value_dependencies": tuple(spec.evaluation_dependencies[forward_name]),
                     "temperature_dependent": forward_name in spec.temperature_dependent_names}
         if kind == "equilibrium":
-            snapshot.update(authority=json_safe_equilibrium_authority_payload(dict(step.authority.identity_items())), reverse_binding_name=reverse_name)
+            snapshot.update(authority=dict(step.authority.identity_items()), reverse_binding_name=reverse_name)
         snapshots.append(FrozenDict(snapshot))
     return tuple(snapshots)
 

@@ -60,7 +60,7 @@ class FitDatasetSpec:
             self.species_list if self.x_name == "t" else (*self.species_list, self.x_name)
         )
         # Order the admitted target weights by the weighted roster.
-        weights = {name: float(self.target_weights[name]) for name in weight_roster}
+        weights = {name: self.target_weights[name] for name in weight_roster}
         object.__setattr__(
             self,
             "observations",

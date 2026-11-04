@@ -87,7 +87,6 @@ __all__ = [
     "build_parameter_layout_for_dataset_ids",
     "normalize_weights",
     "evaluate_dataset_simulation",
-    "fit_result_target_values",
     "parameter_group_variable_id",
 ]
 
@@ -285,8 +284,8 @@ class GlobalFitResult:
 
     def __post_init__(self) -> None:
         # Its sole producer publishes the settled replay state: the literal
-        # ending with its settlement facts, the admitted finite
-        # optimizer vector, its decoded finite parameters, and one
+        # ending with its settlement facts, the finite optimizer
+        # vector, its decoded finite parameters, and one
         # DatasetFitInfo per included dataset in roster order.  This carrier
         # freezes them.
         optimizer_vector = np.asarray(self.optimizer_vector, dtype=float).copy()
@@ -1627,8 +1626,7 @@ def _assemble_fit_result_facts(
 ) -> GlobalFitResult:
     """Construct terminal metrics and values from complete scientific facts.
 
-    The replay admitted the candidate vector and found every dataset's facts
-    available, in roster order.
+    Every dataset's facts are available, in roster order.
     """
     fitted_params = layout.shared_param_dict_from_vector(candidate_vector)
     combined_dataset_params = {

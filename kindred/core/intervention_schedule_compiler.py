@@ -96,7 +96,7 @@ def _protocol_boundary(
         value += Decimal(repr(duration))
     try:
         return validate_time_seconds(float(value), field="Protocol boundary")
-    except (TypeError, ValueError) as exc:
+    except ValueError as exc:
         raise _annotated_schedule_error(
             str(exc),
             operation=operation,

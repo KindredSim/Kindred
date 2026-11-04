@@ -684,7 +684,7 @@ class FitSessionOwner(QtCore.QObject):
         if comments:
             newline = "\r\n" if "\r\n" in source_text else "\n"
             separator = "" if source_text.endswith(("\n", "\r")) else newline
-            source_text += separator + newline.join(comments)
+            source_text += separator + newline.join(comments) + ("" if separator else newline)
         source = MechanismAuthoringSource(reactions_text=source_text)
         if source == document.tab(tab_id).mechanism_source:
             # IC-only and unchanged-value Apply retain the accepted owner so

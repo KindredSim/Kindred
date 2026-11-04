@@ -39,13 +39,6 @@ class FitMetric:
     def unavailable(cls, reason: str) -> "FitMetric":
         return cls(value=None, unavailable_reason=reason)
 
-    def to_payload(self) -> dict[str, object]:
-        return {
-            "value": self.value,
-            "available": self.available,
-            "unavailable_reason": self.unavailable_reason,
-        }
-
 
 @dataclass(frozen=True, slots=True)
 class FitErrorMetrics:

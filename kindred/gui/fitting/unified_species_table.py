@@ -1320,10 +1320,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         if self._refreshing:
             return
         raw = self._dataset_weight_edit.text()
-        dataset_id = str(self._current_dataset_id or "").strip()
+        dataset_id = self._current_dataset_id
         projected = self._projected_dataset(dataset_id)
-        if not dataset_id or projected is None:
-            return
         key = ("dataset_weight", dataset_id)
         try:
             value = float(raw)
@@ -1362,8 +1360,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     def _eligible_targets(self, dataset_id: str) -> tuple[str, ...]:
         dataset = self._projected_dataset(dataset_id)
         mapped = self._mapped_dataset(dataset_id)
-        if dataset is None or mapped is None:
-            return ()
         x_name = dataset.parametric.x_name if dataset.parametric is not None else None
         # The admitted mapping gives each target exactly one column.
         return tuple(
@@ -1407,12 +1403,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                         if item.checkState() == Qt.CheckState.Checked
                         else Qt.CheckState.Checked
                     )
-                else:
-                    return
                 item.setCheckState(state)
         finally:
             self._table.blockSignals(False)
-        self._stage_visible_target_selection(self._current_dataset_id or "")
+        self._stage_visible_target_selection(self._current_dataset_id)
 
     def _copy_targets_to_compatible_datasets(self) -> None:
         setup = self._projected_setup

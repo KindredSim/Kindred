@@ -96,8 +96,6 @@ def _inverse(
     matrix: Sequence[Sequence[Fraction]],
 ) -> tuple[tuple[Fraction, ...], ...] | None:
     size = len(matrix)
-    if not size or any(len(row) != size for row in matrix):
-        return None
     augmented = [
         [Fraction(value) for value in row]
         + [Fraction(1 if row_index == column else 0) for column in range(size)]
@@ -681,10 +679,7 @@ class CorrectionPlanner:
     ) -> bool:
         grouped: list[list[CorrectionTarget]] = [[] for _block in self._blocks]
         for target in selected:
-            index = self._block_of.get(target.name)
-            if index is None:
-                return False
-            grouped[index].append(target)
+            grouped[self._block_of[target.name]].append(target)
         return all(
             self._block_can_complete(index, tuple(group), integral)
             for index, group in enumerate(grouped)
@@ -699,12 +694,10 @@ class CorrectionPlanner:
     def _selected_targets(
         self,
         selected_names: Sequence[str],
-    ) -> tuple[CorrectionTarget, ...] | None:
+    ) -> tuple[CorrectionTarget, ...]:
+        # The chooser offers only distinct candidates that keep a completion.
         selected = set(selected_names)
-        if len(selected) != len(selected_names):
-            return None
-        chosen = tuple(target for target in self._candidates if target.name in selected)
-        return chosen if len(chosen) == len(selected) else None
+        return tuple(target for target in self._candidates if target.name in selected)
 
     def partial_selection_can_complete(
         self,
@@ -712,12 +705,7 @@ class CorrectionPlanner:
     ) -> bool:
         """Whether one dependent-target selection extends to an exact basis."""
 
-        if self._blocking or self._contradiction:
-            return False
-        selected = self._selected_targets(selected_names)
-        if selected is None or len(selected) > self.required_basis_size:
-            return False
-        return self._selection_can_complete(selected)
+        return self._selection_can_complete(self._selected_targets(selected_names))
 
     def viable_next_targets(
         self,
@@ -760,32 +748,19 @@ class CorrectionPlanner:
         self,
         selected_names: Sequence[str],
     ) -> CorrectionPlan:
-        """Validate and build the exact plan for one user-selected basis."""
+        """Build the exact plan for one user-selected basis.
 
-        unavailable = self._unavailable_plan()
-        if unavailable is not None:
-            return unavailable
+        The chooser opens only for an available plan and offers only targets
+        that keep a completion, so a full selection is an admissible basis.
+        """
+
         selected = self._selected_targets(selected_names)
-        if selected is None:
-            return CorrectionPlan(
-                (),
-                (),
-                False,
-                "selected correction targets must be distinct and eligible",
-            )
         if len(selected) != self.required_basis_size:
             return CorrectionPlan(
                 (),
                 (),
                 False,
                 f"select exactly {self.required_basis_size} dependent parameters",
-            )
-        if not self._selection_can_complete(selected):
-            return CorrectionPlan(
-                (),
-                (),
-                False,
-                "selected correction targets do not form an admissible full-rank basis",
             )
         return self._plan_for_basis(selected)
 
@@ -897,8 +872,6 @@ def build_correction_expressions(
 ) -> dict[str, str]:
     """Render the exact coupled solution for the selected global basis."""
 
-    if not plan.available or not plan.basis:
-        return {}
     cycles_by_id = {item.cycle_id: item for item in composition.constraints}
     closures = _closures(
         composition,

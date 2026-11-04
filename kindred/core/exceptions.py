@@ -144,8 +144,7 @@ class FitSimulationError(KindredError):
     """Raised when a simulation fails while evaluating a fitting objective."""
     def __init__(self, message: str, **kwargs):
         kwargs.setdefault("code", "E404")
-        details = dict(kwargs.pop("details", {}) or {})
-        super().__init__(message, details=details, **kwargs)
+        super().__init__(message, **kwargs)
 
 
 class FittingCancelled(KindredError):

@@ -24,7 +24,6 @@ from kindred.core.project_presentation_state import (
     WorkspacePresentationState,
     default_project_presentation_state,
     reconcile_workspace_presentation_state,
-    validate_project_presentation_state,
 )
 
 __all__ = [
@@ -179,12 +178,12 @@ class WorkspaceTabRegistry:
         *,
         path: str | None,
         baseline_document: ProjectDocument,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
-        """Commit one admitted complete project and its workspace state."""
+    ) -> ProjectContentToken:
+        """Commit one admitted complete project and its workspace state.
 
-        if not self._session.is_content_token_current(expected_token):
-            return None
+        The project controller checked its token immediately before.
+        """
+
         runtime_by_tab_id = self._fresh_runtimes(presentation)
         token = self._session.replace_project(
             document,
@@ -225,7 +224,6 @@ class WorkspaceTabRegistry:
                 for tab in document.tabs
             ),
         )
-        # One reconcile pass also validates the complete workspace state.
         next_workspace = reconcile_workspace_presentation_state(
             document,
             next_workspace,
@@ -245,12 +243,7 @@ class WorkspaceTabRegistry:
             delta.affected_targets_by_tab or delta.removed_targets_by_tab
         ):
             self._prepare_document_delta(delta, previous, document)
-        token = self._session.replace_document(
-            document,
-            expected_token=expected_token,
-        )
-        if token is None:
-            return None
+        token = self._session.replace_document(document)
         self._assign_workspace_state(next_workspace, next_runtime)
         if changed:
             self._post_document_publication(delta)
@@ -305,11 +298,7 @@ class WorkspaceTabRegistry:
         state: ProjectPresentationState,
     ) -> None:
         tab = self._session.document.tab(tab_id)
-        candidate = validate_project_presentation_state(
-            self._session.document,
-            tab,
-            state.reconciled(self._session.document, tab),
-        )
+        candidate = state.reconciled(self._session.document, tab)
         current = self.presentation(tab.tab_id)
         if candidate == current:
             return
@@ -448,8 +437,6 @@ class WorkspaceTabRegistry:
     ) -> MechanismTabDocument | None:
         """Publish a prepared copy, retaining only Runs matching its final inputs."""
 
-        if not self._session.is_content_token_current(expected_token):
-            return None
         final_copy = document.tab(copied.tab_id)
         state = self.presentation(tab_id)
         presentation = replace(
@@ -460,9 +447,7 @@ class WorkspaceTabRegistry:
             plot_set_ids=tuple(set_ids[sid] for sid in state.plot_set_ids),
             pinned_slider_set_ids=(),
         )
-        presentation = validate_project_presentation_state(
-            document, final_copy, presentation.reconciled(document, final_copy),
-        )
+        presentation = presentation.reconciled(document, final_copy)
         delta = self.scientific_document_delta(document.replace_tab(copied), document)
         changed_ids = set(delta.targets_by_tab().get(copied.tab_id, ()))
         matching_set_ids = {
