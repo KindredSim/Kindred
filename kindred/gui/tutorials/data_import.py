@@ -5,7 +5,6 @@ from math import isclose
 
 from PySide6 import QtWidgets
 
-from kindred.core.datasets.foundation import thaw_json_value
 from kindred.core.project_presentation_state import SimulationSeriesAxisSelection
 from kindred.gui.tutorials.controller import Step
 from kindred.gui.tutorials.overlay import Highlight
@@ -40,14 +39,10 @@ class ImportAndMapData(PracticeLesson):
     _needs_preset_set = False
     _sample_folder = "DataImport"
     _sample_file = _FILE
+    _sheet_units = _UNITS
     _import_steps = frozenset({"read_units", "set_units", "import_sheets"})
     _review_steps = frozenset({"map_by_hand", "type_starts", "accept_mapping"})
     _data_steps = _review_steps | {"check_dataset", "show_data", "choose_y", "run_data", "export_original"}
-
-    def __init__(self, **owners):
-        super().__init__(**owners)
-        # Datasets present when the lesson started.
-        self._datasets_before = {record.dataset_id for record in self.registry.document.datasets}
 
     def blocked(self):
         missing = super().blocked()
@@ -85,26 +80,6 @@ class ImportAndMapData(PracticeLesson):
             and defaults.t_start == 0
             and defaults.t_end == 150
         )
-
-    def _workbook(self) -> dict[str, str]:
-        """Run name -> dataset ID of the newest sheets of runs.xlsx imported in this lesson
-        with every column and its own units."""
-        document = self.registry.document
-        runs = {}
-        for record in document.datasets:
-            if (
-                record.dataset_id not in self._datasets_before
-                and record.source_id is not None
-                and document.imported_source(record.source_id).original_filename == _FILE
-            ):
-                # The worksheet identity survives renaming the dataset.
-                metadata = thaw_json_value(record.source_metadata)
-                run = metadata.get("sheet_name")
-                if run in _RUNS and (
-                    metadata.get("original_time_unit"), metadata.get("original_concentration_units")
-                ) == _UNITS[run]:
-                    runs[run] = record.dataset_id
-        return runs if len(runs) == len(_RUNS) else {}
 
     def _default_unit(self) -> QtWidgets.QComboBox | None:
         """The Default unit control of the open import dialog."""
@@ -200,11 +175,6 @@ class ImportAndMapData(PracticeLesson):
             )
             for dataset_id in self._workbook().values()
         )
-
-    def _workbook_sets(self) -> tuple[str, ...]:
-        """The set of each workbook run; the Run step is blocked until each is mapped."""
-        found = self._workbook()
-        return tuple(self.tab.dataset_link(found[run]).set_id for run in _RUNS)
 
     def _ran(self) -> bool:
         identities = self._workbook_sets()

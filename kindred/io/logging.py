@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import logging
-import logging.handlers
 import os
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
+
+if sys.platform != "win32":
+    import fcntl
 
 __all__ = ["diagnostic_log_path", "setup_logging"]
 
 _DEFAULT_LOG_LEVEL = "INFO"
-_DEFAULT_LOG_FILENAME = "kindred.log"
-_MAX_LOG_SIZE = 10 * 1024 * 1024
-_BACKUP_COUNT = 5
+# Each Kindred writes its own log, so several open at once never share a file.
+_LOG_PATTERN = "kindred-*.log"
+_KEPT_LOGS = 10
 _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
@@ -70,21 +73,46 @@ def _get_log_level_from_env() -> str:
 def diagnostic_log_path() -> Path:
     """Return the active diagnostic log path."""
 
-    # setup_logging installs the rotating file handler or startup stops.
-    handler = next(
-        item for item in logging.getLogger().handlers
-        if isinstance(item, logging.handlers.RotatingFileHandler)
-    )
+    # setup_logging installs the file handler or startup stops.
+    handler = next(item for item in logging.getLogger().handlers if isinstance(item, logging.FileHandler))
     handler.flush()
     return Path(handler.baseFilename)
 
 
+def _in_use(path: Path) -> bool:
+    """Whether another open Kindred still writes this log. Windows cannot delete an open log at all, so
+    only Linux and macOS check the lock its Kindred holds."""
+    if sys.platform == "win32":
+        return False
+    with path.open("rb") as stream:
+        try:
+            # A shared lock needs only read access, also on NFS, and still meets the exclusive lock of
+            # a running Kindred.
+            fcntl.flock(stream, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+    return False
+
+
+def _remove_old_logs(directory: Path) -> None:
+    """Delete the oldest logs beyond the newest _KEPT_LOGS, except those another open Kindred still writes."""
+    # Each name starts with its start time, so the newest sort last.
+    for path in sorted(directory.glob(_LOG_PATTERN))[:-_KEPT_LOGS]:
+        try:
+            if not _in_use(path):
+                path.unlink()
+        except OSError:
+            # Windows refuses to delete a log another Kindred has open.
+            continue
+
+
 def setup_logging() -> None:
-    """Configure bounded rotating-file logging and usable terminal diagnostics.
+    """Configure a log file of this Kindred and usable terminal diagnostics.
 
     Calling this function replaces and closes all existing root handlers. The
-    platform log file is always attempted first, followed by a system
-    temporary-directory file when the normal location cannot be opened.
+    platform log directory is always attempted first, followed by a system
+    temporary directory when the normal location cannot be opened. Each start
+    writes a new file and deletes the oldest beyond the newest _KEPT_LOGS.
     """
 
     resolved_level = _get_log_level_from_env()
@@ -98,7 +126,6 @@ def setup_logging() -> None:
         existing_handler.close()
 
     formatter = logging.Formatter(
-        # Several Kindred windows share one log file; the process tells their lines apart.
         "%(asctime)s - %(process)d - %(name)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
@@ -110,24 +137,24 @@ def setup_logging() -> None:
         console_handler.setFormatter(formatter)
         root_logger.addHandler(console_handler)
 
-    normal_log = _get_normal_log_dir() / _DEFAULT_LOG_FILENAME
-    fallback_log = _get_fallback_log_dir() / _DEFAULT_LOG_FILENAME
+    log_name = f"kindred-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.log"
+    normal_log = _get_normal_log_dir() / log_name
+    fallback_log = _get_fallback_log_dir() / log_name
     log_paths = tuple(dict.fromkeys((normal_log, fallback_log)))
     file_error: OSError | None = None
     log_path: Path | None = None
     for candidate in log_paths:
         try:
             candidate.parent.mkdir(parents=True, exist_ok=True)
-            rotating_handler = logging.handlers.RotatingFileHandler(
-                candidate,
-                maxBytes=_MAX_LOG_SIZE,
-                backupCount=_BACKUP_COUNT,
-                encoding="utf-8",
-            )
-            rotating_handler.setLevel(numeric_level)
-            rotating_handler.setFormatter(formatter)
-            root_logger.addHandler(rotating_handler)
+            file_handler = logging.FileHandler(candidate, encoding="utf-8")
+            if sys.platform != "win32":
+                # Held while the file is open, so another Kindred leaves it in place.
+                fcntl.flock(file_handler.stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            file_handler.setLevel(numeric_level)
+            file_handler.setFormatter(formatter)
+            root_logger.addHandler(file_handler)
             log_path = candidate
+            _remove_old_logs(candidate.parent)
             root_logger.info(
                 "Logging configured: level=%s, file=%s",
                 resolved_level,
@@ -155,8 +182,6 @@ def setup_logging() -> None:
     root_logger.debug("Log level: %s", resolved_level)
     root_logger.debug("Console handler: %s", console_stream is not None)
     root_logger.debug("Log file: %s", log_path)
-    root_logger.debug("Max log size: %.1f MB", _MAX_LOG_SIZE / (1024 * 1024))
-    root_logger.debug("Backup count: %s", _BACKUP_COUNT)
 
 
 def _log_unhandled(exc_type, exc, traceback) -> None:
