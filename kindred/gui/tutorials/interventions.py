@@ -468,7 +468,7 @@ class Interventions(PracticeLesson):
                 "threshold.</li>"
                 "</ul>"
                 "<p><b>scale</b> and <b>withdraw</b> act in the context of volume and are covered in the "
-                "<b>Solutions, Dilution, and Aliquots</b> tutorial.</p>"
+                "<b>Models with Explicit Volume</b> tutorial.</p>"
                 "<p>By default, times are given in seconds and concentrations in M for intervention fields, "
                 "unless defined as a parameter (as shown in step 8). Multiple interventions can be defined per "
                 "model. When several act at the same time, Kindred applies them in a fixed order, and it refuses "
@@ -627,8 +627,8 @@ class Interventions(PracticeLesson):
                 )
                 + "<p><b>during</b> intervals accept <b>op=flux</b> or <b>op=hold</b> as valid operations. "
                 "<b>before</b> and <b>after</b> inputs take <b>op=set</b>, <b>op=jump</b>, as well as "
-                "<b>op=scale</b>, or <b>op=withdraw</b> in the context of volume (see the <b>Solutions, Dilution, "
-                "and Aliquots</b> tutorial).</p>"
+                "<b>op=scale</b>, or <b>op=withdraw</b> in the context of volume (see the <b>Models with Explicit "
+                "Volume</b> tutorial).</p>"
                 "<p>A is continuously fed into the reaction for the first 60 s of each repetition, from 60 to "
                 "120 s, 180 to 240 s, and 300 to 360 s.</p>",
                 nothing,

@@ -12,6 +12,7 @@ from kindred.gui.tutorials.advanced_fitting import (
 )
 from kindred.gui.tutorials.controller import TutorialController
 from kindred.gui.tutorials.data_import import ImportAndMapData
+from kindred.gui.tutorials.explicit_volume import ModelsWithExplicitVolume
 from kindred.gui.tutorials.explore_plot import ExplorePlot
 from kindred.gui.tutorials.fit_basics import FittingBasics
 from kindred.gui.tutorials.interactive_sliders import InteractiveSliders
@@ -36,6 +37,7 @@ LESSONS = (
     FittingAgainstMeasuredQuantity,
     TitrationsWithoutTime,
     Interventions,
+    ModelsWithExplicitVolume,
     CreateAndReuseTemplates,
 )
 
