@@ -240,13 +240,10 @@ def build_raw_record_batch_proposal(
     sources_by_id: dict[str, ImportedSource] = {}
     for unit in completion.units:
         raw_name = unit.display_name.strip()
-        stem, dot, suffix = raw_name.rpartition(".")
-        base = stem if dot and stem else raw_name
-        extension = f".{suffix}" if dot and stem else ""
         display_name = raw_name
-        counter = 1
+        counter = 2
         while display_name.casefold() in used_names:
-            display_name = f"{base}_{counter}{extension}"
+            display_name = f"{raw_name}_{counter}"
             counter += 1
         used_names.add(display_name.casefold())
         # Each import config captures one uuid-named source for all its units.

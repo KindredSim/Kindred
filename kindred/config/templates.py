@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import tempfile
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -15,7 +14,11 @@ from typing import Any, Dict, List, Mapping, Optional
 from PySide6.QtCore import QStandardPaths
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
-from kindred.io.paths import file_error_text
+from kindred.io.paths import (
+    create_sibling_temporary,
+    file_error_text,
+    replace_destination,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -230,11 +233,7 @@ class TemplateManager:
     def _write_template(self, template: Template) -> None:
         payload = template.to_dict()
         target = self._template_path(payload["id"], create_root=True)
-        descriptor, temporary_path = tempfile.mkstemp(
-            prefix=f".{payload['id']}.",
-            suffix=".tmp",
-            dir=target.parent,
-        )
+        descriptor, temporary_path = create_sibling_temporary(target)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
                 json.dump(
@@ -249,7 +248,7 @@ class TemplateManager:
                 # crash leaves either the prior or the new template.
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary_path, target)
+            replace_destination(temporary_path, target)
         except BaseException:
             try:
                 os.unlink(temporary_path)

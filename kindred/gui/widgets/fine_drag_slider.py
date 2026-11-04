@@ -23,7 +23,21 @@ class NumericValueEdit(QtWidgets.QLineEdit):
 
     def focusInEvent(self, event: QtGui.QFocusEvent) -> None:
         super().focusInEvent(event)
-        self.editStarted.emit()
+        # Returning from a dialog resumes the edit with its Escape baseline.
+        if not (
+            event.reason() == QtCore.Qt.FocusReason.ActiveWindowFocusReason
+            and self.isModified()
+        ):
+            self.editStarted.emit()
+
+    def focusOutEvent(self, event: QtGui.QFocusEvent) -> None:
+        # A dialog opening pauses the edit; leaving the field finishes it.
+        with QtCore.QSignalBlocker(self):
+            super().focusOutEvent(event)
+        popup = QtWidgets.QApplication.activePopupWidget()
+        own_menu = popup is not None and popup.parentWidget() is self
+        if QtWidgets.QApplication.activeModalWidget() is None and not own_menu:
+            self.editingFinished.emit()
 
     def event(self, event: QtCore.QEvent) -> bool:
         # Escape first cancels an unentered edit, ahead of the window's Esc

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from kindred.core.project_document import ProjectDocument
 from kindred.core.project_presentation_state import (
@@ -15,6 +15,15 @@ __all__ = [
     "ProjectSession",
     "SavedArchiveBaseline",
 ]
+
+
+def _saved_choices(presentation: WorkspacePresentationState) -> tuple:
+    # The active tab and each tab's current row are saved navigation, so
+    # changing them alone is not an unsaved change.
+    return tuple(
+        (tab_id, replace(state, current_set_id=None))
+        for tab_id, state in presentation.presentation_by_tab_id
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +89,9 @@ class ProjectSession:
         self,
         presentation: WorkspacePresentationState,
     ) -> bool:
-        return presentation != self.saved_baseline.presentation
+        return _saved_choices(presentation) != _saved_choices(
+            self.saved_baseline.presentation
+        )
 
     def is_dirty(
         self,

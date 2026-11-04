@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import stat
-import tempfile
 
 from PySide6 import QtCore
 
@@ -13,7 +11,12 @@ from kindred.gui.workspace_result_presenter import (
     ResultDataBlock,
     write_xlsx,
 )
-from kindred.io.paths import file_error_text, same_local_path
+from kindred.io.paths import (
+    create_sibling_temporary,
+    file_error_text,
+    replace_destination,
+    same_local_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,10 +71,8 @@ class _XlsxExportWorker(QtCore.QThread):
                 raise FileNotFoundError(
                     f"Export directory does not exist: {parent}."
                 )
-            descriptor, temporary_path = tempfile.mkstemp(
-                prefix=f".{os.path.basename(self._path)}.",
-                suffix=".partial",
-                dir=parent,
+            descriptor, temporary_path = create_sibling_temporary(
+                self._path, ".partial"
             )
             self._check_cancelled()
             with os.fdopen(descriptor, "w+b") as destination:
@@ -84,17 +85,10 @@ class _XlsxExportWorker(QtCore.QThread):
                 )
                 self._check_cancelled()
                 destination.flush()
-                self._check_cancelled()
-            try:
-                existing_mode = stat.S_IMODE(os.stat(self._path).st_mode)
-            except FileNotFoundError:
-                existing_mode = None
-            if existing_mode is not None:
-                os.chmod(temporary_path, existing_mode)
             self._check_cancelled()
             # Cancellation no longer interrupts the single atomic replacement.
             self._commit_started = True
-            os.replace(temporary_path, self._path)
+            replace_destination(temporary_path, self._path)
             temporary_path = ""
         except _XlsxExportCancelled:
             self.cancelled.emit(self._path)

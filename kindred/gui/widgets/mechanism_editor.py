@@ -247,9 +247,10 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         # A mouse Apply accepts the Preview, not the focused editor's draft.
         self._commit_runtime_parameters_btn.setFocusPolicy(QtCore.Qt.TabFocus)
         self._commit_runtime_parameters_btn.setToolTip(
-            "Accept the exact Preview, replacing pending Reactions text and "
-            "initial-condition drafts for the applied sets. Reactions Undo "
-            "can recover replaced text."
+            "Accept the exact Preview, replacing initial-condition drafts for "
+            "the applied sets. Applied parameters also replace pending "
+            "Reactions text after confirmation; Reactions Undo can recover "
+            "replaced text."
         )
         self._commit_runtime_parameters_btn.clicked.connect(self.sliderApplyRequested)
         slider_actions_layout.addWidget(self._commit_runtime_parameters_btn, 0, 2, alignment=QtCore.Qt.AlignLeft)

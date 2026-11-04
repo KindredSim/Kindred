@@ -236,7 +236,7 @@ class InteractiveSliders(PracticeLesson):
                 "<p>Check Reactions for <b>kf = 1.125</b> and <b>kr = 0.25</b> on A ⇌ B, and <b>k = 0.05</b> on B → C. "
                 "The completed curves now belong to the accepted model. Later trials start from these rates, "
                 "and Reset returns to them.</p>"
-                "<p>Apply uses the accepted source behind the Preview. It replaces pending edits in Reactions. "
+                "<p>Apply uses the accepted source behind the Preview. It replaces pending edits in Reactions after asking. "
                 "Finish a source edit with Run before beginning a slider trial if you want that edit included.</p>",
                 lambda: (self._slider_target(), self._source_target()), manual=True,
             ),

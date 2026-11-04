@@ -6,8 +6,6 @@ import json
 import itertools
 import math
 import os
-import stat
-import uuid
 import zipfile
 from dataclasses import dataclass
 from numbers import Real
@@ -51,6 +49,7 @@ from kindred.core.project_presentation_state import (
     SimulationSeriesAxisSelection,
     WorkspacePresentationState,
 )
+from kindred.io.paths import create_sibling_temporary, replace_destination
 
 __all__ = [
     "ArchiveProject",
@@ -1411,15 +1410,7 @@ class KinArchiveStore:
             + "\n"
         ).encode("utf-8")
 
-        temporary_path = os.path.join(
-            parent,
-            f".{os.path.basename(archive_path)}.{uuid.uuid4().hex}.tmp",
-        )
-        descriptor = os.open(
-            temporary_path,
-            os.O_RDWR | os.O_CREAT | os.O_EXCL,
-            0o666,
-        )
+        descriptor, temporary_path = create_sibling_temporary(archive_path)
         try:
             with os.fdopen(descriptor, mode="w+b") as handle:
                 with zipfile.ZipFile(
@@ -1437,21 +1428,7 @@ class KinArchiveStore:
                 # The data reaches the disk before the replacement, so a
                 # crash leaves either the prior or the new archive.
                 os.fsync(handle.fileno())
-            # Inspect the destination entry itself.  In particular, a
-            # dangling or live symlink is replaced as an entry by os.replace;
-            # following it here would either mutate the target or make a
-            # missing target appear to be a missing destination.
-            try:
-                existing_stat = os.lstat(archive_path)
-            except FileNotFoundError:
-                pass
-            else:
-                if stat.S_ISREG(existing_stat.st_mode):
-                    os.chmod(
-                        temporary_path,
-                        stat.S_IMODE(existing_stat.st_mode),
-                    )
-            os.replace(temporary_path, archive_path)
+            replace_destination(temporary_path, archive_path)
         except BaseException:
             try:
                 os.unlink(temporary_path)

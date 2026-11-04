@@ -6,9 +6,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 import os
 from pathlib import Path
-import stat
 from typing import Iterable, Mapping, Sequence
-import uuid
 
 from kindred.core.datasets.observation_mapping import (
     InitialConcentrationSource,
@@ -27,6 +25,7 @@ from kindred.core.project_document import (
     canonical_species_names,
     new_set_id,
 )
+from kindred.io.paths import create_sibling_temporary, replace_destination
 
 class DatasetMappingError(ValueError):
     """Raised when a proposed dataset mutation violates a real invariant."""
@@ -92,24 +91,13 @@ def export_original_source(
         raise DatasetMappingError(
             f"Export directory does not exist: {target.parent}."
         )
-    temporary = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
-    descriptor: int | None = None
+    descriptor: int | None
+    descriptor, temporary = create_sibling_temporary(target)
     try:
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o666,
-        )
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = None
             handle.write(source_bytes)
-        try:
-            existing_mode = stat.S_IMODE(target.stat().st_mode)
-        except FileNotFoundError:
-            pass
-        else:
-            os.chmod(temporary, existing_mode)
-        os.replace(temporary, target)
+        replace_destination(temporary, target)
     except BaseException:
         if descriptor is not None:
             os.close(descriptor)
@@ -126,17 +114,15 @@ def allocate_initial_condition_set_name(
     *,
     existing_names: Iterable[str],
 ) -> str:
-    """Allocate a display-derived set name with extension-aware suffixes."""
-    # Dataset display names and set names are admitted nonblank.
-    raw_name = display_name.strip()
-    stem, dot, suffix = raw_name.rpartition(".")
-    base = stem if dot and stem else raw_name
-    extension = f".{suffix}" if dot and stem else ""
-    occupied = {name.strip().casefold() for name in existing_names}
-    candidate = raw_name
-    counter = 1
+    """Return ``display_name``, or when a set already uses it, regardless of
+    case, the name followed by the first free ``_2``, ``_3`` and so on."""
+    # Dataset display names and set names are admitted nonblank and
+    # edge-normalized.
+    occupied = {name.casefold() for name in existing_names}
+    candidate = display_name
+    counter = 2
     while candidate.casefold() in occupied:
-        candidate = f"{base}_{counter}{extension}"
+        candidate = f"{display_name}_{counter}"
         counter += 1
     return candidate
 
