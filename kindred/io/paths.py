@@ -1,12 +1,18 @@
-"""Export-dialog start folders, local destination identity, and file error text."""
+"""Export-dialog start folders, local destination identity, destination-atomic
+file writing, and file error text."""
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
+import stat
+import sys
+import uuid
 
 __all__ = [
+    "create_sibling_temporary",
     "file_error_text",
+    "replace_destination",
     "resolve_export_start_dir",
     "same_local_path",
 ]
@@ -45,6 +51,45 @@ def same_local_path(
     return second is not None and (
         _canonical_local_path(first) == _canonical_local_path(second)
     )
+
+
+def create_sibling_temporary(
+    destination: str | os.PathLike[str],
+    suffix: str = ".tmp",
+) -> tuple[int, str]:
+    """Create a new hidden file beside ``destination``; return its descriptor
+    and path.
+
+    The umask decides its permissions. The caller owns the descriptor and the
+    file.
+    """
+
+    directory, name = os.path.split(os.fspath(destination))
+    path = os.path.join(directory, f".{name}.{uuid.uuid4().hex}{suffix}")
+    # Callers wrap the descriptor with os.fdopen, whose file object sets
+    # binary mode on Windows, so no O_BINARY flag is needed here.
+    return os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o666), path
+
+
+def replace_destination(
+    temporary: str | os.PathLike[str],
+    destination: str | os.PathLike[str],
+) -> None:
+    """Replace ``destination`` with the written ``temporary`` file.
+
+    An existing destination keeps its permission bits. On Windows they would
+    only carry the read-only flag, which would leave the temporary file
+    undeletable when the replacement fails.
+    """
+
+    if sys.platform != "win32":
+        try:
+            mode = os.stat(destination).st_mode
+        except FileNotFoundError:
+            pass
+        else:
+            os.chmod(temporary, stat.S_IMODE(mode))
+    os.replace(temporary, destination)
 
 
 def file_error_text(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Iterable
+from typing import Callable, Iterable
 
 from PySide6 import QtCore
 
@@ -663,7 +663,7 @@ class TabSliderBinding(QtCore.QObject):
             ),
         )
 
-    def apply(self) -> bool:
+    def apply(self, *, confirm_reactions_replacement: Callable[[], bool]) -> bool:
         runtime = self._registry.tab_runtime(self._tab_id)
         targets = self.resolve_target_set_ids()
         if not targets:
@@ -683,6 +683,15 @@ class TabSliderBinding(QtCore.QObject):
             return self._reject(
                 "Slider Apply requires one settled exact Preview for the current draft and target roster."
             )
+        # Publication discards the slider drafts, so whether parameters are
+        # applied is captured first.
+        applies_parameters = bool(runtime.slider_parameter_draft)
+        if (
+            applies_parameters
+            and runtime.reactions_draft is not None
+            and not confirm_reactions_replacement()
+        ):
+            return False
         # A document change affecting these sets clears their Preview results,
         # so a settled capture is also current for the tab's science.
         pairs = self._simulation_jobs.capture_settled_preview(
@@ -714,6 +723,9 @@ class TabSliderBinding(QtCore.QObject):
             self._tab_id,
             canonical_pairs,
         )
+        if applies_parameters:
+            # Applied parameters rewrite the Reactions text, replacing its draft.
+            runtime.reactions_draft = None
         runtime.slider_parameter_draft.clear()
         for set_id in targets:
             runtime.slider_species_drafts_by_set_id.pop(set_id, None)

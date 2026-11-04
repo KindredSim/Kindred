@@ -113,12 +113,6 @@ class FitSessionOwner(QtCore.QObject):
 
         return self._worker is None and (not self._closing or self._window is None)
 
-    def _notify_application_close_settled(self) -> None:
-        """Publish settlement once owner cleanup is complete."""
-
-        if self.application_close_settled:
-            self.application_close_settlement_changed.emit()
-
     @QtCore.Slot(object)
     def open_fit_configuration(
         self,
@@ -468,7 +462,7 @@ class FitSessionOwner(QtCore.QObject):
         self._redo_setups.clear()
         self._closing = False
         self.window_changed.emit(False)
-        self._notify_application_close_settled()
+        self.application_close_settlement_changed.emit()
         self._set_status("Fit closed. All temporary fit state was discarded.")
 
     def _on_progress(self, done: int, total: int, text: str) -> None:
@@ -802,7 +796,7 @@ class FitSessionOwner(QtCore.QObject):
             self._discard_local()
             self._destroy_window_after_cleanup()
         else:
-            self._notify_application_close_settled()
+            self.application_close_settlement_changed.emit()
 
     def _origin_is_current(self) -> bool:
         return self._origin_science_is_current(self._current_origin())

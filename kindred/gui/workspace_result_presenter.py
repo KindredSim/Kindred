@@ -65,7 +65,6 @@ __all__ = [
     "encode_clipboard_text",
     "encode_tsv_row",
     "iter_blocks_tsv_chunks",
-    "validate_xlsx_export",
     "write_xlsx",
 ]
 
@@ -760,12 +759,11 @@ def _export_column_header(
 
 def _xlsx_metadata_rows(
     blocks: Sequence[ResultDataBlock],
+    titles: Sequence[str],
 ) -> tuple[tuple[str, int, str], ...]:
-    used: set[str] = set()
     seen: set[int] = set()
     rows: list[tuple[str, int, str]] = []
-    for block in blocks:
-        title = _worksheet_title(block.label, used)
+    for block, title in zip(blocks, titles):
         entry = block.result
         if entry is None or id(entry) in seen:
             continue
@@ -846,16 +844,17 @@ def _boundary_export_columns(result):
 
 def _planned_xlsx_worksheet_dimensions(
     blocks: Sequence[ResultDataBlock],
+    titles: Sequence[str],
     *,
+    lineage_title: str | None,
     lineage_row_count: int,
+    metadata_title: str | None,
     metadata_row_count: int,
 ) -> tuple[tuple[str, int, int], ...]:
     """Plan data and support worksheet dimensions without allocating them."""
 
-    used: set[str] = set()
     dimensions: list[tuple[str, int, int]] = []
-    for block in blocks:
-        title = _worksheet_title(block.label, used)
+    for block, title in zip(blocks, titles):
         identity_column_count = int(block.t.size > 0) + (1 if block.kind is ResultLayerKind.EXPERIMENTAL else 2)
         dimensions.append(
             (
@@ -864,28 +863,10 @@ def _planned_xlsx_worksheet_dimensions(
                 identity_column_count + len(block.series) + len(_boundary_export_columns(block.result)),
             )
         )
-    if lineage_row_count:
-        dimensions.append(
-            (
-                _worksheet_title(
-                    "_Kindred Lineage",
-                    used,
-                ),
-                lineage_row_count + 1,
-                8,
-            )
-        )
-    if metadata_row_count:
-        dimensions.append(
-            (
-                _worksheet_title(
-                    "_Kindred Result Metadata",
-                    used,
-                ),
-                metadata_row_count + 1,
-                3,
-            )
-        )
+    if lineage_title is not None:
+        dimensions.append((lineage_title, lineage_row_count + 1, 8))
+    if metadata_title is not None:
+        dimensions.append((metadata_title, metadata_row_count + 1, 3))
     return tuple(dimensions)
 
 
@@ -1435,23 +1416,41 @@ def iter_blocks_tsv_chunks(
 
 def validate_xlsx_export(
     blocks: Sequence[ResultDataBlock],
-) -> tuple[tuple[str, int, str], ...]:
-    """Admit worksheet dimensions and prepare canonical metadata rows once."""
+) -> tuple[
+    tuple[str, ...], str | None, str | None, tuple[tuple[str, int, str], ...]
+]:
+    """Name every worksheet, admit its dimensions and prepare metadata rows once.
 
-    block_values = tuple(blocks)
+    Returns the data worksheet titles in block order, the lineage and result
+    metadata worksheet titles (None when that sheet is not written), and the
+    metadata rows.
+    """
+
+    used: set[str] = set()
+    titles = tuple(_worksheet_title(block.label, used) for block in blocks)
     lineage_row_count = sum(
         int(bool(block.x_provenance))
         + sum(bool(provenance) for _, provenance in block.series_provenance)
-        for block in block_values
+        for block in blocks
     )
-    metadata_rows = _xlsx_metadata_rows(block_values)
-    dimensions = _planned_xlsx_worksheet_dimensions(
-        block_values,
-        lineage_row_count=lineage_row_count,
-        metadata_row_count=len(metadata_rows),
+    metadata_rows = _xlsx_metadata_rows(blocks, titles)
+    lineage_title = (
+        _worksheet_title("_Kindred Lineage", used) if lineage_row_count else None
     )
-    _validate_xlsx_worksheet_dimensions(dimensions)
-    return metadata_rows
+    metadata_title = (
+        _worksheet_title("_Kindred Result Metadata", used) if metadata_rows else None
+    )
+    _validate_xlsx_worksheet_dimensions(
+        _planned_xlsx_worksheet_dimensions(
+            blocks,
+            titles,
+            lineage_title=lineage_title,
+            lineage_row_count=lineage_row_count,
+            metadata_title=metadata_title,
+            metadata_row_count=len(metadata_rows),
+        )
+    )
+    return titles, lineage_title, metadata_title, metadata_rows
 
 def write_xlsx(
     blocks: Sequence[ResultDataBlock],
@@ -1462,21 +1461,21 @@ def write_xlsx(
     """Write full-resolution worksheets directly to the destination."""
 
     block_values = tuple(blocks)
-    metadata_rows = validate_xlsx_export(block_values)
+    titles, lineage_title, metadata_title, metadata_rows = validate_xlsx_export(
+        block_values
+    )
     output = _XlsxDestination(
         destination,
         cancellation_check=cancellation_check,
     )
     workbook = Workbook(write_only=True)
-    used: set[str] = set()
     lineage_rows: list[tuple[str, str, Mapping[str, object]]] = []
     data_rows = 0
     archive: ZipFile | None = None
     original_failure: BaseException | None = None
     try:
-        for block in block_values:
+        for block, title in zip(block_values, titles):
             cancellation_check()
-            title = _worksheet_title(block.label, used)
             sheet = workbook.create_sheet(title=title)
             if block.kind is ResultLayerKind.EXPERIMENTAL:
                 identity_headers = ["row_id"]
@@ -1486,14 +1485,21 @@ def write_xlsx(
                     "discontinuity_id",
                 ]
             volume_columns = _boundary_export_columns(block.result)
-            x_headers = (block.unit_label(block.x_name, x=True),) if block.t.size else ()
+            x_headers = (
+                (f"{block.label}::{block.unit_label(block.x_name, x=True)}",)
+                if block.t.size
+                else ()
+            )
             _append_xlsx_row(
                 sheet,
                 (
                     *x_headers,
                     *identity_headers,
-                    *(block.unit_label(name) for name, _values in block.series),
-                    *(name for name, _, _ in volume_columns),
+                    *(
+                        f"{block.label}::{block.unit_label(name)}"
+                        for name, _values in block.series
+                    ),
+                    *(f"{block.label} — {name}" for name, _, _ in volume_columns),
                 ),
             )
             row_count = max((block.series[0][1].size, *(len(values) for _, values, _ in volume_columns)))
@@ -1528,14 +1534,9 @@ def write_xlsx(
                 for name, provenance in block.series_provenance
                 if provenance
             )
-        if lineage_rows:
+        if lineage_title is not None:
             cancellation_check()
-            lineage_sheet = workbook.create_sheet(
-                    title=_worksheet_title(
-                    "_Kindred Lineage",
-                    used,
-                )
-            )
+            lineage_sheet = workbook.create_sheet(title=lineage_title)
             _append_xlsx_row(
                 lineage_sheet,
                 (
@@ -1565,14 +1566,9 @@ def write_xlsx(
                     ),
                 )
             lineage_sheet.sheet_state = "hidden"
-        if metadata_rows:
+        if metadata_title is not None:
             cancellation_check()
-            metadata_sheet = workbook.create_sheet(
-                    title=_worksheet_title(
-                    "_Kindred Result Metadata",
-                    used,
-                )
-            )
+            metadata_sheet = workbook.create_sheet(title=metadata_title)
             _append_xlsx_row(
                 metadata_sheet,
                 ("worksheet", "part", "repository_entry"),
@@ -1593,7 +1589,9 @@ def write_xlsx(
         )
         ExcelWriter(workbook, archive).save()
         return XlsxExportCompletion(
-            worksheet_count=len(used),
+            worksheet_count=len(titles)
+            + (lineage_title is not None)
+            + (metadata_title is not None),
             data_row_count=data_rows,
             bytes_written=output.bytes_written,
         )

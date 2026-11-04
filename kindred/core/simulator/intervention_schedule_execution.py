@@ -191,10 +191,8 @@ class InterventionScheduleExecutionOwner:
             ctc_segments: list[tuple[float, np.ndarray, np.ndarray]] | None = (
                 [] if req.species_ctc else None
             )
-            # Each species' largest published concentration so far and its time.
-            maximum: tuple[np.ndarray, np.ndarray] | None = (
-                (np.full(len(req.y0), -np.inf), np.zeros(len(req.y0))) if req.species_maximum else None
-            )
+            # Each species' candidate maxima and their times.
+            maximum: list[tuple[np.ndarray, np.ndarray]] | None = [] if req.species_maximum else None
             integration_segments: list[dict[str, object]] = []
             segment_projections: dict[str, SegmentProjection] = {}
             segment_count = 0
@@ -483,10 +481,10 @@ class InterventionScheduleExecutionOwner:
                         dense_segments.append((segment_output_identity, segment_result.dense_output, active_holds, discontinuity_id, segment_temperature))
                     if maximum is not None:
                         # Executed bounds: SciPy's last step can extend past a root.
-                        _fold_maximum(maximum, _segment_maximum(
+                        maximum.extend(_segment_maximum(
                             segment_result, sub_start, actual_segment_end, active_holds, segment_temperature,
                             species_index=species_index, parameter_values=req.parameter_values_at_temperature,
-                            cancellation_check=cancellation_check,
+                            rtol=req.rtol, atol=req.atol, cancellation_check=cancellation_check,
                         ))
                     _record_segment_projection(
                         segment_projections,
@@ -938,14 +936,14 @@ class InterventionScheduleExecutionOwner:
                         values = np.full(len(req.y0), -np.inf)
                         for name, value in state.concentrations:
                             values[species_index[name]] = value
-                        _fold_maximum(maximum, (values, np.full(values.size, boundary.time)))
+                        maximum.append((values, np.full(values.size, boundary.time)))
             _raise_if_cancelled(cancellation_check)
             return FinalSimulationOutput(
                 t=output_t,
                 Y=output_y,
                 volume=volume.trajectory(output_t),
                 species_ctc=species_ctc,
-                species_maximum=maximum,
+                species_maximum=None if maximum is None else _earliest_maximum(maximum, req.rtol),
                 temperature_K=output_temperature,
                 provenance=provenance,
                 intervention_execution=final_contract,
@@ -983,10 +981,15 @@ def _segment_maximum(
     *,
     species_index: Mapping[str, int],
     parameter_values: Callable[[float, tuple[str, ...]], Mapping[str, float]],
+    rtol: float,
+    atol: float,
     cancellation_check: Callable[[], bool] | None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Each species' largest published concentration on one continuous segment
-    and its time.
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Each species' candidate maxima on one continuous segment and their
+    times: its published concentrations at both ends, and its largest one
+    between them where that rises above both ends by more than the solver's
+    tolerance for it, atol + rtol·|value|.  Otherwise noise on a plateau, or
+    on a return to the starting value, would decide the time.
 
     The solver's step ends locate each maximum and its step interpolant refines
     it, so solver tolerances, not output points, control its accuracy.  Holds
@@ -1011,43 +1014,51 @@ def _segment_maximum(
     low = times[np.maximum(index - 1, 0)]
     width = times[np.minimum(index + 1, times.size - 1)] - low
     searched = np.flatnonzero(width > 0.0)
-    if not searched.size:
-        return best, best_times
-    low, width = low[searched], width[searched]
-    columns = np.arange(searched.size)
+    if searched.size:
+        low, width = low[searched], width[searched]
+        columns = np.arange(searched.size)
 
-    def own(offsets: np.ndarray) -> np.ndarray:
-        # Each searched species at its own candidate time.  Offsets from
-        # ``low`` keep a late clock from coarsening the search.
-        return states(low + offsets)[searched, columns]
+        def own(offsets: np.ndarray) -> np.ndarray:
+            # Each searched species at its own candidate time.  Offsets from
+            # ``low`` keep a late clock from coarsening the search.
+            return states(low + offsets)[searched, columns]
 
-    # One golden-section search per species, advanced together, so each step
-    # evaluates the interpolant once for every species.
-    a, b = np.zeros(searched.size), width
-    c, d = b - _INVERSE_GOLDEN * b, _INVERSE_GOLDEN * b
-    fc, fd = own(c), own(d)
-    for _ in range(_GOLDEN_STEPS):
-        _raise_if_cancelled(cancellation_check)
-        left = fc > fd
-        a, b = np.where(left, a, c), np.where(left, d, b)
-        c, d = np.where(left, b - _INVERSE_GOLDEN * (b - a), d), np.where(left, c, a + _INVERSE_GOLDEN * (b - a))
-        found = own(np.where(left, c, d))
-        fc, fd = np.where(left, found, fd), np.where(left, fc, found)
-    found = np.maximum(fc, fd)
-    better = found > best[searched]
-    best[searched[better]] = found[better]
-    best_times[searched[better]] = (low + np.where(fc >= fd, c, d))[better]
-    return best, best_times
+        # One golden-section search per species, advanced together, so each
+        # step evaluates the interpolant once for every species.
+        a, b = np.zeros(searched.size), width
+        c, d = b - _INVERSE_GOLDEN * b, _INVERSE_GOLDEN * b
+        fc, fd = own(c), own(d)
+        for _ in range(_GOLDEN_STEPS):
+            _raise_if_cancelled(cancellation_check)
+            left = fc > fd
+            a, b = np.where(left, a, c), np.where(left, d, b)
+            c, d = np.where(left, b - _INVERSE_GOLDEN * (b - a), d), np.where(left, c, a + _INVERSE_GOLDEN * (b - a))
+            found = own(np.where(left, c, d))
+            fc, fd = np.where(left, found, fd), np.where(left, fc, found)
+        found = np.maximum(fc, fd)
+        better = found > best[searched]
+        best[searched[better]] = found[better]
+        best_times[searched[better]] = (low + np.where(fc >= fd, c, d))[better]
+    first, last = values[:, 0].copy(), values[:, -1].copy()
+    peak = np.where(best > np.maximum(first, last) + atol + rtol * np.abs(best), best, -np.inf)
+    return [
+        (first, np.full(first.size, times[0])),
+        (last, np.full(last.size, times[-1])),
+        (peak, best_times),
+    ]
 
 
-def _fold_maximum(
-    maximum: tuple[np.ndarray, np.ndarray], candidate: tuple[np.ndarray, np.ndarray],
-) -> None:
-    """Keep each species' larger value; a tie keeps the earlier time."""
+def _earliest_maximum(
+    candidates: Sequence[tuple[np.ndarray, np.ndarray]], rtol: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Each species' largest candidate and the earliest time at which a
+    candidate lies within the solver's relative tolerance of it."""
 
-    larger = candidate[0] > maximum[0]
-    maximum[0][larger] = candidate[0][larger]
-    maximum[1][larger] = candidate[1][larger]
+    values = np.array([value for value, _time in candidates])
+    times = np.array([time for _value, time in candidates])
+    largest = values.max(axis=0)
+    near = values >= largest - rtol * np.abs(largest)
+    return largest, np.where(near, times, np.inf).min(axis=0)
 
 
 def _append_presentation_boundary(

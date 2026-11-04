@@ -7,8 +7,6 @@ from datetime import datetime, timezone
 import json
 import math
 import os
-from pathlib import Path
-import tempfile
 
 import numpy as np
 import scipy
@@ -16,6 +14,7 @@ import scipy
 from kindred._version import __version__ as KINDRED_VERSION
 from kindred.scan.config import START, END
 from kindred.core.quantity_units import presentation_unit
+from kindred.io.paths import create_sibling_temporary, replace_destination
 
 
 def plain(value):
@@ -89,9 +88,7 @@ class JsonScanWriter:
         self.count = 0
 
     def initialize(self, config, design):
-        directory = os.path.dirname(self.destination)
-        descriptor, self.path = tempfile.mkstemp(prefix=f".{Path(self.destination).name}.",
-                                                suffix=".partial.json", dir=directory)
+        descriptor, self.path = create_sibling_temporary(self.destination, ".partial.json")
         self.stream = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
         versions = {"kindred": KINDRED_VERSION, "numpy": np.__version__,
                     "scipy": scipy.__version__}
@@ -121,7 +118,7 @@ class JsonScanWriter:
         self.stream.write("}\n")
         self.stream.close()
         if progress.state == "complete":
-            os.replace(self.path, self.destination)
+            replace_destination(self.path, self.destination)
             self.path = self.destination
         return self.path
 

@@ -1726,6 +1726,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self._discard_slider_draft(tab_id)
         return True
 
+    def _confirm_slider_apply_replaces_reactions(self) -> bool:
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setWindowTitle("Apply")
+        dialog.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        dialog.setText(
+            "Applying Slider parameter values rewrites Reactions from the accepted "
+            "mechanism and replaces the unaccepted Reactions edits. Reactions Undo "
+            "can restore them."
+        )
+        confirm = dialog.addButton(
+            "Replace Reactions Edits and Apply",
+            QtWidgets.QMessageBox.ButtonRole.DestructiveRole,
+        )
+        dialog.setDefaultButton(
+            dialog.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        )
+        dialog.exec()
+        return dialog.clickedButton() is confirm
+
     def _discard_slider_draft(self, tab_id: str) -> None:
         """Reset or Discard one tab's Slider drafts and Slider-owned curves."""
 
@@ -2086,10 +2105,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         self._slider_apply_refreshing.add(target)
         try:
-            bundle.initial_actions.capture_active_editor()
-            if not bundle.slider_binding.apply():
+            self._capture_visible_tab_inputs(tab_id=target)
+            if not bundle.slider_binding.apply(
+                confirm_reactions_replacement=self._confirm_slider_apply_replaces_reactions,
+            ):
                 return False
-            self._workspace_tab_registry.tab_runtime(target).reactions_draft = None
         finally:
             self._slider_apply_refreshing.discard(target)
         self._refresh_tab_controls(target, preserve_slider_editor_drafts=False)

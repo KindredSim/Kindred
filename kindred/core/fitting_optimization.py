@@ -218,7 +218,7 @@ def fit_parameters(
         return evaluate(list(points))
 
     def run_least_squares(start: np.ndarray, least_squares_method: str):
-        # SciPy loads only when a Fit runs; GUI modules import this module.
+        # Imported here, not at module level, so the window opens before SciPy loads.
         from scipy.optimize import least_squares
 
         # SciPy's default finite-difference step keeps an absolute floor, so

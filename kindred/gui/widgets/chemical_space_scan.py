@@ -43,7 +43,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         self.baseline = QtWidgets.QComboBox()
         for initial in tab.initial_condition_sets:
             self.baseline.addItem(initial.name, initial.set_id)
-        # Start on the set the main window runs; the first when it is gone.
+        # Start on the set the main window has selected; the first when the capture lacks it.
         self.baseline.setCurrentIndex(max(self.baseline.findData(selected_set_id), 0))
         header = QtWidgets.QFormLayout()
         header.addRow("Initial-condition baseline", self.baseline)
