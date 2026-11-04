@@ -10,7 +10,11 @@ logger = logging.getLogger(__name__)
 
 # Every Kindred process runs BLAS and OpenMP on one thread. Each extra OpenBLAS
 # thread commits a buffer on Windows, and Kindred's small solves gain nothing.
-SCIENTIFIC_THREAD_LIMITS = {"OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"}
+# VECLIB_MAXIMUM_THREADS limits Apple's Accelerate, used by macOS 14+ wheels.
+SCIENTIFIC_THREAD_LIMITS = {
+    "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OMP_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+}
 
 
 def detect_wsl_environment() -> bool:

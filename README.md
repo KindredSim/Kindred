@@ -26,7 +26,8 @@ and examples.
 
 ## Installation
 
-Kindred is a Windows desktop application. Its GUI requires Python 3.12.
+Kindred is a desktop application for Windows and macOS; the setup steps below
+are for Windows. Its GUI requires Python 3.12.
 From the repository root, use native Windows Python 3.12 to create an
 environment and install the application:
 
@@ -55,7 +56,7 @@ Provision it once, and again whenever `[tool.kindred.fitting-runtime]` or the
 Python constraint and dependencies remain under `[project]`.
 
 1. Obtain the Windows 64-bit free-threaded Python archive for
-   `python-version` (currently 3.15.0rc2t).
+   `python-version` (currently 3.15.2t).
 2. Unpack the complete installation so that `python.exe` sits directly in
    `.venv\kindred-fitting-runtime\python\`. Keep this depth; one level higher,
    CPython would read the GUI environment's `pyvenv.cfg`.
