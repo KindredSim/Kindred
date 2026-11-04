@@ -152,11 +152,6 @@ class TitrationsWithoutTime(PracticeLesson):
             return message, label, self._reopen_fit
         return None
 
-    def _reopen_fit(self) -> None:
-        """Closing the Fitting Window discards its datasets, choices, and result, so its steps wait to be
-        done again from Open the Fitting Window."""
-        self.revisitRequested.emit("open_fit")
-
     def _fit_closed(self, *_args) -> None:
         self._seen_fit = None
         if self.step.name in self._fit_steps:
@@ -206,10 +201,7 @@ class TitrationsWithoutTime(PracticeLesson):
             if (
                 link is None
                 or link.set_id not in sets
-                or dict(link.observation_mapping) != {
-                    series.raw_observation_id: series.column_name
-                    for series in self.registry.document.dataset(dataset_id).observations
-                }
+                or dict(link.observation_mapping) != self._expected_mapping(dataset_id)
                 or not all(
                     isclose(value, _STARTS[run].get(species, 0.0), abs_tol=1e-12)
                     for species, value in sets[link.set_id].items()
@@ -217,13 +209,6 @@ class TitrationsWithoutTime(PracticeLesson):
             ):
                 return False
         return bool(found)
-
-    def _fit_window(self) -> FittingWindow | None:
-        """The open Fitting Window, also while a dialog opened from it is in front."""
-        widget = QtWidgets.QApplication.activeModalWidget()
-        while widget is not None and not isinstance(widget, FittingWindow):
-            widget = widget.parentWidget()
-        return widget
 
     def _observe_fit(self) -> None:
         """Record the Fit Data settings and the Species Table of the dataset that an open Fitting Window of
@@ -328,14 +313,6 @@ class TitrationsWithoutTime(PracticeLesson):
             ):
                 varied.add(name.data(QtCore.Qt.ItemDataRole.UserRole))
         return varied == set(names)
-
-    def _fit_result(self) -> bool:
-        """The open Fitting Window has a current result to apply. Changing the fit setup makes the shown
-        result stale until the fit runs again."""
-        apply = self._shown(
-            self._fit_window(), QtWidgets.QPushButton, lambda button: button.text().replace("&", "") == "Apply Fit"
-        )
-        return apply.isEnabled()
 
     def _fitted(self, sheets: tuple[str, ...], names: tuple[str, ...]) -> bool:
         """The open Fitting Window has a current result for these sheets, set up as the lesson asks, with

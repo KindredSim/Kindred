@@ -191,6 +191,9 @@ def _finite(value: object, *, field: str) -> float:
 
 
 def _nonnegative(value: object, *, field: str) -> float:
+    # A required time the declaration leaves out.
+    if value is None:
+        raise InterventionScheduleError(f"{field} is required.")
     try:
         return validate_input_time_seconds(value, field=field)
     except ValueError as exc:
@@ -332,17 +335,14 @@ def _reject_keys(
 
 @dataclass(frozen=True, slots=True)
 class PhysicalQuantity:
-    """One scientific literal or live parameter reference in a physical action."""
+    """One scientific literal or live parameter reference in a physical action.
+
+    _physical_quantity admits authored ones; execution builds resolved ones from checked values."""
 
     value: float | None = None
     parameter: str | None = None
     authored: str | None = None
     declared_unit: Unit | None = None
-
-    def __post_init__(self) -> None:
-        value, parameter = _pair(self.value, self.parameter, field="physical quantity", domain="signed")
-        object.__setattr__(self, "value", value)
-        object.__setattr__(self, "parameter", parameter)
 
     def put(self, payload: dict[str, Any], field: str) -> None:
         if self.parameter is not None:
@@ -1452,6 +1452,7 @@ def _physical_quantity(data: Mapping[str, Any], field: str, *, optional: bool = 
             except ValueError as exc:
                 # The unit refusal does not name the field it was written for.
                 raise InterventionScheduleError(f"{field}: {exc}") from exc
+    value, parameter = _pair(value, parameter, field=field, domain="signed")
     return PhysicalQuantity(value, parameter, authored, declared_unit)
 
 

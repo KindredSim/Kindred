@@ -8,6 +8,7 @@ import shutil
 
 from PySide6 import QtCore, QtWidgets
 
+from kindred.gui.fitting.window import FittingWindow
 from kindred.gui.parameter_enumeration import enumerate_parameter_coordinates
 from kindred.gui.tutorials.controller import Lesson, Step
 from kindred.gui.tutorials.overlay import Highlight, menu_target, scroll_into_view
@@ -405,6 +406,34 @@ class PracticeLesson(Lesson):
             (widget for widget in parent.findChildren(kind) if widget.isVisibleTo(parent) and predicate(widget)),
             None,
         )
+
+    # -- the Fitting Window ----------------------------------------------------
+    def _fit_window(self) -> FittingWindow | None:
+        """The open Fitting Window, also while a dialog opened from it is in front."""
+        widget = QtWidgets.QApplication.activeModalWidget()
+        while widget is not None and not isinstance(widget, FittingWindow):
+            widget = widget.parentWidget()
+        return widget
+
+    def _reopen_fit(self) -> None:
+        """Closing the Fitting Window discards its datasets, choices, and result, so its steps wait to be
+        done again from Open the Fitting Window."""
+        self.revisitRequested.emit("open_fit")
+
+    def _fit_result(self) -> bool:
+        """The open Fitting Window has a current result to apply. Changing the fit setup makes the shown
+        result stale until the fit runs again."""
+        apply = self._shown(
+            self._fit_window(), QtWidgets.QPushButton, lambda button: button.text().replace("&", "") == "Apply Fit"
+        )
+        return apply.isEnabled()
+
+    def _expected_mapping(self, dataset_id: str) -> dict[str, str]:
+        """Each column of the dataset maps to the species it is named after."""
+        return {
+            series.raw_observation_id: series.column_name
+            for series in self.registry.document.dataset(dataset_id).observations
+        }
 
     # -- the sample file -------------------------------------------------------
     def _save_file(self) -> None:

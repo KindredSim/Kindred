@@ -8,6 +8,7 @@ This module launches the Kindred desktop GUI:
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
@@ -38,6 +39,9 @@ def main() -> int:
         return 64
 
     setup_logging()
+    # The log file collects every session; these lines mark where each begins and ends.
+    logger = logging.getLogger("kindred")
+    logger.info("Kindred session started")
     from PySide6 import QtCore, QtGui, QtWidgets
 
     gui_startup.apply_qt_startup_workarounds(qt_core=QtCore)
@@ -65,7 +69,9 @@ def main() -> int:
     # The first Run would otherwise wait for SciPy and SymPy to load; a
     # daemon thread so closing Kindred never waits for it.
     threading.Thread(target=_load_run_libraries, name="Kindred library preload", daemon=True).start()
-    return app.exec()
+    exit_code = app.exec()
+    logger.info("Kindred session ended (exit code %d)", exit_code)
+    return exit_code
 
 
 if __name__ == "__main__":

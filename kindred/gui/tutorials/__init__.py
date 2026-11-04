@@ -15,6 +15,7 @@ from kindred.gui.tutorials.data_import import ImportAndMapData
 from kindred.gui.tutorials.explore_plot import ExplorePlot
 from kindred.gui.tutorials.fit_basics import FittingBasics
 from kindred.gui.tutorials.interactive_sliders import InteractiveSliders
+from kindred.gui.tutorials.interventions import Interventions
 from kindred.gui.tutorials.quick_start import QuickStart
 from kindred.gui.tutorials.reactions_and_initials import ReactionsAndInitialConditions
 from kindred.gui.tutorials.templates import CreateAndReuseTemplates
@@ -34,6 +35,7 @@ LESSONS = (
     ProfileLikelihood,
     FittingAgainstMeasuredQuantity,
     TitrationsWithoutTime,
+    Interventions,
     CreateAndReuseTemplates,
 )
 

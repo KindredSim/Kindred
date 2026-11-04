@@ -98,7 +98,8 @@ def setup_logging() -> None:
         existing_handler.close()
 
     formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        # Several Kindred windows share one log file; the process tells their lines apart.
+        "%(asctime)s - %(process)d - %(name)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
