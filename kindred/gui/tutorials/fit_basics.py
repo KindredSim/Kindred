@@ -78,11 +78,6 @@ class FittingBasics(PracticeLesson):
             return message, label, self._reopen_fit
         return None
 
-    def _reopen_fit(self) -> None:
-        """Closing the Fitting Window discards its datasets, Vary choices, and result, so its
-        steps wait to be done again from Open the Fitting Window."""
-        self.revisitRequested.emit("open_fit")
-
     def _fit_closed(self, *_args) -> None:
         self._seen_fit = None
         if self.step.name in self._fit_steps and not self._fit_applied():
@@ -97,7 +92,7 @@ class FittingBasics(PracticeLesson):
         """Record what an open Fitting Window of the lesson tab applies. The window blocks every other
         edit, so while it is open a new tab can only come from Apply Fit to Tab Copy, and new rate
         constants only from Apply Fit to Project."""
-        window = self._dialog(FittingWindow)
+        window = self._fit_window()
         if window is None or self.practice is None or self.registry.active_tab_id != self.practice:
             return
         tabs = {tab.tab_id for tab in self.registry.document.tabs}
@@ -137,12 +132,6 @@ class FittingBasics(PracticeLesson):
                     runs[run] = record.dataset_id
         return runs if len(runs) == len(_RUNS) else {}
 
-    def _expected_mapping(self, dataset_id: str) -> dict[str, str]:
-        return {
-            series.raw_observation_id: series.column_name
-            for series in self.registry.document.dataset(dataset_id).observations
-        }
-
     def _mapped(self) -> bool:
         """Each run maps A, B, and C by name to its own set, which starts from its row at time 0."""
         found = self._workbook()
@@ -175,9 +164,6 @@ class FittingBasics(PracticeLesson):
         found = self._workbook()
         return tuple(self.tab.dataset_link(found[run]).set_id for run in _RUNS)
 
-    def _fit_window(self) -> FittingWindow | None:
-        return self._dialog(FittingWindow)
-
     def _included(self) -> bool:
         """The open Fitting Window includes the three workbook datasets."""
         # Fit steps run their checks only while the window is open.
@@ -201,13 +187,6 @@ class FittingBasics(PracticeLesson):
             if name.data(QtCore.Qt.ItemDataRole.UserRole + 1) is None:
                 varied[name.data(QtCore.Qt.ItemDataRole.UserRole)] = vary.checkState() == QtCore.Qt.CheckState.Checked
         return all(varied.get(name) for name in _RATES) and not varied.get("concentration_floor", False)
-
-    def _fit_result(self) -> bool:
-        """The open Fitting Window has a current result to apply."""
-        apply = self._shown(
-            self._fit_window(), QtWidgets.QPushButton, lambda button: button.text().replace("&", "") == "Apply Fit"
-        )
-        return apply.isEnabled()
 
     def _ran(self, rates: dict[str, float]) -> bool:
         identities = self._workbook_sets()

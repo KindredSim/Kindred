@@ -158,11 +158,6 @@ class AdvancedFittingLesson(PracticeLesson):
             return message, label, self._reopen_fit
         return None
 
-    def _reopen_fit(self) -> None:
-        """Closing the Fitting Window discards its datasets, choices, and result, so its steps
-        wait to be done again from Open the Fitting Window."""
-        self.revisitRequested.emit("open_fit")
-
     def _fit_closed(self, *_args) -> None:
         self._seen_fit = None
         if self.step.name in self._fit_steps and not self._applied:
@@ -188,12 +183,6 @@ class AdvancedFittingLesson(PracticeLesson):
                 ) == _UNITS[run]:
                     runs[run] = record.dataset_id
         return runs if len(runs) == len(_UNITS) else {}
-
-    def _expected_mapping(self, dataset_id: str) -> dict[str, str]:
-        return {
-            series.raw_observation_id: series.column_name
-            for series in self.registry.document.dataset(dataset_id).observations
-        }
 
     @staticmethod
     def _starts(run: str) -> dict[str, float]:
@@ -222,13 +211,6 @@ class AdvancedFittingLesson(PracticeLesson):
             ):
                 return False
         return bool(found)
-
-    def _fit_window(self) -> FittingWindow | None:
-        """The open Fitting Window, also while a dialog opened from it is in front."""
-        widget = QtWidgets.QApplication.activeModalWidget()
-        while widget is not None and not isinstance(widget, FittingWindow):
-            widget = widget.parentWidget()
-        return widget
 
     def _observe_fit(self) -> None:
         """Record whether an open Fitting Window of the lesson tab applied the lesson's final fit. The
@@ -350,14 +332,6 @@ class AdvancedFittingLesson(PracticeLesson):
         """The open Fitting Window has a current result for the lesson's datasets and species, with
         these values varied, the lesson's unless given."""
         return self._included_only() and self._targets_chosen() and self._varied(names) and self._fit_result()
-
-    def _fit_result(self) -> bool:
-        """The open Fitting Window has a current result to apply. Changing the fit setup makes the
-        shown result stale until the fit runs again."""
-        apply = self._shown(
-            self._fit_window(), QtWidgets.QPushButton, lambda button: button.text().replace("&", "") == "Apply Fit"
-        )
-        return apply.isEnabled()
 
     def _final_setup(self) -> bool:
         """The open Fitting Window holds the setup whose result the lesson applies to a tab copy."""
