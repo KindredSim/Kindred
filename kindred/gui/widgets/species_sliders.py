@@ -14,10 +14,6 @@ from kindred.gui.ui_helpers import (
 )
 from kindred.gui.interactive_preview import SliderInteractionKind
 from kindred.gui.widgets.fine_drag_slider import FineDragSlider, NumericValueEdit, SliderPress
-from kindred.gui.species_sliders_logic import (
-    compute_slider_max_option_c,
-    _scale_finite_gui_range,
-)
 
 __all__ = ["BatchSpeciesSliders"]
 
@@ -202,7 +198,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         slider.setPageStep(50 if self._fine_mode else 1000)
         slider.set_fine_mode(self._fine_mode)
         # The maximum is always at least 1.
-        maximum = compute_slider_max_option_c(v=value)
+        maximum = max(1.0, 5.0 * value)
         slider.setValue(self._value_to_position(value, maximum))
         slider.setEnabled(bool(self._target_set_ids))
         slider.sliderPressed.connect(
@@ -287,7 +283,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
                     if species in self._hidden_species:
                         row = self._rows[species]
                         value = self._values[species]
-                        row.maximum = compute_slider_max_option_c(v=value)
+                        row.maximum = max(1.0, 5.0 * value)
                         row.maximum_label.setText(format_slider_value(row.maximum))
                         with QtCore.QSignalBlocker(row.slider):
                             row.slider.setValue(
@@ -340,10 +336,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         row = self._rows[species_s]
         value_f = value
         if value_f > row.maximum:
-            row.maximum = max(
-                value_f,
-                _scale_finite_gui_range(row.maximum, 2.0),
-            )
+            row.maximum = max(value_f, 2.0 * row.maximum)
             row.maximum_label.setText(format_slider_value(row.maximum))
         self._values[species_s] = value_f
         if species_s not in self._active_presses:

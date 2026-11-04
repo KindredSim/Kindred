@@ -96,7 +96,6 @@ class FitSessionOwner(QtCore.QObject):
         self._redo_setups: list[FitSetupSnapshot] = []
         self._closing = False
         self._application_close_fenced = False
-        self._application_close_settlement_pending = False
 
     def refresh_plot_preferences(self) -> None:
         if self._window is not None:
@@ -115,13 +114,9 @@ class FitSessionOwner(QtCore.QObject):
         return self._worker is None and (not self._closing or self._window is None)
 
     def _notify_application_close_settled(self) -> None:
-        """Publish only the transition reached after complete owner cleanup."""
+        """Publish settlement once owner cleanup is complete."""
 
-        if (
-            self._application_close_settlement_pending
-            and self.application_close_settled
-        ):
-            self._application_close_settlement_pending = False
+        if self.application_close_settled:
             self.application_close_settlement_changed.emit()
 
     @QtCore.Slot(object)
@@ -238,7 +233,6 @@ class FitSessionOwner(QtCore.QObject):
         worker.cancelled.connect(self._on_cancelled)
         worker.finished.connect(lambda r=request: self._finish_worker(r))
         self._worker = worker
-        self._application_close_settlement_pending = True
         window.set_executing(True)
         self.execution_changed.emit(True)
         window.prepare_fit_plots(request, waiting=True)
@@ -418,12 +412,9 @@ class FitSessionOwner(QtCore.QObject):
         """Dispose Fit state and close through the existing owner lifecycle."""
 
         was_closing = self._closing
-        first_close_attempt = not self._application_close_fenced
         # The fence silences Fit status lines for the rest of Close.
         self._application_close_fenced = True
         self._closing = True
-        if first_close_attempt and not self.application_close_settled:
-            self._application_close_settlement_pending = True
         window = self._window
         worker = self._worker
         self._discard_local()

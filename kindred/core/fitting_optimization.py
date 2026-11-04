@@ -16,8 +16,6 @@ from typing import Callable, Dict, Literal, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from kindred.core.exceptions import FittingCancelled
-from kindred.core.optimization_least_squares import build_least_squares_kwargs
-from kindred.core.scipy_optimize import load_scipy_optimize
 
 __all__ = [
     "FitResult",
@@ -220,17 +218,24 @@ def fit_parameters(
         return evaluate(list(points))
 
     def run_least_squares(start: np.ndarray, least_squares_method: str):
-        least_squares, _de = load_scipy_optimize()
+        # SciPy loads only when a Fit runs; GUI modules import this module.
+        from scipy.optimize import least_squares
+
         # SciPy's default finite-difference step keeps an absolute floor, so
         # coordinates near zero still get usable Jacobian columns.
-        lsq_kwargs = build_least_squares_kwargs(
-            ftol=ftol,
-            xtol=xtol,
-            max_nfev=max_nfev,
-            method=least_squares_method,
-            bounds=scipy_bounds,
-            workers=finite_difference_points,
-        )
+        lsq_kwargs = {
+            "ftol": ftol,
+            "xtol": xtol,
+            # SciPy tests optimality < gtol. The smallest positive float
+            # admits only computed zero, without stopping on small
+            # concentration scales.
+            "gtol": math.ulp(0.0),
+            "max_nfev": max_nfev,
+            "verbose": 0,
+            "method": least_squares_method,
+            "bounds": scipy_bounds,
+            "workers": finite_difference_points,
+        }
         with warnings.catch_warnings():
             # The zero-only gradient stop deliberately sits below epsilon.
             warnings.filterwarnings(
@@ -245,7 +250,7 @@ def fit_parameters(
             return least_squares(wrapped_objective, start, **lsq_kwargs)
 
     if method == "differential_evolution":
-        _least_squares, differential_evolution = load_scipy_optimize()
+        from scipy.optimize import differential_evolution
 
         def de_objective(params):
             # The Fit objective returns finite residuals with a finite
