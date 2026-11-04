@@ -8,6 +8,7 @@ import shutil
 
 from PySide6 import QtCore, QtWidgets
 
+from kindred.core.datasets.foundation import thaw_json_value
 from kindred.gui.fitting.window import FittingWindow
 from kindred.gui.parameter_enumeration import enumerate_parameter_coordinates
 from kindred.gui.tutorials.controller import Lesson, Step
@@ -40,6 +41,9 @@ class PracticeLesson(Lesson):
     # The sample file a lesson ships in kindred/data/tutorial_files/<folder>/, if any.
     _sample_folder = ""
     _sample_file = ""
+    # Sheet name -> the time unit and the unit of each column that an import of every sheet of the
+    # sample file keeps.
+    _sheet_units: dict[str, tuple[str, dict[str, str]]] = {}
 
     def __init__(
         self,
@@ -62,6 +66,8 @@ class PracticeLesson(Lesson):
         self._tabs_before = set()
         self._sets_before = set()
         self._run_baselines = {}
+        # Datasets present when the lesson started.
+        self._datasets_before = {record.dataset_id for record in self.registry.document.datasets}
         # The folder Save Tutorial File… copied the sample file into, and the folder last chosen.
         self._folder: Path | None = None
         self._chosen_parent: str | None = None
@@ -434,6 +440,32 @@ class PracticeLesson(Lesson):
             series.raw_observation_id: series.column_name
             for series in self.registry.document.dataset(dataset_id).observations
         }
+
+    # -- the workbook ----------------------------------------------------------
+    def _workbook(self) -> dict[str, str]:
+        """Sheet name -> dataset ID of the newest sheets of the sample file imported in this lesson, each
+        in the units of its sheet, or nothing until every sheet is."""
+        document = self.registry.document
+        sheets = {}
+        for record in document.datasets:
+            if (
+                record.dataset_id not in self._datasets_before
+                and record.source_id is not None
+                and document.imported_source(record.source_id).original_filename == self._sample_file
+            ):
+                # The worksheet identity survives renaming the dataset.
+                metadata = thaw_json_value(record.source_metadata)
+                sheet = metadata.get("sheet_name")
+                if sheet in self._sheet_units and (
+                    metadata.get("original_time_unit"), metadata.get("original_concentration_units")
+                ) == self._sheet_units[sheet]:
+                    sheets[sheet] = record.dataset_id
+        return sheets if len(sheets) == len(self._sheet_units) else {}
+
+    def _workbook_sets(self) -> tuple[str, ...]:
+        """The set of each workbook sheet. The steps that run them are blocked until each is mapped."""
+        found = self._workbook()
+        return tuple(self.tab.dataset_link(found[sheet]).set_id for sheet in self._sheet_units)
 
     # -- the sample file -------------------------------------------------------
     def _save_file(self) -> None:

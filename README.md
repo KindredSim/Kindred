@@ -93,16 +93,19 @@ arguments.
 
 ## Diagnostics
 
-Kindred keeps detailed rotating logs in the platform log directory:
+Each time Kindred starts, it writes a new detailed log in the platform log
+directory, named after its start time and process, such as
+`kindred-20261104-153000-1234.log`. Help, Diagnostic Log shows the log of the
+open window. Each time Kindred starts, it keeps the newest ten logs and
+deletes older ones, except a log another open Kindred is still writing.
 
-- Linux: `~/.cache/kindred/logs/kindred.log` (or
-  `$XDG_CACHE_HOME/kindred/logs/kindred.log`)
-- macOS: `~/Library/Logs/kindred/kindred.log`
-- Windows: `%LOCALAPPDATA%\kindred\logs\kindred.log`
+- Linux: `~/.cache/kindred/logs/` (or `$XDG_CACHE_HOME/kindred/logs/`)
+- macOS: `~/Library/Logs/kindred/`
+- Windows: `%LOCALAPPDATA%\kindred\logs\`
 
 Set `KINDRED_LOG_DIR` to choose another normal log directory. If that location
-cannot be opened, Kindred writes the log to the system temporary directory at
-`kindred/logs/kindred.log`. `LOG_LEVEL` or `KINDRED_LOG_LEVEL` may be set to
+cannot be opened, Kindred writes the log to `kindred/logs/` in the system
+temporary directory. `LOG_LEVEL` or `KINDRED_LOG_LEVEL` may be set to
 `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`.
 
 Fitting checks for the required Python build and scientific dependencies.

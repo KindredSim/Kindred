@@ -114,8 +114,6 @@ class TitrationsWithoutTime(PracticeLesson):
 
     def __init__(self, **owners):
         super().__init__(**owners)
-        # Datasets present when the lesson started.
-        self._datasets_before = {record.dataset_id for record in self.registry.document.datasets}
         # The Fitting Window last seen, and the Fit Data settings last seen for each dataset it showed.
         self._seen_fit: FittingWindow | None = None
         self._data_seen: dict[str, _FitData] = {}

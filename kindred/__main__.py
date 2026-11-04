@@ -39,7 +39,7 @@ def main() -> int:
         return 64
 
     setup_logging()
-    # The log file collects every session; these lines mark where each begins and ends.
+    # These lines mark where the session begins and whether it ended cleanly.
     logger = logging.getLogger("kindred")
     logger.info("Kindred session started")
     from PySide6 import QtCore, QtGui, QtWidgets

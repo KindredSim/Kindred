@@ -6,7 +6,6 @@ from math import isclose
 
 from PySide6 import QtCore, QtWidgets
 
-from kindred.core.datasets.foundation import thaw_json_value
 from kindred.core.intervention_schedule import (
     InterventionFlux,
     InterventionHold,
@@ -107,6 +106,7 @@ class Interventions(PracticeLesson):
     _needs_preset_set = False
     _sample_folder = "Interventions"
     _sample_file = _FILE
+    _sheet_units = dict.fromkeys(_RUNS, _UNITS)
     _run_steps = frozenset({
         "load_preset", "set", "jump", "flux", "hold", "time_param", "protocol_before", "protocol_during",
         "protocol_after", "protocol_groups", "protocol_param", "trigger", "stop", "ignore_stop", "load_example",
@@ -124,8 +124,6 @@ class Interventions(PracticeLesson):
 
     def __init__(self, **owners):
         super().__init__(**owners)
-        # Datasets present when the lesson started.
-        self._datasets_before = {record.dataset_id for record in self.registry.document.datasets}
         # Slider steps whose Preview has been seen; they complete once it is reset.
         self._previews_seen: set[str] = set()
         self._seen_fit: FittingWindow | None = None
@@ -285,26 +283,6 @@ class Interventions(PracticeLesson):
             for identity in identities
         )
 
-    def _workbook(self) -> dict[str, str]:
-        """Run name -> dataset ID of the newest sheets of light_runs.xlsx imported in this lesson in
-        seconds and M."""
-        document = self.registry.document
-        runs = {}
-        for record in document.datasets:
-            if (
-                record.dataset_id not in self._datasets_before
-                and record.source_id is not None
-                and document.imported_source(record.source_id).original_filename == _FILE
-            ):
-                # The worksheet identity survives renaming the dataset.
-                metadata = thaw_json_value(record.source_metadata)
-                run = metadata.get("sheet_name")
-                if run in _RUNS and (
-                    metadata.get("original_time_unit"), metadata.get("original_concentration_units")
-                ) == _UNITS:
-                    runs[run] = record.dataset_id
-        return runs if len(runs) == len(_RUNS) else {}
-
     def _mapped(self) -> bool:
         """Each run maps A and B by name to its own set, which starts from its row at time 0."""
         found = self._workbook()
@@ -324,11 +302,6 @@ class Interventions(PracticeLesson):
             ):
                 return False
         return bool(found)
-
-    def _workbook_sets(self) -> tuple[str, ...]:
-        """The set of each run; the steps that run them are blocked until each is mapped."""
-        found = self._workbook()
-        return tuple(self.tab.dataset_link(found[run]).set_id for run in _RUNS)
 
     def _overlays_shown(self) -> bool:
         """Plot Overlays checks every column of each workbook dataset."""

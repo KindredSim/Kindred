@@ -6,7 +6,6 @@ from math import isclose
 
 from PySide6 import QtCore, QtWidgets
 
-from kindred.core.datasets.foundation import thaw_json_value
 from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
 from kindred.gui.fitting.constants import DIFFERENTIAL_EVOLUTION_METHOD
 from kindred.gui.fitting.window import FittingWindow
@@ -76,6 +75,7 @@ class AdvancedFittingLesson(PracticeLesson):
     _needs_preset_set = False
     _sample_folder = "AdvancedFitting"
     _sample_file = _FILE
+    _sheet_units = _UNITS
     # The values the lesson fits.
     _fitted: tuple[str, ...] = ()
     # The sheets the lesson fits, as the lesson names them, and the species it compares.
@@ -164,26 +164,6 @@ class AdvancedFittingLesson(PracticeLesson):
             self._reopen_fit()
 
     # -- observations ----------------------------------------------------------
-    def _workbook(self) -> dict[str, str]:
-        """Sheet name -> dataset ID of the newest sheets of advanced_fitting.xlsx imported in this
-        series with every column in seconds and M."""
-        document = self.registry.document
-        runs = {}
-        for record in document.datasets:
-            if (
-                record.dataset_id not in self._datasets_before
-                and record.source_id is not None
-                and document.imported_source(record.source_id).original_filename == _FILE
-            ):
-                # The worksheet identity survives renaming the dataset.
-                metadata = thaw_json_value(record.source_metadata)
-                run = metadata.get("sheet_name")
-                if run in _UNITS and (
-                    metadata.get("original_time_unit"), metadata.get("original_concentration_units")
-                ) == _UNITS[run]:
-                    runs[run] = record.dataset_id
-        return runs if len(runs) == len(_UNITS) else {}
-
     @staticmethod
     def _starts(run: str) -> dict[str, float]:
         a, b, c = _STARTS[run]
