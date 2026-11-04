@@ -123,7 +123,6 @@ from kindred.gui.widgets.dataset_mapping_batch_dialog import DatasetMappingBatch
 from kindred.gui.widgets.dataset_overlay_panel import (
     DatasetOverlayPanel,
 )
-from kindred.gui.widgets.editor_panel import EditorPanel
 from kindred.gui.widgets.exact_correction_basis_dialog import (
     ExactCorrectionBasisDialog,
 )
@@ -170,7 +169,6 @@ class _TabSurfaceBundle:
     """MainWindow-owned retained non-plot physical state for one tab."""
 
     tab_id: str
-    editor_panel: EditorPanel
     editor: MechanismEditorTabbed
     slider_panel: QtWidgets.QWidget
     batch_model: BatchInitialConditionsTableModel
@@ -381,8 +379,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         surface_registry = self._workspace_tab_registry
         target = tab_id
-        editor_panel = EditorPanel(parent=self._mechanism_stack)
-        editor = editor_panel.editor
+        editor = MechanismEditorTabbed(parent=self._mechanism_stack)
+        editor.setObjectName("mechanismEditor")
         slider_panel = editor.slider_pane_for_dock()
         slider_panel.setParent(self._slider_stack)
         batch_model = BatchInitialConditionsTableModel(parent=self._workspace)
@@ -441,7 +439,7 @@ class MainWindow(QtWidgets.QMainWindow):
             tab_id=target,
             editor=editor,
             registry=surface_registry,
-            parent=editor_panel,
+            parent=editor,
         )
         initial_actions = InitialConditionsTableActions(
             tab_id=target,
@@ -459,11 +457,10 @@ class MainWindow(QtWidgets.QMainWindow):
             simulation_jobs=self._simulation_jobs,
             preview_points=self.config_controller.preview_points(),
             preview_delay_ms=self.config_controller.preview_delay_ms(),
-            parent=editor_panel,
+            parent=editor,
         )
         bundle = _TabSurfaceBundle(
             tab_id=target,
-            editor_panel=editor_panel,
             editor=editor,
             slider_panel=slider_panel,
             batch_model=batch_model,
@@ -480,7 +477,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._tab_surfaces[target] = bundle
         for stack, widget in (
-            (self._mechanism_stack, editor_panel),
+            (self._mechanism_stack, editor),
             (self._slider_stack, slider_panel),
             (self._initial_conditions_stack, simulation_panel),
             (self._data_stack, right_panel),
@@ -657,7 +654,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bundle.slider_binding.dispose()
         bundle.calculator_owner.dispose()
         for stack, widget in (
-            (self._mechanism_stack, bundle.editor_panel),
+            (self._mechanism_stack, bundle.editor),
             (self._slider_stack, bundle.slider_panel),
             (self._initial_conditions_stack, bundle.simulation_panel),
             (self._data_stack, bundle.right_panel),
@@ -816,7 +813,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         target = tab_id
         bundle = self._tab_surfaces[target]
-        self._mechanism_stack.setCurrentWidget(bundle.editor_panel)
+        self._mechanism_stack.setCurrentWidget(bundle.editor)
         self._slider_stack.setCurrentWidget(bundle.slider_panel)
         self._initial_conditions_stack.setCurrentWidget(bundle.simulation_panel)
         self._data_stack.setCurrentWidget(bundle.right_panel)

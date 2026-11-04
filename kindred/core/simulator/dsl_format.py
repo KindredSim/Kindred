@@ -7,7 +7,7 @@ def format_stoichiometry_side(side: Dict[str, float]) -> str:
     """
     Render a stoichiometry side as "A + 2B + 0.5C" with deterministic term order.
 
-    This is a presentation helper shared by DSL parsing context strings and preview formatting.
+    The mechanism build uses it for each step's context string.
     """
 
     parts: List[str] = []
