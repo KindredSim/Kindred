@@ -1,4 +1,4 @@
-"""Native Windows headless Fit entry point; stdout is exclusively binary."""
+"""Headless Fit entry point; stdout is exclusively binary."""
 
 from __future__ import annotations
 

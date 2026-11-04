@@ -99,6 +99,12 @@ def physical_core_count() -> int:
             ((path / "physical_package_id").read_text().strip(), (path / "core_id").read_text().strip())
             for path in topology.glob("cpu[0-9]*/topology")
         })
+    if sys.platform == "darwin":
+        import subprocess
+
+        return int(subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "hw.physicalcpu"], capture_output=True, text=True, check=True,
+        ).stdout)
     raise RuntimeError(f"Counting processor cores is not supported on {sys.platform}.")
 
 

@@ -1,10 +1,11 @@
-"""Qt bridge owning one installed Windows scientific subprocess."""
+"""Qt bridge owning one installed scientific subprocess."""
 
 from __future__ import annotations
 
 import logging
 import queue
 import subprocess
+import sys
 import threading
 
 from PySide6 import QtCore
@@ -131,7 +132,7 @@ class GlobalFitWorker(QtCore.QThread):
                         argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE, bufsize=0, shell=False,
                         env=env, cwd=cwd,
-                        creationflags=subprocess.CREATE_NO_WINDOW,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                     )
                 if process is None:
                     terminal = ("cancelled", ())
