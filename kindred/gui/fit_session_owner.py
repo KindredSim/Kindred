@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
+from types import MappingProxyType
 
 from PySide6 import QtCore, QtWidgets
 
@@ -30,15 +31,11 @@ from kindred.gui.fitting.launch import (
     create_initial_fit_setup,
     fit_parameter_overall,
 )
-from kindred.gui.fitting.reporting import fit_identity_text
+from kindred.gui.fitting.reporting import fit_better_fit_text, fit_identity_text
 from kindred.gui.fitting.window import FittingWindow
 from kindred.gui.fitting.execution import FitCandidate
 from kindred.gui.fitting.worker import GlobalFitWorker
 from kindred.gui.workspace_tab_registry import WorkspaceTabRegistry
-
-__all__ = [
-    "FitSessionOwner",
-]
 
 ColorResolver = Callable[[str, Sequence[str]], object]
 
@@ -190,21 +187,26 @@ class FitSessionOwner(QtCore.QObject):
         return window
 
     @QtCore.Slot()
-    def execute(self) -> None:
-        """Admit one Fit worker from the current accepted setup."""
+    def execute(self, initial_starts: Mapping[str, float] = MappingProxyType({})) -> None:
+        """Admit one Fit worker from the current accepted setup.
+
+        ``initial_starts`` starts named varied starting concentrations
+        elsewhere than their Starting IC, for this run only.
+        """
         window = self._window
         if self._closing:
             self._set_status("Fit rejected while the window is closing.")
-            return
-        if not self._origin_is_current():
-            self._set_status("Fit rejected: origin science is no longer current.")
             return
         if not self._gate.is_idle:
             self._set_status(
                 f"Fit rejected: {self._gate.active_kind} is active."
             )
             return
-        request = self._build_request()
+        request = build_fit_execution_request(
+            setup=self._accepted_setup(),
+            workers=self._parallel_workers(),
+            initial_starts=initial_starts,
+        )
         # The gate was idle just above, with nothing in between to take it.
         self._gate.try_acquire(self, "fit")
         # A retained result of another setup ends here; one of this setup
@@ -300,10 +302,9 @@ class FitSessionOwner(QtCore.QObject):
         # "Last Fit" is offered only once a Fit set that snapshot, and Apply
         # rebases both snapshots with the setup.
         window = self._window
-        kind = reset_kind
         snapshot = (
             self._initial_setup_snapshot
-            if kind == "initial"
+            if reset_kind == "initial"
             else self._last_fit_setup_snapshot
         )
         current = self._accepted_setup()
@@ -315,7 +316,7 @@ class FitSessionOwner(QtCore.QObject):
         # A reset discards held invalid text only in the part it replaces.
         window.clear_pending_setup_edits(data=part != "parameters", parameters=part != "data")
         self._restore_setup(snapshot)
-        target = "the setup when this window opened" if kind == "initial" else "the last Fit"
+        target = "the setup when this window opened" if reset_kind == "initial" else "the last Fit"
         scope = {"data": "Data and Targets", "parameters": "Parameters", "both": "Fit setup"}[part]
         self._set_status(f"{scope} reset to {target}.")
 
@@ -568,8 +569,6 @@ class FitSessionOwner(QtCore.QObject):
             reason = "These Fit values have already been applied to the project. Run a new fit to apply again."
         elif self._candidate is None:
             reason = "Run a fit to obtain current values to apply."
-        elif not self._origin_science_is_current(self._candidate.origin):
-            reason = "Origin science is no longer current."
         elif not self._candidate_is_current():
             reason = "Run a fit to obtain current values to apply."
         else:
@@ -588,14 +587,10 @@ class FitSessionOwner(QtCore.QObject):
         origin = self._current_origin()
         setup = self._accepted_setup()
         window = self._window
-        if not self._origin_science_is_current(candidate.origin):
-            self._set_status("Fit Apply rejected: origin science is no longer current.")
-            return
         reason = self._candidate_apply_reason(candidate)
         if reason:
             self._set_status(f"Fit Apply rejected: {reason}")
             return
-        token = self._session.capture_content_token()
         if to_copy:
             document, copied, set_ids = self._registry.prepare_tab_copy(
                 origin.tab_id, name_suffix="Fit",
@@ -604,8 +599,7 @@ class FitSessionOwner(QtCore.QObject):
                 candidate, document, copied.tab_id, set_ids=set_ids,
             )
             published = self._registry.publish_tab_copy(
-                origin.tab_id, copied, set_ids, proposed_document,
-                expected_token=token, activate=False,
+                origin.tab_id, copied, set_ids, proposed_document, activate=False,
             )
             self._candidate_copy_name = published.name
             self._refresh_apply_availability()
@@ -630,7 +624,7 @@ class FitSessionOwner(QtCore.QObject):
             candidate.setup_snapshot,
             origin=successor_origin,
         )
-        self._registry.replace_document(proposed_document, expected_token=token)
+        self._registry.replace_document(proposed_document)
         # Applied starting concentrations supersede their sets' Initial
         # Conditions table drafts, as a Slider Apply's do.
         runtime = self._registry.tab_runtime(origin.tab_id)
@@ -797,69 +791,28 @@ class FitSessionOwner(QtCore.QObject):
             self._destroy_window_after_cleanup()
         else:
             self.application_close_settlement_changed.emit()
+            candidate = self._candidate
+            if candidate is not None and candidate.request is request and candidate.better_setup is not None:
+                self._offer_better_fit(candidate)
 
-    def _origin_is_current(self) -> bool:
-        return self._origin_science_is_current(self._current_origin())
+    def _offer_better_fit(self, candidate: FitCandidate) -> None:
+        """Offer to run again from the refit Profile found clearly better."""
 
-    def _origin_science_is_current(
-        self,
-        captured: FitOriginSnapshot,
-    ) -> bool:
-        """Compare retained Fit science while excluding defaults/presentation."""
-
-        # Nothing removes the origin tab or its mechanism while Fit is open.
-        current = capture_fit_origin(
-            self._session.document,
-            captured.tab_id,
-        )
-
-        def dataset_science(item: object) -> tuple[object, ...]:
-            return (
-                item.dataset_id,
-                item.set_id,
-                item.initial_values,
-                # resolved_t_start only seeds the Fit-owned interval; a later
-                # Run-start change must not make an explicit interval stale.
-                tuple(
-                    (
-                        observation.raw_observation_id,
-                        observation.model_target,
-                        observation.unit,
-                        observation.t,
-                        observation.y,
-                        observation.source_rows,
-                    )
-                    for observation in item.observations
-                ),
-            )
-
-        return (
-            captured.tab_id == current.tab_id
-            and captured.mechanism_source == current.mechanism_source
-            and captured.prepared_dsl is current.prepared_dsl
-            and captured.scientific_settings == current.scientific_settings
-            and tuple(
-                dataset_science(item)
-                for item in sorted(
-                    captured.mapped_datasets,
-                    key=lambda value: value.dataset_id,
-                )
-            )
-            == tuple(
-                dataset_science(item)
-                for item in sorted(
-                    current.mapped_datasets,
-                    key=lambda value: value.dataset_id,
-                )
-            )
-            and captured.parameter_defaults == current.parameter_defaults
-        )
-
-    def _build_request(self) -> FitExecutionRequest:
-        return build_fit_execution_request(
-            setup=self._accepted_setup(),
-            workers=self._parallel_workers(),
-        )
+        message = QtWidgets.QMessageBox(self._window)
+        message.setWindowTitle("Better Fit Found")
+        message.setIcon(QtWidgets.QMessageBox.Information)
+        message.setTextFormat(QtCore.Qt.RichText)
+        message.setText(fit_better_fit_text(candidate))
+        start = message.addButton("Run Fit From There", QtWidgets.QMessageBox.AcceptRole)
+        message.addButton("Not Now", QtWidgets.QMessageBox.RejectRole)
+        message.exec()
+        if message.clickedButton() is start:
+            # The refit's parameter values become the setup, as a fit's own do.
+            # Its varied starting concentrations start this one run only, so
+            # every Starting IC and its range stay as the user set them.
+            self._record_setup_change(self._accepted_setup())
+            self._restore_setup(candidate.better_setup)
+            self.execute(dict(candidate.better_initial_starts))
 
     def _accepted_setup(self) -> FitSetupSnapshot | None:
         """Return the one accepted setup owner for the current route."""

@@ -18,10 +18,6 @@ from typing import Dict, Iterator, List, Tuple
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.mechanism_metadata import MechanismMetadataKeys
 
-__all__ = [
-    "get_step_index_map",
-    "iter_canonical_parameters",
-]
 
 def get_step_index_map(mechanism: object) -> List[Dict[str, object]]:
     """Return the builder-owned step map; a missing map is a producer error."""

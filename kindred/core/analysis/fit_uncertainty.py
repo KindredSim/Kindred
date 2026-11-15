@@ -24,7 +24,6 @@ from kindred.core.exceptions import (
 )
 from kindred.core.fitting_completion import FitExtensionProgress
 from kindred.core.fitting_optimization import (
-    _JACOBIAN_RANK_RTOL,
     fit_bound_position,
     fit_parameters_with_fixed,
 )
@@ -35,25 +34,11 @@ from kindred.core.simulation_failure import (
 )
 from kindred.core.simulator.step_indexing import iter_canonical_parameters
 
-__all__ = [
-    "ProfileLikelihoodConfig",
-    "ProfileLikelihoodOptions",
-    "ProfileLikelihoodEndpoint",
-    "ProfileLikelihoodInterval",
-    "ProfileLikelihoodResult",
-    "ProfileCutoff",
-    "ProfileNoiseBlock",
-    "ProfileNoiseModel",
-    "profile_likelihood_settlement_result",
-    "profile_likelihood_result",
-    "profile_noise_model",
-    "rate_scale_undetermined",
-    "undetermined_coordinates",
-]
-
-
 _PROFILE_METHOD = "weighted Gaussian profile likelihood"
-_LIKELIHOOD_MODEL = "independent Gaussian residuals with one noise level per series"
+# Finite-difference Jacobians resolve exactly dependent fitted values only to
+# singular-value ratios of roughly 1e-8 to 1e-5, far above numpy's default
+# rank tolerance, so the rank uses a tolerance above that level.
+_JACOBIAN_RANK_RTOL = 1e-4
 
 
 def _confidence(value: object) -> float:
@@ -135,6 +120,10 @@ class ProfileNoiseModel:
 
     blocks: tuple[ProfileNoiseBlock, ...]
     cutoffs: Mapping[object, ProfileCutoff]
+    # The coordinates the data see only together with others: each changes
+    # the residuals, and the others' columns reach the Jacobian's rank
+    # without its own.
+    coupled: tuple[object, ...]
 
 
 def profile_noise_model(
@@ -153,20 +142,24 @@ def profile_noise_model(
     measured-X curve location matched inside a segment.  A residual the fit
     reproduces exactly observes no noise and does not count.  Leverages come
     from the column-scaled weighted Jacobian at the estimate, by central
-    differences inside the bounds.  A coordinate's variance averages the
+    differences inside the bounds; a value one of whose steps crosses a jump
+    of the model or leaves its domain takes the one-sided difference on the
+    fit's side.  A coordinate's variance averages the
     variances of the blocks with an estimate by the share of its information
     each carries: the part of its Jacobian column the other coordinates do not
     explain, within the Jacobian's numerical rank, so values the data see only
-    in combination share that combination's information.  A value converged
-    onto a bound at zero, like an exact zero, is stepped by one unit within its
-    bounds; any other value by a step relative to it.  Returns None when a
-    Jacobian step is scientifically unavailable.
+    in combination share that combination's information; they are the
+    coordinates whose column is not zero and whose removal leaves that rank
+    unchanged.  A value converged onto a bound at zero, like an exact zero, is
+    stepped by one unit within its bounds; any other value by a step relative
+    to it.  Returns None when a value has no step on the fit's side.
     """
 
     weighted = np.concatenate([info.weighted_residuals for info in dataset_info])
     raw = np.concatenate([info.residuals for info in dataset_info])
     x = np.asarray(vector, dtype=float)
     columns = []
+    centre = None
     for index, key in enumerate(keys):
         low, high = bounds[key]
         # Relative to the value, as SciPy's relative step.  A value at zero,
@@ -181,17 +174,36 @@ def profile_noise_model(
         forward, backward = x.copy(), x.copy()
         forward[index] = min(x[index] + step, high)
         backward[index] = max(x[index] - step, low)
-        # One pair at a time: an unavailable column ends the model before
-        # the next column runs.
         upper, lower = objective.evaluate_scientific_residuals([forward, backward])
-        if upper is None or lower is None:
+        # A step across a jump of the model, or out of its domain, leaves the
+        # fit's side; the other step alone measures the slope there.
+        if (upper is None) != (lower is None):
+            if centre is None:
+                [centre] = objective.evaluate_scientific_residuals([x])
+            if upper is None:
+                upper, forward = centre, x
+            else:
+                lower, backward = centre, x
+        # One column at a time: a value with no step on the fit's side ends
+        # the model before the next column runs.
+        if upper is None or lower is None or forward[index] == backward[index]:
             return None
         columns.append((upper - lower) / (forward[index] - backward[index]))
     jacobian = np.column_stack(columns)
     norms = np.linalg.norm(jacobian, axis=0)
     scaled = np.divide(jacobian, norms, out=np.zeros_like(jacobian), where=norms > 0.0)
     basis, singular, rows = np.linalg.svd(scaled, full_matrices=False)
-    rank = int(np.sum(singular > _JACOBIAN_RANK_RTOL * singular[0])) if singular[0] > 0.0 else 0
+
+    def numerical_rank(values: np.ndarray) -> int:
+        return int(np.sum(values > _JACOBIAN_RANK_RTOL * values[0])) if values.size and values[0] > 0.0 else 0
+
+    rank = numerical_rank(singular)
+    # A zero column, a value that changes no residual, is the bound check's.
+    coupled = tuple(
+        key for index, key in enumerate(keys)
+        if norms[index] > 0.0
+        and numerical_rank(np.linalg.svd(np.delete(scaled, index, axis=1), compute_uv=False)) == rank
+    )
     leverage = np.sum(basis[:, :rank] ** 2, axis=1)
 
     blocks: list[ProfileNoiseBlock] = []
@@ -235,7 +247,7 @@ def profile_noise_model(
         cutoffs[key] = ProfileCutoff(
             variance, variance ** 2 / sum(term ** 2 / freedom for term, freedom in terms),
         )
-    return ProfileNoiseModel(tuple(blocks), MappingProxyType(cutoffs))
+    return ProfileNoiseModel(tuple(blocks), MappingProxyType(cutoffs), coupled)
 
 
 def undetermined_coordinates(
@@ -495,25 +507,46 @@ class ProfileLikelihoodInterval:
 
 
 @dataclass(frozen=True, slots=True)
+class ProfileBetterFit:
+    """A refit whose weighted SSE fell a whole cut-off or more below the fit's."""
+
+    coordinate: _fit_execution.FitCoordinate
+    # The value the refit held this coordinate at.
+    held_value: float
+    weighted_sse: float
+    fit_weighted_sse: float
+    # Every optimizer coordinate of the refit, in layout order.
+    optimizer_vector: tuple[float, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ProfileLikelihoodResult:
     """Immutable factual result of a weighted-Gaussian Profile analysis."""
 
     status: ProfileLikelihoodStatus
     method: str
     confidence_level: float
-    likelihood_model: str
     intervals: Mapping[object, ProfileLikelihoodInterval]
     noise_blocks: tuple[ProfileNoiseBlock, ...] = ()
     unavailable_reason: str | None = None
     diagnostic: FactualCause | None = None
     provenance: Mapping[str, object] = field(default_factory=dict)
+    better_fit: ProfileBetterFit | None = None
 
     def __post_init__(self) -> None:
         # The Profile owner builds every result from its admitted
-        # configuration, literal statuses, a factual reason for an unavailable
-        # result and a diagnostic for a failed one.
+        # configuration, literal statuses, a factual reason or a better fit
+        # for an unavailable result and a diagnostic for a failed one.
         object.__setattr__(self, "intervals", MappingProxyType(dict(self.intervals)))
         object.__setattr__(self, "provenance", MappingProxyType(dict(self.provenance)))
+
+
+class _BetterFit(Exception):
+    """Ends Profile at a refit clearly better than the fit."""
+
+    def __init__(self, better_fit: ProfileBetterFit) -> None:
+        super().__init__()
+        self.better_fit = better_fit
 
 
 class _SideEnd(Exception):
@@ -536,7 +569,6 @@ def profile_likelihood_settlement_result(
         status=status,
         method=_PROFILE_METHOD,
         confidence_level=config.options.confidence_level,
-        likelihood_model=_LIKELIHOOD_MODEL,
         intervals={},
         diagnostic=cause,
         provenance={"settlement": status, "primary_fit_preserved": True},
@@ -632,7 +664,6 @@ def profile_likelihood_result(
                 status="failed",
                 method=_PROFILE_METHOD,
                 confidence_level=options.confidence_level,
-                likelihood_model=_LIKELIHOOD_MODEL,
                 intervals={},
                 diagnostic=cause,
                 provenance={"settlement": "failed", **provenance},
@@ -644,7 +675,6 @@ def profile_likelihood_result(
             status="unavailable",
             method=_PROFILE_METHOD,
             confidence_level=options.confidence_level,
-            likelihood_model=_LIKELIHOOD_MODEL,
             intervals={},
             unavailable_reason="the fitted values explain every observation, so the noise cannot be estimated.",
             provenance={"settlement": "unavailable"},
@@ -732,12 +762,8 @@ def profile_likelihood_result(
                     refinement_step=refinement_step,
                 )
                 # A scientific residual call, never an optimizer penalty.
-                [evaluation_residuals] = objective.evaluate_scientific_residuals([
-                    np.asarray(
-                        [fit.parameters[item] for item in initial],
-                        dtype=float,
-                    ),
-                ])
+                vector = np.asarray([fit.parameters[item] for item in initial], dtype=float)
+                [evaluation_residuals] = objective.evaluate_scientific_residuals([vector])
                 if evaluation_residuals is None:
                     record = {
                         "fixed_optimizer_value": float(fixed),
@@ -750,6 +776,15 @@ def profile_likelihood_result(
                     "rise": finite_sum_of_squares(evaluation_residuals) - base_sse,
                     "converged": bool(fit.success),
                 }
+                if record["rise"] <= -threshold:
+                    # The fit lies outside this refit's own confidence region.
+                    raise _BetterFit(ProfileBetterFit(
+                        coordinate=name,
+                        held_value=decode_coordinate(name, fixed),
+                        weighted_sse=base_sse + record["rise"],
+                        fit_weighted_sse=base_sse,
+                        optimizer_vector=tuple(float(value) for value in vector),
+                    ))
                 return record, fit.parameters
 
             for discovery_step in range(1, options.max_bracketing_steps_per_side + 1):
@@ -860,6 +895,15 @@ def profile_likelihood_result(
                 emit_progress(stage="side", coordinate=active_coordinate, side=side)
             except (FittingCancelled, SimulationCancelled):
                 raise
+            except _BetterFit as better:
+                return finish(ProfileLikelihoodResult(
+                    status="unavailable",
+                    method=_PROFILE_METHOD,
+                    confidence_level=options.confidence_level,
+                    intervals={},
+                    provenance={"settlement": "unavailable"},
+                    better_fit=better.better_fit,
+                ))
             except Exception as exc:
                 return failure_result(
                     factual_cause_from_exception(
@@ -909,7 +953,6 @@ def profile_likelihood_result(
         status=result_status,
         method=_PROFILE_METHOD,
         confidence_level=options.confidence_level,
-        likelihood_model=_LIKELIHOOD_MODEL,
         intervals=intervals,
         unavailable_reason=unavailable_reason,
         provenance={

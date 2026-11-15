@@ -11,19 +11,6 @@ from kindred.core.project_document import (
 )
 from kindred.core.datasets.foundation import validate_raw_observation_id
 
-__all__ = [
-    "AxisSeriesSelection",
-    "ExperimentalAxisSelection",
-    "ProjectPresentationState",
-    "SimulationSeriesAxisSelection",
-    "VesselVolumeAxisSelection",
-    "WorkspacePresentationState",
-    "default_project_presentation_state",
-    "default_workspace_presentation_state",
-    "reconcile_workspace_presentation_state",
-    "validate_workspace_presentation_state",
-]
-
 
 @dataclass(frozen=True, slots=True)
 class SimulationSeriesAxisSelection:
@@ -173,7 +160,10 @@ class ProjectPresentationState:
             overlay_raw_observation_ids_by_dataset=tuple(overlays),
             selected_x_series=selected_x,
             selected_y_series=selected_y,
-            selected_y_uses_default_all=self.selected_y_uses_default_all,
+            # A selection whose every series is gone shows all series; an
+            # emptied selection the user made stays empty.
+            selected_y_uses_default_all=self.selected_y_uses_default_all
+            or (bool(self.selected_y_series) and not selected_y),
             reference_lines_visible=self.reference_lines_visible,
             intervention_annotations_visible=(
                 self.intervention_annotations_visible

@@ -31,11 +31,6 @@ from kindred.io.paths import file_error_text, same_local_path
 
 logger = logging.getLogger(__name__)
 
-__all__ = [
-    "ProjectController",
-    "ProjectTransientState",
-]
-
 
 @dataclass(frozen=True, slots=True)
 class ProjectTransientState:
@@ -146,9 +141,8 @@ class ProjectController(QtCore.QObject):
             [
                 ProjectDocument,
                 tuple[tuple[str, tuple[str, ...]], ...],
-                ProjectContentToken,
             ],
-            ProjectContentToken | None,
+            ProjectContentToken,
         ],
         inspect_transient_state: Callable[[], ProjectTransientState],
         discard_authoring: Callable[[], None],
@@ -197,18 +191,11 @@ class ProjectController(QtCore.QObject):
 
     @property
     def mutation_admitted(self) -> bool:
-        """Whether a new user mutation may enter the project lifecycle."""
+        """Whether the shell's controls stay enabled; false once Close has started."""
 
-        # Close is a one-way lifecycle.  Keep the admission latched even
-        # after early native authorization has cleared ``_close_pending`` so
-        # the event loop cannot reopen a writable window before closeEvent.
-        return not (self._close_started or self._close_pending)
-
-    def _reject_mutation_during_close(self, action: str) -> bool:
-        if self.mutation_admitted:
-            return False
-        self._set_status(f"{action} rejected: application Close is in progress.")
-        return True
+        # Close is a one-way lifecycle: nothing reopens a writable window
+        # between its start and closeEvent.
+        return not self._close_started
 
     def _show_error(self, title: str, message: str) -> None:
         logger.error("%s: %s", title, message)
@@ -445,8 +432,6 @@ class ProjectController(QtCore.QObject):
     def new_project(self) -> bool:
         """Replace the current project after project-action admission."""
 
-        if self._reject_mutation_during_close("New Project"):
-            return False
         disposition = self._resolve_disposition("New Project")
         if disposition is None:
             return False
@@ -465,11 +450,10 @@ class ProjectController(QtCore.QObject):
     def load_project(self) -> bool:
         """Choose and directly install one validated project archive."""
 
-        if self._reject_mutation_during_close("Open Project"):
-            return False
         # Capture the visible editor before opening the native picker.  The
-        # picker may take focus away; canceling it must leave this exact draft
-        # owned by the current project with no publication or disposition.
+        # picker may take focus away; canceling it leaves this exact draft
+        # owned by the current project with no disposition.  A typed set name
+        # has no draft form and is finished here.
         self._capture_visible_tab_inputs()
         path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
             self._parent_widget,
@@ -487,8 +471,6 @@ class ProjectController(QtCore.QObject):
     ) -> bool:
         """Admit and directly install one selected project archive."""
 
-        if self._reject_mutation_during_close("Open Project"):
-            return False
         if not os.path.isfile(path):
             self._show_error(
                 "Open Project Error",
@@ -534,8 +516,6 @@ class ProjectController(QtCore.QObject):
         )
 
     def save_project(self) -> bool:
-        if self._reject_mutation_during_close("Save Project"):
-            return False
         self._capture_visible_tab_inputs()
         expected_token = self._session.capture_content_token()
         prepared = self._prepare_before_save(False)
@@ -553,8 +533,6 @@ class ProjectController(QtCore.QObject):
         )
 
     def save_project_as(self) -> bool:
-        if self._reject_mutation_during_close("Save Project As"):
-            return False
         self._capture_visible_tab_inputs()
         expected_token = self._session.capture_content_token()
         prepared = self._prepare_before_save(False)
@@ -673,16 +651,7 @@ class ProjectController(QtCore.QObject):
         if self._scan.owns_destination(path):
             self._show_error("Save Error", "Cannot overwrite the destination of an active Chemical Space Scan.")
             return None
-        committed_token = self._commit_saved_document(
-            candidate,
-            materialized_by_tab,
-            expected_token,
-        )
-        if committed_token is None:
-            self._set_status(
-                "The selected save candidate was superseded before publication."
-            )
-            return None
+        committed_token = self._commit_saved_document(candidate, materialized_by_tab)
         try:
             presentation = self._tabs.workspace_presentation()
             self._archive_store.save(
@@ -696,11 +665,7 @@ class ProjectController(QtCore.QObject):
                 f"Failed to save project:\n\n{file_error_text(exc, path)}",
             )
             return None
-        self._session.mark_saved(
-            path,
-            presentation,
-            expected_token=committed_token,
-        )
+        self._session.mark_saved(path, presentation)
         status = f"Saved project: {path}"
         try:
             self._config.record_recent_project(path)

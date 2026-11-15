@@ -10,12 +10,6 @@ from kindred.core.project_presentation_state import (
     default_workspace_presentation_state,
 )
 
-__all__ = [
-    "ProjectContentToken",
-    "ProjectSession",
-    "SavedArchiveBaseline",
-]
-
 
 def _saved_choices(presentation: WorkspacePresentationState) -> tuple:
     # The active tab and each tab's current row are saved navigation, so
@@ -104,7 +98,8 @@ class ProjectSession:
     def replace_document(self, document: ProjectDocument) -> ProjectContentToken:
         """Publish one admitted document directly.
 
-        The registry checked the caller's token immediately before.  An
+        A caller that showed a dialog between reading the project and
+        publishing checks its content token first; the registry does not.  An
         unchanged document is an accepted no-op and returns the still-current
         token.
         """
@@ -140,16 +135,11 @@ class ProjectSession:
         self,
         path: str,
         presentation: WorkspacePresentationState,
-        *,
-        expected_token: ProjectContentToken,
-    ) -> bool:
-        """Conditionally publish path and baseline without changing content."""
+    ) -> None:
+        """Publish path and baseline without changing content."""
 
-        if not self.is_content_token_current(expected_token):
-            return False
         self._current_path = path
         self._saved_baseline = SavedArchiveBaseline(
             document=self.document,
             presentation=presentation,
         )
-        return True

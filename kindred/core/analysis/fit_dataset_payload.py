@@ -8,11 +8,6 @@ from types import MappingProxyType
 
 import numpy as np
 
-__all__ = [
-    "FitDatasetSpec",
-    "FitObservationSeries",
-]
-
 
 def _readonly_float_vector(values: object) -> np.ndarray:
     array = np.asarray(values, dtype=float).reshape(-1).copy()

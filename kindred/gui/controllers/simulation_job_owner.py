@@ -30,14 +30,6 @@ from kindred.gui.interactive_preview import (
 )
 from kindred.gui.workspace_tab_registry import ScientificDocumentDelta
 
-__all__ = [
-    "ExplicitRunCapture",
-    "PreviewCapture",
-    "SimulationJobOwner",
-    "build_explicit_target",
-    "build_execution_request",
-]
-
 
 @dataclass(frozen=True, slots=True)
 class ExplicitRunTarget:
@@ -335,11 +327,6 @@ class SimulationJobOwner(QtCore.QObject):
         else:
             self._worker.cancel()
         return True
-
-    def reset_project_session(self) -> None:
-        """Forget failed-Run memory when an actual project replacement occurs."""
-
-        self._failed_run_requests.clear()
 
     def _retire_unserved_reference_run(self) -> None:
         """A Reference Run lives only while its pending exact Preview needs it."""
@@ -835,13 +822,10 @@ class SimulationJobOwner(QtCore.QObject):
             self.reconcile_canonical_targets(operation_tab_id, reconcile_target_ids)
         # A Preview superseded by a newer request reports nothing; the newer
         # request's outcome is the one the user sees.
-        if operation_kind == "run" or not superseded_preview:
+        retired = removed_ids.issuperset(target.set_id for target in operation["targets"])
+        if not retired and (operation_kind == "run" or not superseded_preview):
             prefix = "Reference " if operation_purpose == "preview-reference" else ""
             self.status_changed.emit(prefix + self._terminal_status(summary))
-        if operation_kind == "run":
-            # The waiting Preview starts now and uses this Run's outcomes as
-            # its Reference; failed requests are remembered, not retried.
-            self._redrive_pending_preview()
 
     @staticmethod
     def _terminal_status(summary: SimulationTerminalSummary) -> str:

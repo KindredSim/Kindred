@@ -11,20 +11,6 @@ from dataclasses import dataclass
 from html import escape
 import re
 
-__all__ = [
-    "CompactText",
-    "DATASET_LIST_LABEL_MAX_CHARS",
-    "PLOT_TITLE_LABEL_MAX_CHARS",
-    "TAB_LABEL_MAX_CHARS",
-    "compact_dataset_label",
-    "compact_plot_title_label",
-    "compact_text",
-    "literal_tooltip",
-    "scientific_symbol_label",
-    "scientific_symbol_html",
-    "scientific_symbol_spoken",
-]
-
 _SCIENTIFIC_SYMBOL_LABELS = {
     "h_bar": "ħ",
     "kappa": "κ",
@@ -133,11 +119,10 @@ def compact_text(
     full = _raw_full_text(text, empty_text=empty_text)
     display_source = _normalize_text(text, empty_text=empty_text)
     # Limits are fixed widths of 18 characters or more.
-    limit = max_chars
-    if len(display_source) <= limit:
+    if len(display_source) <= max_chars:
         return CompactText(display=display_source, full=full, was_elided=(display_source != full))
 
-    available = limit - 1
+    available = max_chars - 1
     head = available // 2
     tail = available - head
     return CompactText(

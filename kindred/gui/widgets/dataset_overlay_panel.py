@@ -14,8 +14,6 @@ from kindred.gui.display_name_policy import literal_tooltip
 from kindred.core.validation import parse_whole_number_text
 from kindred.gui.ui_helpers import INVALID_EDITOR_STYLE, ControlRowsLayout, configure_compact_numeric_edit
 
-__all__ = ["DatasetOverlayPanel"]
-
 
 class _MarkerControls(QtWidgets.QWidget):
     """Keep small marker settings on one row, wrapping when necessary."""
@@ -242,10 +240,9 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
     ) -> None:
         """Project one accepted membership change without rebuilding the tree."""
 
-        target = dataset_id
-        link = self._links_by_dataset_id[target]
+        link = self._links_by_dataset_id[dataset_id]
         selected = tuple(raw_observation_ids)
-        self._links_by_dataset_id[target] = replace(
+        self._links_by_dataset_id[dataset_id] = replace(
             link,
             overlay_raw_observation_ids=selected,
         )
@@ -308,7 +305,6 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         self.speciesColorRequested.emit(species_name, color)
 
     def _on_item_changed(self, item: QtWidgets.QTreeWidgetItem, column: int) -> None:
-        _ = column
         parent = item.parent()
         self._tree.blockSignals(True)
         try:

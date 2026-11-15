@@ -48,48 +48,6 @@ from kindred.core.species import (
 )
 from kindred.core.datasets.observation_mapping import normalize_observation_mapping
 
-__all__ = [
-    "DatasetLink",
-    "FitDefaults",
-    "InitialConditionSet",
-    "MechanismSourceCollision",
-    "MechanismSourceReconciliation",
-    "ExactCorrectionAssessment",
-    "MechanismTabDocument",
-    "ProjectDocument",
-    "SimulationExecutionSettings",
-    "TabScientificSettings",
-    "default_fit_defaults",
-    "default_project_document",
-    "default_simulation_execution_settings",
-    "default_tab_scientific_settings",
-    "FIT_MAX_NFEV_RANGE",
-    "FIT_SEED_RANGE",
-    "SIMULATION_POINT_RANGE",
-    "parse_points_text",
-    "SUPPORTED_SOLVERS",
-    "fresh_mechanism_tab",
-    "new_dataset_id",
-    "new_project_id",
-    "new_set_id",
-    "new_tab_id",
-    "next_mechanism_name",
-    "next_set_name",
-    "canonical_initial_values",
-    "canonical_observation_target_names",
-    "canonical_species_names",
-    "prepare_authored_source_admission",
-    "reconcile_tab_mechanism_source",
-    "assess_tab_exact_correction",
-    "select_exact_correction_basis",
-    "prepare_tab_scientific_settings",
-    "resolve_simulation_execution_settings",
-    "validate_fit_defaults",
-    "validate_project_document",
-    "validate_simulation_execution_settings",
-    "validate_tab_scientific_settings",
-]
-
 _SIMULATION_POINT_RANGE = (10, MAX_GENERATED_TIME_ROWS)
 _SOLVERS = ("Radau", "BDF")
 _FITTING_MAX_NFEV_RANGE = (10, MAX_FIT_EVALUATIONS)
@@ -140,10 +98,9 @@ def _require_id(value: object, label: str) -> str:
 
 
 def _require_int(value: int, label: str, minimum: int, maximum: int) -> int:
-    parsed = value
-    if parsed < minimum or parsed > maximum:
+    if value < minimum or value > maximum:
         raise ValueError(f"{label} must be between {minimum} and {maximum}.")
-    return parsed
+    return value
 
 
 def _require_finite(
@@ -325,16 +282,14 @@ class MechanismTabDocument:
         return None if prepared is None else prepared.analysis
 
     def initial_condition_set(self, set_id: str) -> InitialConditionSet:
-        target = set_id
         for item in self.initial_condition_sets:
-            if item.set_id == target:
+            if item.set_id == set_id:
                 return item
-        raise KeyError(f"Unknown initial-condition set ID: {target!r}.")
+        raise KeyError(f"Unknown initial-condition set ID: {set_id!r}.")
 
     def dataset_link(self, dataset_id: str) -> DatasetLink | None:
-        target = dataset_id
         for current_id, link in self.dataset_links:
-            if current_id == target:
+            if current_id == dataset_id:
                 return link
         return None
 
@@ -446,13 +401,12 @@ class MechanismTabDocument:
         return replace(self, dataset_links=tuple(links.items()))
 
     def without_dataset(self, dataset_id: str) -> "MechanismTabDocument":
-        target = dataset_id
         return replace(
             self,
             dataset_links=tuple(
                 (current_id, link)
                 for current_id, link in self.dataset_links
-                if current_id != target
+                if current_id != dataset_id
             ),
         )
 
@@ -462,15 +416,13 @@ class MechanismTabDocument:
         fresh_run_defaults: SimulationExecutionSettings,
         fresh_scientific_settings: TabScientificSettings,
     ) -> bool:
-        expected_run_defaults = fresh_run_defaults
-        expected_scientific_settings = fresh_scientific_settings
         if self.mechanism_source != MechanismAuthoringSource():
             return True
         if self.notes.strip():
             return True
         if (
-            self.run_defaults != expected_run_defaults
-            or self.scientific_settings != expected_scientific_settings
+            self.run_defaults != fresh_run_defaults
+            or self.scientific_settings != fresh_scientific_settings
             or self.run_overrides_by_set_id
         ):
             return True
@@ -491,25 +443,22 @@ class ProjectDocument:
     imported_sources: tuple[dataset_foundation.ImportedSource, ...] = ()
 
     def tab(self, tab_id: str) -> MechanismTabDocument:
-        target = tab_id
         for item in self.tabs:
-            if item.tab_id == target:
+            if item.tab_id == tab_id:
                 return item
-        raise KeyError(f"Unknown mechanism tab ID: {target!r}.")
+        raise KeyError(f"Unknown mechanism tab ID: {tab_id!r}.")
 
     def dataset(self, dataset_id: str) -> dataset_foundation.RawDatasetRecord:
-        target = dataset_id
         for item in self.datasets:
-            if item.dataset_id == target:
+            if item.dataset_id == dataset_id:
                 return item
-        raise KeyError(f"Unknown dataset ID: {target!r}.")
+        raise KeyError(f"Unknown dataset ID: {dataset_id!r}.")
 
     def imported_source(self, source_id: str) -> dataset_foundation.ImportedSource:
-        target = source_id
         for source in self.imported_sources:
-            if source.source_id == target:
+            if source.source_id == source_id:
                 return source
-        raise KeyError(f"Unknown imported source ID: {target!r}.")
+        raise KeyError(f"Unknown imported source ID: {source_id!r}.")
 
     def replace_tab(self, tab: MechanismTabDocument) -> "ProjectDocument":
         # Callers take the tab from the current document.
@@ -591,11 +540,10 @@ class ProjectDocument:
         )
 
     def remove_dataset(self, dataset_id: str) -> "ProjectDocument":
-        target = dataset_id
         datasets = tuple(
             item
             for item in self.datasets
-            if item.dataset_id != target
+            if item.dataset_id != dataset_id
         )
         referenced_source_ids = {item.source_id for item in datasets if item.source_id is not None}
         imported_sources = tuple(
@@ -607,7 +555,7 @@ class ProjectDocument:
             self,
             datasets=datasets,
             imported_sources=imported_sources,
-            tabs=tuple(tab.without_dataset(target) for tab in self.tabs),
+            tabs=tuple(tab.without_dataset(dataset_id) for tab in self.tabs),
         )
 
 
@@ -1272,10 +1220,9 @@ def assess_tab_exact_correction(
     """
 
     tab = document.tab(tab_id)
-    source = visible_source
 
     empty_composition = ExactConstraintComposition(())
-    if not source.reactions_text.strip():
+    if not visible_source.reactions_text.strip():
         return ExactCorrectionAssessment(
             composition=empty_composition,
             targets=(),
@@ -1286,12 +1233,12 @@ def assess_tab_exact_correction(
         # This is intentionally parse-only.  Mandatory exact validation is
         # owned by ordinary source admission after a user accepts a proposal.
         prepared = prepare_dsl_request_set(
-            source.reactions_text,
+            visible_source.reactions_text,
             units=tab.scientific_settings.default_units,
         )
         detached_tab = replace(
             tab,
-            mechanism_source=source,
+            mechanism_source=visible_source,
             prepared_dsl=prepared,
         )
         parameter_spec = prepared.parameter_algebra_spec_for_execution()
@@ -1323,7 +1270,7 @@ def assess_tab_exact_correction(
         )
 
     try:
-        proposal, corrections = _correction_proposal(source, composition, plan)
+        proposal, corrections = _correction_proposal(visible_source, composition, plan)
     except ValueError as exc:
         return ExactCorrectionAssessment(
             composition=composition,

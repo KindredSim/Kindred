@@ -13,11 +13,6 @@ from types import MappingProxyType
 
 from kindred.core.exceptions import ErrorContext
 
-__all__ = [
-    "FactualCause",
-    "factual_cause_from_exception",
-]
-
 
 def freeze_factual_value(value: object) -> object:
     """Recursively freeze factual metadata without inventing a schema."""

@@ -30,10 +30,6 @@ from kindred.gui.theme_manager import readable_plot_color
 
 logger = logging.getLogger(__name__)
 
-__all__ = [
-    "ConfigController",
-]
-
 _RECENT_PROJECTS_KEY = "recent_files"
 _RECENT_PROJECT_LIMIT = 10
 _THEME_KEY = "ui/dark_mode"
@@ -151,17 +147,16 @@ class ConfigController(QtCore.QObject):
             )
             return None
         # The dialog admits 1 to the physical cores.
-        accepted = value
         settings = self._settings()
         snapshot = self._snapshot_settings(settings, (_PARALLEL_MAXIMUM_KEY,))
-        settings.setValue(_PARALLEL_MAXIMUM_KEY, accepted)
+        settings.setValue(_PARALLEL_MAXIMUM_KEY, value)
         self._sync_or_report(
             settings,
             "Parallel execution maximum",
             snapshot=snapshot,
-            success_message=f"Parallel execution maximum set to {accepted}.",
+            success_message=f"Parallel execution maximum set to {value}.",
         )
-        return accepted
+        return value
 
     def preview_points(self) -> int:
         return self._preview_setting(
@@ -193,17 +188,16 @@ class ConfigController(QtCore.QObject):
         self, key: str, value: int, previous: int, *, label: str,
     ) -> int:
         # The Simulation Settings editors admit the range.
-        accepted = value
         settings = self._settings()
         snapshot = self._snapshot_settings(settings, (key,))
-        settings.setValue(key, accepted)
+        settings.setValue(key, value)
         self._sync_or_report(
             settings, label, snapshot=snapshot,
-            success_message=f"{label} set to {accepted}.",
+            success_message=f"{label} set to {value}.",
         )
-        if previous != accepted:
+        if previous != value:
             self.previewSettingsChanged.emit()
-        return accepted
+        return value
 
     @staticmethod
     def _setting(
@@ -649,17 +643,16 @@ class ConfigController(QtCore.QObject):
             return _DEFAULT_EXPERIMENTAL_POINT_SIZE
 
     def set_experimental_point_size(self, size: int) -> int:
-        accepted = size
         settings = self._settings()
         snapshot = self._snapshot_settings(settings, (_EXPERIMENTAL_POINT_SIZE_KEY,))
-        settings.setValue(_EXPERIMENTAL_POINT_SIZE_KEY, accepted)
+        settings.setValue(_EXPERIMENTAL_POINT_SIZE_KEY, size)
         self._sync_or_report(
             settings,
             "experimental point size",
             snapshot=snapshot,
         )
         self.applicationPlotPreferencesChanged.emit()
-        return accepted
+        return size
 
     def experimental_point_opacity(self) -> float:
         value = self._setting(
@@ -674,17 +667,16 @@ class ConfigController(QtCore.QObject):
             return _DEFAULT_EXPERIMENTAL_POINT_OPACITY
 
     def set_experimental_point_opacity(self, opacity: float) -> float:
-        accepted = opacity
         settings = self._settings()
         snapshot = self._snapshot_settings(settings, (_EXPERIMENTAL_POINT_OPACITY_KEY,))
-        settings.setValue(_EXPERIMENTAL_POINT_OPACITY_KEY, accepted)
+        settings.setValue(_EXPERIMENTAL_POINT_OPACITY_KEY, opacity)
         self._sync_or_report(
             settings,
             "experimental point opacity",
             snapshot=snapshot,
         )
         self.applicationPlotPreferencesChanged.emit()
-        return accepted
+        return opacity
 
     @staticmethod
     def _validate_experimental_point_size(value: int) -> int:

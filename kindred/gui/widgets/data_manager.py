@@ -43,10 +43,6 @@ from kindred.gui.display_name_policy import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = [
-    "DataManagerPanel",
-]
-
 
 class _DatasetSelector(QtWidgets.QComboBox):
     """Keep the closed selector compact and expand filenames in its popup."""

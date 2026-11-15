@@ -17,7 +17,6 @@ from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
 from kindred.core.analysis.fit_uncertainty import (
     ProfileLikelihoodConfig,
     ProfileLikelihoodResult,
-    ProfileNoiseModel,
     profile_likelihood_settlement_result,
     profile_likelihood_result,
     profile_noise_model,
@@ -36,10 +35,6 @@ from kindred.core.analysis.fit_evaluation_outcome import ScientificUnavailable
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 
 logger = logging.getLogger(__name__)
-
-__all__ = [
-    "fit_global",
-]
 
 
 def fit_global(
@@ -67,11 +62,11 @@ def fit_global(
 ) -> _fit_execution.GlobalFitResult | ScientificUnavailable:
     """Fit immutable dataset captures through one evaluator per dataset.
 
-    After the fit, it checks for fitted values the data do not determine
-    within their bounds, and for a rate scale they do not determine, and runs
-    the requested Profile likelihood.  ``search_evaluations_callback``
-    receives the primary optimizer's known objective-call count, as
-    :func:`fit_parameters` reports it.
+    After the fit, it checks for fitted values the data see only together
+    with others or do not determine within their bounds, and for a rate scale
+    they do not determine, and runs the requested Profile likelihood.
+    ``search_evaluations_callback`` receives the primary optimizer's known
+    objective-call count, as :func:`fit_parameters` reports it.
     """
 
     # The Fit setup admits the method and evaluation budget (Fit defaults), and
@@ -79,21 +74,19 @@ def fit_global(
     # for each unique included dataset, in roster order.
     payloads = list(datasets)
     evaluators = dict(fit_evaluators)
-    overrides = dataset_overrides
     fixed_dataset_params = {
         item.dataset_id: dict(item.fixed_params)
-        for item in overrides
+        for item in dataset_overrides
     }
     weights_norm = _fit_execution.normalize_weights(
         payloads,
         None if weights is None else dict(weights),
     )
-    layout = optimizer_layout
 
     logger.info(
         "Global fitting: %d datasets, %d optimizer coordinates",
         len(payloads),
-        len(layout.opt_param_keys()),
+        len(optimizer_layout.opt_param_keys()),
     )
     penalty_value = 1e6
 
@@ -110,30 +103,32 @@ def fit_global(
         progress: Optional[Callable[[_fit_execution.FitProgress], None]] = None,
         *,
         honor_stop: bool = True,
+        held: Sequence[_fit_execution.DatasetFitInfo] = (),
     ) -> _fit_execution.GlobalFitObjective:
         return _fit_execution.GlobalFitObjective(
             fit_evaluators=evaluators,
             payloads=payloads,
             dataset_params=fixed_dataset_params,
             weights=weights_norm,
-            layout=layout,
+            layout=optimizer_layout,
             penalty_value=penalty_value,
             progress_callback=progress,
             cancellation_check=active_cancelled if honor_stop else hard_cancelled,
             cancellation_control=active_control if honor_stop else cancellation_control,
             executor=executor,
+            held=held,
         )
 
     objective = new_objective(progress_callback)
     if starting_facts:
-        objective.retain_complete_candidate(layout.x0, starting_facts)
-    keys = layout.opt_param_keys()
+        objective.retain_complete_candidate(optimizer_layout.x0, starting_facts)
+    keys = optimizer_layout.opt_param_keys()
     primary_stopped = False
     try:
         optimizer_result = fit_parameters(
             objective.evaluate_points,
-            layout.initial_params(),
-            bounds=layout.bounds_dict(),
+            optimizer_layout.initial_params(),
+            bounds=optimizer_layout.bounds_dict(),
             method=method,
             max_nfev=max_nfev,
             seed=seed,
@@ -153,12 +148,11 @@ def fit_global(
             candidate_vector: np.ndarray,
             *,
             endpoint_replaced: bool,
-            identifiability_warning: str | None,
         ) -> _fit_execution.GlobalFitResult | ScientificUnavailable:
             return _fit_execution._replay_fit_result(
                 fit_evaluators=evaluators,
                 payloads=payloads,
-                layout=layout,
+                layout=optimizer_layout,
                 candidate_vector=candidate_vector,
                 fixed_dataset_params=fixed_dataset_params,
                 weights=weights_norm,
@@ -167,25 +161,18 @@ def fit_global(
                 ending=ending,
                 message=message,
                 endpoint_replaced=endpoint_replaced,
-                identifiability_warning=identifiability_warning,
                 executor=executor,
             )
 
         # Scientific availability belongs to the actual optimizer endpoint
         # replay. A better fully evaluated probe must not replace it.
-        result = replay(
-            optimizer_endpoint_vector,
-            endpoint_replaced=False,
-            identifiability_warning=optimizer_result.identifiability_warning,
-        )
+        result = replay(optimizer_endpoint_vector, endpoint_replaced=False)
         if isinstance(result, ScientificUnavailable):
             retained_best = objective.best_complete_vector
             if retained_best is None:
                 return result
             retained_best_vector = np.asarray(retained_best, dtype=float).reshape(-1)
-            # The replaced endpoint's rank warning does not describe the
-            # retained candidate, so it is not reported.
-            result = replay(retained_best_vector, endpoint_replaced=True, identifiability_warning=None)
+            result = replay(retained_best_vector, endpoint_replaced=True)
             if isinstance(result, ScientificUnavailable):
                 return result
     except (FittingCancelled, SimulationCancelled):
@@ -198,7 +185,7 @@ def fit_global(
         message = "Fit stopped. Best complete candidate retained."
         result = _fit_execution._assemble_fit_result_facts(
             payloads=payloads,
-            layout=layout,
+            layout=optimizer_layout,
             candidate_vector=retained_vector,
             facts=objective.best_complete_facts,
             cancellation_check=hard_cancelled,
@@ -233,14 +220,17 @@ def fit_global(
             # before the noise model and the bound check run.
             extension_progress_callback(FitExtensionProgress(status="running", stage="primary_complete"))
             analysis_objective = new_objective(honor_stop=False)
+            # The noise model differentiates each curve where the fit left
+            # it, so its derivative never follows the solver's steps or a
+            # jump of the model.
             noise = profile_noise_model(
-                objective=analysis_objective, vector=vector, keys=keys,
-                bounds=layout.bounds_dict(), dataset_info=result.dataset_info,
+                objective=new_objective(honor_stop=False, held=result.dataset_info), vector=vector, keys=keys,
+                bounds=optimizer_layout.bounds_dict(), dataset_info=result.dataset_info,
             )
             if noise is not None and noise.cutoffs:
                 undetermined = undetermined_coordinates(
                     objective=analysis_objective, vector=vector, keys=keys,
-                    bounds=layout.bounds_dict(),
+                    bounds=optimizer_layout.bounds_dict(),
                     base_residuals=base_residuals, cutoffs=noise.cutoffs,
                 )
         except (FittingCancelled, SimulationCancelled):
@@ -284,8 +274,8 @@ def fit_global(
                 else FactualCause(
                     domain="fit", origin="profile_likelihood", code=None,
                     message=(
-                        "The noise of the data could not be estimated, because a candidate "
-                        "next to the estimate is scientifically unavailable."
+                        "Estimating the noise expects the model to be available without a "
+                        "jump on at least one side of each fitted value."
                     ),
                 )
             ),
@@ -300,16 +290,16 @@ def fit_global(
                 },
                 bounds={
                     group_targets.get(key, key): value
-                    for key, value in layout.bounds_dict().items()
+                    for key, value in optimizer_layout.bounds_dict().items()
                 },
                 config=profile_likelihood,
-                decode_coordinate=lambda coordinate, value: layout.decode_coordinate(
+                decode_coordinate=lambda coordinate, value: optimizer_layout.decode_coordinate(
                     optimizer_keys.get(coordinate, coordinate), value,
                 ),
                 ftol=ftol,
                 xtol=xtol,
                 base_residuals=base_residuals,
-                noise=ProfileNoiseModel(noise.blocks, {
+                noise=replace(noise, cutoffs={
                     group_targets.get(key, key): cutoff for key, cutoff in noise.cutoffs.items()
                 }),
                 undetermined=frozenset(group_targets.get(key, key) for key in undetermined),
@@ -346,11 +336,12 @@ def fit_global(
         result,
         message=message,
         profile_likelihood_result=profile_result,
+        coupled_values=() if noise is None else noise.coupled,
         undetermined_values=undetermined,
         # Structural, so it holds after a stopped Fit too.
         rate_scale_undetermined=rate_scale_undetermined(
             prepared_dsl=prepared_dsl, fit_evaluators=evaluators, datasets=payloads,
-            fixed_dataset_params=fixed_dataset_params, layout=layout, vector=vector,
+            fixed_dataset_params=fixed_dataset_params, layout=optimizer_layout, vector=vector,
             dataset_info=result.dataset_info,
         ),
     )

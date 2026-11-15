@@ -35,9 +35,6 @@ from kindred.gui.workspace_result_presenter import (
     encode_tsv_row,
 )
 
-__all__ = ["GridPlotView"]
-
-
 ColorResolver = Callable[[str], object]
 _FIT_COPY_ROWS_PER_CHUNK = 2048
 

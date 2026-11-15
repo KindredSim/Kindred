@@ -22,8 +22,6 @@ from .species import validate_input_time_seconds, validate_temperature
 from .temperature import TemperatureChange
 from .validation import parse_finite_numeric_text
 
-__all__ = ["parse_temperature_schedule", "TemperatureDSLError"]
-
 
 class TemperatureDSLError(AuthoredSourceError):
     """Temperature schedule DSL parsing error."""

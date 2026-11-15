@@ -64,14 +64,6 @@ from kindred.gui.fitting.launch import (
 from kindred.core.species import CONCENTRATION_MIN_M
 from kindred.core.validation import six_digit_text
 
-__all__ = [
-    "FitCandidate",
-    "FitCurveDataset",
-    "FitLiveUpdate",
-    "project_fit_candidate_curves",
-    "published_fitted_concentration",
-]
-
 _BEST_INTERVAL_SECONDS = 0.25
 _CURVE_INTERVAL_SECONDS = 2.0
 
@@ -131,6 +123,11 @@ class FitCandidate:
     request: FitExecutionRequest
     result: GlobalFitResult
     setup_snapshot: FitSetupSnapshot
+    # Where a fit started from the refit Profile found clearly better begins:
+    # that refit's parameter values as the setup, and its varied starting
+    # concentrations by optimizer variable, which no setup holds.
+    better_setup: FitSetupSnapshot | None = None
+    better_initial_starts: tuple[tuple[str, float], ...] = ()
 
     @property
     def origin(self) -> FitOriginSnapshot:
@@ -292,7 +289,8 @@ def _initial_values_from_result(
 def _terminal_setup_snapshot(
     setup_snapshot: FitSetupSnapshot,
     *,
-    result: GlobalFitResult,
+    shared_params: Mapping[str, float],
+    dataset_params: Mapping[str, Mapping[str, float]],
     dispatch: _FitDispatchCompilation,
 ) -> FitSetupSnapshot:
     """Overlay fitted parameter values as the next starting values.
@@ -306,14 +304,14 @@ def _terminal_setup_snapshot(
     }
     shared_results = {
         str(name): float(value)
-        for name, value in result.shared_params.items()
+        for name, value in shared_params.items()
     }
     dataset_results = {
         dataset_id: {
             str(name): float(value)
             for name, value in values.items()
         }
-        for dataset_id, values in result.dataset_params.items()
+        for dataset_id, values in dataset_params.items()
         if dataset_id in included_ids
     }
     fixed_results = {
@@ -470,13 +468,32 @@ def _assemble_fit_terminal(
 
     terminal_setup = _terminal_setup_snapshot(
         setup_snapshot,
-        result=result,
+        shared_params=result.shared_params,
+        dataset_params=result.dataset_params,
         dispatch=request.dispatch,
     )
+    profile = result.profile_likelihood_result
+    if profile is None or profile.better_fit is None:
+        return FitCandidate(request=request, result=result, setup_snapshot=terminal_setup)
+    layout = request.dispatch.ordinary_optimizer_layout
+    vector = np.asarray(profile.better_fit.optimizer_vector, dtype=float)
     return FitCandidate(
         request=request,
         result=result,
         setup_snapshot=terminal_setup,
+        better_setup=_terminal_setup_snapshot(
+            setup_snapshot,
+            shared_params=layout.shared_param_dict_from_vector(vector),
+            dataset_params=layout.dataset_params_from_vector(request.dispatch.included_dataset_ids, vector),
+            dispatch=request.dispatch,
+        ),
+        better_initial_starts=tuple(
+            (spec.variable_id, layout.decode_coordinate(
+                FitCoordinate("coupled", spec.variable_id), vector[layout.coupled_var_index[spec.variable_id]],
+            ))
+            for spec in layout.coupled_var_order
+            if spec.parameter_name.startswith(INITIAL_PREFIX)
+        ),
     )
 
 
@@ -587,7 +604,6 @@ class _FitExecution(_FitControl):
         if self._checkpoint():
             raise FittingCancelled()
         included = tuple(item for item in setup.datasets if item.included)
-        mapped_by_id = {item.dataset_id: item for item in setup.origin.mapped_datasets}
         dispatch = request.dispatch
         fixed_by_dataset = {
             item.dataset_id: dict(item.fixed_params)
@@ -654,29 +670,18 @@ class _FitExecution(_FitControl):
             if setup.dataset_weight_mode == "user" else None,
         )
         starting_futures = {}
+        variable_by_dataset = {
+            values.dataset_id: values.variable_params for values in execution_dataset_overrides
+        }
         for local in included:
-            mapped = mapped_by_id[local.dataset_id]
-            starting_values = {
-                parameter.name: (
-                    dict(parameter.selected_config.dataset_values)[local.dataset_id]
-                    if parameter.scope == "per_dataset"
-                    else parameter.selected_config.value
-                )
-                for parameter in setup.parameters
-            }
+            # The starting evaluation is the optimizer's start, so it reads the dispatch.
+            starting_values = dict(fixed_by_dataset[local.dataset_id])
             starting_values.update({item.name: item.initial for item in execution_shared_variables})
-            starting_values.update(fixed_by_dataset[local.dataset_id])
-            grouped_species = {
-                group.species
-                for group in setup.shared_initial_groups
-                if local.dataset_id in group.member_dataset_ids
-            }
-            for initial in setup.initials:
-                if initial.set_id == mapped.set_id and initial.species not in grouped_species:
-                    starting_values[f"{INITIAL_PREFIX}{initial.species}"] = initial.initial
-            for group in setup.shared_initial_groups:
-                if local.dataset_id in group.member_dataset_ids:
-                    starting_values[f"{INITIAL_PREFIX}{group.species}"] = group.initial
+            starting_values.update({item.name: item.initial for item in variable_by_dataset[local.dataset_id]})
+            starting_values.update({
+                item.parameter_name: item.initial for item in execution_coupled_variables
+                if local.dataset_id in item.dataset_ids
+            })
             starting_origins = {
                 name: (
                     FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED

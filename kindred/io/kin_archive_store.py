@@ -51,12 +51,6 @@ from kindred.core.project_presentation_state import (
 )
 from kindred.io.paths import create_sibling_temporary, replace_destination
 
-__all__ = [
-    "ArchiveProject",
-    "CURRENT_PROJECT_FORMAT",
-    "KinArchiveStore",
-]
-
 CURRENT_PROJECT_FORMAT = "kindred-kin-7"
 _PROJECT_MEMBER = "project.json"
 _SOURCE_MEMBER_PREFIX = "sources/"

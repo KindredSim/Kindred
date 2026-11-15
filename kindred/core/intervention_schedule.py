@@ -19,36 +19,6 @@ from kindred.core.species import (
     validate_input_time_seconds,
 )
 
-__all__ = [
-    "InterventionPhysical",
-    "PhysicalAction",
-    "PhysicalQuantity",
-    "intervention_species",
-    "InterventionFlux",
-    "InterventionHold",
-    "InterventionJump",
-    "InterventionProtocol",
-    "InterventionProtocolOperation",
-    "InterventionSchedule",
-    "InterventionScheduleDependencyMetadata",
-    "InterventionScheduleError",
-    "InterventionScheduleFieldIdentity",
-    "InterventionSet",
-    "InterventionTrigger",
-    "InterventionTriggerAction",
-    "InterventionStopAction",
-    "SpeciesTriggerCondition",
-    "ObservableTriggerCondition",
-    "INTERVENTION_CLOCK_FIELDS",
-    "admit_intervention_parameter_units",
-    "intervention_schedule_clock_parameters",
-    "intervention_schedule_parameter_dependencies",
-    "intervention_schedule_parameter_names",
-    "declaration_line",
-    "locate_declaration",
-]
-
-
 # The declaration ordinal and (where applicable) the authored nested ordinal
 # are part of the key.  Keeping the location in the key is important: two
 # protocol records may use the same field name without overwriting one another.
@@ -217,10 +187,9 @@ def _concentration(value: object, *, field: str) -> float:
 def _positive_int(value: object, *, field: str) -> int:
     if type(value) is not int:
         raise InterventionScheduleError(f"{field} must be a positive integer.")
-    number = value
-    if number <= 0:
+    if value <= 0:
         raise InterventionScheduleError(f"{field} must be a positive integer.")
-    return number
+    return value
 
 
 def _name(value: object, *, field: str) -> str:
@@ -384,11 +353,11 @@ class PhysicalAction:
     def amount_field(self) -> str:
         return {"jump": "volume", "flux": "volume_rate", "withdraw": "volume", "scale": "factor"}[self.op]
 
-    def quantities(self, *, include_initializer: bool = True) -> tuple[tuple[str, PhysicalQuantity], ...]:
+    def quantities(self) -> tuple[tuple[str, PhysicalQuantity], ...]:
         prefix = "solution." if self.op in {"jump", "flux"} else ""
         items = [(prefix + self.amount_field, self.amount)]
         items.extend((f"solution.stock.{name}.value", value) for name, value in self.stock)
-        if include_initializer and self.initial_volume is not None:
+        if self.initial_volume is not None:
             items.append(("initial_volume", self.initial_volume))
         return tuple(items)
 
@@ -1190,11 +1159,10 @@ def _operation_from_fields(
     data = dict(fields)
     _literal_fields(data, context="intervention")
     op = _enum(data.get("op"), field="op")
-    ordinal = declaration_ordinal
     if "solution" in data or op in {"scale", "withdraw"}:
         clocks = ("start_time", "end_time") if op == "flux" else ("time",)
         physical = _physical_from_fields(data, extra_keys={key for field in clocks for key in (field, field + "_param")})
-        return InterventionPhysical(physical=physical, declaration_ordinal=ordinal,
+        return InterventionPhysical(physical=physical, declaration_ordinal=declaration_ordinal,
                                     **{key: data.get(key) for field in clocks for key in (field, field + "_param")})
     if op == "set":
         allowed = frozenset(
@@ -1207,7 +1175,7 @@ def _operation_from_fields(
             time_param=data.get("time_param"),
             value=data.get("value"),
             value_param=data.get("value_param"),
-            declaration_ordinal=ordinal,
+            declaration_ordinal=declaration_ordinal,
         )
     if op == "jump":
         allowed = frozenset(
@@ -1220,7 +1188,7 @@ def _operation_from_fields(
             time_param=data.get("time_param"),
             delta=data.get("delta"),
             delta_param=data.get("delta_param"),
-            declaration_ordinal=ordinal,
+            declaration_ordinal=declaration_ordinal,
         )
     if op == "flux":
         allowed = frozenset(
@@ -1244,7 +1212,7 @@ def _operation_from_fields(
             end_time_param=data.get("end_time_param"),
             flux_rate=data.get("flux_rate"),
             flux_rate_param=data.get("flux_rate_param"),
-            declaration_ordinal=ordinal,
+            declaration_ordinal=declaration_ordinal,
         )
     if op == "hold":
         allowed = frozenset(
@@ -1268,7 +1236,7 @@ def _operation_from_fields(
             end_time_param=data.get("end_time_param"),
             value=data.get("value"),
             value_param=data.get("value_param"),
-            declaration_ordinal=ordinal,
+            declaration_ordinal=declaration_ordinal,
         )
     if op == "protocol":
         allowed = frozenset(
@@ -1298,7 +1266,7 @@ def _operation_from_fields(
             every=data.get("every"),
             count=data.get("count"),
             duration=data.get("duration"),
-            declaration_ordinal=ordinal,
+            declaration_ordinal=declaration_ordinal,
             **phases,
         )
     if op == "trigger":
@@ -1333,7 +1301,7 @@ def _operation_from_fields(
             max_count=data.get("max_count"),
             min_interval=data.get("min_interval"),
             then=then,
-            declaration_ordinal=ordinal,
+            declaration_ordinal=declaration_ordinal,
         )
     raise InterventionScheduleError(f"Unsupported intervention op: {op!r}.")
 

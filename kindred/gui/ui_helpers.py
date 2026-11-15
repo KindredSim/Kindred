@@ -10,27 +10,6 @@ from kindred.gui.display_name_policy import (
     literal_tooltip,
 )
 
-__all__ = [
-    "INVALID_EDITOR_STYLE",
-    "SCIENTIFIC_NAME_HTML_ROLE",
-    "SOLVER_TOOLTIP",
-    "ControlRowsLayout",
-    "configure_compact_numeric_edit",
-    "ScientificNameComboBox",
-    "ScientificNameDelegate",
-    "ScientificNameHeaderView",
-    "clamp_initial_size",
-    "cell_text_as_shown",
-    "copy_current_cell_as_shown",
-    "enter_confirms_only",
-    "ChoicesComboBox",
-    "ignore_wheel",
-    "make_bounded_label",
-    "make_scroll_area",
-    "set_bounded_label_text",
-]
-
-
 DEFAULT_DYNAMIC_LABEL_MAX_WIDTH = 220
 
 
@@ -303,8 +282,7 @@ def set_bounded_label_text(
     tooltip: bool = True,
     tooltip_text: str | None = None,
 ) -> None:
-    full = text
-    _set_label_projection(label, CompactText(full, full, False),
+    _set_label_projection(label, CompactText(text, text, False),
                           max_width=max_width, tooltip=tooltip, tooltip_text=tooltip_text)
 
 

@@ -21,14 +21,6 @@ from kindred.core.datasets.source_rules import (
 from kindred.core.species import validate_imported_time_seconds, validate_observation
 from kindred.core.quantity_units import Unit, SECOND, conversion_scale, scientific_unit
 
-__all__ = [
-    "CsvImportInterrupted",
-    "PhysicalRow",
-    "TemporalCell",
-    "UncachedFormulaCell",
-    "read_csv_rows_from_bytes",
-    "parse_physical_rows",
-]
 
 class CsvImportInterrupted(Exception):
     """Raised internally to unwind when an import is interrupted."""
@@ -91,10 +83,8 @@ def read_csv_rows_from_bytes(
     or explicitly closed.  Header positions remain physical, including blank
     and sparse positions, for the shared ``parse_physical_rows`` boundary.
     """
-    owned_bytes = source_bytes
-    label = source_label
     handle = io.TextIOWrapper(
-        io.BytesIO(owned_bytes),
+        io.BytesIO(source_bytes),
         encoding="utf-8-sig",
         newline="",
     )
@@ -104,17 +94,17 @@ def read_csv_rows_from_bytes(
         header = next(reader, None)
     except csv.Error as exc:
         handle.close()
-        raise ValueError(f"CSV file {label!r}: {exc}") from exc
+        raise ValueError(f"CSV file {source_label!r}: {exc}") from exc
     except BaseException:
         handle.close()
         raise
     if header is None:
         handle.close()
-        raise ValueError(f"CSV file {label!r} is empty.")
+        raise ValueError(f"CSV file {source_label!r} is empty.")
     columns = tuple(identify_physical_columns(header))
     if not columns:
         handle.close()
-        raise ValueError(f"CSV file {label!r} has no named columns.")
+        raise ValueError(f"CSV file {source_label!r} has no named columns.")
 
     def _iter_rows() -> Iterable[PhysicalRow]:
         try:
@@ -134,7 +124,7 @@ def read_csv_rows_from_bytes(
                 )
                 previous_end_row = row_end_row
         except csv.Error as exc:
-            raise ValueError(f"CSV file {label!r}: {exc}") from exc
+            raise ValueError(f"CSV file {source_label!r}: {exc}") from exc
         finally:
             handle.close()
 
@@ -174,7 +164,6 @@ def parse_physical_rows(
     first_item = next(row_iter, None)
     if first_item is None:
         raise ValueError(f"{_source_prefix()}the source contains no data rows.")
-    first_source_row = source_row_start
 
     def _row_values_and_source_row(
         item: Mapping[PhysicalColumn, object] | PhysicalRow,
@@ -182,11 +171,10 @@ def parse_physical_rows(
     ) -> tuple[Mapping[PhysicalColumn, object], int]:
         if isinstance(item, PhysicalRow):
             return item.values, item.source_row
-        return item, first_source_row + logical_index
+        return item, source_row_start + logical_index
 
     first, first_row_source = _row_values_and_source_row(first_item, 0)
 
-    resolved_time = time_column
     resolved_species = tuple(species_columns)
 
     time_scale = conversion_scale(time_unit, SECOND)
@@ -204,7 +192,7 @@ def parse_physical_rows(
     }
     selected_columns = tuple(
         column for column in physical_columns
-        if column == resolved_time or column in resolved_species
+        if column == time_column or column in resolved_species
     )
     saw_nonempty_row = False
     def _cell(row: Mapping[PhysicalColumn, object], column: PhysicalColumn) -> str:
@@ -235,37 +223,37 @@ def parse_physical_rows(
         ):
             continue
         saw_nonempty_row = True
-        if resolved_time is not None:
-            temporal = row.get(resolved_time)
+        if time_column is not None:
+            temporal = row.get(time_column)
             if isinstance(temporal, TemporalCell):
                 parsed_time = temporal.elapsed_seconds
                 if parsed_time is None:
                     raise ValueError(
                         f"{_source_prefix()}row {row_index}, time column "
-                        f"{resolved_time.assigned_name!r}: calendar date cell "
+                        f"{time_column.assigned_name!r}: calendar date cell "
                         f"{str(temporal)!r} is not an elapsed time. Format "
                         "times as [h]:mm:ss durations or plain numbers."
                     )
             else:
-                raw_time = _cell(row, resolved_time)
+                raw_time = _cell(row, time_column)
                 if not raw_time:
                     raise ValueError(
                         f"{_source_prefix()}row {row_index}, time column "
-                        f"{resolved_time.assigned_name!r}: missing value."
+                        f"{time_column.assigned_name!r}: missing value."
                     )
                 try:
                     parsed_time = time_scale.apply(float(raw_time))
                 except (TypeError, ValueError) as exc:
                     raise ValueError(
                         f"{_source_prefix()}row {row_index}, time column "
-                        f"{resolved_time.assigned_name!r}: invalid numeric value "
+                        f"{time_column.assigned_name!r}: invalid numeric value "
                         f"{raw_time!r}."
                     ) from exc
             parsed_time = validate_imported_time_seconds(
                 parsed_time,
                 field=(
                     f"{_source_prefix()}row {row_index}, time column "
-                    f"{resolved_time.assigned_name!r}"
+                    f"{time_column.assigned_name!r}"
                 ),
             )
 
@@ -290,7 +278,7 @@ def parse_physical_rows(
                 ),
             )
             spec = observations_by_column[column]
-            if resolved_time is not None:
+            if time_column is not None:
                 spec["t"].append(parsed_time)
             spec["y"].append(parsed_value)
             spec["source_rows"].append(row_index)
@@ -325,7 +313,7 @@ def parse_physical_rows(
             name: unit.symbol
             for name, unit in observation_units.items()
         },
-        "time_column": resolved_time.assigned_name if resolved_time is not None else None,
+        "time_column": time_column.assigned_name if time_column is not None else None,
         "observation_columns": [
             column.assigned_name for column in retained_columns
         ],

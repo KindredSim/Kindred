@@ -21,8 +21,6 @@ from kindred.gui.widgets.batch_initial_conditions_table import (
     BatchInitialConditionsTableView,
 )
 
-__all__ = ["SimulationPanel"]
-
 
 class _ControlsScrollArea(QtWidgets.QScrollArea):
     """Give wrapping controls their full content height and native overflow."""
@@ -245,7 +243,6 @@ class SimulationPanel(QtWidgets.QWidget):
         *,
         simulation_job_kind: str | None,
     ) -> None:
-        kind = simulation_job_kind
         # Rendering is never nested inside another render.
         self._rendering = True
         try:
@@ -253,7 +250,7 @@ class SimulationPanel(QtWidgets.QWidget):
                 self._candidate_dirty and settings == self._canonical_settings
             )
             self._canonical_settings = settings
-            self._simulation_job_kind = kind
+            self._simulation_job_kind = simulation_job_kind
             if not preserve_candidate:
                 self._candidate_dirty = False
                 self._reproject_canonical()
@@ -420,8 +417,9 @@ class SimulationPanel(QtWidgets.QWidget):
 
     @QtCore.Slot()
     def _request_run(self) -> None:
-        # The Run owner captures focused editors and Run-setting drafts after
-        # it admits Reactions; nothing is published before that admission.
+        # The Run owner captures focused editors and Run-setting drafts itself;
+        # apart from a typed set name, nothing is published before it admits
+        # Reactions.
         self.runSelectedRequested.emit()
 
     def _sync_controls(self) -> None:

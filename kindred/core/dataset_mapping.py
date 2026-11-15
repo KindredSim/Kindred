@@ -333,13 +333,12 @@ def plan_global_dataset_delete(
     uses; it does not duplicate the replacement document or presentation.
     """
     # Both mappings cover the same tabs.
-    target = dataset_id
     referenced = False
     for raw_tab_id, links in links_by_tab.items():
-        if any(current_dataset_id == target for current_dataset_id, _link in links):
+        if any(current_dataset_id == dataset_id for current_dataset_id, _link in links):
             referenced = True
         if any(
-            raw_dataset_id == target
+            raw_dataset_id == dataset_id
             for raw_dataset_id, _raw_columns in overlays_by_tab[raw_tab_id]
         ):
             referenced = True

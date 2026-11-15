@@ -4,8 +4,6 @@ from typing import Callable
 
 from PySide6 import QtWidgets
 
-__all__ = ["FloatingDockContainer"]
-
 
 class FloatingDockContainer(QtWidgets.QWidget):
     """Wrap dock content with a floating-only re-dock affordance."""
@@ -73,8 +71,7 @@ class FloatingDockContainer(QtWidgets.QWidget):
         self._floating_banner.setVisible(bool(floating))
 
     def _update_message(self, title: str) -> None:
-        panel_title = title
         self._message_label.setText(
-            f"{panel_title} is floating. Drag the title bar to snap it back to a side, or use Dock Back. "
+            f"{title} is floating. Drag the title bar to snap it back to a side, or use Dock Back. "
             "Restore Default Panel Layout returns all panels to the factory arrangement."
         )

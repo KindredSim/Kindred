@@ -10,11 +10,6 @@ from PySide6 import QtGui
 
 logger = logging.getLogger(__name__)
 
-__all__ = [
-    "ThemeManager", "semantic_color", "plot_background_color",
-    "plot_foreground_color", "readable_plot_color",
-]
-
 
 def semantic_color(role: str, dark_mode: bool) -> QtGui.QColor:
     """Return readable accent text for the current light or dark surface."""

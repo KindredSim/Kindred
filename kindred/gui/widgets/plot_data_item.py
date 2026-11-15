@@ -8,9 +8,6 @@ import numpy as np
 
 import pyqtgraph as pg
 
-__all__ = ["PlotDataItem"]
-
-
 
 class PlotDataItem(pg.PlotDataItem):
     """Mark lone displayed samples of a line, and treat scatter axes with no

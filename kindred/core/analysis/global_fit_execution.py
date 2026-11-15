@@ -33,6 +33,7 @@ from kindred.core.analysis.parametric_alignment import (
     ParametricProjection,
     UndefinedComparedTargets,
     align_parametric,
+    follow_parametric,
     project_parametric_y,
 )
 from kindred.core.analysis.dataset_parameter_overrides import (
@@ -74,21 +75,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _DATASET_DEADLINE_SECONDS = 10.0
-
-
-__all__ = [
-    "FitCoordinate",
-    "FitProgress",
-    "DatasetFitInfo",
-    "GlobalFitResult",
-    "FitParameterLayout",
-    "ObjectiveDatasetInput",
-    "GlobalFitObjective",
-    "build_parameter_layout_for_dataset_ids",
-    "normalize_weights",
-    "evaluate_dataset_simulation",
-    "parameter_group_variable_id",
-]
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,9 +259,9 @@ class GlobalFitResult:
     # The optimizer endpoint was scientifically unavailable and the best
     # retained complete candidate replaced it.
     endpoint_replaced: bool = False
-    # The rank warning for the reported endpoint.
-    identifiability_warning: str | None = None
     profile_likelihood_result: ProfileLikelihoodResult | None = None
+    # Optimizer coordinates the data see only together with others.
+    coupled_values: tuple["FitCoordinate", ...] = ()
     # Optimizer coordinates the data do not determine within their bounds.
     undetermined_values: tuple["FitCoordinate", ...] = ()
     # The fitted values can scale every rate constant by one common factor
@@ -316,13 +302,12 @@ def fit_result_message(
     base_message: str,
     ending: FitEnding,
     endpoint_replaced: bool,
-    identifiability_warning: str | None,
 ) -> str:
     # A Stop's own message already says the fit stopped.
     if ending == "stopped":
         return base_message
     termination = base_message.strip()
-    if not endpoint_replaced and identifiability_warning is None:
+    if not endpoint_replaced:
         if ending == "not_converged":
             return f"Fit completed. Optimizer stopped: {termination or 'the optimizer stopped without a termination message'}"
         return base_message
@@ -332,16 +317,13 @@ def fit_result_message(
             f"Optimizer stopped: {termination}" if termination
             else "Optimizer stopped without a termination message"
         )
-    elif endpoint_replaced and termination:
+    elif termination:
         # A converged optimizer whose endpoint was replaced did not stop early.
         warning_parts.append(termination)
-    if endpoint_replaced:
-        warning_parts.append(
-            "The unavailable optimizer endpoint was replaced by the "
-            "best scientifically available evaluated candidate."
-        )
-    if identifiability_warning is not None:
-        warning_parts.append(identifiability_warning)
+    warning_parts.append(
+        "The unavailable optimizer endpoint was replaced by the "
+        "best scientifically available evaluated candidate."
+    )
     return "Global fit completed with warnings: " + " ".join(warning_parts)
 
 
@@ -580,6 +562,13 @@ class FitParameterLayout:
             )
         return out
 
+    def dataset_params_from_vector(self, dataset_ids, vector: np.ndarray) -> Dict[str, Dict[str, float]]:
+        """Each dataset's own and coupled fitted values."""
+        return {
+            ds_id: {**self.dataset_var_params_for_dataset(ds_id, vector), **self.coupled_params_for_dataset(ds_id, vector)}
+            for ds_id in dataset_ids
+        }
+
     def coupled_params_for_dataset(
         self,
         ds_id: str,
@@ -746,6 +735,9 @@ class ObjectiveDatasetInput:
     payload: FitDatasetSpec
     full_params: Dict[str, float]
     parameter_origins: Dict[str, str]
+    # The fitted facts a measured-X candidate follows: its curve sampled at
+    # their times, each row on the piece they placed it on.
+    held: DatasetFitInfo | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "full_params", dict(self.full_params))
@@ -759,6 +751,7 @@ def _objective_dataset_input(
     vector: np.ndarray,
     shared_values: Mapping[str, float],
     fixed_values: Mapping[str, float],
+    held: DatasetFitInfo | None = None,
 ) -> ObjectiveDatasetInput:
     """Assemble one dataset's candidate parameters and their origins."""
 
@@ -774,6 +767,7 @@ def _objective_dataset_input(
             **dict.fromkeys(fixed_values, FITTING_PARAM_ORIGIN_CONFIGURED_DATASET),
             **dict.fromkeys(optimized, FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET),
         },
+        held=held,
     )
 
 
@@ -880,7 +874,15 @@ def _build_dataset_fit_info(
             SimulationSeriesAxisSelection(x_name),
             tuple((name, SimulationSeriesAxisSelection(name)) for name in payload.species_list),
         )
-        x_projection = align_parametric(
+        x_projection = follow_parametric(
+            held=item.held.x_projection,
+            observed_x=x_observations["x"],
+            model_x=alignment_x,
+            observations=payload.observations,
+            model_y=alignment_y,
+            multipliers=target_multipliers,
+            x_name=x_name,
+        ) if item.held is not None else align_parametric(
             observed_x=x_observations["x"],
             source_rows=x_observations["source_rows"],
             model_x=alignment_x,
@@ -988,16 +990,15 @@ def evaluate_dataset_simulation(
     ds_id = item.payload.dataset_id
     started = time.monotonic()
     deadline = started + _DATASET_DEADLINE_SECONDS
-    worker_cancel = cancellation_control
     task_control = SimulationCancellationControl(
-        lambda: worker_cancel.cancel_requested()
+        lambda: cancellation_control.cancel_requested()
         or time.monotonic() >= deadline
     )
 
     def deadline_unavailable() -> ScientificUnavailable:
         # Recheck whole-worker cancellation immediately before settling a
         # timeout so Stop/Close wins a simultaneous deadline race.
-        _raise_if_fitting_cancel_requested(worker_cancel)
+        _raise_if_fitting_cancel_requested(cancellation_control)
         return ScientificUnavailable(
             producer="fit_dataset_deadline",
             stage="dataset_deadline",
@@ -1005,7 +1006,7 @@ def evaluate_dataset_simulation(
         )
 
     try:
-        _raise_if_fitting_cancel_requested(worker_cancel)
+        _raise_if_fitting_cancel_requested(cancellation_control)
         # The dispatch compiled one evaluator per included dataset.
         evaluator = fit_evaluators[ds_id]
         series_result = evaluator.evaluate_series_with_parameter_origins(
@@ -1013,8 +1014,9 @@ def evaluate_dataset_simulation(
             origins=item.parameter_origins,
             outputs=item.payload.target_roster,
             cancellation_control=task_control,
+            along=None if item.held is None else item.held.simulation_result,
         )
-        _raise_if_fitting_cancel_requested(worker_cancel)
+        _raise_if_fitting_cancel_requested(cancellation_control)
         if time.monotonic() >= deadline:
             return deadline_unavailable()
         if isinstance(series_result, ScientificUnavailable):
@@ -1039,17 +1041,17 @@ def evaluate_dataset_simulation(
             if rejection is None:
                 raise _target_not_calculated(series_result, targets[0], ds_id) from None
             return replace(rejection, factual_cause=_cause_naming_dataset(rejection.factual_cause, ds_id))
-        _raise_if_fitting_cancel_requested(worker_cancel)
+        _raise_if_fitting_cancel_requested(cancellation_control)
         if time.monotonic() >= deadline:
             return deadline_unavailable()
         return fit_info
     except Exception as exc:
         if isinstance(exc, (FittingCancelled, SimulationCancelled)):
-            _raise_if_fitting_cancel_requested(worker_cancel)
+            _raise_if_fitting_cancel_requested(cancellation_control)
             if time.monotonic() >= deadline:
                 return deadline_unavailable()
             raise
-        _raise_if_fitting_cancel_requested(worker_cancel)
+        _raise_if_fitting_cancel_requested(cancellation_control)
         if time.monotonic() >= deadline:
             return deadline_unavailable()
         _name_dataset(exc, ds_id)
@@ -1122,6 +1124,7 @@ class GlobalFitObjective:
         cancellation_check: Callable[[], bool],
         cancellation_control: SimulationCancellationControl,
         executor: Executor,
+        held: Sequence[DatasetFitInfo] = (),
     ) -> None:
         # One compiled Fit setup supplies the nonempty unique included
         # roster, its evaluators and the layout built from that roster.
@@ -1136,6 +1139,9 @@ class GlobalFitObjective:
         self._cancellation_check = cancellation_check
         self._cancellation_control = cancellation_control
         self._executor = executor
+        # Candidates follow these fitted facts, on the same side of every
+        # jump of their curves.
+        self._held = {info.dataset_id: info for info in held}
 
         self._objective_calls = 0
         self._best_cost = float("inf")
@@ -1507,6 +1513,7 @@ class GlobalFitObjective:
                         vector=params,
                         shared_values=param_dict,
                         fixed_values=self._dataset_params[payload.dataset_id],
+                        held=self._held.get(payload.dataset_id),
                     )
                 )
             point_inputs.append(dataset_inputs)
@@ -1556,7 +1563,6 @@ def _replay_fit_result(
     ending: FitEnding,
     message: str,
     endpoint_replaced: bool,
-    identifiability_warning: str | None,
     cancellation_control: SimulationCancellationControl,
     executor: Executor,
 ) -> GlobalFitResult | ScientificUnavailable:
@@ -1607,7 +1613,6 @@ def _replay_fit_result(
         ending=ending,
         message=message,
         endpoint_replaced=endpoint_replaced,
-        identifiability_warning=identifiability_warning,
     )
 
 
@@ -1622,20 +1627,15 @@ def _assemble_fit_result_facts(
     ending: FitEnding,
     message: str,
     endpoint_replaced: bool = False,
-    identifiability_warning: str | None = None,
 ) -> GlobalFitResult:
     """Construct terminal metrics and values from complete scientific facts.
 
     Every dataset's facts are available, in roster order.
     """
     fitted_params = layout.shared_param_dict_from_vector(candidate_vector)
-    combined_dataset_params = {
-        payload.dataset_id: {
-            **layout.dataset_var_params_for_dataset(payload.dataset_id, candidate_vector),
-            **layout.coupled_params_for_dataset(payload.dataset_id, candidate_vector),
-        }
-        for payload in payloads
-    }
+    combined_dataset_params = layout.dataset_params_from_vector(
+        [payload.dataset_id for payload in payloads], candidate_vector,
+    )
     dataset_info = []
     global_weighted_residual_blocks: List[np.ndarray] = []
     for evaluation in facts:
@@ -1655,10 +1655,9 @@ def _assemble_fit_result_facts(
         base_message=message,
         ending=ending,
         endpoint_replaced=endpoint_replaced,
-        identifiability_warning=identifiability_warning,
     )
 
-    if ending == "stopped" or endpoint_replaced or identifiability_warning is not None:
+    if ending == "stopped" or endpoint_replaced:
         logger.warning("Global fit complete with warnings: %s", result_message)
     else:
         logger.info("Global fit complete with typed weighted metrics.")
@@ -1679,7 +1678,6 @@ def _assemble_fit_result_facts(
         message=result_message,
         ending=ending,
         endpoint_replaced=endpoint_replaced,
-        identifiability_warning=identifiability_warning,
         optimizer_vector=candidate_vector,
         profile_likelihood_result=None,
     )

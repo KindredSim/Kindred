@@ -20,13 +20,6 @@ from .equilibrium_rate_authority import (
     normalize_equilibrium_rate_authority,
 )
 
-__all__ = [
-    "Reaction",
-    "Equilibrium",
-    "Mechanism",
-]
-
-
 # --------------------------------- helpers ----------------------------------
 
 

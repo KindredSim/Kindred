@@ -63,6 +63,7 @@ def _bounds_text(item: ScanInput) -> str:
 
 def admitted_ranges(catalog: tuple[ScanInput, ...], config: ScanConfig) -> dict[str, tuple[Interval, ...]]:
     # The scanned keys come from this capture's catalog.
+    calculated = {condition.dependent for condition in config.constraints if condition.condition == "equals"}
     out = {}
     for item in catalog:
         requested = config.ranges.get(item.key)
@@ -76,5 +77,19 @@ def admitted_ranges(catalog: tuple[ScanInput, ...], config: ScanConfig) -> dict[
                     raise ValueError(f"{item.label}: {value:g} is not an included endpoint.")
                 if not any(i.contains(value) for i in allowed):
                     raise ValueError(f"{item.label}: selected endpoint {value:g} is outside its scientific bounds, {_bounds_text(item)}.")
+            # Beside a range, sampling reaches a single value only through its
+            # endpoint face. A value an entered range covers is left to that
+            # range, which draws it like any other of its values (an exact zero
+            # the scientific bounds set apart still needs its endpoint face).
+            # A Calculated input takes whatever its equality gives.
+            if item.key not in calculated and any(i.lower < i.upper for i in allowed):
+                for row in intervals:
+                    if row.lower == row.upper and row.lower not in requested.endpoints and any(
+                        i.contains(row.lower) for i in allowed
+                    ) and not any(i.lower < i.upper and i.contains(row.lower) for i in intervals):
+                        raise ValueError(
+                            f"{item.label}: the single value {row.lower:g} beside a range is sampled only with Sample Exactly "
+                            "and Deliberately Sample Selected Included Endpoints ticked. Remove its row to sample only the range."
+                        )
         out[item.key] = allowed
     return out

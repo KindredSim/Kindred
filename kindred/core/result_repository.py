@@ -21,11 +21,6 @@ from kindred.core.simulation_preparation import (
 if TYPE_CHECKING:
     from kindred.core.simulation_parameters import DerivedParameterValue
 
-__all__ = [
-    "ResultRepository",
-    "SimulationResultValue",
-]
-
 
 @dataclass(frozen=True, slots=True, eq=False)
 class SimulationResultValue:
@@ -118,22 +113,20 @@ class ResultRepository:
     def retain_explicit_as_reference(self, set_id: str) -> None:
         """Retain the current Run unless its Reference is already retained."""
 
-        sid = set_id
         if (
-            sid not in self._current_run_set_ids
-            or sid in self._reference_by_set_id
+            set_id not in self._current_run_set_ids
+            or set_id in self._reference_by_set_id
         ):
             return
         # The Run set IDs are always a subset of the current values.
-        self._reference_by_set_id[sid] = self._current_by_set_id.pop(sid)
-        self._current_run_set_ids.discard(sid)
+        self._reference_by_set_id[set_id] = self._current_by_set_id.pop(set_id)
+        self._current_run_set_ids.discard(set_id)
 
     def clear_preview(self, set_id: str) -> None:
         """Remove the set's Preview value; its Reference stays retained."""
 
-        sid = set_id
-        if sid not in self._current_run_set_ids:
-            self._current_by_set_id.pop(sid, None)
+        if set_id not in self._current_run_set_ids:
+            self._current_by_set_id.pop(set_id, None)
 
     def restore_reference_or_current(self, set_id: str) -> bool:
         """Expose the retained canonical Run.
@@ -143,14 +136,13 @@ class ResultRepository:
         Reference is promoted directly to current Run authority.
         """
 
-        sid = set_id
-        if sid in self._current_run_set_ids:
+        if set_id in self._current_run_set_ids:
             return True
-        reference = self._reference_by_set_id.pop(sid, None)
+        reference = self._reference_by_set_id.pop(set_id, None)
         if reference is None:
             return False
-        self._current_by_set_id[sid] = reference
-        self._current_run_set_ids.add(sid)
+        self._current_by_set_id[set_id] = reference
+        self._current_run_set_ids.add(set_id)
         return True
 
     def preview_set_ids(self) -> tuple[str, ...]:
@@ -178,14 +170,13 @@ class ResultRepository:
         becomes that Preview's Reference instead of replacing it.
         """
 
-        sid = set_id
         entry = (execution_request, result)
-        if keep_preview and sid in self.preview_set_ids():
-            self._reference_by_set_id[sid] = entry
+        if keep_preview and set_id in self.preview_set_ids():
+            self._reference_by_set_id[set_id] = entry
         else:
-            self._current_by_set_id[sid] = entry
-            self._current_run_set_ids.add(sid)
-            self._reference_by_set_id.pop(sid, None)
+            self._current_by_set_id[set_id] = entry
+            self._current_run_set_ids.add(set_id)
+            self._reference_by_set_id.pop(set_id, None)
         return result
 
     def publish_preview(
@@ -196,9 +187,8 @@ class ResultRepository:
     ) -> SimulationResultValue:
         """Publish a Preview current value without Reference changes."""
 
-        sid = set_id
-        self._current_by_set_id[sid] = (execution_request, result)
-        self._current_run_set_ids.discard(sid)
+        self._current_by_set_id[set_id] = (execution_request, result)
+        self._current_run_set_ids.discard(set_id)
         return result
 
     def deauthorize_sets(self, set_ids: Iterable[str]) -> None:

@@ -21,12 +21,6 @@ from typing import Sequence
 
 import numpy as np
 
-__all__ = [
-    "TemperatureChange",
-    "TemperatureSegment",
-    "starting_temperature_segment",
-]
-
 
 @dataclass(frozen=True, slots=True)
 class TemperatureChange:

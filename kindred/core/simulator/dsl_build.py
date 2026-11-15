@@ -17,8 +17,6 @@ from .dsl_build_input import DslMechanismBuildInput
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["build_mechanism_from_ir"]
-
 
 def build_mechanism_from_ir(
     build_input: DslMechanismBuildInput,

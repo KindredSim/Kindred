@@ -40,9 +40,6 @@ from ..ui_helpers import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["VariableSliders"]
-
-
 _LOG_SLIDER_VALUE_MIN = 1e-12
 _LOG_SLIDER_EXP_MIN = -12.0
 _LOG_SLIDER_EXP_MAX = 12.0
@@ -475,14 +472,13 @@ class VariableSliders(QtWidgets.QWidget):
         return name not in self._hidden_names
 
     def set_variable_visible(self, name: str, visible: bool) -> None:
-        name_s = name
-        if name_s not in self._containers:
+        if name not in self._containers:
             return
         if visible:
-            self._hidden_names.discard(name_s)
+            self._hidden_names.discard(name)
         else:
-            self._hidden_names.add(name_s)
-        self._apply_variable_visibility(name_s)
+            self._hidden_names.add(name)
+        self._apply_variable_visibility(name)
         self._sync_visibility_state()
 
     def apply_visibility_projection(self, projected: Dict[str, bool]) -> None:
@@ -636,8 +632,7 @@ class VariableSliders(QtWidgets.QWidget):
             self.editorValidityChanged.emit()
 
     def _commit_editor(self, name: str) -> None:
-        name_s = name
-        editor = self._value_labels.get(name_s)
+        editor = self._value_labels.get(name)
         if editor is None:
             return
         # Displayed text is a rounded readout; only text the user edited is a
@@ -648,10 +643,10 @@ class VariableSliders(QtWidgets.QWidget):
         try:
             value = parse_finite_numeric_text(raw.strip())
         except ValueError:
-            self._decorate_editor(name_s)
+            self._decorate_editor(name)
             return
         self._set_value_projection(
-            name_s,
+            name,
             value,
             editor_text=raw,
             emit=True,
@@ -667,15 +662,13 @@ class VariableSliders(QtWidgets.QWidget):
         emit: bool,
         interaction: SliderInteractionKind | None = None,
     ) -> None:
-        name_s = name
-        value_f = value
-        previous_range = self._slider_ranges[name_s]
-        self._ensure_range_covers(name_s, value_f)
-        self._variables[name_s] = value_f
-        slider = self._sliders[name_s]
+        previous_range = self._slider_ranges[name]
+        self._ensure_range_covers(name, value)
+        self._variables[name] = value
+        slider = self._sliders[name]
         with QtCore.QSignalBlocker(slider):
-            slider.setValue(self._value_to_slider_pos(name_s, value_f))
-        value_label = self._value_labels[name_s]
+            slider.setValue(self._value_to_slider_pos(name, value))
+        value_label = self._value_labels[name]
         if (
             not emit and editor_text is None
             and value_label.property("invalidNumeric")
@@ -683,23 +676,23 @@ class VariableSliders(QtWidgets.QWidget):
             return
         self._set_editor_text(
             value_label,
-            format_slider_value(value_f) if editor_text is None else editor_text,
+            format_slider_value(value) if editor_text is None else editor_text,
         )
-        self._decorate_editor(name_s)
-        logger.debug("Variable projected: %s = %.12g", name_s, value_f)
+        self._decorate_editor(name)
+        logger.debug("Variable projected: %s = %.12g", name, value)
         if emit:
-            self.interactionRequested.emit(name_s, value_f, interaction)
+            self.interactionRequested.emit(name, value, interaction)
             if (
                 interaction is SliderInteractionKind.EXACT_TYPED_COMMIT
-                and self._value_labels.get(name_s) is value_label
+                and self._value_labels.get(name) is value_label
                 and bool(value_label.property("invalidNumeric"))
             ):
                 # The synchronous owner restored the accepted value. A rejected
                 # typed number must not expand its slider's display range.
-                self._slider_ranges[name_s] = previous_range
-                self._update_range_labels(name_s)
+                self._slider_ranges[name] = previous_range
+                self._update_range_labels(name)
                 with QtCore.QSignalBlocker(slider):
-                    slider.setValue(self._value_to_slider_pos(name_s, self._variables[name_s]))
+                    slider.setValue(self._value_to_slider_pos(name, self._variables[name]))
 
     @staticmethod
     def _set_editor_text(editor: QtWidgets.QLineEdit, text: str) -> None:

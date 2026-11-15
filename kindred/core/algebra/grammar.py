@@ -160,12 +160,3 @@ ASSOCIATIVITY: Dict[str, str] = {
     "^": "right",   # right-associative power
     "unary": "right",
 }
-
-
-__all__ = [
-    "TokenKind",
-    "TOKEN_SPEC",
-    "KEYWORDS",
-    "PRECEDENCE",
-    "ASSOCIATIVITY",
-]

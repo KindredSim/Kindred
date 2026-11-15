@@ -12,8 +12,6 @@ from kindred.gui.theme_manager import semantic_color
 
 from kindred.core.simulator.algebra_section import is_algebra_line
 
-__all__ = ["MechanismHighlighter"]
-
 
 class MechanismHighlighter(QtGui.QSyntaxHighlighter):
     """

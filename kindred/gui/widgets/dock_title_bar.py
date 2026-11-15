@@ -7,8 +7,6 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.gui.ui_helpers import set_bounded_label_text
 
-__all__ = ["DockTitleBar"]
-
 _MINIMIZE_GLYPH = "\u2014"  # em dash
 _RESTORE_GLYPH = "\u25a1"  # white square
 _CLOSE_GLYPH = "\u00d7"  # multiplication sign

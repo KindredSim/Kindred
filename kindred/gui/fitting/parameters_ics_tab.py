@@ -59,8 +59,6 @@ from kindred.gui.fitting.constants import (
 )
 from kindred.gui.fitting.reporting import fit_identity_text
 
-__all__ = ["ParametersIcsTab"]
-
 
 @dataclass(frozen=True, slots=True)
 class _InvalidRow:

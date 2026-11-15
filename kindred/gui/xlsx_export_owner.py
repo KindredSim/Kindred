@@ -20,8 +20,6 @@ from kindred.io.paths import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["XlsxExportOwner"]
-
 
 class _XlsxExportCancelled(Exception):
     """Internal cooperative cancellation marker."""

@@ -26,12 +26,6 @@ from kindred.core.project_presentation_state import (
     reconcile_workspace_presentation_state,
 )
 
-__all__ = [
-    "ScientificDocumentDelta",
-    "TabRuntimeState",
-    "WorkspaceTabRegistry",
-]
-
 
 @dataclass(slots=True)
 class TabRuntimeState:
@@ -153,9 +147,6 @@ class WorkspaceTabRegistry:
 
         return self._session.document.tab(tab_id)
 
-    def capture_content_token(self) -> ProjectContentToken:
-        return self._session.capture_content_token()
-
     def presentation(self, tab_id: str) -> ProjectPresentationState:
         return dict(self._presentation_by_tab_id)[tab_id]
 
@@ -184,6 +175,11 @@ class WorkspaceTabRegistry:
         The project controller checked its token immediately before.
         """
 
+        # Every prior set leaves with its project.
+        self._computation_fence(ScientificDocumentDelta(removed_targets_by_tab=tuple(
+            (tab.tab_id, tuple(item.set_id for item in tab.initial_condition_sets))
+            for tab in self._session.document.tabs
+        )))
         runtime_by_tab_id = self._fresh_runtimes(presentation)
         token = self._session.replace_project(
             document,
@@ -197,13 +193,14 @@ class WorkspaceTabRegistry:
     def replace_document(
         self,
         document: ProjectDocument,
-        *,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
-        """Publish one admitted document mutation directly."""
+    ) -> ProjectContentToken:
+        """Publish one admitted document mutation directly.
 
-        if not self._session.is_content_token_current(expected_token):
-            return None
+        A caller that read the project, showed a dialog and only then
+        publishes checks the session's content token first; every other
+        caller reads and publishes in one step.
+        """
+
         previous = self._session.document
         changed = document != previous
         existing_presentation = dict(self._presentation_by_tab_id)
@@ -344,18 +341,13 @@ class WorkspaceTabRegistry:
         *,
         run_defaults: SimulationExecutionSettings,
         scientific_settings: TabScientificSettings,
-        expected_token: ProjectContentToken,
-    ) -> MechanismTabDocument | None:
+    ) -> MechanismTabDocument:
         candidate = self._session.document.add_tab(
             run_defaults=run_defaults,
             scientific_settings=scientific_settings,
         )
         created = candidate.tabs[-1]
-        if self.replace_document(
-            candidate,
-            expected_token=expected_token,
-        ) is None:
-            return None
+        self.replace_document(candidate)
         self._active_tab_id = created.tab_id
         # A new tab starts like a replaced project: its current row is the
         # sole Run selection.
@@ -367,16 +359,11 @@ class WorkspaceTabRegistry:
     def copy_tab(
         self,
         tab_id: str,
-        *,
-        expected_token: ProjectContentToken,
-    ) -> MechanismTabDocument | None:
+    ) -> MechanismTabDocument:
         """Copy accepted setup and retained results without touching source drafts."""
 
         document, copied, set_ids = self.prepare_tab_copy(tab_id, name_suffix="Copy")
-        return self.publish_tab_copy(
-            tab_id, copied, set_ids, document,
-            expected_token=expected_token, activate=True,
-        )
+        return self.publish_tab_copy(tab_id, copied, set_ids, document, activate=True)
 
     def prepare_tab_copy(
         self,
@@ -432,9 +419,8 @@ class WorkspaceTabRegistry:
         set_ids: Mapping[str, str],
         document: ProjectDocument,
         *,
-        expected_token: ProjectContentToken,
         activate: bool,
-    ) -> MechanismTabDocument | None:
+    ) -> MechanismTabDocument:
         """Publish a prepared copy, retaining only Runs matching its final inputs."""
 
         final_copy = document.tab(copied.tab_id)
@@ -456,8 +442,7 @@ class WorkspaceTabRegistry:
         }
         source_runtime = self.tab_runtime(tab_id)
         repository = source_runtime.result_repository
-        if self.replace_document(document, expected_token=expected_token) is None:
-            return None
+        self.replace_document(document)
         self._presentation_by_tab_id = tuple(
             (current_id, presentation if current_id == copied.tab_id else current)
             for current_id, current in self._presentation_by_tab_id
@@ -474,46 +459,32 @@ class WorkspaceTabRegistry:
     def reorder_tabs(
         self,
         tab_ids: tuple[str, ...],
-        *,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
+    ) -> ProjectContentToken:
         document = self.document
         candidate = replace(
             document, tabs=tuple(document.tab(tab_id) for tab_id in tab_ids)
         )
-        return self.replace_document(candidate, expected_token=expected_token)
+        return self.replace_document(candidate)
 
     def rename_tab(
         self,
         tab_id: str,
         name: str,
-        *,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
+    ) -> ProjectContentToken:
         candidate = self._session.document.rename_tab(tab_id, name)
-        return self.replace_document(candidate, expected_token=expected_token)
+        return self.replace_document(candidate)
 
     def close_tab(
         self,
         tab_id: str,
-        *,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
-        """Close an eligible tab and return its successor content token.
+    ) -> ProjectContentToken:
+        """Close an eligible tab and return its successor content token."""
 
-        Return ``None`` when the expected project content is no longer current.
-        """
         document = self._session.document
-        target = tab_id
-        index = next(index for index, tab in enumerate(document.tabs) if tab.tab_id == target)
-        was_active = self.active_tab_id == target
-        candidate = document.remove_tab(target)
-        result = self.replace_document(
-            candidate,
-            expected_token=expected_token,
-        )
-        if result is None:
-            return None
+        index = next(index for index, tab in enumerate(document.tabs) if tab.tab_id == tab_id)
+        was_active = self.active_tab_id == tab_id
+        candidate = document.remove_tab(tab_id)
+        result = self.replace_document(candidate)
         if was_active:
             self._active_tab_id = candidate.tabs[
                 min(index, len(candidate.tabs) - 1)
@@ -539,98 +510,66 @@ class WorkspaceTabRegistry:
     def replace_tab(
         self,
         tab: MechanismTabDocument,
-        *,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
+    ) -> ProjectContentToken:
         candidate = self._session.document.replace_tab(tab)
-        return self.replace_document(candidate, expected_token=expected_token)
+        return self.replace_document(candidate)
 
     def mutate_tab(
         self,
         tab_id: str,
         mutation: Callable[[MechanismTabDocument], MechanismTabDocument],
-        *,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
+    ) -> ProjectContentToken:
         target = self.tab(tab_id)
         candidate = mutation(target)
-        return self.replace_tab(
-            candidate,
-            expected_token=expected_token,
-        )
+        return self.replace_tab(candidate)
 
     def replace_initial_condition_set(
         self,
         tab_id: str,
         initial_set: InitialConditionSet,
-        *,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
+    ) -> ProjectContentToken:
         tab = self.tab(tab_id)
         candidate = tab.replace_initial_condition_set(initial_set)
-        return self.replace_tab(
-            candidate,
-            expected_token=expected_token,
-        )
+        return self.replace_tab(candidate)
 
     def set_run_defaults(
         self,
         tab_id: str,
         settings: SimulationExecutionSettings,
-        *,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
+    ) -> ProjectContentToken:
         tab = self.tab(tab_id)
-        return self.replace_tab(
-            tab.with_run_defaults(settings),
-            expected_token=expected_token,
-        )
+        return self.replace_tab(tab.with_run_defaults(settings))
 
     def set_run_override(
         self,
         tab_id: str,
         set_id: str,
         settings: SimulationExecutionSettings | None,
-        *,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
+    ) -> ProjectContentToken:
         tab = self.tab(tab_id)
         target = tab.initial_condition_set(set_id).set_id
-        return self.replace_tab(
-            tab.with_run_override(target, settings),
-            expected_token=expected_token,
-        )
+        return self.replace_tab(tab.with_run_override(target, settings))
 
     def set_scientific_settings(
         self,
         tab_id: str,
         settings: TabScientificSettings,
-        *,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
+    ) -> ProjectContentToken:
         tab = self.tab(tab_id)
         candidate_tab = prepare_tab_scientific_settings(tab, settings)
         candidate_document = self._session.document.replace_tab(candidate_tab)
-        return self.replace_document(
-            candidate_document,
-            expected_token=expected_token,
-        )
+        return self.replace_document(candidate_document)
 
     def remove_initial_condition_sets(
         self,
         tab_id: str,
         set_ids: Iterable[str],
-        *,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
+    ) -> ProjectContentToken:
         # The table returns early when nothing is selected.
         targets = tuple(set_ids)
         tab = self.tab(tab_id)
         candidate = tab.without_initial_condition_sets(targets)
-        return self.replace_tab(
-            candidate,
-            expected_token=expected_token,
-        )
+        return self.replace_tab(candidate)
 
     @staticmethod
     def scientific_document_delta(

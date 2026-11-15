@@ -4,17 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-__all__ = [
-    "FitCoupledVariableParamSpec",
-    "FitDatasetParameterOverrides",
-    "FitDatasetVariableParamSpec",
-    "FitSharedVariableParamSpec",
-]
-
-
 # Names, values and bounds arrive admitted: parameter values, bounds and Log10
 # by FitParameterVariable, initial concentrations and their bounds by
-# FitInitialVariable and FitSharedInitialGroup.
+# FitInitialVariable and FitSharedInitialGroup.  A fit started from a Profile
+# refit starts its varied concentrations at that refit's values, which lie
+# inside those bounds.
 @dataclass(frozen=True, slots=True)
 class FitDatasetVariableParamSpec:
     """One optimizer coordinate owned by exactly one stable dataset."""

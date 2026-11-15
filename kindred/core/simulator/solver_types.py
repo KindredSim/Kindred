@@ -123,6 +123,9 @@ class SimulationRequest:
     # and its time, located on the solver's own step interpolant.
     species_maximum: bool
     stop_observable_value: Callable[[str, float, np.ndarray, float], float] | None
+    # Under a stop, sample at ``t_eval`` up to the executed end rather than at
+    # a regular grid over it (a measured-X curve held where the Fit left it).
+    keep_sample_times: bool
 
     def __post_init__(self) -> None:
         # Starting states arrive admitted nonnegative and finite, Fit

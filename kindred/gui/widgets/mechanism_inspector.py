@@ -33,12 +33,6 @@ from kindred.core.simulator.step_indexing import (
 )
 from kindred.core.stoichiometry import directional_order_fraction
 
-__all__ = [
-    "MechanismInspectorDialog",
-    "MechanismInspectorSections",
-    "build_mechanism_inspector_sections",
-]
-
 
 @dataclass(frozen=True, slots=True)
 class MechanismInspectorSections:
