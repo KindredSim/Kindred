@@ -11,8 +11,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from fractions import Fraction
 
-__all__ = ["directional_order_fraction"]
-
 
 def directional_order_fraction(
     stoichiometry: Mapping[str, float],

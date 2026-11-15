@@ -20,10 +20,6 @@ from kindred.gui.display_name_policy import CompactText, literal_tooltip
 from kindred.gui.widgets.mechanism_highlighter import MechanismHighlighter
 from kindred.gui.widgets.variable_sliders import VariableSliders
 from kindred.gui.widgets.species_sliders import BatchSpeciesSliders
-__all__ = [
-    "MechanismEditorBinding",
-    "MechanismEditorTabbed",
-]
 
 
 def _make_sliders_icon(color: QtGui.QColor) -> QtGui.QIcon:
@@ -353,6 +349,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<pre>[A] = 1.0, [B] = 0.0\ninit: A=1.0, B=0.0\ninitial: A=1.0, B=0.0</pre>"
             "<p>Concentrations must be finite and nonnegative. To name an initial-condition set, enclose its concentrations in braces:</p>"
             "<pre>start = {\n[A] = 1.0\n[B] = 0.0\n}</pre>"
+            "<p>Concentrations below <b>Absolute tolerance</b> ÷ <b>Relative tolerance</b> (1 µM at the defaults) are solved less accurately. Lower <b>Absolute tolerance</b> in <b>Simulation Settings</b> for smaller concentrations.</p>"
             "<h2>Reaction Arrows</h2>"
             "<table border=\"1\" cellpadding=\"5\" cellspacing=\"0\">"
             "<tr><th>Reaction</th><th>Arrow Options</th></tr>"
@@ -844,18 +841,17 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         return self._species_sliders
 
     def set_slider_edit_targets_summary(self, text: str) -> None:
-        summary = text
         base_tooltip = (
             "Concentration sliders affect the current set and any pinned sets."
         )
         tooltip = (
             base_tooltip
-            if summary == "Initial-condition sets: none"
-            else f"{base_tooltip}\n\n{summary}"
+            if text == "Initial-condition sets: none"
+            else f"{base_tooltip}\n\n{text}"
         )
         set_bounded_label_text(
             self._slider_edit_targets_label,
-            summary,
+            text,
             max_width=16777215,
             tooltip_text=tooltip,
         )
@@ -1085,7 +1081,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             )
 
     def _set_validation_label_text(self, text: str) -> None:
-        full_text = text
         self._validation_label.setMaximumWidth(520)
         self._validation_label.setMaximumHeight(96)
         self._validation_label.setWordWrap(True)
@@ -1093,9 +1088,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Maximum,
         )
-        self._validation_label.setVisible(bool(full_text))
-        self._validation_label.setText(full_text)
-        self._validation_label.setToolTip(full_text)
+        self._validation_label.setVisible(bool(text))
+        self._validation_label.setText(text)
+        self._validation_label.setToolTip(text)
 
     @property
     def run_btn(self) -> QtWidgets.QPushButton:
@@ -1270,10 +1265,6 @@ class MechanismEditorBinding(QtCore.QObject):
         editor.sourceDraftEdited.connect(self._on_source_draft)
         editor.reactionsRevertRequested.connect(self.revert_reactions_draft)
         editor.notesEdited.connect(self._on_notes_edited)
-
-    @property
-    def tab_id(self) -> str:
-        return self._tab_id
 
     def render(self) -> None:
         tab = self._registry.tab(self._tab_id)

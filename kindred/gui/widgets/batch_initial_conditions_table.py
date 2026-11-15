@@ -22,15 +22,6 @@ from kindred.core.validation import six_digit_text
 from kindred.gui.ui_helpers import INVALID_EDITOR_STYLE, copy_current_cell_as_shown
 from kindred.gui.widgets.solver_settings import SolverSettingsDialog
 
-__all__ = [
-    "BatchInitialConditionsTableModel",
-    "BatchInitialConditionsTableView",
-    "InitialConditionsTableActions",
-    "is_valid_initial_text",
-    "resolve_live_slider_target_set_ids",
-]
-
-
 _INVALID_BRUSH = QtGui.QBrush(QtGui.QColor(255, 210, 210))
 _RUN_GEAR = "\N{GEAR}"
 _MAX_SET_COLUMN_WIDTH = 220
@@ -95,12 +86,10 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         invalid_raw_by_set: dict[str, dict[str, str]],
         species_names: Sequence[str],
     ) -> None:
-        species = species_names
         admitted_sets = tab.initial_condition_sets
         override_ids = {
             set_id for set_id, _settings in tab.run_overrides_by_set_id
         }
-        invalid = invalid_raw_by_set
         plot_ids = set(presentation.plot_set_ids)
         pinned_ids = set(presentation.pinned_slider_set_ids)
         rows = tuple(
@@ -111,12 +100,12 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
                 raw_values=tuple(
                     (species_name, raw)
                     for species_name, raw
-                    in invalid.get(initial_set.set_id, {}).items()
+                    in invalid_raw_by_set.get(initial_set.set_id, {}).items()
                 ),
                 invalid_raw_values=tuple(
                     (species_name, raw)
                     for species_name, raw
-                    in invalid.get(initial_set.set_id, {}).items()
+                    in invalid_raw_by_set.get(initial_set.set_id, {}).items()
                     if not is_valid_initial_text(raw)
                 ),
                 custom_run_settings=initial_set.set_id in override_ids,
@@ -125,10 +114,10 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
             )
             for initial_set in admitted_sets
         )
-        if rows == self._rows and species == self._species:
+        if rows == self._rows and species_names == self._species:
             return
         structure_changed = (
-            species != self._species
+            species_names != self._species
             or tuple(row.set_id for row in rows)
             != tuple(row.set_id for row in self._rows)
         )
@@ -137,7 +126,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
             try:
                 self._binding_generation += 1
                 self._rows = rows
-                self._species = species
+                self._species = species_names
             finally:
                 self.endResetModel()
         else:
@@ -650,10 +639,6 @@ class InitialConditionsTableActions(QtCore.QObject):
         table.selectionModel().selectionChanged.connect(self._capture_run_selection)
         table.selectionModel().currentChanged.connect(self._capture_current_set)
 
-    @property
-    def tab_id(self) -> str:
-        return self._tab_id
-
     def render(self) -> None:
         """Render the complete table from the published tab and its drafts."""
 
@@ -700,7 +685,8 @@ class InitialConditionsTableActions(QtCore.QObject):
             del selection_blocker
 
     def capture_active_editor(self) -> None:
-        """Capture the focused numeric editor without committing its value."""
+        """Capture the focused cell editor: an edited concentration becomes a
+        draft without committing its value, and a set name is finished."""
 
         editor = QtWidgets.QApplication.focusWidget()
         if not isinstance(editor, QtWidgets.QLineEdit):
@@ -713,10 +699,16 @@ class InitialConditionsTableActions(QtCore.QObject):
             return
         species = self._model.species_for_column(index.column())
         set_id = self._model.set_id_for_live_index(index)
-        if species is None or set_id is None:
+        if set_id is None:
             return
-        runtime = self._registry.tab_runtime(self._tab_id)
-        runtime.initial_text_by_set_id.setdefault(set_id, {})[species] = editor.text()
+        if species is None:
+            # A set name has no draft form: finish it as leaving the cell would.
+            self._table.settle_active_editor()
+            return
+        if editor.isModified():
+            # A cell opened only to read its exact value holds no edit.
+            runtime = self._registry.tab_runtime(self._tab_id)
+            runtime.initial_text_by_set_id.setdefault(set_id, {})[species] = editor.text()
         # closeEditor(NoHint) does not emit commitData.  Block the native
         # signals while focus leaves so editingFinished cannot publish a
         # second path during a modal disposition boundary.
@@ -791,7 +783,6 @@ class InitialConditionsTableActions(QtCore.QObject):
             self._registry.replace_initial_condition_set(
                 self._tab_id,
                 candidate,
-                expected_token=self._registry.capture_content_token(),
             )
         invalid_cleared = self._clear_invalid_value(set_id, species)
         self.render()
@@ -855,7 +846,6 @@ class InitialConditionsTableActions(QtCore.QObject):
         if changed_ids:
             self._registry.replace_tab(
                 tab.with_initial_condition_sets(tuple(candidate_sets)),
-                expected_token=self._registry.capture_content_token(),
             )
         invalid_cleared = False
         for set_id, species in cleared_cells:
@@ -889,7 +879,6 @@ class InitialConditionsTableActions(QtCore.QObject):
         self._registry.replace_initial_condition_set(
             self._tab_id,
             replace(initial_set, name=normalized),
-            expected_token=self._registry.capture_content_token(),
         )
         self.render()
         if changed:
@@ -908,7 +897,6 @@ class InitialConditionsTableActions(QtCore.QObject):
         self._registry.mutate_tab(
             self._tab_id,
             lambda current: current.add_initial_condition_set(created),
-            expected_token=self._registry.capture_content_token(),
         )
         self.render()
 
@@ -937,7 +925,6 @@ class InitialConditionsTableActions(QtCore.QObject):
         self._registry.mutate_tab(
             self._tab_id,
             lambda current: current.with_initial_condition_sets(tuple(ordered)),
-            expected_token=self._registry.capture_content_token(),
         )
         self.render()
 
@@ -949,7 +936,6 @@ class InitialConditionsTableActions(QtCore.QObject):
         self._registry.remove_initial_condition_sets(
             self._tab_id,
             targets,
-            expected_token=self._registry.capture_content_token(),
         )
         self.render()
         self.initialValuesChanged.emit(self._tab_id)
@@ -1001,17 +987,8 @@ class InitialConditionsTableActions(QtCore.QObject):
         self.render()
         return True
 
-    def set_workspace_run_defaults(
-        self,
-        settings: SimulationExecutionSettings,
-        *,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
-        result = self._registry.set_run_defaults(
-            self._tab_id,
-            settings,
-            expected_token=expected_token,
-        )
+    def set_workspace_run_defaults(self, settings: SimulationExecutionSettings) -> ProjectContentToken:
+        result = self._registry.set_run_defaults(self._tab_id, settings)
         self.render()
         return result
 
@@ -1072,7 +1049,6 @@ class InitialConditionsTableActions(QtCore.QObject):
             self._tab_id,
             set_id,
             settings,
-            expected_token=self._registry.capture_content_token(),
         )
         self.render()
         self.initialValuesChanged.emit(self._tab_id)

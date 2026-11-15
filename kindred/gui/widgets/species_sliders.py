@@ -15,21 +15,18 @@ from kindred.gui.ui_helpers import (
 from kindred.gui.interactive_preview import SliderInteractionKind
 from kindred.gui.widgets.fine_drag_slider import FineDragSlider, NumericValueEdit, SliderPress
 
-__all__ = ["BatchSpeciesSliders"]
-
 
 def format_slider_value(value: float) -> str:
-    value_f = value
-    if value_f == 0.0:
+    if value == 0.0:
         return "0"
-    magnitude = abs(value_f)
+    magnitude = abs(value)
     if magnitude < 1e-3 or magnitude >= 1e3:
-        return f"{value_f:.3e}"
+        return f"{value:.3e}"
     if magnitude < 0.1:
-        return f"{value_f:.4f}"
+        return f"{value:.4f}"
     if magnitude < 10.0:
-        return f"{value_f:.3f}"
-    return f"{value_f:.2f}"
+        return f"{value:.3f}"
+    return f"{value:.2f}"
 
 
 @dataclass(slots=True)
@@ -93,21 +90,20 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         self._reconcile_visibility_scope(set(normalized))
         self._target_set_ids = tuple(target_set_ids)
         self._values = normalized
-        mixed = mixed_species
         if tuple(normalized) == tuple(self._rows):
             for species, value in normalized.items():
                 self._update_row_projection(
                     species,
                     value,
-                    mixed=species in mixed,
+                    mixed=species in mixed_species,
                 )
         else:
             self._clear_rows()
             for species, value in normalized.items():
-                self._add_row(species, value, mixed=species in mixed)
+                self._add_row(species, value, mixed=species in mixed_species)
         if not preserve_editor_drafts:
             for species, value in normalized.items():
-                text = "Multiple values" if species in mixed else format_slider_value(value)
+                text = "Multiple values" if species in mixed_species else format_slider_value(value)
                 self._set_value_projection(
                     species, value, editor_text=text, emit=False
                 )
@@ -164,18 +160,17 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         *,
         mixed: bool,
     ) -> None:
-        display_name = species
         container = QtWidgets.QWidget(self._content)
         layout = QtWidgets.QGridLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setColumnStretch(0, 1)
-        name_label = make_bounded_label(display_name, container, max_width=16777215)
+        name_label = make_bounded_label(species, container, max_width=16777215)
         if mixed:
             initial_text = "Multiple values"
         else:
             initial_text = format_slider_value(value)
         value_editor = NumericValueEdit(initial_text, container)
-        value_editor.setAccessibleName(f"{display_name} initial concentration")
+        value_editor.setAccessibleName(f"{species} initial concentration")
         name_label.setBuddy(value_editor)
         configure_compact_numeric_edit(value_editor, characters=15)
         value_editor.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
@@ -192,7 +187,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             lambda item=species: self._commit_editor(item)
         )
         slider = FineDragSlider(container)
-        slider.setAccessibleName(f"{display_name} initial concentration slider")
+        slider.setAccessibleName(f"{species} initial concentration slider")
         slider.setRange(0, 10_000)
         slider.setSingleStep(1 if self._fine_mode else 50)
         slider.setPageStep(50 if self._fine_mode else 1000)
@@ -332,17 +327,15 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         emit: bool,
         interaction: SliderInteractionKind | None = None,
     ) -> None:
-        species_s = species
-        row = self._rows[species_s]
-        value_f = value
-        if value_f > row.maximum:
-            row.maximum = max(value_f, 2.0 * row.maximum)
+        row = self._rows[species]
+        if value > row.maximum:
+            row.maximum = max(value, 2.0 * row.maximum)
             row.maximum_label.setText(format_slider_value(row.maximum))
-        self._values[species_s] = value_f
-        if species_s not in self._active_presses:
+        self._values[species] = value
+        if species not in self._active_presses:
             blocker = QtCore.QSignalBlocker(row.slider)
             try:
-                row.slider.setValue(self._value_to_position(value_f, row.maximum))
+                row.slider.setValue(self._value_to_position(value, row.maximum))
             finally:
                 del blocker
         if editor_text is not None:
@@ -350,11 +343,11 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         elif not row.value_label.hasFocus():
             self._set_editor_text(
                 row.value_label,
-                format_slider_value(value_f),
+                format_slider_value(value),
             )
-        self._decorate_editor(species_s)
+        self._decorate_editor(species)
         if emit:
-            self.interactionRequested.emit(species_s, value_f, interaction)
+            self.interactionRequested.emit(species, value, interaction)
 
     def remember_editor_state(self, species: str) -> None:
         """Remember the current value and text for subsequent local Escape."""
@@ -387,8 +380,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         )
 
     def _commit_editor(self, species: str) -> None:
-        species_s = species
-        row = self._rows.get(species_s)
+        row = self._rows.get(species)
         if row is None:
             return
         # Displayed text is a rounded readout; only text the user edited is a
@@ -399,13 +391,13 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         try:
             value = float(raw.strip())
         except ValueError:
-            self._decorate_editor(species_s)
+            self._decorate_editor(species)
             return
         if not math.isfinite(value) or value < 0.0:
-            self._decorate_editor(species_s)
+            self._decorate_editor(species)
             return
         self._set_value_projection(
-            species_s,
+            species,
             value,
             editor_text=raw,
             emit=True,

@@ -498,7 +498,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         return self._projected_dataset(self._current_dataset_id)
 
     def _mapped_dataset(self, dataset_id: str) -> FitMappedDatasetSnapshot:
-        # The setup holds exactly one dataset per mapped dataset.
+        # Every dataset of the setup is a mapped dataset.
         return next(
             item
             for item in self._origin.mapped_datasets
@@ -1685,6 +1685,3 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             f"{self._dataset_name(dataset_id)}: {label}"
             for dataset_id, _row, _column, label in located
         )
-
-
-__all__ = ["UnifiedSpeciesTable"]

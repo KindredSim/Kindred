@@ -448,7 +448,7 @@ class FeasibleSpace:
             if not intervals:
                 raise InputGenerationError(f"No representable feasible value remains for {input_label(key)}.", values)
             selection = selections[key]
-            values[key] = sample(tuple(intervals), units[key], selection.allocation, selection.log_scale)
+            values[key] = sample(tuple(intervals), units[key], selection.intervals, selection.allocation, selection.log_scale)
         return values
 
 

@@ -21,5 +21,3 @@ main_window.py   : QMainWindow, menus, docks, signals and slots
 controllers/     : configuration, project-disposition, and simulation-job ownership
 widgets/         : editors, dialogs, and PyQtGraph-backed plot widgets
 """
-
-__all__: list[str] = []

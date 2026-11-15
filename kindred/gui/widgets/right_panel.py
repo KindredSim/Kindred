@@ -8,8 +8,6 @@ from PySide6 import QtWidgets
 from kindred.gui.widgets.data_manager import DataManagerPanel
 from kindred.gui.widgets.dataset_overlay_panel import DatasetOverlayPanel
 
-__all__ = ["RightPanelTabbed"]
-
 
 class RightPanelTabbed(QtWidgets.QWidget):
     """

@@ -6,12 +6,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from kindred.core.project_presentation_state import AxisSeriesSelection
 
-__all__ = [
-    "AxisSelectionCandidate",
-    "TIME_DISPLAY_UNITS",
-]
-
-
 TIME_DISPLAY_UNITS = ("fs", "ps", "ns", "µs", "ms", "s", "ks", "min", "h", "d", "yr")
 
 

@@ -158,8 +158,6 @@ from kindred.io.resources import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["MainWindow"]
-
 _ABOUT_DIALOG_PREFERRED_WIDTH = 520
 _ABOUT_DIALOG_IMAGE_MAX_SIZE = 320
 
@@ -378,7 +376,6 @@ class MainWindow(QtWidgets.QMainWindow):
         """Construct one complete tab surface beneath the permanent root."""
 
         surface_registry = self._workspace_tab_registry
-        target = tab_id
         editor = MechanismEditorTabbed(parent=self._mechanism_stack)
         editor.setObjectName("mechanismEditor")
         slider_panel = editor.slider_pane_for_dock()
@@ -391,7 +388,7 @@ class MainWindow(QtWidgets.QMainWindow):
         batch_model.setParent(simulation_panel)
         batch_table = simulation_panel.batch_table
         data_panel = DataManagerPanel(
-            origin_tab_id=target,
+            origin_tab_id=tab_id,
             parent=self._data_stack,
         )
         data_panel.set_import_busy(self._dataset_import_staging.busy)
@@ -411,10 +408,10 @@ class MainWindow(QtWidgets.QMainWindow):
             overlay_panel=overlay_panel,
         )
         calculator_owner = SymbolicCalculatorOwner(
-            canonical_prepared_dsl=lambda captured=target: (
+            canonical_prepared_dsl=lambda captured=tab_id: (
                 self._workspace_tab_registry.tab(captured).prepared_dsl
             ),
-            canonical_source=lambda captured=target: (
+            canonical_source=lambda captured=tab_id: (
                 self._workspace_tab_registry.tab(captured).mechanism_source
             ),
             gate=self._computation_gate,
@@ -424,7 +421,7 @@ class MainWindow(QtWidgets.QMainWindow):
         calculator_owner.disposed.connect(self._calculator_owner_disposed)
         calculator_owner.application_close_settlement_changed.connect(self._calculator_settlement_changed)
         calculator_panel = SymbolicCalculatorPanel(
-            on_evaluate=lambda query, captured=target: self._evaluate_symbolic(
+            on_evaluate=lambda query, captured=tab_id: self._evaluate_symbolic(
                 captured,
                 query,
             ),
@@ -436,20 +433,20 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         calculator_owner.stateChanged.connect(calculator_panel.render_state)
         editor_binding = MechanismEditorBinding(
-            tab_id=target,
+            tab_id=tab_id,
             editor=editor,
             registry=surface_registry,
             parent=editor,
         )
         initial_actions = InitialConditionsTableActions(
-            tab_id=target,
+            tab_id=tab_id,
             registry=surface_registry,
             model=batch_model,
             table=batch_table,
             parent=simulation_panel,
         )
         slider_binding = TabSliderBinding(
-            tab_id=target,
+            tab_id=tab_id,
             registry=surface_registry,
             variable_sliders=editor.variable_sliders_widget(),
             species_sliders=editor.species_sliders_widget(),
@@ -460,7 +457,7 @@ class MainWindow(QtWidgets.QMainWindow):
             parent=editor,
         )
         bundle = _TabSurfaceBundle(
-            tab_id=target,
+            tab_id=tab_id,
             editor=editor,
             slider_panel=slider_panel,
             batch_model=batch_model,
@@ -475,7 +472,7 @@ class MainWindow(QtWidgets.QMainWindow):
             initial_actions=initial_actions,
             slider_binding=slider_binding,
         )
-        self._tab_surfaces[target] = bundle
+        self._tab_surfaces[tab_id] = bundle
         for stack, widget in (
             (self._mechanism_stack, editor),
             (self._slider_stack, slider_panel),
@@ -668,27 +665,24 @@ class MainWindow(QtWidgets.QMainWindow):
         species: str,
         color: QtGui.QColor,
     ) -> None:
-        if self._mutation_input_admitted("Change Species Color"):
-            try:
-                self.config_controller.set_species_color(species, color)
-            except OSError as exc:
-                self.set_status_text(str(exc))
+        try:
+            self.config_controller.set_species_color(species, color)
+        except OSError as exc:
+            self.set_status_text(str(exc))
 
     def _set_experimental_point_size(self, request: object) -> None:
-        if self._mutation_input_admitted("Change Experimental Point Size"):
-            try:
-                self.config_controller.set_experimental_point_size(request)
-            except OSError as exc:
-                self.set_status_text(str(exc))
-                self._refresh_application_plot_preferences()
+        try:
+            self.config_controller.set_experimental_point_size(request)
+        except OSError as exc:
+            self.set_status_text(str(exc))
+            self._refresh_application_plot_preferences()
 
     def _set_experimental_point_opacity(self, request: object) -> None:
-        if self._mutation_input_admitted("Change Experimental Point Opacity"):
-            try:
-                self.config_controller.set_experimental_point_opacity(request)
-            except OSError as exc:
-                self.set_status_text(str(exc))
-                self._refresh_application_plot_preferences()
+        try:
+            self.config_controller.set_experimental_point_opacity(request)
+        except OSError as exc:
+            self.set_status_text(str(exc))
+            self._refresh_application_plot_preferences()
 
     def _selected_bundle(self) -> _TabSurfaceBundle:
         return self._tab_surfaces[self._workspace_tab_registry.active_tab_id]
@@ -758,16 +752,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._populate_recent_menu
         )
 
-    def _mutation_input_admitted(self, action: str | None = None) -> bool:
-        """Return whether user mutations may still enter the live shell."""
-
-        admitted = self.project_controller.mutation_admitted
-        if not admitted and action:
-            self.set_status_text(
-                f"{action} rejected: application Close is in progress."
-            )
-        return admitted
-
     @staticmethod
     def _menu_actions(menu: QtWidgets.QMenu) -> tuple[QtGui.QAction, ...]:
         actions: list[QtGui.QAction] = []
@@ -778,10 +762,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 actions.extend(MainWindow._menu_actions(child))
         return tuple(actions)
 
-    def _fence_shell_for_close(self) -> None:
-        """Physically disable writable shell surfaces; Close is one-way."""
-
-        for widget in (
+    def _close_fenced_surfaces(self) -> tuple[QtWidgets.QWidget, ...]:
+        return (
             self._workspace,
             self._mechanism_dock,
             self._sliders_dock,
@@ -789,7 +771,31 @@ class MainWindow(QtWidgets.QMainWindow):
             self._right_dock,
             self._analysis_dock,
             self._symbolic_calculator_dock,
+        )
+
+    def _finish_typed_input_for_close(self) -> None:
+        """Finish the edit still being typed before Close inspects the project.
+
+        The fence takes focus from it otherwise, after Close has already
+        decided, so a typed value would count or not by when focus moved.
+        Initial Conditions and Run settings become drafts first, as for any
+        project action.
+        """
+
+        self._capture_visible_tab_inputs(tab_id=self._workspace_tab_registry.active_tab_id)
+        focused = QtWidgets.QApplication.focusWidget()
+        if focused is not None and any(
+            surface is focused or surface.isAncestorOf(focused)
+            for surface in self._close_fenced_surfaces()
         ):
+            focused.clearFocus()
+            # Leaving finished it; the caret returns there if Close is canceled.
+            focused.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+
+    def _fence_shell_for_close(self) -> None:
+        """Physically disable writable shell surfaces; Close is one-way."""
+
+        for widget in self._close_fenced_surfaces():
             widget.setEnabled(False)
         for menu in (
             self._file_menu,
@@ -811,14 +817,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _select_tab_surfaces(self, tab_id: str) -> None:
         """Raise retained pages; selecting a tab never reconstructs them."""
 
-        target = tab_id
-        bundle = self._tab_surfaces[target]
+        bundle = self._tab_surfaces[tab_id]
         self._mechanism_stack.setCurrentWidget(bundle.editor)
         self._slider_stack.setCurrentWidget(bundle.slider_panel)
         self._initial_conditions_stack.setCurrentWidget(bundle.simulation_panel)
         self._data_stack.setCurrentWidget(bundle.right_panel)
         self._calculator_stack.setCurrentWidget(bundle.calculator_panel)
-        self._workspace.select_tab_surface(target)
+        self._workspace.select_tab_surface(tab_id)
         self._refresh_title()
         self._refresh_actions()
 
@@ -840,32 +845,31 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         """Bind one retained plot only to intents from its owning tab."""
 
-        target = tab_id
         plot.referenceLayerVisibilityRequested.connect(
-            lambda visible: self._set_reference_lines_visible(target, visible)
+            lambda visible: self._set_reference_lines_visible(tab_id, visible)
         )
         plot.interventionAnnotationsVisibilityRequested.connect(
             lambda visible: self._set_intervention_annotations_visible(
-                target,
+                tab_id,
                 visible,
             )
         )
         plot.interventionLabelsVisibilityRequested.connect(
-            lambda visible: self._set_intervention_labels_visible(target, visible)
+            lambda visible: self._set_intervention_labels_visible(tab_id, visible)
         )
         plot.copyAllRequested.connect(
-            lambda captured=target: self._copy_all_for_tab(captured)
+            lambda captured=tab_id: self._copy_all_for_tab(captured)
         )
         plot.xSeriesRequested.connect(
-            lambda selection: self._set_x_series(target, selection)
+            lambda selection: self._set_x_series(tab_id, selection)
         )
         plot.ySeriesRequested.connect(
-            lambda selections: self._set_y_series(target, selections)
+            lambda selections: self._set_y_series(tab_id, selections)
         )
-        plot.yAllSeriesRequested.connect(lambda: self._select_all_y_series(target))
+        plot.yAllSeriesRequested.connect(lambda: self._select_all_y_series(tab_id))
         plot.plotPresentationIntentRequested.connect(
             lambda option, enabled: self._set_plot_presentation(
-                target,
+                tab_id,
                 option,
                 enabled,
             )
@@ -882,7 +886,6 @@ class MainWindow(QtWidgets.QMainWindow):
             document = self._project_session.document
             document_ids = {tab.tab_id for tab in document.tabs}
             if project_replaced:
-                self._simulation_jobs.reset_project_session()
                 # Same-ID retained widgets otherwise keep old debounce/capture
                 # state and can publish an old gesture into the new document.
                 for tab_id, bundle in tuple(self._tab_surfaces.items()):
@@ -926,11 +929,10 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         """Refresh one tab's controls, sliders and data views."""
 
-        target = tab_id
-        bundle = self._tab_surfaces[target]
+        bundle = self._tab_surfaces[tab_id]
         document = self._project_session.document
-        tab = self._workspace_tab_registry.tab(target)
-        presentation = self._workspace_tab_registry.presentation(target)
+        tab = self._workspace_tab_registry.tab(tab_id)
+        presentation = self._workspace_tab_registry.presentation(tab_id)
         try:
             bundle.editor_binding.render()
             bundle.initial_actions.render()
@@ -940,8 +942,8 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             bundle.slider_binding.render(preserve_editor_drafts=preserve_slider_editor_drafts)
             self._render_dataset_panels(bundle, document, tab, presentation)
-            self._refresh_slider_target_summary(target, bundle.slider_binding.resolve_target_set_ids())
-            self._refresh_symbolic_calculator(target)
+            self._refresh_slider_target_summary(tab_id, bundle.slider_binding.resolve_target_set_ids())
+            self._refresh_symbolic_calculator(tab_id)
         finally:
             self._refresh_project_state()
 
@@ -1106,25 +1108,23 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _render_results_for_tab(self, tab_id: str) -> None:
-        target = tab_id
         try:
-            self._project_session.document.tab(target)
+            self._project_session.document.tab(tab_id)
         except KeyError:
             return
-        if target not in self._tab_surfaces:
+        if tab_id not in self._tab_surfaces:
             return
-        render_input = self._compose_result_input(target)
-        plot = self._workspace.plot_for_tab(target)
-        plot.set_copy_all_available(self._canonical_export_available(target))
+        render_input = self._compose_result_input(tab_id)
+        plot = self._workspace.plot_for_tab(tab_id)
+        plot.set_copy_all_available(self._canonical_export_available(tab_id))
         plot.apply_result_input(render_input)
         self._refresh_actions()
 
     def _canonical_export_available(self, tab_id: str) -> bool:
         """Return whether the active-tab repositories own any retained result."""
 
-        target = tab_id
-        tab = self._project_session.document.tab(target)
-        repository = self._repository_for_tab(target)
+        tab = self._project_session.document.tab(tab_id)
+        repository = self._repository_for_tab(tab_id)
         return any(
             repository.current_result(initial_set.set_id) is not None
             or repository.reference_result(initial_set.set_id) is not None
@@ -1132,18 +1132,16 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _canonical_export_blocks(self, tab_id: str):
-        target = tab_id
         return compose_canonical_export_blocks(
             document=self._project_session.document,
-            tab_id=target,
-            repository=self._repository_for_tab(target),
+            tab_id=tab_id,
+            repository=self._repository_for_tab(tab_id),
         )
 
     def _copy_all_for_tab(self, tab_id: str) -> bool:
         """Serialize the active tab's complete canonical export roster once."""
 
-        target = tab_id
-        blocks = self._canonical_export_blocks(target)
+        blocks = self._canonical_export_blocks(tab_id)
         if not blocks:
             self.set_status_text("No current result data is available to copy.")
             return False
@@ -1166,28 +1164,26 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_results_changed(self, tab_id: str) -> None:
         """Recompose result publications after their owner-side retirement."""
 
-        target = tab_id
         if self._rendering_workspace:
             return
         if (
-            target in self._slider_apply_refreshing
-            or target in self._current_row_refreshing
+            tab_id in self._slider_apply_refreshing
+            or tab_id in self._current_row_refreshing
         ):
             return
-        self._render_results_for_tab(target)
+        self._render_results_for_tab(tab_id)
 
     @QtCore.Slot(str, object)
     def _plot_sets(self, tab_id: str, set_ids: object) -> None:
         """Add a Run's or a Slider Preview's sets to the plot."""
 
         # Run dispatch and the slider binding emit for a live tab.
-        target = tab_id
-        bundle = self._tab_surfaces[target]
+        bundle = self._tab_surfaces[tab_id]
         if not bundle.initial_actions.union_plot_membership(set_ids):
             return
         # A newly plotted set restyles its linked measurements at once, even
         # before, or without, a result of its own.
-        self._render_results_for_tab(target)
+        self._render_results_for_tab(tab_id)
         self._refresh_project_state()
 
     def _repository_for_tab(self, tab_id: str) -> ResultRepository:
@@ -1227,20 +1223,18 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         """Select the first newly materialized authored set after publication."""
 
-        ids = materialized_set_ids
-        if not ids:
+        if not materialized_set_ids:
             return
-        target = tab_id
-        current = self._workspace_tab_registry.presentation(target)
-        next_state = replace(current, current_set_id=ids[0])
+        current = self._workspace_tab_registry.presentation(tab_id)
+        next_state = replace(current, current_set_id=materialized_set_ids[0])
         self._workspace_tab_registry.set_presentation(
-            target,
+            tab_id,
             next_state,
         )
-        self._workspace_tab_registry.tab_runtime(target).selected_run_set_ids = (
-            ids[0],
+        self._workspace_tab_registry.tab_runtime(tab_id).selected_run_set_ids = (
+            materialized_set_ids[0],
         )
-        self._render_results_for_tab(target)
+        self._render_results_for_tab(tab_id)
 
     def _publish_source_proposal(
         self,
@@ -1250,16 +1244,16 @@ class MainWindow(QtWidgets.QMainWindow):
         expected_token: ProjectContentToken,
         refresh_after_admission: bool = True,
     ) -> ProjectContentToken | None:
-        """Publish one admitted source proposal and clear its draft."""
+        """Publish one admitted source proposal and clear its draft.
 
-        tab_id = tab_id
-        runtime = self._workspace_tab_registry.tab_runtime(tab_id)
-        result = self._workspace_tab_registry.replace_document(
-            proposal.proposed_document,
-            expected_token=expected_token,
-        )
-        if result is None:
+        The proposal was built before its confirmation dialogs, so nothing is
+        published when the project changed during them.
+        """
+
+        if not self._project_session.is_content_token_current(expected_token):
             return None
+        runtime = self._workspace_tab_registry.tab_runtime(tab_id)
+        result = self._workspace_tab_registry.replace_document(proposal.proposed_document)
         proposed_tab = proposal.proposed_document.tab(tab_id)
         self._activate_materialized_set(tab_id, proposal.materialized_set_ids)
         runtime.reactions_draft = None
@@ -1297,27 +1291,21 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     @QtCore.Slot(str)
     def _select_tab(self, tab_id: str) -> None:
-        if not self._mutation_input_admitted("Select Tab"):
-            return
-        target = tab_id
         previous = self._workspace_tab_registry.active_tab_id
-        if target == previous:
+        if tab_id == previous:
             return
         self._settle_visible_tab_inputs()
-        self._workspace_tab_registry.select_tab(target)
-        self._select_tab_surfaces(target)
+        self._workspace_tab_registry.select_tab(tab_id)
+        self._select_tab_surfaces(tab_id)
 
     @QtCore.Slot()
     def _create_tab(self) -> None:
-        if not self._mutation_input_admitted("Create Tab"):
-            return
         self._settle_visible_tab_inputs()
         tab = self._workspace_tab_registry.create_tab(
             run_defaults=self.config_controller.application_run_defaults(),
             scientific_settings=(
                 self.config_controller.application_scientific_defaults()
             ),
-            expected_token=self._project_session.capture_content_token(),
         )
         self._create_tab_surface(tab.tab_id)
         self._refresh_workspace_tab_structure()
@@ -1335,13 +1323,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str)
     def _copy_tab(self, tab_id: str) -> None:
-        if not self._mutation_input_admitted("Create Copy"):
-            return
         self._finish_focused_tab_input()
-        tab = self._workspace_tab_registry.copy_tab(
-            tab_id,
-            expected_token=self._project_session.capture_content_token(),
-        )
+        tab = self._workspace_tab_registry.copy_tab(tab_id)
         self._create_tab_surface(tab.tab_id)
         self._refresh_workspace_tab_structure()
         self._apply_persisted_plot_state(tab.tab_id)
@@ -1350,23 +1333,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(object)
     def _reorder_tabs(self, tab_ids: tuple[str, ...]) -> None:
-        if self._mutation_input_admitted("Reorder Tabs"):
-            self._workspace_tab_registry.reorder_tabs(
-                tab_ids,
-                expected_token=self._project_session.capture_content_token(),
-            )
+        self._workspace_tab_registry.reorder_tabs(tab_ids)
         self._refresh_workspace_tab_structure()
 
     @QtCore.Slot(str, str)
     def _rename_tab(self, tab_id: str, name: str) -> None:
-        if not self._mutation_input_admitted("Rename Tab"):
-            return
         try:
-            self._workspace_tab_registry.rename_tab(
-                tab_id,
-                name,
-                expected_token=self._project_session.capture_content_token(),
-            )
+            self._workspace_tab_registry.rename_tab(tab_id, name)
         except ValueError as exc:
             self._workspace.show_rename_error(tab_id, str(exc))
             return
@@ -1374,8 +1347,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str)
     def _close_tab(self, tab_id: str) -> None:
-        if not self._mutation_input_admitted("Delete Tab"):
-            return
         document = self._project_session.document
         if len(document.tabs) <= 1:
             self.set_status_text("The last mechanism tab cannot be deleted.")
@@ -1420,10 +1391,7 @@ class MainWindow(QtWidgets.QMainWindow):
         runtime.notes_draft = None
         runtime.initial_text_by_set_id.clear()
         bundle.simulation_panel.discard_run_defaults_draft()
-        self._workspace_tab_registry.close_tab(
-            tab_id,
-            expected_token=self._project_session.capture_content_token(),
-        )
+        self._workspace_tab_registry.close_tab(tab_id)
         self._drop_tab_surface(
             tab_id,
         )
@@ -1431,8 +1399,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_workspace_tab_structure()
 
     def _add_initial_set(self, tab_id: str) -> None:
-        if not self._mutation_input_admitted("Add Initial Conditions Set"):
-            return
         if not self._accept_visible_source(
             tab_id,
             description="Add Initial Conditions Set",
@@ -1442,8 +1408,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_dataset_views((tab_id,))
 
     def _move_initial_sets(self, tab_id: str, delta: int) -> None:
-        if not self._mutation_input_admitted("Move Initial Conditions Set"):
-            return
         before = tuple(
             item.set_id
             for item in self._workspace_tab_registry.tab(
@@ -1461,8 +1425,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_dataset_views((tab_id,))
 
     def _delete_initial_sets(self, tab_id: str) -> None:
-        if not self._mutation_input_admitted("Delete Initial Conditions Set"):
-            return
         bundle = self._tab_surfaces[tab_id]
         targets = bundle.batch_table.selected_set_ids()
         if not targets:
@@ -1491,14 +1453,9 @@ class MainWindow(QtWidgets.QMainWindow):
         tab_id: str,
         settings: SimulationExecutionSettings,
     ) -> None:
-        if not self._mutation_input_admitted("Configure Run Defaults"):
-            return
         bundle = self._tab_surfaces[tab_id]
         token = self._project_session.capture_content_token()
-        result = bundle.initial_actions.set_workspace_run_defaults(
-            settings,
-            expected_token=token,
-        )
+        result = bundle.initial_actions.set_workspace_run_defaults(settings)
         if result != token:
             tab = self._workspace_tab_registry.tab(tab_id)
             bundle.simulation_panel.render_run_defaults(
@@ -1514,8 +1471,6 @@ class MainWindow(QtWidgets.QMainWindow):
         set_id: str,
         requested: bool,
     ) -> None:
-        if not self._mutation_input_admitted("Change Plot Membership"):
-            return
         changed = self._tab_surfaces[tab_id].initial_actions.set_plot_requested(
             set_id,
             requested,
@@ -1553,7 +1508,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return bool(self._visible_source_for_tab(tab_id).reactions_text.strip())
 
     def _set_tab_run_enabled(self, tab_id: str, enabled: bool) -> None:
-        admitted = bool(enabled) and self._mutation_input_admitted()
+        admitted = bool(enabled) and self.project_controller.mutation_admitted
         bundle = self._tab_surfaces.get(tab_id)
         if bundle is None:
             return
@@ -1573,10 +1528,7 @@ class MainWindow(QtWidgets.QMainWindow):
             discard_invalid=True,
         )
         if candidate != self._project_session.document:
-            self._workspace_tab_registry.replace_document(
-                candidate,
-                expected_token=self._project_session.capture_content_token(),
-            )
+            self._workspace_tab_registry.replace_document(candidate)
         self._clear_settled_input_drafts((target,), candidate)
         self._refresh_tab_controls(target)
 
@@ -1751,8 +1703,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tab_surfaces[tab_id].slider_binding.discard_slider_draft()
 
     def _start_selected_run(self, tab_id: str | None = None) -> bool:
-        if not self._mutation_input_admitted("Run"):
-            return False
         target = (
             self._workspace_tab_registry.active_tab_id
             if tab_id is None
@@ -1929,16 +1879,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         document: ProjectDocument,
         materialized_by_tab: tuple[tuple[str, tuple[str, ...]], ...],
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
-        """Semantically admit one exact save candidate before archive output."""
+    ) -> ProjectContentToken:
+        """Semantically admit one exact save candidate before archive output.
 
-        result = self._workspace_tab_registry.replace_document(
-            document,
-            expected_token=expected_token,
-        )
-        if result is None:
-            return None
+        The project controller checked its content token immediately before.
+        """
+
+        result = self._workspace_tab_registry.replace_document(document)
         self._clear_settled_input_drafts(
             (tab.tab_id for tab in document.tabs),
             document,
@@ -2013,8 +1960,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_selected_run_sets_changed(self, tab_id: str) -> None:
         """Refresh one tab's Run eligibility after its selected rows change."""
 
-        target = tab_id
-        self._set_tab_run_enabled(target, self._run_admitted(target))
+        self._set_tab_run_enabled(tab_id, self._run_admitted(tab_id))
         self._refresh_project_state()
 
     @QtCore.Slot(str, object)
@@ -2025,39 +1971,37 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         """Refresh one current-row gesture through one guarded owner path."""
 
-        target = tab_id
         if self._rendering_workspace:
             return
-        bundle = self._tab_surfaces[target]
+        bundle = self._tab_surfaces[tab_id]
         previous_set_id = (
             bundle.batch_model.set_id_for_live_index(previous_index)
         )
         current_set_id = self._workspace_tab_registry.presentation(
-            target
+            tab_id
         ).current_set_id
         if previous_set_id is not None and previous_set_id == current_set_id:
             return
-        if target in self._current_row_refreshing:
+        if tab_id in self._current_row_refreshing:
             return
         # The guard coalesces results_changed emitted synchronously inside
         # this block; queued results published afterwards render normally.
-        self._current_row_refreshing.add(target)
+        self._current_row_refreshing.add(tab_id)
         try:
             # InitialConditionsTableActions has already admitted the distinct
             # current-row presentation intent.  Refresh Slider targets first,
             # then compose/draw results once, and finally publish shell state.
             bundle.slider_binding.render()
-            self._render_results_for_tab(target)
+            self._render_results_for_tab(tab_id)
             self._refresh_project_state()
         finally:
-            self._current_row_refreshing.discard(target)
+            self._current_row_refreshing.discard(tab_id)
 
     def _on_initial_draft_state_changed(self, tab_id: str) -> None:
         """Apply current IC-draft admission to the owning tab."""
 
-        target = tab_id
-        self._workspace.set_tab_dirty(target, self._tab_has_drafts(target))
-        self._set_tab_run_enabled(target, self._run_admitted(target))
+        self._workspace.set_tab_dirty(tab_id, self._tab_has_drafts(tab_id))
+        self._set_tab_run_enabled(tab_id, self._run_admitted(tab_id))
         self._refresh_title()
         self._refresh_actions()
 
@@ -2065,8 +2009,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_initial_values_changed(self, tab_id: str) -> None:
         """Refresh the owning Slider projection after canonical IC mutation."""
 
-        target = tab_id
-        bundle = self._tab_surfaces[target]
+        bundle = self._tab_surfaces[tab_id]
         bundle.slider_binding.render()
         self._refresh_project_state()
 
@@ -2074,11 +2017,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_initial_set_name_changed(self, tab_id: str) -> None:
         """Reproject every display label after one accepted set rename."""
 
-        target = tab_id
-        bundle = self._tab_surfaces[target]
-        self._refresh_dataset_views((target,))
+        bundle = self._tab_surfaces[tab_id]
+        self._refresh_dataset_views((tab_id,))
         self._refresh_slider_target_summary(
-            target,
+            tab_id,
             bundle.slider_binding.resolve_target_set_ids(),
         )
 
@@ -2099,21 +2041,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def _apply_slider_draft(self, tab_id: str) -> bool:
         """Publish one Slider Apply, then reproject every existing consumer."""
 
-        target = tab_id
-        bundle = self._tab_surfaces[target]
-        if target in self._slider_apply_refreshing:
+        bundle = self._tab_surfaces[tab_id]
+        if tab_id in self._slider_apply_refreshing:
             return False
-        self._slider_apply_refreshing.add(target)
+        self._slider_apply_refreshing.add(tab_id)
         try:
-            self._capture_visible_tab_inputs(tab_id=target)
+            self._capture_visible_tab_inputs(tab_id=tab_id)
             if not bundle.slider_binding.apply(
                 confirm_reactions_replacement=self._confirm_slider_apply_replaces_reactions,
             ):
                 return False
         finally:
-            self._slider_apply_refreshing.discard(target)
-        self._refresh_tab_controls(target, preserve_slider_editor_drafts=False)
-        self._render_results_for_tab(target)
+            self._slider_apply_refreshing.discard(tab_id)
+        self._refresh_tab_controls(tab_id, preserve_slider_editor_drafts=False)
+        self._render_results_for_tab(tab_id)
         self.set_status_text("Slider values applied. The exact preview became the current results.")
         return True
 
@@ -2136,8 +2077,6 @@ class MainWindow(QtWidgets.QMainWindow):
         refresh_after_admission: bool = True,
     ) -> MechanismSourceReconciliation | None:
         """Admit one action against retained truth or one exact visible draft."""
-        if not self._mutation_input_admitted(description):
-            return None
         document = self._project_session.document
         runtime = self._workspace_tab_registry.tab_runtime(tab_id)
         if source is None and runtime.reactions_draft is None:
@@ -2436,11 +2375,8 @@ class MainWindow(QtWidgets.QMainWindow):
         *,
         description: str,
     ) -> bool:
-        if not self._mutation_input_admitted(description):
-            return False
-        target = tab_id
-        self._capture_visible_tab_inputs(tab_id=target)
-        runtime = self._workspace_tab_registry.tab_runtime(target)
+        self._capture_visible_tab_inputs(tab_id=tab_id)
+        runtime = self._workspace_tab_registry.tab_runtime(tab_id)
         if runtime.reactions_draft is not None or runtime.has_slider_draft:
             answer = QtWidgets.QMessageBox.question(
                 self,
@@ -2455,19 +2391,17 @@ class MainWindow(QtWidgets.QMainWindow):
             if answer != QtWidgets.QMessageBox.StandardButton.Yes:
                 return False
         if not self._accept_visible_source(
-            target,
+            tab_id,
             description=description,
             source=source,
             refresh_after_admission=False,
         ):
             return False
-        self._discard_slider_draft(target)
-        self._refresh_tab_controls(target)
+        self._discard_slider_draft(tab_id)
+        self._refresh_tab_controls(tab_id)
         return True
 
     def _load_preset_mechanism(self, preset_id: str) -> None:
-        if not self._mutation_input_admitted("Load Preset Mechanism"):
-            return
         from kindred.io.resources import get_preset_mechanism_source
 
         source = get_preset_mechanism_source(preset_id)
@@ -2479,8 +2413,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.set_status_text(f"Loaded preset mechanism: {preset_id}")
 
     def _load_intervention_example(self, example_id: str) -> None:
-        if not self._mutation_input_admitted("Load Intervention Example"):
-            return
         from kindred.io.resources import get_intervention_example_source
 
         source = get_intervention_example_source(example_id)
@@ -2531,8 +2463,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.set_status_text(f"Applied template: {template.name}")
 
     def _open_template_manager(self) -> None:
-        if not self._mutation_input_admitted("Open Template Manager"):
-            return
         from kindred.gui.widgets.template_manager_dialog import TemplateManagerDialog
 
         source_tab = self._workspace_tab_registry.tab(
@@ -2595,8 +2525,6 @@ class MainWindow(QtWidgets.QMainWindow):
         configs: tuple[ImportConfig, ...],
     ) -> None:
         """Admit one configured import intent into the global staging owner."""
-        if not self._mutation_input_admitted("Import Dataset"):
-            return
         dataset_count = sum(len(config.plans) for config in configs)
         label = count_text(dataset_count, "dataset")
         self._dataset_import_progress_dialog = QtWidgets.QProgressDialog(
@@ -2662,11 +2590,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         completion: DatasetImportCompletion,
     ) -> None:
-        if not self._mutation_input_admitted("Commit Dataset Import"):
-            self.set_status_text(
-                "Dataset import completed after Close was requested, so publication was skipped."
-            )
-            return
         batch_proposal = build_raw_record_batch_proposal(
             completion,
             existing_records=self._project_session.document.datasets,
@@ -2677,7 +2600,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._workspace_tab_registry.replace_document(
             document,
-            expected_token=self._project_session.capture_content_token(),
         )
         self._refresh_dataset_views()
         message = f"Imported {count_text(len(batch_proposal.records), 'raw dataset')}."
@@ -2733,15 +2655,12 @@ class MainWindow(QtWidgets.QMainWindow):
             batch=batch,
             model_targets=model_targets,
         )
-        result = self._workspace_tab_registry.replace_tab(
-            candidate_tab,
-            expected_token=mapping_expected_token,
-        )
-        if result is None:
+        if not self._project_session.is_content_token_current(mapping_expected_token):
             self.set_status_text(
                 message + " Mapping was not published. Raw data remains unmapped."
             )
             return
+        result = self._workspace_tab_registry.replace_tab(candidate_tab)
         mapping_changed = result != mapping_expected_token
         if mapping_changed:
             current_tab = self._workspace_tab_registry.tab(origin_tab_id)
@@ -2757,8 +2676,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str, str)
     def _rename_dataset(self, dataset_id: str, display_name: str) -> None:
-        if not self._mutation_input_admitted("Rename Dataset"):
-            return
         changed = False
         try:
             name = validate_unique_dataset_name(
@@ -2774,10 +2691,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 name,
             )
             expected_token = self._project_session.capture_content_token()
-            result = self._workspace_tab_registry.replace_document(
-                candidate,
-                expected_token=expected_token,
-            )
+            result = self._workspace_tab_registry.replace_document(candidate)
             changed = result != expected_token
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, "Rename Dataset", str(exc))
@@ -2786,8 +2700,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str)
     def _delete_dataset(self, dataset_id: str) -> None:
-        if not self._mutation_input_admitted("Delete Dataset"):
-            return
         presentations = dict(self._workspace_tab_registry.presentation_items())
         plan = plan_global_dataset_delete(
             dataset_id=dataset_id,
@@ -2818,13 +2730,12 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._workspace_tab_registry.replace_document(
             candidate,
-            expected_token=self._project_session.capture_content_token(),
         )
         self._refresh_dataset_views()
 
     @QtCore.Slot(str, str)
     def _open_spreadsheet(self, origin_tab_id: str, selected_id: str) -> None:
-        if not self._mutation_input_admitted("Create from Data") or self._spreadsheet_editor is not None:
+        if self._spreadsheet_editor is not None:
             return
         from kindred.gui.widgets.spreadsheet_editor import SpreadsheetEditorDialog, SpreadsheetSelectionDialog
 
@@ -2862,8 +2773,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_actions()
 
     def _create_spreadsheet_datasets(self, editor, origin_tab_id, records) -> None:
-        if not self._mutation_input_admitted("Create from Data"):
-            return
         # The worksheets are detached from the project, so outputs are reviewed
         # and published against the project as it is now, including visible
         # Reactions admitted like every other mapping action.
@@ -2895,11 +2804,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 review.deleteLater()
             mapped = apply_dataset_mapping_batch(document=candidate, tab=tab, batch=batch, model_targets=targets)
             candidate = candidate.replace_tab(mapped)
-            if not self._mutation_input_admitted("Create from Data"):
-                return
-            if self._workspace_tab_registry.replace_document(candidate, expected_token=token) is None:
+            if not self._project_session.is_content_token_current(token):
                 QtWidgets.QMessageBox.warning(editor, "Create from Data", "The project changed during the review, so nothing was created. Click Review and Create again.")
                 return
+            self._workspace_tab_registry.replace_document(candidate)
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(editor, "Create from Data", str(exc))
             return
@@ -2921,8 +2829,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str)
     def _export_original_dataset(self, dataset_id: str) -> None:
-        if not self._mutation_input_admitted("Export Original Dataset"):
-            return
         document = self._project_session.document
         record = document.dataset(dataset_id)
         if record.source_id is None:
@@ -2988,8 +2894,6 @@ class MainWindow(QtWidgets.QMainWindow):
         set_id: str | None,
         occupied_choice: str | None,
     ) -> None:
-        if not self._mutation_input_admitted("Map Dataset"):
-            return
         changed = False
         previous_set_ids: tuple[str, ...] = ()
         try:
@@ -3053,14 +2957,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 batch=DatasetMappingBatchProposal(proposals=(proposal,)),
                 model_targets=model_targets,
             )
-            result = self._workspace_tab_registry.replace_tab(
-                candidate_tab,
-                expected_token=expected_token,
-            )
-            if result is None:
+            if not self._project_session.is_content_token_current(expected_token):
                 QtWidgets.QMessageBox.warning(self, "Dataset Mapping", "The project changed while this dialog was open, so the mapping was not applied. Map the dataset again.")
                 return
-            changed = result != expected_token
+            changed = self._workspace_tab_registry.replace_tab(candidate_tab) != expected_token
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, "Dataset Mapping", str(exc))
         if not changed:
@@ -3076,8 +2976,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_dataset_views((tab_id,))
 
     def _edit_observation_mapping(self, tab_id: str, dataset_id: str) -> None:
-        if not self._mutation_input_admitted("Edit Observation Mapping"):
-            return
         if not self._accept_visible_source(
             tab_id,
             description="Edit Observation Mapping"
@@ -3108,14 +3006,10 @@ class MainWindow(QtWidgets.QMainWindow):
             model_targets=model_targets,
             confirmed_mapping=mapping,
         )
-        result = self._workspace_tab_registry.replace_tab(
-            candidate,
-            expected_token=expected_token,
-        )
-        if result is None:
+        if not self._project_session.is_content_token_current(expected_token):
             QtWidgets.QMessageBox.warning(self, "Observation Mapping", "The project changed while this dialog was open, so the mapping was not applied. Open the mapping again.")
             return
-        if result != expected_token:
+        if self._workspace_tab_registry.replace_tab(candidate) != expected_token:
             self._refresh_dataset_views((tab_id,))
 
     def _set_overlay_selection(
@@ -3124,8 +3018,6 @@ class MainWindow(QtWidgets.QMainWindow):
         dataset_id: str,
         raw_observation_ids: tuple[str, ...],
     ) -> None:
-        if not self._mutation_input_admitted("Change Dataset Overlay"):
-            return
         state = self._workspace_tab_registry.presentation(tab_id)
         overlays = dict(state.overlay_raw_observation_ids_by_dataset)
         if raw_observation_ids:
@@ -3147,8 +3039,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_project_state()
 
     def _set_reference_lines_visible(self, tab_id: str, visible: bool) -> None:
-        if not self._mutation_input_admitted("Change Reference Lines"):
-            return
         state = self._workspace_tab_registry.presentation(tab_id)
         self._workspace_tab_registry.set_presentation(
             tab_id,
@@ -3162,10 +3052,6 @@ class MainWindow(QtWidgets.QMainWindow):
         tab_id: str,
         visible: bool,
     ) -> None:
-        if not self._mutation_input_admitted(
-            "Change Intervention Indicators"
-        ):
-            return
         self._workspace_tab_registry.set_intervention_annotations_visible(
             tab_id,
             visible,
@@ -3178,8 +3064,6 @@ class MainWindow(QtWidgets.QMainWindow):
         tab_id: str,
         visible: bool,
     ) -> None:
-        if not self._mutation_input_admitted("Change Intervention Labels"):
-            return
         self._workspace_tab_registry.set_intervention_labels_visible(tab_id, visible)
         self._refresh_project_state()
         self._render_results_for_tab(tab_id)
@@ -3189,8 +3073,6 @@ class MainWindow(QtWidgets.QMainWindow):
         tab_id: str,
         selection: AxisSeriesSelection,
     ) -> None:
-        if not self._mutation_input_admitted("Change X Series"):
-            return
         state = self._workspace_tab_registry.presentation(tab_id)
         self._workspace_tab_registry.set_presentation(
             tab_id,
@@ -3200,15 +3082,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._render_results_for_tab(tab_id)
 
     def _set_y_series(self, tab_id: str, selections: object) -> None:
-        if not self._mutation_input_admitted("Change Y Series"):
-            return
-        selected = selections
         state = self._workspace_tab_registry.presentation(tab_id)
         self._workspace_tab_registry.set_presentation(
             tab_id,
             replace(
                 state,
-                selected_y_series=selected,
+                selected_y_series=selections,
                 selected_y_uses_default_all=False,
             ),
         )
@@ -3216,8 +3095,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._render_results_for_tab(tab_id)
 
     def _select_all_y_series(self, tab_id: str) -> None:
-        if not self._mutation_input_admitted("Change Y Series"):
-            return
         state = self._workspace_tab_registry.presentation(tab_id)
         self._workspace_tab_registry.set_presentation(
             tab_id,
@@ -3232,8 +3109,6 @@ class MainWindow(QtWidgets.QMainWindow):
         option: str,
         value: bool | float | str,
     ) -> None:
-        if not self._mutation_input_admitted("Change Plot Presentation"):
-            return
         state = self._workspace_tab_registry.presentation(tab_id)
         changes = {"grid_x": value, "grid_y": value} if option == "show_grid" else {option: value}
         next_state = replace(state, **changes)
@@ -3283,8 +3158,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _project_actions_idle(self, action: str) -> bool:
-        if not self._mutation_input_admitted(action):
-            return False
         if self._active_project_work():
             self.set_status_text(
                 f"{action} rejected: active work must finish first."
@@ -3313,14 +3186,10 @@ class MainWindow(QtWidgets.QMainWindow):
         return bool(self.project_controller.load_recent_project(path))
 
     def _reset_layout(self) -> None:
-        if not self._mutation_input_admitted("Reset Layout"):
-            return
         self._workspace.reset_visible_dock_layout()
         self.set_status_text("Panel layout reset.")
 
     def _restore_default_panel_layout(self) -> None:
-        if not self._mutation_input_admitted("Restore Default Panel Layout"):
-            return
         self._workspace.restore_default_panel_layout()
         self.set_status_text("Default panel layout restored.")
 
@@ -3662,8 +3531,6 @@ class MainWindow(QtWidgets.QMainWindow):
         return action
 
     def _open_simulation_settings(self) -> None:
-        if not self._mutation_input_admitted("Configure Simulation Settings"):
-            return
         tab_id = self._workspace_tab_registry.active_tab_id
         tab = self._workspace_tab_registry.tab(tab_id)
         dialog = SimulationSettingsDialog(
@@ -3701,7 +3568,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._workspace_tab_registry.set_scientific_settings(
                     tab_id,
                     settings,
-                    expected_token=self._workspace_tab_registry.capture_content_token(),
                 )
                 changed = True
             if changed:
@@ -3750,7 +3616,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._simulation_jobs.cancel_current()
 
     def _capture_scan_session(self):
-        """Admit all visible authoring inputs once, without project publication."""
+        """Admit all visible authoring inputs once; only a typed set name is published."""
         tab_id = self._workspace_tab_registry.active_tab_id
         self._capture_visible_tab_inputs(tab_id=tab_id)
         document = self._project_session.document
@@ -3772,8 +3638,6 @@ class MainWindow(QtWidgets.QMainWindow):
         return candidate.tab(tab_id)
 
     def _open_chemical_space_scan(self) -> None:
-        if not self._mutation_input_admitted("Chemical Space Scan"):
-            return
         try:
             self._scan_owner.open(
                 self._capture_scan_session,
@@ -3785,8 +3649,6 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Chemical Space Scan", str(exc))
 
     def _run_global_fit(self) -> bool:
-        if not self._mutation_input_admitted("Global Fit"):
-            return False
         tab_id = self._workspace_tab_registry.active_tab_id
         self._capture_visible_tab_inputs(tab_id=tab_id)
         if not self._confirm_discard_slider_preview(tab_id, "Global Fit"):
@@ -3799,8 +3661,6 @@ class MainWindow(QtWidgets.QMainWindow):
         return self._fit_session_owner.open_fit_configuration(tab_id) is not None
 
     def _configure_fitting(self) -> bool:
-        if not self._mutation_input_admitted("Configure Fitting"):
-            return False
         defaults = self._project_session.document.fit_defaults
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle("Fitting Defaults")
@@ -3926,7 +3786,6 @@ class MainWindow(QtWidgets.QMainWindow):
             expected_token = self._project_session.capture_content_token()
             changed = self._workspace_tab_registry.replace_document(
                 replace(self._project_session.document, fit_defaults=candidate),
-                expected_token=expected_token,
             ) != expected_token
             if changed:
                 self.set_status_text("Current-project Fit defaults updated.")
@@ -3941,8 +3800,6 @@ class MainWindow(QtWidgets.QMainWindow):
         return True
 
     def _export_xlsx(self) -> bool:
-        if not self._mutation_input_admitted("Export Results XLSX"):
-            return False
         blocks = self._canonical_export_blocks(
             self._workspace_tab_registry.active_tab_id
         )
@@ -4057,8 +3914,6 @@ class MainWindow(QtWidgets.QMainWindow):
         bundle.editor.symbolic_calculator_btn.setEnabled(state.available)
 
     def _toggle_symbolic_calculator(self, tab_id: str) -> None:
-        if not self._mutation_input_admitted("Toggle Symbolic Calculator"):
-            return
         identity = SYMBOLIC_CALCULATOR_DOCK_SPEC.identity_key
         dock = self._workspace.dock_for_identity(identity)
         if self._workspace.is_dock_frontmost(identity):
@@ -4067,15 +3922,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._open_symbolic_calculator(tab_id)
 
     def _open_symbolic_calculator(self, tab_id: str) -> None:
-        if not self._mutation_input_admitted("Open Symbolic Calculator"):
-            return
         self._refresh_symbolic_calculator(tab_id)
         # The stacks already show the active tab, the only one that reaches here.
         self._workspace.reveal_dock(SYMBOLIC_CALCULATOR_DOCK_SPEC.identity_key)
 
     def _toggle_interactive_sliders(self, tab_id: str) -> None:
-        if not self._mutation_input_admitted("Toggle Interactive Sliders"):
-            return
         identity = SLIDERS_DOCK_SPEC.identity_key
         dock = self._workspace.dock_for_identity(identity)
         if self._workspace.is_dock_frontmost(identity):
@@ -4085,8 +3936,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _evaluate_symbolic(self, tab_id: str, query: str):
         bundle = self._tab_surfaces[tab_id]
-        if not self._mutation_input_admitted("Evaluate Symbolic Expression"):
-            return bundle.calculator_owner.view_state()
         if self._workspace_tab_registry.tab_runtime(tab_id).reactions_draft is not None:
             return bundle.calculator_owner.invalidate_current_snapshot()
         return bundle.calculator_owner.evaluate(query)
@@ -4094,8 +3943,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _open_mechanism_inspector(self, tab_id: str) -> None:
         from kindred.gui.widgets.mechanism_inspector import MechanismInspectorDialog
 
-        if not self._mutation_input_admitted("Open Mechanism Inspector"):
-            return
         prepared_dsl = self._workspace_tab_registry.tab(tab_id).prepared_dsl
         if self._workspace_tab_registry.tab_runtime(tab_id).reactions_draft is not None or prepared_dsl is None:
             self.set_status_text("Write reactions and click Run to inspect the mechanism.")
@@ -4426,16 +4273,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str)
     def _on_fit_project_document_changed(self, tab_id: str) -> None:
-        target = tab_id
-        created = target not in self._tab_surfaces
+        created = tab_id not in self._tab_surfaces
         if created:
-            self._create_tab_surface(target)
+            self._create_tab_surface(tab_id)
             self._refresh_workspace_tab_structure()
-            self._apply_persisted_plot_state(target)
-        self._refresh_tab_controls(target)
+            self._apply_persisted_plot_state(tab_id)
+        self._refresh_tab_controls(tab_id)
         if created:
             # The origin tab's results redraw when its document is published.
-            self._render_results_for_tab(target)
+            self._render_results_for_tab(tab_id)
 
     @QtCore.Slot()
     def _on_simulation_state_changed(self) -> None:
@@ -4469,7 +4315,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bundle = self._tab_surfaces.get(tab_id)
         if bundle is None:
             return
-        mutation_admitted = self._mutation_input_admitted()
+        mutation_admitted = self.project_controller.mutation_admitted
         for surface in self._tab_surfaces.values():
             surface.data_panel.set_creation_busy(self._spreadsheet_editor is not None or not mutation_admitted)
         import_action = bundle.data_panel.import_action
@@ -4537,6 +4383,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if not self.project_controller.consume_native_close_authorization():
             event.ignore()
+            self._finish_typed_input_for_close()
             self.project_controller.request_close()
             return
         if not self._save_settings():

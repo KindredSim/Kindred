@@ -57,8 +57,6 @@ from kindred.gui.ui_helpers import (
 )
 from kindred.gui.display_name_policy import compact_text, literal_tooltip
 
-__all__ = ["AxisToolbar"]
-
 
 class AxisToolbar(QtWidgets.QWidget):
     # High-level signals

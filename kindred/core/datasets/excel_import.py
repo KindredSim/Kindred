@@ -16,10 +16,6 @@ from kindred.core.datasets.source_rules import (
     identify_physical_columns,
 )
 
-__all__ = [
-    "ExcelWorkbookPair",
-]
-
 
 class ExcelWorkbookPair:
     """One explicitly owned read-only data/formula workbook pair.

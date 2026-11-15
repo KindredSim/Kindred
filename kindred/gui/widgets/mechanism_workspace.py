@@ -9,8 +9,6 @@ from PySide6 import QtCore, QtWidgets
 from kindred.core.project_document import ProjectDocument
 from kindred.gui.widgets.pyqtgraph_plot_panel_impl import PyQtGraphPlotPanel
 
-__all__ = ["ProjectWorkspaceWidget"]
-
 _CREATE_TAB_TOOLTIP = "Create a fresh mechanism tab"
 
 
@@ -281,8 +279,7 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
             self._analysis_stack.addWidget(analysis)
 
     def _ensure_plot(self, tab_id: str) -> PyQtGraphPlotPanel:
-        target = tab_id
-        plot = self._plot_by_tab_id.get(target)
+        plot = self._plot_by_tab_id.get(tab_id)
         if plot is not None:
             return plot
         if self._initial_plot is not None:
@@ -293,8 +290,8 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         plot.setObjectName("plotPanel")
         self._plot_stack.addWidget(plot)
         self._install_analysis_widget(plot)
-        self._plot_by_tab_id[target] = plot
-        self.plotCreated.emit(target, plot)
+        self._plot_by_tab_id[tab_id] = plot
+        self.plotCreated.emit(tab_id, plot)
         return plot
 
     def plot_for_tab(self, tab_id: str) -> PyQtGraphPlotPanel:
@@ -372,9 +369,8 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         self._analysis_stack.setCurrentWidget(active_plot.analysis_tabs())
 
     def select_tab_surface(self, tab_id: str) -> None:
-        target = tab_id
-        plot = self._plot_by_tab_id[target]
-        index = self._index_for_tab_id(target)
+        plot = self._plot_by_tab_id[tab_id]
+        index = self._index_for_tab_id(tab_id)
         blocked = self._tab_bar.blockSignals(True)
         try:
             self._tab_bar.setCurrentIndex(index)
@@ -385,8 +381,7 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
 
     def drop_tab_session_state(self, tab_id: str) -> None:
         # Called for an existing tab's plot, before any re-render.
-        target = tab_id
-        plot = self._plot_by_tab_id.pop(target)
+        plot = self._plot_by_tab_id.pop(tab_id)
         analysis = plot.analysis_tabs()
         self._plot_stack.removeWidget(plot)
         self._analysis_stack.removeWidget(analysis)
@@ -421,11 +416,10 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         )
 
     def _index_for_tab_id(self, tab_id: str) -> int:
-        target = tab_id
         for index in range(self._tab_bar.count()):
-            if self._tab_bar.tabData(index) == target:
+            if self._tab_bar.tabData(index) == tab_id:
                 return index
-        raise KeyError(f"Unknown rendered mechanism tab ID: {target!r}.")
+        raise KeyError(f"Unknown rendered mechanism tab ID: {tab_id!r}.")
 
     def _mechanism_tab_count(self) -> int:
         return max(0, self._tab_bar.count() - 1)

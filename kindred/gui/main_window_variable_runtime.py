@@ -42,8 +42,6 @@ from kindred.gui.widgets.batch_initial_conditions_table import (
 )
 from kindred.gui.widgets.mechanism_editor import MechanismEditorTabbed
 
-__all__ = ["TabSliderBinding"]
-
 
 @dataclass(frozen=True, slots=True)
 class ParameterSliderProjection:
@@ -712,13 +710,7 @@ class TabSliderBinding(QtCore.QObject):
         # lose the strict object identity checked above and could publish a
         # request other than the one that produced these results.
         canonical_pairs = tuple(pairs)
-        # Capture the session token only after the same-tab request and
-        # target-roster guards have passed.  Edits confined to unrelated
-        # tabs therefore do not invalidate this tab's settled preview.
-        self._registry.replace_document(
-            candidate,
-            expected_token=self._registry.capture_content_token(),
-        )
+        self._registry.replace_document(candidate)
         self._simulation_jobs.promote_preview_to_run(
             self._tab_id,
             canonical_pairs,

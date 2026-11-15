@@ -815,7 +815,8 @@ class InterventionScheduleExecutionOwner:
                 output_temperature = np.concatenate(outputs_temperature)
             if has_stops:
                 try:
-                    base_times = (np.array([t0], dtype=float) if actual_end == t0
+                    base_times = (t_eval[t_eval <= actual_end] if req.keep_sample_times
+                                  else np.array([t0], dtype=float) if actual_end == t0
                                   else build_time_grid(t0, actual_end, req.grid))
                 except ValueError as exc:
                     raise InterventionScheduleError(str(exc)) from exc

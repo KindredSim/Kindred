@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 import math
 import os
+import uuid
 
 import numpy as np
 import scipy
@@ -14,7 +15,7 @@ import scipy
 from kindred._version import __version__ as KINDRED_VERSION
 from kindred.scan.config import START, END
 from kindred.core.quantity_units import presentation_unit
-from kindred.io.paths import create_sibling_temporary, replace_destination
+from kindred.io.paths import replace_destination
 
 
 def plain(value):
@@ -88,7 +89,11 @@ class JsonScanWriter:
         self.count = 0
 
     def initialize(self, config, design):
-        descriptor, self.path = create_sibling_temporary(self.destination, ".partial.json")
+        # A cancelled or failed Scan hands this file to the user, so it is
+        # named visibly beside the destination, never as a hidden temporary.
+        path = f"{self.destination}.{uuid.uuid4().hex}.partial.json"
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o666)
+        self.path = path
         self.stream = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
         versions = {"kindred": KINDRED_VERSION, "numpy": np.__version__,
                     "scipy": scipy.__version__}

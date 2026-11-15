@@ -52,16 +52,6 @@ from kindred.core.algebra.evaluator import PreparedAlgebraPointEvaluator
 from kindred.core.algebra.simulation_series import failing_let_facts
 
 
-__all__ = [
-    "PreparedSolverConfig",
-    "SimulationExecutionRequest",
-    "PreparedSimulationRun",
-    "build_simulation_request_from_prepared_run",
-    "build_simulation_execution_request",
-    "prepare_simulation_run",
-]
-
-
 @dataclass(frozen=True, slots=True)
 class PreparedSolverConfig:
     """Solver policy consumed by all direct execution paths.
@@ -146,6 +136,7 @@ def build_simulation_request_from_prepared_run(
     sample_solver_steps: bool = False,
     species_ctc: bool = False,
     species_maximum: bool = False,
+    keep_sample_times: bool = False,
 ) -> SimulationRequest:
     """Solve exactly what preparation admitted: its starting state, schedule,
     Jacobian and cancellation owner."""
@@ -169,6 +160,7 @@ def build_simulation_request_from_prepared_run(
         sample_solver_steps=sample_solver_steps,
         species_ctc=species_ctc,
         species_maximum=species_maximum,
+        keep_sample_times=keep_sample_times,
         stop_observable_value=prepared_run.stop_observable_value,
         parameter_values_at_temperature=prepared_run.parameter_values_at_temperature,
         intervention_lines=request.prepared_dsl.analysis.intervention_lines,
@@ -449,8 +441,6 @@ def prepare_simulation_run(
                     exc.annotate(**failing_let_facts(parameter_algebra_spec, exc))
                 raise
 
-    request = execution_request
-
     return PreparedSimulationRun(
         rhs=rhs,
         y0=y0,
@@ -459,7 +449,7 @@ def prepare_simulation_run(
         intervention_execution=intervention_execution,
         symbolic_jacobian=runtime_symbolic_jacobian,
         initials_for_algebra=initials_for_algebra,
-        request=request,
+        request=execution_request,
         stop_observable_value=stop_observable_value,
         parameter_values_at_temperature=symbols,
     )

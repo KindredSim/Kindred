@@ -18,9 +18,3 @@ class ScientificUnavailable:
     producer: str
     stage: str
     factual_cause: FactualCause
-
-
-
-__all__ = [
-    "ScientificUnavailable",
-]

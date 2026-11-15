@@ -15,8 +15,6 @@ from kindred.core.analysis.fit_dataset_payload import FitObservationSeries
 from kindred.core.exceptions import FittingCancelled
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 
-__all__ = ["ParametricProjection", "UndefinedComparedTargets", "align_parametric", "project_parametric_y"]
-
 
 class UndefinedComparedTargets(Exception):
     """Targets data compares with where at least one of them is undefined."""
@@ -138,6 +136,47 @@ def align_parametric(
     return ParametricProjection(
         source_rows=tuple(source_rows), delta_x=selected_x - observed_x,
         left_rows=selected_left, right_rows=selected_right, fractions=fractions,
+    )
+
+
+def follow_parametric(
+    *,
+    held: ParametricProjection,
+    observed_x: np.ndarray,
+    observations: Mapping[str, FitObservationSeries],
+    model_x: np.ndarray,
+    model_y: Mapping[str, np.ndarray],
+    multipliers: Mapping[str, float],
+    x_name: str,
+) -> ParametricProjection:
+    """Keep each row on the piece ``held`` placed it on, along a curve sampled
+    as that one was.
+
+    A row inside a piece takes the location on that piece's line that
+    minimizes its weighted discrepancy, as ``align_parametric`` does, without
+    being kept between the piece's ends; a row at a corner stays on it.
+    """
+    names = tuple(sorted(observations))
+    model = np.column_stack((model_x, *(model_y[name] for name in names)))
+    observed_by_row = {
+        name: dict(zip(observations[name].source_rows, observations[name].y, strict=True))
+        for name in names
+    }
+    observed = np.column_stack((observed_x, *(
+        [observed_by_row[name].get(row, np.nan) for row in held.source_rows] for name in names
+    )))
+    weight = np.asarray([multipliers[x_name], *(multipliers[name] for name in names)])
+    start = model[held.left_rows]
+    available = np.isfinite(observed)
+    direction = np.where(available, (model[held.right_rows] - start) * weight, 0.0)
+    offset = np.where(available, (observed - start) * weight, 0.0)
+    inside = (held.left_rows != held.right_rows) & (held.fractions > 0.0) & (held.fractions < 1.0)
+    fractions = np.where(inside, np.sum(offset * direction, axis=1) / np.where(
+        inside, np.sum(direction * direction, axis=1), 1.0), held.fractions)
+    selected_x = model_x[held.left_rows] + fractions * (model_x[held.right_rows] - model_x[held.left_rows])
+    return ParametricProjection(
+        source_rows=held.source_rows, delta_x=selected_x - observed_x,
+        left_rows=held.left_rows, right_rows=held.right_rows, fractions=fractions,
     )
 
 

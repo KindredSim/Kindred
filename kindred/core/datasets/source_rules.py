@@ -10,12 +10,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-__all__ = [
-    "PhysicalColumn",
-    "identify_physical_columns",
-    "validate_tabular_source_bytes",
-]
-
 _ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 _OLE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
@@ -28,14 +22,13 @@ def validate_tabular_source_bytes(
 ) -> None:
     """Admit exact nonempty bytes for one current CSV or XLSX source."""
 
-    label = source_label
     if not source_bytes:
-        raise ValueError(f"Dataset source {label!r} is empty.")
+        raise ValueError(f"Dataset source {source_label!r} is empty.")
     signature = source_bytes[:8]
     if source_format == "xlsx":
         if not signature.startswith(_ZIP_SIGNATURES):
             raise ValueError(
-                f"File {label!r} has an .xlsx extension but is not an XLSX "
+                f"File {source_label!r} has an .xlsx extension but is not an XLSX "
                 "workbook."
             )
         return
@@ -44,18 +37,18 @@ def validate_tabular_source_bytes(
         _OLE_SIGNATURE
     ):
         raise ValueError(
-            f"File {label!r} has a .csv extension but contains a workbook or "
+            f"File {source_label!r} has a .csv extension but contains a workbook or "
             "other binary container."
         )
     if b"\x00" in source_bytes:
         raise ValueError(
-            f"File {label!r} is binary data, not a UTF-8 CSV source."
+            f"File {source_label!r} is binary data, not a UTF-8 CSV source."
         )
     try:
         source_bytes.decode("utf-8-sig", errors="strict")
     except UnicodeDecodeError as exc:
         raise ValueError(
-            f"File {label!r} is not a valid UTF-8 CSV source."
+            f"File {source_label!r} is not a valid UTF-8 CSV source."
         ) from exc
 
 

@@ -570,6 +570,8 @@ class Interventions(PracticeLesson):
                 "<p>This is identical to step 5, because t_add is 200 s. But it is possible to vary t_add, for "
                 "example through sliders or fitting, without changing the accepted model, the text the last Run "
                 "accepted.</p>"
+                "<p>If the <b>Interactive Sliders panel</b> is hidden, open "
+                "<b>View → Panels → Interactive Sliders</b>.</p>"
                 "<p>In the <b>Interactive Sliders</b> panel, open <b>Visible Sliders</b> and check <b>t_add</b>. "
                 "Move the slider.</p>"
                 "<p>The Preview shows the <b>jump</b> at the new time.</p>"
@@ -732,6 +734,8 @@ class Interventions(PracticeLesson):
                 "protocol_slider",
                 "Move the Protocol with Its Slider",
                 "<p>This is identical to step 12, because t_first is 60 s.</p>"
+                "<p>If the <b>Interactive Sliders panel</b> is hidden, open "
+                "<b>View → Panels → Interactive Sliders</b>.</p>"
                 "<p>In the <b>Interactive Sliders</b> panel, open <b>Visible Sliders</b> and check "
                 "<b>t_first</b>. Move the slider.</p>"
                 "<p>The Preview shows every repetition move with the start. The spacing and the <b>duration</b> "

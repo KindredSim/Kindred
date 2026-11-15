@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from types import MappingProxyType
 from typing import Iterable, Literal, Sequence
 
 from kindred.core.quantity_units import Unit
@@ -40,39 +42,6 @@ from kindred.gui.parameter_enumeration import (
 )
 from kindred.gui.fitting.contracts import FitParametricSettings
 from kindred.gui.fitting.ic_tolerance import FitInitialTolerance
-
-__all__ = [
-    "FitParameterConfiguration",
-    "FitDatasetLocalSettings",
-    "FitDatasetWeightMode",
-    "FitSolver",
-    "FitExecutionRequest",
-    "FitPreparedDatasetConfig",
-    "FitSharedInitialGroup",
-    "FitInitialVariable",
-    "FitMappedDatasetSnapshot",
-    "FitObservationSnapshot",
-    "FitOriginSnapshot",
-    "FitParameterVariable",
-    "FitProfileSetup",
-    "FitSetupSnapshot",
-    "build_fit_execution_request",
-    "capture_fit_origin",
-    "create_initial_fit_setup",
-    "selected_observations",
-    "fit_execution_span",
-    "fit_dataset_time_defaults",
-    "fit_coordinate_datasets_text",
-    "fit_group_labels",
-    "shared_initial_group_labels",
-    "shared_initial_group_variable_id",
-    "skipped_fit_analysis_coordinates",
-    "fit_parameter_overall",
-    "fit_uncertainty_coordinates",
-    "fit_profile_config",
-    "fit_profile_targets",
-    "fit_setup_readiness",
-]
 
 FitDatasetWeightMode = Literal["implicit", "user"]
 FitSolver = Literal["BDF", "Radau"]
@@ -1093,8 +1062,13 @@ def _compile_fit_dispatch(
     *,
     setup: FitSetupSnapshot,
     prepared_datasets: tuple[FitPreparedDatasetConfig, ...],
+    initial_starts: Mapping[str, float],
 ) -> _FitDispatchCompilation:
-    """Complete all static Fit facts before a worker can be constructed."""
+    """Complete all static Fit facts before a worker can be constructed.
+
+    A varied starting concentration starts at its Starting IC unless
+    ``initial_starts`` names its variable; its range stays the Starting IC's.
+    """
 
     included = tuple(item for item in setup.datasets if item.included)
     included_ids = tuple(item.dataset_id for item in included)
@@ -1180,12 +1154,13 @@ def _compile_fit_dispatch(
         for dataset_id in applicable_ids:
             grouped_dataset_species.add((dataset_id, group.species))
         if group.fit and applicable_ids:
+            variable_id = shared_initial_group_variable_id(group.species, group.origin_dataset_id)
             coupled_variables.append(
                 FitCoupledVariableParamSpec(
-                    variable_id=shared_initial_group_variable_id(group.species, group.origin_dataset_id),
+                    variable_id=variable_id,
                     parameter_name=f"{INITIAL_PREFIX}{group.species}",
                     dataset_ids=applicable_ids,
-                    initial=group.initial,
+                    initial=initial_starts.get(variable_id, group.initial),
                     minimum=group.minimum,
                     maximum=group.maximum,
                     log10=group.log10,
@@ -1202,12 +1177,13 @@ def _compile_fit_dispatch(
             if (dataset_id, initial.species) not in grouped_dataset_species
         )
         if initial.fit and target_ids:
+            variable_id = f"initial:{initial.set_id}:{initial.species}"
             coupled_variables.append(
                 FitCoupledVariableParamSpec(
-                    variable_id=f"initial:{initial.set_id}:{initial.species}",
+                    variable_id=variable_id,
                     parameter_name=f"{INITIAL_PREFIX}{initial.species}",
                     dataset_ids=target_ids,
-                    initial=initial.initial,
+                    initial=initial_starts.get(variable_id, initial.initial),
                     minimum=initial.minimum,
                     maximum=initial.maximum,
                     log10=initial.log10,
@@ -1250,6 +1226,7 @@ def build_fit_execution_request(
     *,
     setup: FitSetupSnapshot,
     workers: int,
+    initial_starts: Mapping[str, float] = MappingProxyType({}),
 ) -> FitExecutionRequest:
     """Compile one exact accepted setup into its immutable execution request.
 
@@ -1262,6 +1239,7 @@ def build_fit_execution_request(
     dispatch = _compile_fit_dispatch(
         setup=setup,
         prepared_datasets=prepared_datasets,
+        initial_starts=initial_starts,
     )
     return FitExecutionRequest(
         setup=setup,

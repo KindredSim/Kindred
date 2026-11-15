@@ -46,13 +46,6 @@ from kindred.gui.fitting.execution import (
     FitCandidate, FitLiveUpdate, published_fitted_concentration,
 )
 
-__all__ = [
-    "fit_candidate_presentation",
-    "fit_identity_text",
-    "fit_overview",
-    "fit_live_presentation",
-]
-
 
 def fit_identity_text(text: str, origin: FitOriginSnapshot) -> str:
     """Replace retained dataset and set identities with their readable names."""
@@ -130,7 +123,6 @@ def _profile_data(candidate: FitCandidate) -> dict[str, object]:
         "method": result.method,
         "confidence_level": result.confidence_level,
         "facts": (
-            ("Likelihood model", result.likelihood_model),
             ("Confidence level", f"{_display(100.0 * options.confidence_level)}%"),
             ("Maximum outward search steps per side", options.max_bracketing_steps_per_side),
             ("Maximum evaluations per refit", options.max_nfev_per_point),
@@ -138,6 +130,7 @@ def _profile_data(candidate: FitCandidate) -> dict[str, object]:
         ),
         "noise_blocks": result.noise_blocks,
         "unavailable_reason": result.unavailable_reason,
+        "better_fit": result.better_fit,
         "diagnostic": result.diagnostic,
         "settlement": result.provenance.get("settlement"),
         "intervals": [
@@ -299,6 +292,8 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
         for group in terminal_setup.shared_initial_groups
         for dataset_id in group.member_dataset_ids
     }
+    # The start the fit used, read from its own dispatch.
+    starts = {spec.variable_id: spec.initial for spec in request.dispatch.ordinary_coupled_variables}
     rows: list[dict[str, object]] = []
     for item in terminal_setup.initials:
         if not item.fit:
@@ -314,7 +309,7 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
             )
             rows.append({"kind": "initial", "name": item.species, "display_name": f"initial {item.species}",
                 "scope": mapped.display_name, "unit": "M",
-                "nominal_value": launch_item.initial,
+                "nominal_value": starts[f"initial:{item.set_id}:{item.species}"],
                 "fitted_value": published_fitted_concentration(value),
                 "minimum": launch_item.minimum, "maximum": launch_item.maximum,
                 "bound_state": fit_bound_position(
@@ -352,7 +347,7 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
         )
         rows.append({"kind": "initial", "name": item.species, "display_name": f"initial {item.species}",
             "scope": labels[item.species][item.origin_dataset_id][1], "unit": "M",
-            "nominal_value": launch_item.initial,
+            "nominal_value": starts[shared_initial_group_variable_id(item.species, item.origin_dataset_id)],
             "fitted_value": published_fitted_concentration(value),
             "minimum": launch_item.minimum, "maximum": launch_item.maximum,
             "bound_state": fit_bound_position(
@@ -635,7 +630,9 @@ def _analysis_section(title: str, data: Mapping[str, object], request: object,
     heading = title if level is None else f"{title} ({_display(100.0 * float(level))}%)"
     section = f"<h3>{_text(heading)}</h3>"
     status = data["status"]
-    if status == "unavailable":
+    if status == "unavailable" and data["better_fit"] is not None:
+        section += f"<p>Not available: {_better_fit_clause(data['better_fit'], label)}, so this fit is not the best fit.</p>"
+    elif status == "unavailable":
         section += f"<p>{_text('Not available: ' + _diagnostic(data['unavailable_reason'], origin))}</p>"
     elif status == "failed":
         section += f"<p>{_text('Failed: ' + _diagnostic(data['diagnostic'], origin))}</p>"
@@ -775,19 +772,9 @@ def fit_live_presentation(
 _BOUND_POSITION_WORDS = {"lower": "at minimum", "upper": "at maximum", "interior": "within bounds"}
 
 
-def fit_candidate_presentation(
-    candidate: FitCandidate,
-) -> tuple[tuple[str, ...], str, str, tuple[FitValueEntry, ...], str]:
-    """Project one terminal into its compact header, Results document,
-    Provenance document, fitted values and warnings."""
-    result = candidate.result
-    shared, individual = _estimate_rows(candidate)
-    rows = shared + individual + _initial_rows(candidate)
-    phase = _fit_completion_text(candidate)
-    model = candidate.origin.tab_name
-    objective = _metric_text(result.weighted_residual_sse)
-    fitted_values = len(candidate.request.dispatch.ordinary_optimizer_layout.opt_param_keys())
-    overview = fit_overview(phase, model, objective, len(result.dataset_info), fitted_values)
+def _summary_names(candidate: FitCandidate):
+    """Each parameter's rich symbol, the Summary's row namer and its coordinate labeller."""
+
     parameters = {parameter.name: parameter for parameter in candidate.setup_snapshot.parameters}
     symbols = {name: scientific_symbol_html(name, family=parameter.family, role=parameter.role)
                for name, parameter in parameters.items()}
@@ -805,11 +792,48 @@ def fit_candidate_presentation(
         parameter.name: parameter_name({"name": parameter.name, "display_name": parameter.display_name})
         for parameter in candidate.setup_snapshot.parameters
     }
-    label = _coordinate_labeler(candidate.request, names)
+    return symbols, parameter_name, _coordinate_labeler(candidate.request, names)
+
+
+def _better_fit_clause(better_fit, label) -> str:
+    """What the refit Profile found clearly better held and reached, as rich text."""
+
+    return (f"with {label(better_fit.coordinate)} held at {_text(better_fit.held_value)}, a refit reached a "
+            f"weighted SSE of {_text(better_fit.weighted_sse)}, below this fit's {_text(better_fit.fit_weighted_sse)}")
+
+
+def _better_fit_sentence(better_fit, label) -> str:
+    return f"Profile likelihood found a better fit: {_better_fit_clause(better_fit, label)}."
+
+
+def fit_better_fit_text(candidate: FitCandidate) -> str:
+    """The rich sentence naming the refit Profile found clearly better than this fit."""
+
+    _symbols, _parameter_name, label = _summary_names(candidate)
+    return _better_fit_sentence(candidate.result.profile_likelihood_result.better_fit, label)
+
+
+def fit_candidate_presentation(
+    candidate: FitCandidate,
+) -> tuple[tuple[str, ...], str, str, tuple[FitValueEntry, ...], str]:
+    """Project one terminal into its compact header, Results document,
+    Provenance document, fitted values and warnings."""
+    result = candidate.result
+    shared, individual = _estimate_rows(candidate)
+    rows = shared + individual + _initial_rows(candidate)
+    phase = _fit_completion_text(candidate)
+    model = candidate.origin.tab_name
+    objective = _metric_text(result.weighted_residual_sse)
+    fitted_values = len(candidate.request.dispatch.ordinary_optimizer_layout.opt_param_keys())
+    overview = fit_overview(phase, model, objective, len(result.dataset_info), fitted_values)
+    symbols, parameter_name, label = _summary_names(candidate)
+    better_fit = None if result.profile_likelihood_result is None else result.profile_likelihood_result.better_fit
     # The Results tab shows the same warnings above its fitted values.
     warnings = ""
-    if result.identifiability_warning is not None:
-        warnings += f"<p><b>Warning:</b> {_text(result.identifiability_warning)}</p>"
+    if better_fit is not None:
+        warnings += f"<p><b>Warning:</b> {_better_fit_sentence(better_fit, label)}</p>"
+    for coordinate in result.coupled_values:
+        warnings += f"<p><b>Warning:</b> These data do not determine this value separately: {label(coordinate)}.</p>"
     for coordinate in result.undetermined_values:
         warnings += f"<p><b>Warning:</b> These data do not determine this value within its bounds: {label(coordinate)}.</p>"
     if result.rate_scale_undetermined:
@@ -973,7 +997,8 @@ def fit_candidate_presentation(
         ))
     if profile.get("noise_blocks"):
         units = _series_units(candidate)
-        provenance += "<h4>Estimated Noise</h4>" + _table(
+        provenance += ("<h4>Estimated Noise</h4><p>Residuals are taken as independent and Gaussian, with one "
+                       "noise level per row below.</p>") + _table(
             ("Dataset", "Series", "Observations", "Degrees of Freedom", "Noise SD", "Unit"),
             ((dataset_names[block.dataset_id], block.series, block.observations,
               float(block.degrees_of_freedom),

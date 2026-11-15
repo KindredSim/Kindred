@@ -21,32 +21,6 @@ from kindred.core.exceptions import ValueDomainError
 
 from .validation import parse_finite_numeric_text
 
-__all__ = [
-    "CONCENTRATION_MIN_M",
-    "CONCENTRATION_MAX_M",
-    "C0_MIN_M",
-    "C0_MAX_M",
-    "TEMPERATURE_MIN_K",
-    "TEMPERATURE_MAX_K",
-    "TIME_MIN_S",
-    "TIME_INPUT_MIN_S",
-    "TIME_MAX_S",
-    "IMPORTED_TIME_MIN_S",
-    "IMPORTED_TIME_MAX_S",
-    "MAX_GENERATED_TIME_ROWS",
-    "MAX_FIT_EVALUATIONS",
-    "Species",
-    "concentration_from_text",
-    "validate_concentration",
-    "validate_c0",
-    "validate_temperature",
-    "validate_time_seconds",
-    "validate_input_time_seconds",
-    "validate_imported_time_seconds",
-    "validate_observation",
-]
-
-
 # Numerical admission is category-specific.  Keep these values in one small,
 # dependency-free owner so parsing, project/archive admission, runtime request
 # construction, and Fit setup can share the exact same boundary semantics.
@@ -77,7 +51,6 @@ def validate_concentration(
     value: object,
     *,
     field: str = "concentration",
-    allow_zero: bool = True,
 ) -> float:
     """Admit one authored concentration in molar units.
 
@@ -87,9 +60,8 @@ def validate_concentration(
     """
 
     parsed = _numeric(value, field=field)
-    if parsed < 0.0 or (not allow_zero and parsed == 0.0):
-        qualifier = "nonnegative" if allow_zero else "strictly positive"
-        raise ValueDomainError(f"{field} must be {qualifier}.")
+    if parsed < 0.0:
+        raise ValueDomainError(f"{field} must be nonnegative.")
     if parsed == 0.0:
         return 0.0
     if parsed < CONCENTRATION_MIN_M:

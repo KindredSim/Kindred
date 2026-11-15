@@ -13,8 +13,6 @@ from typing import Mapping, Optional
 
 from PySide6 import QtCore, QtWidgets
 
-__all__ = ["ParameterStatisticsTable"]
-
 
 class ParameterStatisticsTable(QtWidgets.QTableWidget):
     """

@@ -51,23 +51,6 @@ from kindred.gui.curve_copy_headers import observable_copy_definitions
 from kindred.gui.dataset_payload_snapshot import ExperimentalLayerInput
 from kindred.gui.plot_config import AxisSelectionCandidate
 
-__all__ = [
-    "MAX_COPY_CELLS",
-    "MAX_COPY_CHARACTERS",
-    "ResultDataBlock",
-    "ResultLayerKind",
-    "ResultRenderInput",
-    "VESSEL_VOLUME_COLOR",
-    "VisibleResultSet",
-    "XlsxExportCompletion",
-    "compose_canonical_export_blocks",
-    "compose_result_input",
-    "encode_clipboard_text",
-    "encode_tsv_row",
-    "iter_blocks_tsv_chunks",
-    "write_xlsx",
-]
-
 MAX_COPY_CELLS = 1_000_000
 MAX_COPY_CHARACTERS = 64 * 1024 * 1024
 _MAX_XLSX_STRING_LENGTH = 32_767
@@ -1038,44 +1021,37 @@ def compose_result_input(
     selected_y_uses_default_all: bool,
 ) -> ResultRenderInput:
     # Reconciliation always picks a current set.
-    current_id = current_set_id
     preview_ids = set(repository.preview_set_ids())
-    colors = color_by_axis_selection
-    selected_x = selected_x_series
-    selected_y = selected_y_series
-    point_size = experimental_point_size
-    point_opacity = experimental_point_opacity
-    active = active_overlay_layers
-    experimental_by_axis = {item.axis: item for item in active}
+    experimental_by_axis = {item.axis: item for item in active_overlay_layers}
     selected_model_y = {
-        item.series_name for item in selected_y
+        item.series_name for item in selected_y_series
         if isinstance(item, SimulationSeriesAxisSelection)
     }
     mapped_overlay_locks = tuple(
         (item.axis, item.model_target)
-        for item in active
+        for item in active_overlay_layers
         if item.model_target is not None
         and (selected_y_uses_default_all or item.model_target in selected_model_y)
-        and item.axis not in selected_y
+        and item.axis not in selected_y_series
     )
     effective_y = tuple(
         dict.fromkeys(
             (
-                *selected_y,
+                *selected_y_series,
                 *(axis for axis, _model_target in mapped_overlay_locks),
             )
         )
     )
     wanted_y = None if selected_y_uses_default_all else set(effective_y)
     selected_x_source: ExperimentalLayerInput | None = None
-    if isinstance(selected_x, ExperimentalAxisSelection):
-        selected_x_source = experimental_by_axis.get(selected_x)
+    if isinstance(selected_x_series, ExperimentalAxisSelection):
+        selected_x_source = experimental_by_axis.get(selected_x_series)
     simulation_x = (
         SimulationSeriesAxisSelection(selected_x_source.model_target)
-        if isinstance(selected_x, ExperimentalAxisSelection)
+        if isinstance(selected_x_series, ExperimentalAxisSelection)
         and selected_x_source is not None
         and selected_x_source.model_target is not None
-        else selected_x
+        else selected_x_series
     )
 
     blocks: list[ResultDataBlock] = []
@@ -1089,7 +1065,7 @@ def compose_result_input(
             candidates.append(AxisSelectionCandidate(selection, label))
 
     add_candidate(SimulationSeriesAxisSelection("t"), "t")
-    for selection in colors:
+    for selection in color_by_axis_selection:
         if isinstance(selection, SimulationSeriesAxisSelection):
             add_candidate(selection, selection.series_name)
     annotations: list[_DisplayAnnotation] = []
@@ -1117,7 +1093,7 @@ def compose_result_input(
             semantic = _result_block(
                 set_id=visible.set_id, label=visible.label, result=foreground,
                 prepared_dsl=repository.current_request(visible.set_id).prepared_dsl,
-                kind=foreground_kind, color_by_axis_selection=colors,
+                kind=foreground_kind, color_by_axis_selection=color_by_axis_selection,
                 set_position=position,
             )
             for name, selection in semantic.series_axes:
@@ -1149,7 +1125,7 @@ def compose_result_input(
                 set_id=visible.set_id, label=visible.label, result=reference,
                 prepared_dsl=repository.reference_request(visible.set_id).prepared_dsl,
                 kind=ResultLayerKind.REFERENCE,
-                color_by_axis_selection=colors, visible=reference_lines_visible,
+                color_by_axis_selection=color_by_axis_selection, visible=reference_lines_visible,
                 set_position=position,
             )
             for name, selection in reference_semantic.series_axes:
@@ -1177,13 +1153,13 @@ def compose_result_input(
                 annotations.extend(_owned_annotations(reference, "ghost", visible.set_id))
             else:
                 blocks.append(reference_semantic)
-    analysis_block = _select_analysis_block(blocks, current_id)
+    analysis_block = _select_analysis_block(blocks, current_set_id)
     statistics_names = (
         _statistics_series_names(analysis_block, y_axes=wanted_y)
         if analysis_block is not None
         else ()
     )
-    for experimental in active:
+    for experimental in active_overlay_layers:
         y_axis = experimental.axis
         label = f"{experimental.dataset_name}: {experimental.raw_column}"
         if experimental.model_target:
@@ -1200,19 +1176,19 @@ def compose_result_input(
         y_values.setflags(write=False)
         source_rows.setflags(write=False)
         sample_time = x_values if experimental.t else None
-        unavailable = _is_time_selection(selected_x) and not experimental.t
-        if not _is_time_selection(selected_x):
+        unavailable = _is_time_selection(selected_x_series) and not experimental.t
+        if not _is_time_selection(selected_x_series):
             x_source = (
                 next(
                     (
-                        item for item in active
-                        if isinstance(selected_x, SimulationSeriesAxisSelection)
+                        item for item in active_overlay_layers
+                        if isinstance(selected_x_series, SimulationSeriesAxisSelection)
                         and item.axis.dataset_id == experimental.axis.dataset_id
-                        and item.model_target == selected_x.series_name
+                        and item.model_target == selected_x_series.series_name
                     ),
                     None,
                 )
-                if isinstance(selected_x, SimulationSeriesAxisSelection)
+                if isinstance(selected_x_series, SimulationSeriesAxisSelection)
                 else selected_x_source
             )
             if (
@@ -1228,7 +1204,7 @@ def compose_result_input(
                     x_values, y_values, source_rows, sample_time = paired
                     x_name = x_source.raw_column
                     x_unit = x_source.unit
-                    x_axis = selected_x
+                    x_axis = selected_x_series
                     x_provenance = _observation_provenance(x_source)
         if unavailable:
             if wanted_y is None or y_axis in wanted_y:
@@ -1257,28 +1233,28 @@ def compose_result_input(
                     (experimental.raw_column, _observation_provenance(experimental)),
                 ),
                 x_provenance=x_provenance,
-                color_by_series=((experimental.raw_column, colors[y_axis]),),
+                color_by_series=((experimental.raw_column, color_by_axis_selection[y_axis]),),
                 set_position=set_positions.get(experimental.set_id),
                 legend_label=(
                     f"{label} ({experimental.set_name})"
                     if experimental.set_name is not None
                     else f"{label} (no set)"
                 ),
-                opacity=point_opacity,
+                opacity=experimental_point_opacity,
                 markers=True,
-                point_size=point_size,
+                point_size=experimental_point_size,
             )
         )
 
-    owned_annotations = tuple(annotations) if _is_time_selection(selected_x) else ()
-    if selected_x not in candidate_ids:
+    owned_annotations = tuple(annotations) if _is_time_selection(selected_x_series) else ()
+    if selected_x_series not in candidate_ids:
         add_candidate(
-            selected_x,
-            selected_x.series_name if isinstance(selected_x, SimulationSeriesAxisSelection)
-            else "Vessel volume" if isinstance(selected_x, VesselVolumeAxisSelection)
+            selected_x_series,
+            selected_x_series.series_name if isinstance(selected_x_series, SimulationSeriesAxisSelection)
+            else "Vessel volume" if isinstance(selected_x_series, VesselVolumeAxisSelection)
             else selected_x_label,
         )
-    selected_candidate = next(item for item in candidates if item.selection == selected_x)
+    selected_candidate = next(item for item in candidates if item.selection == selected_x_series)
     def axis_units(axis):
         selected = [(block, block.x_name) for block in blocks if block.visible] if axis == "x" else [
             (block, name) for block in blocks if block.visible for name, _values in block.series]
@@ -1296,12 +1272,12 @@ def compose_result_input(
     y_unit, y_options = axis_units("y")
 
     return ResultRenderInput(
-        tab_id=tab_id, current_set_id=current_id, blocks=tuple(blocks),
+        tab_id=tab_id, current_set_id=current_set_id, blocks=tuple(blocks),
         statistics_series_names=statistics_names,
-        selected_x_series=selected_x, selected_y_series=selected_y,
+        selected_x_series=selected_x_series, selected_y_series=selected_y_series,
         mapped_overlay_locks=mapped_overlay_locks,
         selected_y_uses_default_all=selected_y_uses_default_all,
-        x_label="Time (s)" if _is_time_selection(selected_x) else selected_candidate.label,
+        x_label="Time (s)" if _is_time_selection(selected_x_series) else selected_candidate.label,
         y_label="Concentration" if y_unit is not None and y_unit.compatible(MOLAR) else "Value",
         x_unit=x_unit, y_unit=y_unit,
         x_unit_options=x_options, y_unit_options=y_options,

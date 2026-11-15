@@ -34,20 +34,6 @@ from __future__ import annotations
 
 from kindred.core.exceptions import ErrorContext, KindredError, ValueDomainError
 
-__all__ = [
-    "AlgebraError",
-    "AlgebraSyntaxError",
-    "AlgebraNameError",
-    "AlgebraDomainError",
-    "AlgebraZeroDivError",
-    "AlgebraTypeError",
-    "AlgebraNonFiniteError",
-    "AlgebraBoolCastError",
-    "AlgebraUndefinedError",
-    "UNCOMPUTABLE_ERRORS",
-]
-
-
 # ----------------------------- base class ------------------------------------
 
 

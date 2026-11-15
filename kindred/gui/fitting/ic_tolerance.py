@@ -7,8 +7,6 @@ from typing import Literal
 
 from kindred.core.species import validate_concentration
 
-__all__ = ["FitInitialTolerance", "FitInitialToleranceMode", "ZERO_IC_PERCENT_MESSAGE"]
-
 ZERO_IC_PERCENT_MESSAGE = "A zero Starting IC can vary only with Minimum / Maximum (in M)."
 
 FitInitialToleranceMode = Literal[

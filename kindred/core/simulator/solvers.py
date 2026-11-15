@@ -67,12 +67,6 @@ def _solve_ivp(*, fun: Callable[[float, np.ndarray], np.ndarray], t_span: Tuple[
     return solve_ivp(fun=fun, t_span=t_span, y0=y0, **kwargs)
 
 
-__all__ = [
-    "normalize_solver_name",
-    "solve_ode",
-]
-
-
 def _normal_event_states_with_projection(
     raw_states: object,
     *,

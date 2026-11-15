@@ -31,8 +31,6 @@ from kindred.gui.ui_helpers import (
 )
 from kindred.gui.widgets.observation_mapping_widget import ObservationMappingWidget
 
-__all__ = ["DatasetMappingBatchDialog"]
-
 _COPY_TOOLTIP = (
     "Make every other dataset match this one. Each column that both datasets have maps to the "
     "same quantity or stays unused. A column that only the other dataset has keeps its choice "

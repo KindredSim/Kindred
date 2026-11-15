@@ -26,8 +26,6 @@ from kindred.core.mechanism_source import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["TemplateManagerDialog", "TemplateEditorDialog"]
-
 
 class TemplateEditorDialog(QtWidgets.QDialog):
     """

@@ -22,9 +22,6 @@ from kindred.io.paths import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["Template", "TemplateManager"]
-
-
 _TEMPLATE_FIELDS = frozenset(
     {
         "id",
@@ -391,9 +388,8 @@ class TemplateManager:
         """Replace one existing template with a complete same-ID value."""
 
         template_id = template.id
-        candidate = template
-        self._assert_available_name(candidate.name, except_template_id=template_id)
-        self._write_template(candidate)
-        self._templates[template_id] = candidate
+        self._assert_available_name(template.name, except_template_id=template_id)
+        self._write_template(template)
+        self._templates[template_id] = template
         logger.info("Replaced template: %s", template_id)
-        return candidate
+        return template

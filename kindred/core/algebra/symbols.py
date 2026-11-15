@@ -30,16 +30,6 @@ from ..constants import k_B, h, h_bar, N_A, R
 logger = logging.getLogger(__name__)
 
 
-__all__ = [
-    "heaviside",
-    "clip",
-    "ifelse",
-    "BUILTIN_FUNCTIONS",
-    "PROTECTED_NAMES",
-    "SymbolTable",
-]
-
-
 # ----------------------------- helper functions ------------------------------
 
 def heaviside(x: float) -> float:
@@ -48,8 +38,7 @@ def heaviside(x: float) -> float:
     Returns 0.0 for x <= 0, 1.0 for x > 0.
     """
     # The evaluator passes every argument as a float.
-    xf = x
-    if xf <= 0.0:
+    if x <= 0.0:
         return 0.0
     return 1.0
 

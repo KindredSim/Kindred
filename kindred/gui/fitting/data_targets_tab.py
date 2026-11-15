@@ -76,12 +76,11 @@ class DataTargetsTab(QtWidgets.QWidget):
         self._splitter.setSizes([top, max(1, self._splitter.height() - top)])
 
     def _on_unified_dataset_selected(self, dataset_id: str) -> None:
-        ds_id = dataset_id
-        if ds_id == self._current_detail_dataset_id:
+        if dataset_id == self._current_detail_dataset_id:
             return
-        self._current_detail_dataset_id = ds_id
+        self._current_detail_dataset_id = dataset_id
         self.data_settings_panel.select_dataset(
-            ds_id,
-            self.unified_list.dataset_display_name(ds_id),
+            dataset_id,
+            self.unified_list.dataset_display_name(dataset_id),
         )
-        self.species_table.load_for_dataset(ds_id)
+        self.species_table.load_for_dataset(dataset_id)

@@ -60,9 +60,6 @@ from kindred.gui.workspace_result_presenter import (
 )
 
 
-__all__ = ["PyQtGraphPlotPanel"]
-
-
 class _PlotViewBox(pg.ViewBox):
     """Keep native gestures, with effective axis masks for axis drags and rectangles."""
 

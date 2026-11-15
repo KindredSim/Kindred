@@ -13,8 +13,6 @@ from PySide6 import QtCore
 from kindred.core.simulation_failure import FactualCause
 from kindred.gui.fitting import codec, launch, runtime
 
-__all__ = ["GlobalFitWorker"]
-
 logger = logging.getLogger(__name__)
 
 _TERMINAL_EVENTS = frozenset({

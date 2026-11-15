@@ -8,9 +8,6 @@ from .constants import R
 from .exceptions import ValueDomainError
 from .units import admit_keq
 
-__all__ = ["K_from_deltaG_eq", "concentration_Keq_from_deltaG_eq"]
-
-
 # dG_eq arrives admitted by DSL parsing or the grouped coordinate owner, the
 # temperature by the DSL T directive or its admitted schedule, and the standard
 # concentration by DSL parsing; delta_n is the stoichiometric order difference.

@@ -26,10 +26,6 @@ from kindred.core.quantity_units import convert_value
 from kindred.core.units import admit_role_value
 from kindred.core.validation import parse_finite_numeric_text
 
-__all__ = [
-    "apply_parameter_algebra_spec_to_mechanism",
-]
-
 
 def _sentence(exc: Exception) -> str:
     """The failure's own sentence, which the param line then locates."""

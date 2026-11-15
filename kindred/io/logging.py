@@ -13,8 +13,6 @@ from pathlib import Path
 if sys.platform != "win32":
     import fcntl
 
-__all__ = ["diagnostic_log_path", "setup_logging"]
-
 _DEFAULT_LOG_LEVEL = "INFO"
 # Each Kindred writes its own log, so several open at once never share a file.
 _LOG_PATTERN = "kindred-*.log"

@@ -8,6 +8,7 @@
 
 # Unix scripts & source
 *.sh   text eol=lf
+*.command text eol=lf
 *.py   text eol=lf
 *.toml text eol=lf
 *.yml  text eol=lf

@@ -65,10 +65,15 @@ def representable(low: Fraction, high: Fraction, lc: bool, uc: bool) -> Interval
     return Interval(a, b)
 
 
-def sample(intervals: tuple[Interval, ...], u: float, allocation: str, log_scale: bool) -> float:
+def sample(intervals: tuple[Interval, ...], u: float, rows: tuple[Interval, ...],
+           allocation: str, log_scale: bool) -> float:
     """Map one unit sample directly into a union of feasible float intervals.
 
-    Log scale spreads samples evenly in the logarithm of positive intervals.
+    ``rows`` are the intervals the user entered, in any order. Equal
+    allocation gives each row that still has width the same share, taken in
+    ascending order; scientific bounds and constraints only narrow rows.
+    Samples spread by width inside a row, and across all rows under width
+    allocation. Log scale measures width in the logarithm.
     """
     intervals = normalize(intervals)
     positive = tuple(i for i in intervals if i.lower < i.upper)
@@ -76,9 +81,16 @@ def sample(intervals: tuple[Interval, ...], u: float, allocation: str, log_scale
         return intervals[min(int(u * len(intervals)), len(intervals) - 1)].lower
     # Isolated values are supplied through explicit endpoint faces.
     intervals = positive
-    widths = [Fraction(math.log(i.upper)) - Fraction(math.log(i.lower)) if log_scale
-              else Fraction(i.upper) - Fraction(i.lower) for i in intervals]
-    weights = widths if allocation == "width" else [Fraction(1)] * len(intervals)
+    if allocation == "equal":
+        shares = [share for share in (
+            tuple(i for i in intersect(intervals, (row,)) if i.lower < i.upper)
+            for row in sorted(rows, key=lambda row: (row.lower, row.upper))
+        ) if share]
+        position = Fraction(u) * len(shares)
+        index = min(int(position), len(shares) - 1)
+        intervals, u = shares[index], position - index
+    weights = [Fraction(math.log(i.upper)) - Fraction(math.log(i.lower)) if log_scale
+               else Fraction(i.upper) - Fraction(i.lower) for i in intervals]
     position = Fraction(u) * sum(weights)
     for item, weight in zip(intervals, weights):
         if position < weight or item is intervals[-1]:

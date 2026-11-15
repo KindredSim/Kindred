@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-__all__ = ["compute_sampled_indices"]
-
 
 def compute_sampled_indices(*, count: int, n_points: int) -> tuple[int, ...]:
     """Select ``n_points`` of ``count`` rows evenly, including both endpoints.

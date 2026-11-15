@@ -31,8 +31,6 @@ from kindred.gui.ui_helpers import (
     set_bounded_label_text,
 )
 
-__all__ = ["ImportConfigDialog", "ImportDialogResult"]
-
 _TIME_CANDIDATES = ("time", "time_s", "t", "Time", "T", "x")
 _PREVIEW_DATA_ROW_LIMIT = 1000
 

@@ -6,8 +6,6 @@ from typing import Mapping
 
 import numpy as np
 
-__all__ = ["build_time_grid"]
-
 
 def build_time_grid(t0: float, t1: float, grid: Mapping[str, int]) -> np.ndarray:
     """

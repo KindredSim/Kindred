@@ -17,11 +17,6 @@ from kindred.core.project_document import (
 from kindred.core.validation import parse_finite_numeric_text, parse_whole_number_text
 from kindred.gui.ui_helpers import SOLVER_TOOLTIP, clamp_initial_size, ignore_wheel, make_scroll_area
 
-__all__ = [
-    "SimulationSettingsDialog",
-    "SolverSettingsDialog",
-]
-
 
 def _number_edit(
     parent: QtWidgets.QWidget, value: str, tooltip: str,

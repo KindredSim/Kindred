@@ -10,8 +10,6 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 
-__all__ = ["insert_scalar_source_declarations"]
-
 
 def insert_scalar_source_declarations(
     source_text: str,

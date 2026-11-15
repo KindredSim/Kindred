@@ -10,20 +10,6 @@ from PySide6 import QtCore, QtWidgets
 if TYPE_CHECKING:
     from kindred.gui.widgets.mechanism_workspace import ProjectWorkspaceWidget
 
-__all__ = [
-    "ANALYSIS_DOCK_SPEC",
-    "BATCH_DOCK_SPEC",
-    "DOCK_SPECS",
-    "DockShellSpec",
-    "MECHANISM_DOCK_SPEC",
-    "RIGHT_DOCK_SPEC",
-    "SLIDERS_DOCK_SPEC",
-    "SYMBOLIC_CALCULATOR_DOCK_SPEC",
-    "build_module_dock",
-    "build_physical_shell",
-    "build_shell_dock",
-]
-
 
 @dataclass(frozen=True, slots=True)
 class DockShellSpec:

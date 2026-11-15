@@ -16,8 +16,6 @@ from kindred.core.quantity_units import (
 )
 from kindred.gui.ui_helpers import SCIENTIFIC_NAME_HTML_ROLE, ScientificNameHeaderView
 
-__all__ = ["SpeciesStatisticsTable"]
-
 
 def _display_statistic(value: float, source: Unit, target: Unit) -> str:
     try:

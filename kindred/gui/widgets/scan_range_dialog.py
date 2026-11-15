@@ -40,7 +40,7 @@ class ScanRangeDialog(QtWidgets.QDialog):
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table)
         for interval in selection.intervals:
-            self.add_interval(interval)
+            self.add_interval(interval, selection.endpoints)
         row = QtWidgets.QHBoxLayout()
         add = QtWidgets.QPushButton("Add Interval")
         add.clicked.connect(lambda: self.add_interval(Interval(0, 1)))
@@ -66,7 +66,8 @@ class ScanRangeDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def add_interval(self, interval):
+    def add_interval(self, interval, endpoints=()):
+        # A row from Add Interval starts with nothing sampled exactly.
         row = self.table.rowCount()
         self.table.insertRow(row)
         for offset, value, included in ((0, interval.lower, interval.include_lower), (3, interval.upper, interval.include_upper)):
@@ -74,7 +75,7 @@ class ScanRangeDialog(QtWidgets.QDialog):
             include = QtWidgets.QCheckBox()
             include.setChecked(included)
             exact = QtWidgets.QCheckBox()
-            exact.setChecked(included and value in self.selection.endpoints)
+            exact.setChecked(included and value in endpoints)
             exact.setEnabled(included)
             include.toggled.connect(exact.setEnabled)
             include.toggled.connect(lambda checked, box=exact: box.setChecked(box.isChecked() and checked))
@@ -94,7 +95,10 @@ class ScanRangeDialog(QtWidgets.QDialog):
                     endpoints.append(high)
             if self.log_scale.isChecked() and any(i.lower < i.upper and i.lower <= 0.0 for i in intervals):
                 raise ValueError("Log Scale requires every interval to start above zero.")
-            self.selection = InputRange(normalize(tuple(intervals)), self.allocation.currentData(),
+            # The rows stay as entered: equal allocation and Sample Exactly
+            # act on each row, and admission merges them for its own use.
+            normalize(tuple(intervals))
+            self.selection = InputRange(tuple(intervals), self.allocation.currentData(),
                                         tuple(dict.fromkeys(endpoints)), self.log_scale.isChecked())
         except ValueError as exc:
             self.error.setText(str(exc))

@@ -29,7 +29,6 @@ from kindred.gui.fitting.run_results_tab import RunResultsTab
 from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 from kindred.gui.fitting.execution import FitCandidate, FitCurveDataset, FitLiveUpdate
 
-__all__ = ["FittingWindow"]
 
 class FittingWindow(QtWidgets.QDialog):
     """Fit dialog presenting the typed Fit session owner's snapshots.
@@ -519,8 +518,8 @@ class FittingWindow(QtWidgets.QDialog):
         )
 
     def _mapped_dataset(self, dataset_id: str):
-        # The setup holds exactly one dataset per mapped dataset, and the
-        # lists and panels ask only about those.
+        # Every dataset of the setup is a mapped dataset, and the lists and
+        # panels ask only about those.
         return next(
             item
             for item in self._origin.mapped_datasets

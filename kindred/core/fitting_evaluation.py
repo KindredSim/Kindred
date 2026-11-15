@@ -39,15 +39,6 @@ from kindred.core.volume import PhysicalDomainError
 from kindred.core.simulation_failure import FactualCause, factual_cause_from_exception
 
 
-__all__ = [
-    "FITTING_PARAM_ORIGIN_CONFIGURED_DATASET",
-    "FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET",
-    "FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED",
-    "FittingEvaluator",
-    "INITIAL_PREFIX",
-    "prepare_fitting_execution_context",
-]
-
 # A fitted starting concentration is named by this prefix and its species.
 INITIAL_PREFIX = "init:"
 FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED = "optimizer_shared"
@@ -160,8 +151,19 @@ class FittingEvaluator:
         origins: Mapping[str, str],
         outputs: tuple[str, ...],
         cancellation_control: SimulationCancellationControl,
+        along: SimulationResultValue | None = None,
     ) -> SimulationResultValue | ScientificUnavailable:
         """Evaluate one candidate, returning only natural scientific values.
+
+        With ``along``, a curve this evaluator produced, the candidate's curve
+        follows it: a measured-X curve is sampled at that curve's times,
+        without the solver's own steps, its intervention boundaries come from
+        the candidate, and each time keeps its place between the boundaries
+        around it; a time-X curve keeps its sample times, the regular grid and
+        the observation times, each between the same boundaries.  A candidate
+        across a jump of that curve, whose interventions happen a different
+        number of times or move past a sample time, has no such curve and is
+        unavailable.
 
         A value outside its domain rejects the candidate when it depends on an
         optimizer value, and a physical predicate the solved state violates
@@ -173,7 +175,7 @@ class FittingEvaluator:
         """
 
         try:
-            result = self._evaluate_series(params, cancellation_control)
+            result = self._evaluate_series(params, cancellation_control, along)
         except _VALUE_FAILURES as exc:
             # The values a refusal names, through any value calculated from them.
             inputs = self._spec.input_dependencies(
@@ -273,14 +275,13 @@ class FittingEvaluator:
     def _candidate_request(self, params: Mapping[str, float]) -> SimulationExecutionRequest:
         """The dataset's request with a candidate's starting concentrations
         and, as overrides, its other values."""
-        prefix = INITIAL_PREFIX
         request = self._context.request
         species_index = {name: idx for idx, name in enumerate(request.species_names)}
         y0 = list(request.y0)
         overrides = {}
         for name, value in params.items():
-            if name.startswith(prefix):
-                y0[species_index[name[len(prefix):]]] = value
+            if name.startswith(INITIAL_PREFIX):
+                y0[species_index[name[len(INITIAL_PREFIX):]]] = value
             else:
                 overrides[name] = value
         return replace(request, y0=tuple(y0), parameter_overrides=overrides or None)
@@ -288,8 +289,7 @@ class FittingEvaluator:
     def _candidate_names(self, inputs: Sequence[str]) -> tuple[str, ...]:
         """A failure's inputs as the candidate names them; ``[X]_0`` is X's
         starting concentration."""
-        prefix = INITIAL_PREFIX
-        return tuple(prefix + name[1:-3] if name.startswith("[") else name for name in inputs)
+        return tuple(INITIAL_PREFIX + name[1:-3] if name.startswith("[") else name for name in inputs)
 
     def _fit_values(self, names: Sequence[str], params: Mapping[str, float]) -> str:
         """The Fit's own values for a failing value's inputs, which can differ
@@ -309,6 +309,7 @@ class FittingEvaluator:
         self,
         params: Mapping[str, float],
         cancellation_control: SimulationCancellationControl,
+        along: SimulationResultValue | None,
     ) -> SimulationResultValue | SimulationScientificUnavailability:
         def raise_if_cancel_requested() -> None:
             if cancellation_control.cancel_requested():
@@ -325,17 +326,47 @@ class FittingEvaluator:
             ),
             cancellation_control=cancellation_control,
         )
-        request = build_simulation_request_from_prepared_run(
-            prepared_run,
-            cancellation_control=cancellation_control,
-            t_eval=np.asarray(
-                self._context.requested_sample_times,
-                dtype=float,
-            ),
-            candidate_evaluation=True,
-            sample_solver_steps=self._context.sample_solver_steps,
-        )
-        result = solve_ode(request)
+        # A measured-X curve held where the Fit left it is sampled at that
+        # curve's times; a time-X curve keeps its own sample times.
+        follow = along is not None and self._context.sample_solver_steps
+
+        def solve(sample_times: np.ndarray):
+            return solve_ode(build_simulation_request_from_prepared_run(
+                prepared_run,
+                cancellation_control=cancellation_control,
+                t_eval=sample_times,
+                candidate_evaluation=True,
+                sample_solver_steps=along is None and self._context.sample_solver_steps,
+                keep_sample_times=follow,
+            ))
+
+        if not follow:
+            sample_times = np.asarray(self._context.requested_sample_times, dtype=float)
+        else:
+            # The solver places the candidate's own boundaries and end.
+            placed = [boundary.time for boundary in along.presentation_boundaries]
+            placed.append(along.termination.actual_endpoint)
+            sample_times = np.unique(along.t[~np.isin(along.t, placed)])
+        result = solve(sample_times)
+        if along is not None and not isinstance(result, SimulationScientificUnavailability):
+            # A candidate across a jump of the held curve, where interventions
+            # happen a different number of times or, for time-X data, a
+            # sample time changes piece, has no curve that follows it.
+            breaks, moved_breaks = _curve_breaks(along), _curve_breaks(result)
+            if breaks.size != moved_breaks.size or not (follow or np.array_equal(
+                np.searchsorted(breaks, sample_times), np.searchsorted(moved_breaks, sample_times),
+            )):
+                return SimulationScientificUnavailability(
+                    producer="fit_candidate", stage="held_curve",
+                    message="The candidate's curve has pieces the held curve does not.",
+                )
+            if follow:
+                # Each sample keeps its place between the curve breaks around
+                # it, so a moved boundary carries its neighbours with it and
+                # every piece of the curve keeps its samples.
+                moved = np.interp(sample_times, breaks, moved_breaks)
+                if not np.array_equal(moved, sample_times):
+                    result = solve(moved)
         if isinstance(result, SimulationScientificUnavailability):
             return result
         raise_if_cancel_requested()
@@ -349,3 +380,16 @@ class FittingEvaluator:
         )
         raise_if_cancel_requested()
         return admitted
+
+
+def _curve_breaks(result: SimulationResultValue) -> np.ndarray:
+    """The times the drawn curve starts, breaks and ends: its start, each
+    boundary and segment change, and its end."""
+    changes = 1 + np.flatnonzero(
+        (result.segment_ids[1:] != result.segment_ids[:-1])
+        | (result.discontinuity_ids[1:] != result.discontinuity_ids[:-1])
+    )
+    return np.unique(np.concatenate((
+        result.t[:1], [boundary.time for boundary in result.presentation_boundaries],
+        result.t[changes], [result.termination.actual_endpoint],
+    )))
