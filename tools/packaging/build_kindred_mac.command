@@ -2,7 +2,7 @@
 # Kindred macOS builder. Place this file beside pyproject.toml and the kindred
 # folder, then double-click it. It downloads everything it needs into this
 # folder, installs Apple's Command Line Tools if they are missing, accepts
-# Apple's Xcode licence if your Mac password is given when asked, and leaves
+# Apple's Xcode license if your Mac password is given when asked, and leaves
 # Kindred_v<version>_mac_<chip>.dmg beside this file.
 #
 # If double-clicking does nothing or macOS refuses to open it: open Terminal,
@@ -60,11 +60,11 @@ ensure_developer_tools() {
         done
         echo "Command Line Tools installed."
     fi
-    # Xcode blocks its tools until its licence is accepted.
+    # Xcode blocks its tools until its license is accepted.
     case "$(/usr/bin/lipo 2>&1)" in
         *license*)
-            echo "PyInstaller needs Xcode's tools, and Apple's Xcode licence has not been accepted on this Mac."
-            echo "Enter your Mac password to accept Apple's licence and continue."
+            echo "PyInstaller needs Xcode's tools, and Apple's Xcode license has not been accepted on this Mac."
+            echo "Enter your Mac password to accept Apple's license and continue."
             /usr/bin/sudo /usr/bin/xcodebuild -license accept || return 1
             ;;
     esac
