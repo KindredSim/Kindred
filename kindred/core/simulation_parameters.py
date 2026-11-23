@@ -154,7 +154,7 @@ def enumerate_simulation_parameters(
     # admitted into the step map.  Their names are reaction-local (A1/Ea1,
     # dG_act1, dG_eq1, ...); no global uniqueness test or unindexed alias is
     # allowed to collapse repeated reactions.
-    physical_candidates: list[tuple[str, str, str, float]] = []
+    physical_candidates: list[tuple[str, str, str, float, str]] = []
     for entry in step_by_index.values():
         kind = entry["kind"]
         source_coordinates = {
@@ -172,20 +172,21 @@ def enumerate_simulation_parameters(
             equilibrium = equilibria[entry["equilibrium_index"]]
             authority = equilibrium.authority
             model = equilibrium.forward_model
+        context = str(entry["context"]).strip()
         for role, name in source_coordinates.items():
             # The parser ties each authored role to its rate family.
             if role == "A":
-                physical_candidates.append((name, "Arrhenius", role, float(model.A)))
+                physical_candidates.append((name, "Arrhenius", role, float(model.A), context))
             elif role == "Ea":
-                physical_candidates.append((name, "Arrhenius", role, float(model.Ea_J_per_mol)))
+                physical_candidates.append((name, "Arrhenius", role, float(model.Ea_J_per_mol), context))
             elif role == "dG_act":
-                physical_candidates.append((name, "Eyring", role, float(model.dG_act_J_per_mol)))
+                physical_candidates.append((name, "Eyring", role, float(model.dG_act_J_per_mol), context))
             elif role == "dG_eq":
-                physical_candidates.append((name, "equilibrium", role, float(authority.dG_eq_J_per_mol)))
+                physical_candidates.append((name, "equilibrium", role, float(authority.dG_eq_J_per_mol), context))
             elif role == "kappa":
-                physical_candidates.append((name, "Eyring", role, float(model.kappa)))
+                physical_candidates.append((name, "Eyring", role, float(model.kappa), context))
 
-    for name, family, role, value in physical_candidates:
+    for name, family, role, value, context in physical_candidates:
         if (
             name in parameter_assignment_names
             and assignment_kind(name) == "mechanism-bound"
@@ -194,6 +195,7 @@ def enumerate_simulation_parameters(
         coordinates.append(
             SimulationParameter(
                 name=name,
+                context=context,
                 value=input_value(name, value),
                 family=family,
                 role=role,

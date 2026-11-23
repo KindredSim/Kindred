@@ -422,8 +422,8 @@ class PracticeLesson(Lesson):
         return widget
 
     def _reopen_fit(self) -> None:
-        """Closing the Fitting Window discards its datasets, choices, and result, so its steps wait to be
-        done again from Open the Fitting Window."""
+        """The Fit steps are taught inside one open Fitting Window, so once it closes they wait to be done
+        again from Open the Fitting Window."""
         self.revisitRequested.emit("open_fit")
 
     def _fit_result(self) -> bool:

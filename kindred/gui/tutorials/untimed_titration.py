@@ -455,8 +455,8 @@ class TitrationsWithoutTime(PracticeLesson):
             Step(
                 "choose_dilutions",
                 "Choose the Dilutions",
-                "<p>In <b>Datasets</b>, check dilute_A and dilute_C. Each is marked <b>Data error</b> until the next "
-                "step sets its Fit against and Simulation time.</p>",
+                "<p>On <b>Data and Targets</b>, check dilute_A and dilute_C in <b>Datasets</b>. Each is marked "
+                "<b>Data error</b> until its Fit against and Simulation time are set, which the next step does.</p>",
                 lambda: (),
                 lambda: self._included_only(_DILUTIONS),
                 "dilute_A and dilute_C are included.",
@@ -466,11 +466,11 @@ class TitrationsWithoutTime(PracticeLesson):
             Step(
                 "dilutions_against",
                 "Fit Against the Totals",
-                "<p>Select <b>dilute_A</b>. Under <b>Fit Data</b>, <b>Fit against</b> reads <b>Time</b>, but these "
+                "<p>Select <b>dilute_A</b>. Under <b>Fit Data</b>, <b>Fit against</b> starts at <b>Time</b>, but these "
                 "sheets record no time. Fit against a measured total instead: choose <b>A_total</b> in Fit "
                 "against. Kindred places each row at the point of the simulated curve that best matches its total "
                 "together with its shift.</p>"
-                "<p><b>Simulation time (s)</b> is blank: with no recorded time, Kindred cannot propose one. The "
+                "<p><b>Simulation time (s)</b> starts blank: with no recorded time, Kindred cannot propose one. The "
                 "simulation has to run until the total reaches every recorded value, and 1000 s at 0.1 mM "
                 "s<sup>−1</sup> reaches 100 mM. Enter <b>0</b> and <b>1000</b>, and press <b>Enter</b> after "
                 "each.</p>"

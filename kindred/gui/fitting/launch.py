@@ -362,25 +362,11 @@ def _complete_fit_parameter_scopes(
     parameter: FitParameterVariable,
     dataset_ids: Iterable[str],
 ) -> FitParameterVariable:
-    """Seed the inactive Per-dataset config for a captured parameter."""
+    """Seed the inactive Per-dataset config of a captured parameter, which is Shared."""
 
-    retained_ids = tuple(dataset_ids)
-    existing = dict(parameter.per_dataset_config.dataset_values)
-    dataset_values = tuple(
-        (dataset_id, existing.get(dataset_id, parameter.selected_config.value))
-        for dataset_id in retained_ids
-    )
-    if parameter.scope == "per_dataset":
-        return _replace_fit_parameter(parameter, dataset_values=dataset_values)
-    per_dataset = FitParameterConfiguration(
-        value=parameter.selected_config.value,
-        minimum=parameter.selected_config.minimum,
-        maximum=parameter.selected_config.maximum,
-        fit=parameter.selected_config.fit,
-        log10=parameter.selected_config.log10,
-        dataset_values=dataset_values,
-    )
-    return replace(parameter, per_dataset_config=per_dataset)
+    shared = parameter.shared_config
+    dataset_values = tuple((dataset_id, shared.value) for dataset_id in dataset_ids)
+    return replace(parameter, per_dataset_config=replace(shared, dataset_values=dataset_values))
 
 
 @dataclass(frozen=True, slots=True)
@@ -744,11 +730,45 @@ def fit_dataset_time_defaults(
     )
 
 
-def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
-    """Build the sole typed Fit-local setup without consulting widget state."""
+def fit_origin_unchanged(previous: FitOriginSnapshot, current: FitOriginSnapshot) -> bool:
+    """Whether two captures of one tab are equal, names and Fitting Defaults included.
 
+    The same Reactions text under the same settings parses to the same
+    mechanism, so a parse built again does not count as a change.
+    """
+
+    return replace(previous, prepared_dsl=current.prepared_dsl) == current
+
+
+def _mapped_dataset_facts(mapped: FitMappedDatasetSnapshot) -> tuple[object, ...]:
+    """The tab facts a dataset's Fit settings are built from; the dataset and set names only label them."""
+
+    return mapped.set_id, mapped.time_column_name, mapped.observations, mapped.resolved_t_start
+
+
+def create_initial_fit_setup(
+    origin: FitOriginSnapshot,
+    previous: FitSetupSnapshot | None = None,
+) -> FitSetupSnapshot:
+    """Build the sole typed Fit-local setup without consulting widget state.
+
+    ``previous`` is the setup the same tab had before the tab changed.  Each
+    dataset, parameter and starting concentration of it is kept when the tab
+    facts it was built from are unchanged, and otherwise starts from the tab;
+    a kept Per-dataset parameter returns Shared when the dataset list changed.
+    The solver, weight mode and Profile stay, and the Fit settings stay
+    unless the project Fitting Defaults changed.
+    """
+
+    before = origin if previous is None else previous.origin
+    kept_datasets = {} if previous is None else {item.dataset_id: item for item in previous.datasets}
+    facts_before = {item.dataset_id: _mapped_dataset_facts(item) for item in before.mapped_datasets}
     datasets = []
     for mapped in origin.mapped_datasets:
+        kept_dataset = kept_datasets.get(mapped.dataset_id)
+        if kept_dataset is not None and facts_before[mapped.dataset_id] == _mapped_dataset_facts(mapped):
+            datasets.append(kept_dataset)
+            continue
         start, end, low, high = fit_dataset_time_defaults(mapped)
         datasets.append(FitDatasetLocalSettings(
             dataset_id=mapped.dataset_id,
@@ -773,8 +793,20 @@ def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
         for mapped in origin.mapped_datasets
         for species, value in mapped.initial_values
     }
+    values_before = {
+        (mapped.set_id, species): value
+        for mapped in before.mapped_datasets
+        for species, value in mapped.initial_values
+    }
+    kept_initials = {} if previous is None else {
+        (item.set_id, item.species): item
+        for item in previous.initials
+        if values_by_key.get((item.set_id, item.species)) == values_before[(item.set_id, item.species)]
+    }
     initials = tuple(
-        FitInitialVariable(
+        kept_initials[(set_id, species)]
+        if (set_id, species) in kept_initials
+        else FitInitialVariable(
             set_id=set_id,
             species=species,
             initial=value,
@@ -784,19 +816,54 @@ def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
         for (set_id, species), value in values_by_key.items()
     )
     retained_dataset_ids = tuple(item.dataset_id for item in origin.mapped_datasets)
-    parameters = tuple(
-        _complete_fit_parameter_scopes(parameter, retained_dataset_ids)
-        for parameter in origin.parameter_defaults
-    )
-    return FitSetupSnapshot(
+    same_datasets = retained_dataset_ids == tuple(item.dataset_id for item in before.mapped_datasets)
+    defaults_before = {item.name: item for item in before.parameter_defaults}
+    kept_parameters = {} if previous is None else {item.name: item for item in previous.parameters}
+    parameters = []
+    for default in origin.parameter_defaults:
+        parameter = _complete_fit_parameter_scopes(default, retained_dataset_ids)
+        kept_parameter = kept_parameters.get(default.name)
+        if kept_parameter is not None and defaults_before[default.name] == default:
+            if same_datasets:
+                parameter = kept_parameter
+            else:
+                # Per-dataset values follow the dataset list, so the parameter returns Shared.
+                shared = convert_fit_parameter_scope(kept_parameter, "shared", previous.datasets, before)
+                parameter = replace(parameter, shared_config=shared.shared_config)
+        parameters.append(parameter)
+    setup = FitSetupSnapshot(
         origin=origin,
         solver="BDF",
         datasets=tuple(datasets),
-        parameters=parameters,
+        parameters=tuple(parameters),
         initials=initials,
         defaults=origin.fit_defaults,
         dataset_weight_mode="implicit",
         shared_initial_groups=(),
+    )
+    if previous is None:
+        return setup
+    set_before = {item.dataset_id: item.set_id for item in before.mapped_datasets}
+    set_now = {item.dataset_id: item.set_id for item in origin.mapped_datasets}
+    return replace(
+        setup,
+        solver=previous.solver,
+        defaults=previous.defaults if before.fit_defaults == origin.fit_defaults else origin.fit_defaults,
+        dataset_weight_mode=previous.dataset_weight_mode,
+        # A group stays while every member keeps its set and its starting concentration.
+        shared_initial_groups=tuple(
+            group for group in previous.shared_initial_groups
+            if all(
+                set_now.get(dataset_id) == set_before[dataset_id]
+                and (set_before[dataset_id], group.species) in kept_initials
+                for dataset_id in group.member_dataset_ids
+            )
+        ),
+        profile=replace(
+            previous.profile,
+            unticked=previous.profile.unticked
+            & frozenset(fit_uncertainty_coordinates(setup.parameters, setup.datasets)),
+        ),
     )
 
 
