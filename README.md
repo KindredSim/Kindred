@@ -1,133 +1,146 @@
-# Kindred
+Kindred is a Python desktop application designed for the numerical simulation
+and global fitting of chemical kinetic models.
 
-Kindred is a desktop application for building chemical kinetic mechanisms,
-simulating their behavior, comparing results with experimental data, and
-fitting kinetic parameters.
-
-## Capabilities
-
-- Build and inspect multi-step reaction mechanisms in a line-oriented DSL.
-- Run kinetic simulations with configurable time ranges, solvers, tolerances,
-  temperatures, initial conditions, temperature schedules, and interventions.
-- Explore simulation results in interactive plots and analysis views.
-- Import experimental datasets from CSV and XLSX files, map observations to
-  model species or observables, and fit one or more datasets.
-- Copy fit results, export current result data to XLSX, and save projects as
-  `.kin` files. A project keeps its mechanisms, settings, initial conditions,
-  datasets, plotted sets, and plot appearance. Run and fit results, display
-  units, and zoom are not saved, so Run again after opening.
-- Start from bundled mechanism presets and intervention examples.
-
-Mechanism steps use unprefixed reaction lines. Irreversible arrows may be
-written as `->` or `=>`,
-and reversible arrows as `<->` or `<=>`. The bundled presets use the same
-accepted DSL. Open the Reactions Help tab in Kindred for the syntax reference
-and examples.
+## Key Features
+- Elementary reactions with rate constants given directly or through Arrhenius (`A`, `Ea`) or Eyring (`dG_act`) parameters, and equilibria through `kr`, `Keq`, or `dG_eq`
+- Support for symbolic operations on kinetic models
+- User-defined quantities in mechanism as fittable variables
+- Automatic detection and simplification of thermodynamic cycles
+- Interventions: concentration changes, additions, continuous feeds,
+  withdrawals, dilutions, held concentrations, repeated protocols, threshold
+  triggers, and stopping conditions, with optional vessel volume tracking
+- Kinetic model fitting of experimental data, including profile-likelihood confidence intervals
 
 ## Installation
 
-Kindred is a desktop application for Windows and macOS; the setup steps below
-are for Windows. Its GUI requires Python 3.12.
-From the repository root, use native Windows Python 3.12 to create an
-environment and install the application:
+Windows builds of each named release are on the
+[Releases](https://github.com/KindredSim/Kindred/releases) page. On macOS, and
+for any other version of the source, such as a specific commit or the latest code,
+Kindred can be built directly with a build script provided in `tools/packaging/`.
 
-    python -m venv .venv
-    .venv\Scripts\python.exe -m pip install --upgrade pip
-    .venv\Scripts\python.exe -m pip install -e .
+1. Download the source code from GitHub
+2. Place the `kindred/` folder, `pyproject.toml`, and the appropriate build script in a clean folder.
+3. Double-click the script. On macOS, if double-clicking does not work, or macOS
+   refuses to open the script, open Terminal, type `bash ` with a trailing
+   space, drag the script into the window, and press **Return**.
 
-Install in editable mode: the fitting runtime imports this same checkout, and a
-regular install would give the GUI a separate copy of the code.
+The finished build appears in the same folder:
 
-The standard installation includes the required desktop and plotting
-dependencies, including PySide6 and PyQtGraph. To work on Kindred itself, also
-install the development tools:
+- Windows: `Kindred_v<version>_windows_pyinstaller.exe`
+- macOS: `Kindred_v<version>_mac_<chip>.dmg` (`<chip>`: `arm64` for Apple silicon, `x86_64` for Intel).
 
-    .venv\Scripts\python.exe -m pip install -e . --group dev
+Along the way, the scripts may install system components:
 
-### Fitting runtime
+- Windows: if 64-bit Python 3.12 is missing, Python 3.12.10 is installed for
+  the current Windows user.
+- macOS: if the Apple Command Line Tools are missing, a window offers to
+  install them. If the Xcode license has not been accepted on that Mac, the
+  script asks for the Mac password to accept it.
 
-Global Fit runs in a separate native Windows Python 3.15t (free-threaded)
-installation inside the GUI environment,
-`.venv\kindred-fitting-runtime\python\python.exe`. Its scientific dependencies
-are separate from the GUI dependencies, and the fitting entry point loads only
-Qt-free Kindred modules. Kindred never downloads or installs this runtime.
-Provision it once, and again whenever `[tool.kindred.fitting-runtime]` or the
-`fitting-runtime` dependency group in `pyproject.toml` changes; the GUI's
-Python constraint and dependencies remain under `[project]`.
+Each build writes a log to `artifacts\pyinstaller\<date-time>\build.log` on
+Windows and `artifacts/pyinstaller-macos/<date-time>/build.log` on macOS.
 
-1. Obtain the Windows 64-bit free-threaded Python archive for
-   `python-version` (currently 3.15.2t).
-2. Unpack the complete installation so that `python.exe` sits directly in
-   `.venv\kindred-fitting-runtime\python\`. Keep this depth; one level higher,
-   CPython would read the GUI environment's `pyvenv.cfg`.
-3. Install the pinned dependencies into the runtime itself:
+`tools/packaging/build_kindred_windows_nuitka.cmd` builds an alternative Windows
+executable compiled to C, named `Kindred_v<version>_windows_nuitka.exe`. If the
+Microsoft C++ Build Tools are missing, it installs them, and Windows may ask
+for administrator approval.
 
-       .venv\kindred-fitting-runtime\python\python.exe -E -s -m pip install --group fitting-runtime
+## Documentation
 
-   If pip is missing, run `-m ensurepip` with the same interpreter first.
-4. Create `.venv\kindred-fitting-runtime\python\Lib\site-packages\kindred-source.pth`
-   containing one line: the absolute path of the repository root (the folder
-   containing `kindred\`). Do not add the GUI's site-packages.
-5. Verify from the runtime folder, as Kindred itself starts the runtime:
+A Read the Docs page is a work in progress. Current functions are documented in the application (**Help** tab beside **Reactions**).
+Interactive tutorials to teach functionality and workflows are available in **Help → Interactive Tutorials…**.
+
+## Contributing
+
+To run Kindred from a checkout without building it, set up both Pythons by
+hand. Two Python installations share one environment: a 64-bit Python 3.12 runs the application, and a free-threaded
+Python 3.15 with separate scientific packages runs fitting. The fitting Python
+version is set by `python-version` under `[tool.kindred.fitting-runtime]` in
+`pyproject.toml` (currently `3.15.2t`), and the fitting packages by the
+`fitting-runtime` dependency group.
+
+| | Python 3.12 | Free-threaded Python 3.15.2 |
+|---|---|---|
+| Windows | 64-bit installer from [python.org](https://www.python.org/downloads/windows/) | `python-3.15.2t-amd64.zip` from [python.org](https://www.python.org/ftp/python/3.15.2/) |
+| macOS | `cpython-3.12.<n>+<release>-<arch>-apple-darwin-install_only.tar.gz` | `cpython-3.15.2+<release>-<arch>-apple-darwin-freethreaded-install_only.tar.gz` |
+
+The macOS archives come from
+[python-build-standalone](https://github.com/astral-sh/python-build-standalone/releases).
+`<arch>` is `aarch64` on Apple silicon and `x86_64` on Intel Macs.
+
+1. Clone the repository and run every later command from the repository root:
+
+       git clone https://github.com/KindredSim/Kindred.git
+       cd Kindred
+
+2. Create the environment with Python 3.12 and install Kindred in editable
+   mode.
+
+   Windows:
+
+       py -3.12 -m venv .venv
+       .venv\Scripts\python.exe -m pip install --upgrade pip
+       .venv\Scripts\python.exe -m pip install -e .
+
+   macOS, after extracting the Python 3.12 archive to a folder outside the
+   repository:
+
+       <folder>/python/bin/python3 -m venv .venv
+       .venv/bin/python -m pip install --upgrade pip
+       .venv/bin/python -m pip install -e .
+
+   Editable mode (`-e`) is required because fitting runs this same checkout in
+   the second Python. A regular install would leave the two on different
+   copies of the code.
+3. Extract the free-threaded Python 3.15.2 archive inside the environment.
+
+   - Windows: extract the zip into `.venv\kindred-fitting-runtime\python\`,
+     so that the interpreter is `.venv\kindred-fitting-runtime\python\python.exe`.
+   - macOS: extract the archive into `.venv/kindred-fitting-runtime/`. The
+     archive contains the `python` folder, so the interpreter is
+     `.venv/kindred-fitting-runtime/python/bin/python3`.
+4. Install the fitting packages with that interpreter. The command is shown
+   for Windows. On macOS, use `bin/python3` in the same folder.
+
+       .venv\kindred-fitting-runtime\python\python.exe -E -s -m pip install --only-binary=:all: --group fitting-runtime
+
+5. Add the checkout to the fitting Python. Print the package folder of that
+   interpreter:
+
+       .venv\kindred-fitting-runtime\python\python.exe -E -s -c "import sysconfig; print(sysconfig.get_path('purelib'))"
+
+   In that folder, create a file named `kindred-source.pth` that contains one
+   line: the absolute path of the repository root (the folder that contains
+   `kindred`). Do not add the packages of the application environment.
+6. Check the installation from the runtime folder.
+
+   Windows (PowerShell):
 
        Push-Location .venv\kindred-fitting-runtime\python
        .\python.exe -E -s -m kindred.gui.fitting.process --verify-only; "exit code: $LASTEXITCODE"
        Pop-Location
 
-   Exit code 0 means free-threaded 3.15 with the GIL still disabled after the
-   scientific imports, no Qt modules loaded, and Kindred importable from this
-   checkout. Failures print a traceback.
+   macOS:
 
-Kindred starts the runtime with `-E -s` (ignoring PYTHONPATH, PYTHONHOME,
-PYTHON_GIL and the user site-packages) and limits BLAS/OpenMP to one thread.
+       (cd .venv/kindred-fitting-runtime/python && ./bin/python3 -E -s -m kindred.gui.fitting.process --verify-only; echo "exit code: $?")
 
-## Launch
+   Exit code 0 means the fitting Python is ready. Exit code 1 means it is not,
+   and the reason is printed.
 
-Launch the installed application with either command:
+After updating the checkout, rerun the `pip install` commands in steps 2
+and 4. If `python-version` changed, replace the fitting Python (steps 3 to
+5). Then rerun step 6.
 
-    .venv\Scripts\kindred.exe
+Launch Kindred from the checkout with `.venv\Scripts\kindred.exe` on Windows
+or `.venv/bin/kindred` on macOS.
 
-    .venv\Scripts\python.exe -m kindred
+Install the development tools into the application environment. On macOS, use
+`.venv/bin/python`.
 
-Kindred launches only the desktop interface and does not accept command-line
-arguments.
+    .venv\Scripts\python.exe -m pip install -e . --group dev
 
-## Diagnostics
+## License
 
-Each time Kindred starts, it writes a new detailed log in the platform log
-directory, named after its start time and process, such as
-`kindred-20261104-153000-1234.log`. Help, Diagnostic Log shows the log of the
-open window. Each time Kindred starts, it keeps the newest ten logs and
-deletes older ones, except a log another open Kindred is still writing.
-
-- Linux: `~/.cache/kindred/logs/` (or `$XDG_CACHE_HOME/kindred/logs/`)
-- macOS: `~/Library/Logs/kindred/`
-- Windows: `%LOCALAPPDATA%\kindred\logs\`
-
-Set `KINDRED_LOG_DIR` to choose another normal log directory. If that location
-cannot be opened, Kindred writes the log to `kindred/logs/` in the system
-temporary directory. `LOG_LEVEL` or `KINDRED_LOG_LEVEL` may be set to
-`DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`.
-
-Fitting checks for the required Python build and scientific dependencies.
-Launch errors report missing or incompatible runtime
-components and include available diagnostics from the fitting process.
-
-## Basic workflow
-
-1. Choose a bundled example or enter a mechanism in the Reactions editor.
-2. Set initial concentrations and simulation settings, then select **Run**.
-3. Inspect and configure the plot, parameters, statistics, and analysis views.
-4. To compare with experiments, load CSV or XLSX data and map its time and
-   observation columns to the mechanism.
-5. Open **Fitting → Global Fit**, choose datasets and adjustable values, and run
-   the fit.
-6. Export current results to XLSX or save the project as a `.kin` file.
-
-## Links
-
-- [Source repository](https://github.com/kindredsim/kindred)
-- [Issue tracker](https://github.com/kindredsim/kindred/issues)
-- [Kindred license](LICENSE)
-- [Third-party notices](NOTICE.txt)
-- [Third-party licenses](THIRD_PARTY_LICENSES.txt)
+Kindred is written by Pedro Oliveira and released under the
+[MIT License](LICENSE). Third-party components are listed in
+[NOTICE.txt](NOTICE.txt) and [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt).
