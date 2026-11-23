@@ -300,6 +300,7 @@ class MainWindow(QtWidgets.QMainWindow):
             discard_slider_drafts=self._discard_all_slider_drafts,
         )
         self.project_controller.projectStateChanged.connect(self._scan_owner.project_state_changed)
+        self.project_controller.projectStateChanged.connect(self._fit_session_owner.project_state_changed)
 
         from kindred.config.templates import TemplateManager
 
@@ -1392,6 +1393,7 @@ class MainWindow(QtWidgets.QMainWindow):
         runtime.initial_text_by_set_id.clear()
         bundle.simulation_panel.discard_run_defaults_draft()
         self._workspace_tab_registry.close_tab(tab_id)
+        self._fit_session_owner.forget_tab(tab_id)
         self._drop_tab_surface(
             tab_id,
         )

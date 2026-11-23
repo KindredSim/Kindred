@@ -97,6 +97,8 @@ class AdvancedFittingLesson(PracticeLesson):
         self._applied = False
         # The Species Table rows last seen for each dataset the open Fitting Window showed.
         self._rows_seen: dict[str, dict[str, _Row]] = {}
+        # Whether the open Fitting Window was reset to a clean setup.
+        self._reset_seen = False
         self._take_over()
 
     def _mechanism_loaded(self) -> bool:
@@ -163,6 +165,10 @@ class AdvancedFittingLesson(PracticeLesson):
         if self.step.name in self._fit_steps and not self._applied:
             self._reopen_fit()
 
+    def _reset_requested(self, target: str, part: str) -> None:
+        """The open Fitting Window reset its whole setup to the clean one."""
+        self._reset_seen = self._reset_seen or (target, part) == ("initial", "both")
+
     # -- observations ----------------------------------------------------------
     @staticmethod
     def _starts(run: str) -> dict[str, float]:
@@ -201,8 +207,9 @@ class AdvancedFittingLesson(PracticeLesson):
             return
         tabs = {tab.tab_id for tab in self.registry.document.tabs}
         if window is not self._seen_fit:
-            self._seen_fit, self._tabs_at_open, self._rows_seen = window, tabs, {}
+            self._seen_fit, self._tabs_at_open, self._rows_seen, self._reset_seen = window, tabs, {}, False
             window.destroyed.connect(self._fit_closed)
+            window.resetRequested.connect(self._reset_requested)
         shown = self._shown_rows(window)
         if shown is not None:
             dataset, rows = shown
@@ -440,11 +447,37 @@ class AdvancedFittingLesson(PracticeLesson):
             dialog=FittingWindow,
         )
 
+    def _reset_target(self) -> tuple[Highlight, ...]:
+        """Reset Setup… in the open Fitting Window."""
+        window = self._fit_window()
+        button = None if window is None else self._shown(
+            window, QtWidgets.QPushButton, lambda button: button.text() == "Reset Setup…"
+        )
+        return () if button is None else (Highlight(button),)
+
+    def _reset_setup_step(self) -> Step:
+        """The lessons of the series share one tab, whose Fitting Window opens with the setup it last had."""
+        return Step(
+            "reset_setup",
+            "Start from a Clean Setup",
+            "<p>The Fitting Window keeps the setup of a mechanism tab while Kindred stays open, and the Advanced "
+            "Fitting lessons share this tab. Choices from another lesson, or from before the window was closed, "
+            "can still be here.</p>"
+            "<p>Click <b>Reset Setup…</b>. Keep <b>Clean setup from the mechanism tab</b> and <b>Both</b> "
+            "selected, and click <b>Reset</b>.</p>",
+            self._reset_target,
+            lambda: self._applied or self._reset_seen,
+            "The setup starts clean from the mechanism tab.",
+            waiting="Click Reset Setup…, keep Clean setup from the mechanism tab and Both, and click Reset.",
+            dialog=FittingWindow,
+        )
+
     def _choose_datasets_step(self) -> Step:
         return Step(
             "choose_datasets",
             "Choose the Datasets",
-            f"<p>In <b>Datasets</b>, check {self._named}, and leave the other datasets unchecked.</p>",
+            f"<p>On <b>Data and Targets</b>, check {self._named} in <b>Datasets</b>, and leave the other "
+            "datasets unchecked.</p>",
             lambda: (),
             lambda: self._applied or self._included_only(),
             f"{self._named} are included.",
@@ -490,8 +523,8 @@ class BoundsAndSolvers(AdvancedFittingLesson):
     _named = "bounds1, bounds2, and bounds3"
     _first_step = "open_fit"
     _fit_steps = frozenset({
-        "choose_datasets", "choose_targets", "vary_rates", "run_fit", "read_results", "set_bounds", "run_wide",
-        "use_de", "apply_copy",
+        "reset_setup", "choose_datasets", "choose_targets", "vary_rates", "run_fit", "read_results", "set_bounds",
+        "run_wide", "use_de", "apply_copy",
     })
     _mapped_steps = _fit_steps | {"open_fit"}
     # The species with measurements over time, the only ones the fit compares.
@@ -554,6 +587,7 @@ class BoundsAndSolvers(AdvancedFittingLesson):
                 "<b>bounds3</b>. Their true values lie far from those in Reactions, as when a mechanism meets a "
                 "new system for the first time.</p>"
             ),
+            self._reset_setup_step(),
             self._choose_datasets_step(),
             Step(
                 "choose_targets",
@@ -897,8 +931,9 @@ class CalculatedQuantitiesAndConstraints(AdvancedFittingLesson):
             Step(
                 "choose_datasets",
                 "Choose the Datasets",
-                "<p>In <b>Datasets</b>, check base1 — processed, base2 — processed, and base3 — processed, and "
-                "leave the other datasets unchecked, base1 to base3 among them.</p>",
+                "<p>On <b>Data and Targets</b>, check base1 — processed, base2 — processed, and base3 — "
+                "processed in <b>Datasets</b>, and leave the other datasets unchecked, base1 to base3 among "
+                "them.</p>",
                 lambda: (),
                 lambda: self._applied or self._included_only(),
                 "The three new datasets are included.",
@@ -995,7 +1030,9 @@ class VaryingInitialConditions(AdvancedFittingLesson):
     _sheets = ("stock1", "stock2", "stock3")
     _named = "stock1, stock2, and stock3"
     _first_step = "open_fit"
-    _fit_steps = frozenset({"choose_datasets", "choose_targets", "vary_c", "share_c", "run_fit", "read_results"})
+    _fit_steps = frozenset({
+        "reset_setup", "choose_datasets", "choose_targets", "vary_c", "share_c", "run_fit", "read_results",
+    })
     _mapped_steps = _fit_steps | {"open_fit"}
 
     def _c_rows(self) -> dict[str, _Row | None]:
@@ -1031,6 +1068,7 @@ class VaryingInitialConditions(AdvancedFittingLesson):
                 "the experiment showed that the real concentration of the stock solutions is uncertain. stock1 and "
                 "stock2 were made from the same stock solution, so their starting C must be the same.</p>"
             ),
+            self._reset_setup_step(),
             self._choose_datasets_step(),
             self._choose_targets_step(),
             Step(
@@ -1106,7 +1144,8 @@ class PerDatasetRateConstants(AdvancedFittingLesson):
     _named = "k2runs1, k2runs2, and k2runs3"
     _first_step = "open_fit"
     _fit_steps = frozenset({
-        "choose_datasets", "choose_targets", "vary_rates", "per_dataset", "share_k2", "run_fit", "read_results",
+        "reset_setup", "choose_datasets", "choose_targets", "vary_rates", "per_dataset", "share_k2", "run_fit",
+        "read_results",
     })
     _mapped_steps = _fit_steps | {"open_fit"}
 
@@ -1156,12 +1195,13 @@ class PerDatasetRateConstants(AdvancedFittingLesson):
                 "datasets.</p>"
                 "<p>Outside the Fitting Window, a mechanism tab holds one value for each rate constant. <b>Apply "
                 "Fit</b> writes the mean of the per-dataset values, which <b>Summary</b> also lists, into Reactions "
-                "and adds a comment line with each value. Closing the Fitting Window without applying discards the "
-                "result, so copy what you need from <b>Summary</b> first and keep it outside Kindred. You can also "
-                "paste it into the <b>Notes</b> tab beside Reactions once the Fitting Window is closed.</p>"
+                "and adds a comment line with each value. A result that is not applied is not saved with the project, "
+                "so copy what you need from <b>Summary</b> and keep it outside Kindred. You can also paste it into "
+                "the <b>Notes</b> tab beside Reactions once the Fitting Window is closed.</p>"
                 "<p>In this lesson, the three runs share kf1 and kr1, but k2 differs: k2runs1 and k2runs2 were made "
                 "under the same conditions, and k2runs3 under different ones.</p>"
             ),
+            self._reset_setup_step(),
             self._choose_datasets_step(),
             self._choose_targets_step(),
             Step(
@@ -1246,8 +1286,8 @@ class ProfileLikelihood(AdvancedFittingLesson):
     _named = "profile1 to profile7"
     _first_step = "open_fit"
     _fit_steps = frozenset({
-        "choose_datasets", "choose_targets", "vary_rates", "profile", "run_fit", "read_profile", "hold_k3",
-        "read_held",
+        "reset_setup", "choose_datasets", "choose_targets", "vary_rates", "profile", "run_fit", "read_profile",
+        "hold_k3", "read_held",
     })
     _mapped_steps = _fit_steps | {"open_fit"}
 
@@ -1272,6 +1312,7 @@ class ProfileLikelihood(AdvancedFittingLesson):
                 "fits the four rate constants of M11 to <b>profile1</b> to <b>profile7</b>, seven runs with "
                 "different starting concentrations.</p>"
             ),
+            self._reset_setup_step(),
             self._choose_datasets_step(),
             self._choose_targets_step(),
             Step(
@@ -1397,8 +1438,8 @@ class FittingAgainstMeasuredQuantity(AdvancedFittingLesson):
     _mixed_targets = {"base1": _targets | {"Int"}, "base2": _targets, "base3": _targets}
     _first_step = "open_fit"
     _fit_steps = frozenset({
-        "choose_datasets", "fit_against", "choose_targets", "vary_rates", "run_fit", "read_warning", "times_ten",
-        "read_scale", "time_base1", "hold_k3", "run_mixed", "read_results",
+        "reset_setup", "choose_datasets", "fit_against", "choose_targets", "vary_rates", "run_fit", "read_warning",
+        "times_ten", "read_scale", "time_base1", "hold_k3", "run_mixed", "read_results",
     })
     _mapped_steps = _fit_steps | {"open_fit"}
 
@@ -1475,6 +1516,7 @@ class FittingAgainstMeasuredQuantity(AdvancedFittingLesson):
                 "<p>This lesson fits the rate constants of M11 to <b>base1</b>, <b>base2</b>, and <b>base3</b>, "
                 "first against their measured Int and then with base1 against time.</p>"
             ),
+            self._reset_setup_step(),
             self._choose_datasets_step(),
             Step(
                 "fit_against",

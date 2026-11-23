@@ -974,7 +974,7 @@ class Interventions(PracticeLesson):
                 "<li>Run 3: 0 to 117, 189 to 305, and 361 to 470 s</li>"
                 "</ul>"
                 "<p>Compare them with the fitted values.</p>"
-                "<p>Closing the Fitting Window without <b>Apply Fit</b> discards the result.</p>"
+                "<p>A result that is not applied with <b>Apply Fit</b> is not saved with the project.</p>"
                 "<p>Click <b>Finish</b> to close this lesson. Open <b>Help → Interactive Tutorials…</b> to choose "
                 "another.</p>",
                 nothing,

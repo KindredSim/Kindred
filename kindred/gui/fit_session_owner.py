@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 
 from PySide6 import QtCore, QtWidgets
@@ -29,6 +29,7 @@ from kindred.gui.fitting.launch import (
     build_fit_execution_request,
     capture_fit_origin,
     create_initial_fit_setup,
+    fit_origin_unchanged,
     fit_parameter_overall,
 )
 from kindred.gui.fitting.reporting import fit_better_fit_text, fit_identity_text
@@ -48,8 +49,26 @@ def _part_differs(fields: tuple[str, ...], first: FitSetupSnapshot, second: FitS
     return any(getattr(first, field) != getattr(second, field) for field in fields)
 
 
+@dataclass(frozen=True, slots=True)
+class _KeptFit:
+    """What a closed Fit window leaves for its tab while Kindred stays open."""
+
+    setup: FitSetupSnapshot
+    last_fit_setup: FitSetupSnapshot | None
+    undo_setups: tuple[FitSetupSnapshot, ...]
+    redo_setups: tuple[FitSetupSnapshot, ...]
+    candidate: FitCandidate | None
+    candidate_projection: object
+    candidate_copy_name: str | None
+    candidate_applied_to_project: bool
+
+
 class FitSessionOwner(QtCore.QObject):
-    """Retain the window, accepted setup, worker, and candidate custody."""
+    """Retain the window, accepted setup, worker, and candidate custody.
+
+    A closed window leaves its setup, and its result when it closed idle, for
+    the next Fit window of the same tab.
+    """
 
     window_changed = QtCore.Signal(bool)
     execution_changed = QtCore.Signal(bool)
@@ -86,13 +105,23 @@ class FitSessionOwner(QtCore.QObject):
         # A failed retry's status, shown after the earlier result returns.
         self._failure_status: str | None = None
         self._setup_state: FitSetupSnapshot | None = None
-        self._initial_setup_snapshot: FitSetupSnapshot | None = None
         self._last_fit_setup_snapshot: FitSetupSnapshot | None = None
         # Accepted setups before and after the current one, for Undo and Redo.
         self._undo_setups: list[FitSetupSnapshot] = []
         self._redo_setups: list[FitSetupSnapshot] = []
         self._closing = False
         self._application_close_fenced = False
+        self._kept_by_tab_id: dict[str, _KeptFit] = {}
+
+    def forget_tab(self, tab_id: str) -> None:
+        """A closed tab takes its kept Fit setup with it."""
+
+        self._kept_by_tab_id.pop(tab_id, None)
+
+    @QtCore.Slot(bool)
+    def project_state_changed(self, project_replaced: bool) -> None:
+        if project_replaced:
+            self._kept_by_tab_id.clear()
 
     def refresh_plot_preferences(self) -> None:
         if self._window is not None:
@@ -130,7 +159,17 @@ class FitSessionOwner(QtCore.QObject):
             )
             return None
         origin = capture_fit_origin(self._session.document, tab_id)
-        setup = create_initial_fit_setup(origin)
+        kept = self._kept_by_tab_id.pop(tab_id, None)
+        restored = kept is not None and fit_origin_unchanged(kept.setup.origin, origin)
+        if restored:
+            # One origin serves the whole session, the kept result included.
+            origin = kept.setup.origin
+        if kept is None:
+            setup = create_initial_fit_setup(origin)
+        elif restored:
+            setup = kept.setup
+        else:
+            setup = create_initial_fit_setup(origin, kept.setup)
         analysis = origin.prepared_dsl.analysis
         modeled_species = tuple(
             dict.fromkeys(
@@ -149,8 +188,14 @@ class FitSessionOwner(QtCore.QObject):
         )
         self._window = window
         self._install_setup(setup)
-        # The previous window's destruction cleared its last Fit and result.
-        self._initial_setup_snapshot = setup
+        if restored:
+            self._last_fit_setup_snapshot = kept.last_fit_setup
+            self._undo_setups[:] = kept.undo_setups
+            self._redo_setups[:] = kept.redo_setups
+            self._candidate = kept.candidate
+            self._candidate_projection = kept.candidate_projection
+            self._candidate_copy_name = kept.candidate_copy_name
+            self._candidate_applied_to_project = kept.candidate_applied_to_project
         window.project_setup_snapshot(setup)
 
         window.executeRequested.connect(self.execute)
@@ -168,6 +213,12 @@ class FitSessionOwner(QtCore.QObject):
         window.show()
         window.raise_()
         window.activateWindow()
+        if self._last_fit_setup_snapshot is not None:
+            window.set_last_fit_reset_available(self._last_fit_setup_snapshot)
+        if self._candidate is not None:
+            window.prepare_fit_plots(self._candidate.request, waiting=False)
+            self._show_candidate(self._candidate)
+            self._refresh_result_currency()
         declarations = origin.prepared_dsl.authored_stop_declarations()
         if declarations and origin.scientific_settings.use_authored_stops:
             message = QtWidgets.QMessageBox(window)
@@ -183,7 +234,15 @@ class FitSessionOwner(QtCore.QObject):
             )
             message.setStandardButtons(QtWidgets.QMessageBox.Ok)
             message.exec()
-        self._set_status(f"Fit opened for {origin.tab_name}.")
+        if kept is None:
+            self._set_status(f"Fit opened for {origin.tab_name}.")
+        elif restored:
+            self._set_status(f"Fit opened for {origin.tab_name} as it was closed.")
+        else:
+            self._set_status(
+                f"Fit opened for {origin.tab_name}. The project changed since this Fit setup was kept, "
+                "so changed items start from the mechanism tab and no result or Undo step is kept."
+            )
         return window
 
     @QtCore.Slot()
@@ -298,16 +357,17 @@ class FitSessionOwner(QtCore.QObject):
         settings and Profile.
         """
 
-        # Reset is offered only by the open, idle window.
-        # "Last Fit" is offered only once a Fit set that snapshot, and Apply
-        # rebases both snapshots with the setup.
+        # Reset is offered only by the open, idle window, and "Last Fit" only
+        # once a Fit set that snapshot.
         window = self._window
+        current = self._accepted_setup()
+        # The clean setup is built from the origin as it is now, the one Apply
+        # to Project left.
         snapshot = (
-            self._initial_setup_snapshot
+            create_initial_fit_setup(current.origin)
             if reset_kind == "initial"
             else self._last_fit_setup_snapshot
         )
-        current = self._accepted_setup()
         if part != "both":
             fields = _DATA_FIELDS if part == "data" else _PARAMETER_FIELDS
             snapshot = replace(current, **{field: getattr(snapshot, field) for field in fields})
@@ -316,7 +376,7 @@ class FitSessionOwner(QtCore.QObject):
         # A reset discards held invalid text only in the part it replaces.
         window.clear_pending_setup_edits(data=part != "parameters", parameters=part != "data")
         self._restore_setup(snapshot)
-        target = "the setup when this window opened" if reset_kind == "initial" else "the last Fit"
+        target = "a clean setup from the mechanism tab" if reset_kind == "initial" else "the last Fit"
         scope = {"data": "Data and Targets", "parameters": "Parameters", "both": "Fit setup"}[part]
         self._set_status(f"{scope} reset to {target}.")
 
@@ -429,8 +489,24 @@ class FitSessionOwner(QtCore.QObject):
         if self._worker is not None:
             self._worker.request_cancel()
             return False
+        self._keep_for_tab(result=True)
         self._discard_local()
         return True
+
+    def _keep_for_tab(self, *, result: bool) -> None:
+        """Leave the setup, and the result when asked, for the tab's next Fit window."""
+
+        setup = self._accepted_setup()
+        self._kept_by_tab_id[setup.origin.tab_id] = _KeptFit(
+            setup=setup,
+            last_fit_setup=self._last_fit_setup_snapshot,
+            undo_setups=tuple(self._undo_setups),
+            redo_setups=tuple(self._redo_setups),
+            candidate=self._candidate if result else None,
+            candidate_projection=self._candidate_projection if result else None,
+            candidate_copy_name=self._candidate_copy_name if result else None,
+            candidate_applied_to_project=result and self._candidate_applied_to_project,
+        )
 
     def _destroy_window_after_cleanup(self) -> None:
         """Close the window through its owner-authorized path and delete it now."""
@@ -445,7 +521,6 @@ class FitSessionOwner(QtCore.QObject):
     def _discard_local(self) -> None:
         self._invalidate_candidate_custody()
         self._setup_state = None
-        self._initial_setup_snapshot = None
         self._last_fit_setup_snapshot = None
         self._undo_setups.clear()
         self._redo_setups.clear()
@@ -457,14 +532,13 @@ class FitSessionOwner(QtCore.QObject):
         self._window = None
         self._setup_state = None
         self._invalidate_candidate_custody()
-        self._initial_setup_snapshot = None
         self._last_fit_setup_snapshot = None
         self._undo_setups.clear()
         self._redo_setups.clear()
         self._closing = False
         self.window_changed.emit(False)
         self.application_close_settlement_changed.emit()
-        self._set_status("Fit closed. All temporary fit state was discarded.")
+        self._set_status("Fit closed. The mechanism tab keeps this Fit setup while Kindred stays open.")
 
     def _on_progress(self, done: int, total: int, text: str) -> None:
         if self._closing:
@@ -507,10 +581,14 @@ class FitSessionOwner(QtCore.QObject):
         self._undo_setups.clear()
         self._redo_setups.clear()
         window = self._window
-        if window is None:
-            return
         window.project_setup_snapshot(terminal_setup)
         window.set_last_fit_reset_available(terminal_setup)
+        self._show_candidate(candidate)
+
+    def _show_candidate(self, candidate: FitCandidate) -> None:
+        """Show a retained candidate in the open window."""
+
+        window = self._window
         curves = self._candidate_projection
         # A run that ended without Stop shows a full bar; its text states how
         # Profile settled.
@@ -616,10 +694,6 @@ class FitSessionOwner(QtCore.QObject):
         )
         successor_origin = capture_fit_origin(proposed_document, origin.tab_id)
         rebased_setup = replace(setup, origin=successor_origin)
-        rebased_initial_setup = replace(
-            self._initial_setup_snapshot,
-            origin=successor_origin,
-        )
         rebased_last_fit_setup = replace(
             candidate.setup_snapshot,
             origin=successor_origin,
@@ -632,7 +706,6 @@ class FitSessionOwner(QtCore.QObject):
             runtime.initial_text_by_set_id.pop(set_id, None)
         self._candidate_applied_to_project = True
         self._install_setup(rebased_setup)
-        self._initial_setup_snapshot = rebased_initial_setup
         self._last_fit_setup_snapshot = rebased_last_fit_setup
         for history in (self._undo_setups, self._redo_setups):
             history[:] = [replace(item, origin=successor_origin) for item in history]
@@ -787,6 +860,9 @@ class FitSessionOwner(QtCore.QObject):
         self.execution_changed.emit(False)
         worker.deleteLater()
         if closing:
+            if not self._application_close_fenced:
+                # A window closed during its run keeps the setup; the cancelled run left no result.
+                self._keep_for_tab(result=False)
             self._discard_local()
             self._destroy_window_after_cleanup()
         else:

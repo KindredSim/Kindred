@@ -175,8 +175,8 @@ class FittingWindow(QtWidgets.QDialog):
         row.addLayout(actions)
         self._reset_button = QtWidgets.QPushButton("Reset Setup…", footer)
         self._reset_button.setToolTip(
-            "Restore Data and Targets, Parameters or both to the setup captured "
-            "when this window opened or to the last completed Fit's."
+            "Restore Data and Targets, Parameters, or both to a clean setup from "
+            "the mechanism tab or to the setup of the last completed Fit."
         )
         self._reset_button.clicked.connect(self._open_reset_dialog)
         # Undo and Redo of setup changes have only their usual keys; a focused
@@ -269,7 +269,7 @@ class FittingWindow(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(dialog)
         target_group = QtWidgets.QGroupBox("Reset to", dialog)
         target_layout = QtWidgets.QVBoxLayout(target_group)
-        initial = QtWidgets.QRadioButton("Setup when this window opened", target_group)
+        initial = QtWidgets.QRadioButton("Clean setup from the mechanism tab", target_group)
         last_fit = QtWidgets.QRadioButton(
             "Setup of the last completed Fit, with its fitted parameter values as starting values",
             target_group,
@@ -688,6 +688,8 @@ class FittingWindow(QtWidgets.QDialog):
 
     def prepare_fit_plots(self, request, *, waiting: bool) -> None:
         """Prepare the plots; at a run start the tracker also waits for its first candidate."""
+        # The plots are laid out at the size of the displayed Results page.
+        self._tabs.setCurrentIndex(2)
         if waiting:
             self._run_results_tab.set_waiting(request)
         self._run_results_tab.prepare(request)
@@ -703,7 +705,6 @@ class FittingWindow(QtWidgets.QDialog):
             self._paused = False
             # A run starts with no known end.
             self.set_progress(0, 0)
-            self._tabs.setCurrentIndex(2)
             self.set_apply_available(False, "Fit is running.")
         else:
             self._paused = False
@@ -912,6 +913,11 @@ class FittingWindow(QtWidgets.QDialog):
         if self._closing:
             event.ignore()
             return
+        # The title-bar close does not move focus. Let the focused editor
+        # settle through its normal signals before the setup is kept.
+        focused = self.focusWidget()
+        if focused is not None:
+            focused.clearFocus()
         self.enter_stopping()
         if self._close_handler():
             self._closing_after_cleanup = True
